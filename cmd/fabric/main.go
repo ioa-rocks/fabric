@@ -165,12 +165,15 @@ func cmdInit(args []string) error {
 		return err
 	}
 	if _, err := dir.LoadConfig(); err == nil {
-		return fmt.Errorf("state dir %s is already initialized", dir.Path)
+		return fmt.Errorf("state dir %s is already initialized — remove %s/config.json (and the old cert.cbor/events.cbor/namespace.key.age) to re-init; the device key is kept", dir.Path, dir.Path)
 	}
 
-	priv, err := dir.GenerateDeviceKey()
+	priv, reused, err := dir.EnsureDeviceKey()
 	if err != nil {
 		return err
+	}
+	if reused {
+		fmt.Println("reusing this device's existing identity key")
 	}
 
 	// Mint the namespace: the first device self-signs (spec §6).
@@ -331,11 +334,14 @@ func cmdJoin(args []string) error {
 		return err
 	}
 	if _, err := dir.LoadConfig(); err == nil {
-		return fmt.Errorf("state dir %s is already initialized", dir.Path)
+		return fmt.Errorf("state dir %s already belongs to a namespace — to re-join a new one, remove %s/config.json (and the old cert.cbor/events.cbor) first; the device key is kept", dir.Path, dir.Path)
 	}
-	priv, err := dir.GenerateDeviceKey()
+	priv, reused, err := dir.EnsureDeviceKey()
 	if err != nil {
 		return err
+	}
+	if reused {
+		fmt.Println("reusing this device's existing identity key")
 	}
 	devicePubRaw, err := priv.GetPublic().Raw()
 	if err != nil {

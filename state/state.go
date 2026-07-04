@@ -105,24 +105,31 @@ func (d Dir) LoadConfig() (Config, error) {
 	return c, nil
 }
 
-// GenerateDeviceKey creates and persists this node's libp2p identity.
-// Refuses to overwrite an existing key.
-func (d Dir) GenerateDeviceKey() (crypto.PrivKey, error) {
-	if _, err := os.Stat(d.deviceKeyPath()); err == nil {
-		return nil, errors.New("device key already exists; refusing to overwrite an identity")
+// EnsureDeviceKey returns this node's libp2p identity, generating and
+// persisting one on first use. An existing key is never overwritten — a
+// device keeps its identity across namespaces (re-join after a namespace
+// re-init reuses it; only membership is namespace-specific). reused reports
+// whether a key was already there.
+func (d Dir) EnsureDeviceKey() (priv crypto.PrivKey, reused bool, err error) {
+	if data, err := os.ReadFile(d.deviceKeyPath()); err == nil {
+		priv, err := crypto.UnmarshalPrivateKey(data)
+		if err != nil {
+			return nil, false, fmt.Errorf("existing device key is unreadable: %w", err)
+		}
+		return priv, true, nil
 	}
-	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	priv, _, err = crypto.GenerateEd25519Key(rand.Reader)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	data, err := crypto.MarshalPrivateKey(priv)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := os.WriteFile(d.deviceKeyPath(), data, 0o600); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return priv, nil
+	return priv, false, nil
 }
 
 func (d Dir) LoadDeviceKey() (crypto.PrivKey, error) {
