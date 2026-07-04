@@ -112,7 +112,9 @@ function renderHeader(d) {
 
   const selfChip = document.getElementById("self-chip");
   selfChip.innerHTML = "";
-  selfChip.append(dot("var(--good)"), `${d.status.name} — ${d.status.master ? "master" : "member"}`);
+  let role = d.status.master ? "master" : "member";
+  if (d.status.queue_host && !d.status.master) role += " · queue host";
+  selfChip.append(dot("var(--good)"), `${d.status.name} — ${role}`);
 
   const reach = document.getElementById("reach-chip");
   reach.innerHTML = "";

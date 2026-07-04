@@ -69,6 +69,27 @@ channel). Approval prompts for the root-key passphrase and signs a
 membership certificate (90-day validity, auto-verified by every peer
 offline).
 
+## Lighthouse: taking joins when the master is unreachable
+
+The master (root key, a human at a screen) does not have to be the node
+joiners can reach. Designate any always-on, publicly reachable member —
+a cloud instance — as the **queue host**:
+
+```sh
+fabric queue on     # on that member; restart its daemon to apply
+```
+
+Joiners then bootstrap against the lighthouse's address. The pending
+queue lives there, but it holds no signing material: `fabric pending`,
+`fabric approve`, `fabric deny`, and the web UI on the master
+transparently pull the queue over a member- and admin-gated protocol
+(`/fabric/queue/1`), sign locally, and send the cert back through the
+lighthouse for delivery. This is what makes a CGNAT'd / v6-only master
+workable: the master only ever dials out.
+
+Queue restarts are harmless (joiners re-enter by polling). Several
+queue hosts can run at once; the master aggregates them.
+
 **4. Start the new node:**
 
 ```sh
@@ -164,6 +185,7 @@ of its own; don't point `-listen` at a routable interface.
 | `fabric deny <fingerprint>` | master | reject a pending request |
 | `fabric revoke <name \| peer-id \| fingerprint>` | master | revoke a member and gossip the cut-off |
 | `fabric ui [-listen 127.0.0.1:4518]` | any member | serve the topology/admin web UI |
+| `fabric queue on\|off` | any member | run the admission queue (lighthouse role) |
 | `fabric peer add <multiaddr>` | any member | add a bootstrap peer |
 
 All commands take `-state <dir>` (default `~/.config/fabric`), so

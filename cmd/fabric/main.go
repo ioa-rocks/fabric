@@ -86,6 +86,8 @@ func main() {
 		err = cmdRevoke(args)
 	case "ui":
 		err = cmdUI(args)
+	case "queue":
+		err = cmdQueue(args)
 	case "peer":
 		err = cmdPeer(args)
 	default:
@@ -110,6 +112,7 @@ func usage() {
   deny     deny a pending join request by fingerprint (master)
   revoke   revoke a member by name, peer ID, or fingerprint (master)
   ui       serve the topology/admin web UI on localhost
+  queue    queue on|off — run the admission queue on this node (lighthouse)
   peer     peer add <multiaddr> — add a bootstrap peer
 
 Every command accepts -state <dir> (default `+state.DefaultPath()+`).
@@ -201,6 +204,16 @@ func cmdInit(args []string) error {
 	if err := dir.SaveCert(own); err != nil {
 		return err
 	}
+	// The master's own admission event: nodes that enter through a
+	// lighthouse and never handshake the master directly still learn the
+	// full roster (and the master's overlay IP) from gossip.
+	selfAdded, err := event.NewAdded(rootPriv, own, time.Now())
+	if err != nil {
+		return err
+	}
+	if err := dir.SaveEvents([]*event.Event{selfAdded}); err != nil {
+		return err
+	}
 
 	nsDID := cert.DIDForKey(rootPriv.Public().(ed25519.PublicKey))
 	if err := dir.SaveConfig(state.Config{
@@ -262,6 +275,9 @@ func cmdStatus(args []string) error {
 	role := "member"
 	if s.Master {
 		role = "master"
+	}
+	if s.QueueHost && !s.Master {
+		role += ", queue host"
 	}
 	fmt.Printf("%s (%s)  peer %s\n", s.Name, role, s.PeerID)
 	fmt.Printf("namespace %s\n", s.NamespaceDID)
@@ -640,6 +656,35 @@ func cmdUI(args []string) error {
 	}
 	fmt.Printf("topology UI: http://%s  (%s)\n", *listen, role)
 	return http.ListenAndServe(*listen, webui.New(dir).Handler())
+}
+
+func cmdQueue(args []string) error {
+	if len(args) < 1 || (args[0] != "on" && args[0] != "off") {
+		return fmt.Errorf("usage: fabric queue on|off [-state <dir>]")
+	}
+	fs := flag.NewFlagSet("queue", flag.ExitOnError)
+	statePath := stateFlag(fs)
+	fs.Parse(args[1:])
+
+	dir, err := state.Open(*statePath)
+	if err != nil {
+		return err
+	}
+	cfg, err := dir.LoadConfig()
+	if err != nil {
+		return err
+	}
+	cfg.QueueHost = args[0] == "on"
+	if err := dir.SaveConfig(cfg); err != nil {
+		return err
+	}
+	if cfg.QueueHost {
+		fmt.Println("admission queue enabled — this node accepts join requests (lighthouse role); restart the daemon to apply")
+		fmt.Println("joiners bootstrap against this node's address; the master approves from anywhere in the mesh")
+	} else {
+		fmt.Println("admission queue disabled; restart the daemon to apply")
+	}
+	return nil
 }
 
 func cmdPeer(args []string) error {

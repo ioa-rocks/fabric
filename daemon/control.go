@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"aethera.dev/fabric/state"
 
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -63,7 +65,8 @@ type StatusReply struct {
 	Name         string       `json:"name"`
 	PeerID       string       `json:"peer_id"`
 	NamespaceDID string       `json:"namespace_did"`
-	Master       bool         `json:"master"`
+	Master       bool         `json:"master"`     // holds the namespace root key
+	QueueHost    bool         `json:"queue_host"` // runs the admission queue (lighthouse role)
 	Reachability string       `json:"reachability"` // autonat: public / private / unknown
 	OverlayIP    string       `json:"overlay_ip,omitempty"`
 	TUNActive    bool         `json:"tun_active"`
@@ -130,7 +133,8 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		Name:         d.Config.Name,
 		PeerID:       d.Host.ID().String(),
 		NamespaceDID: d.Config.NamespaceDID,
-		Master:       d.Queue != nil,
+		Master:       d.Dir.IsMaster(),
+		QueueHost:    d.Queue != nil,
 		Reachability: d.Reachability(),
 		OverlayIP:    d.ownCert.Payload.Meta.IP,
 		TUNActive:    d.Bridge != nil,
@@ -308,19 +312,77 @@ func decodeEvent(b64, wantKind string) (*event.Event, error) {
 	return e, nil
 }
 
+// handlePending aggregates the local queue (if this node runs one) with
+// every reachable remote queue host — so `fabric pending` and the UI on
+// the master see the whole picture regardless of where joiners knock.
 func (d *Daemon) handlePending(w http.ResponseWriter, _ *http.Request) {
-	if d.Queue == nil {
-		http.Error(w, "this node does not run the admission queue", http.StatusNotFound)
+	pending, sources := d.allPending()
+	if sources == 0 {
+		http.Error(w, "no admission queue here and no queue host reachable", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, d.Queue.List())
+	writeJSON(w, pending)
+}
+
+// allPending merges local and remote queues, deduplicated by fingerprint
+// (a joiner polls one queue host, but be safe). Also returns how many
+// queues were consulted.
+func (d *Daemon) allPending() ([]admission.PendingInfo, int) {
+	sources := 0
+	var out []admission.PendingInfo
+	seen := map[string]bool{}
+	add := func(entries []admission.PendingInfo) {
+		sources++
+		for _, e := range entries {
+			if !seen[e.Fingerprint] {
+				seen[e.Fingerprint] = true
+				out = append(out, e)
+			}
+		}
+	}
+	if d.Queue != nil {
+		add(d.Queue.List())
+	}
+	for _, p := range d.queueHosts() {
+		ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
+		entries, err := admission.RemoteList(ctx, d.Host, p)
+		cancel()
+		if err != nil {
+			log.Printf("queue host %s: list failed: %v", p, err)
+			continue
+		}
+		add(entries)
+	}
+	return out, sources
+}
+
+// routeToQueue finds where a pending fingerprint lives: the local queue
+// (target "") or a remote queue host.
+func (d *Daemon) routeToQueue(fingerprint string) (peer.ID, bool) {
+	if d.Queue != nil {
+		for _, e := range d.Queue.List() {
+			if e.Fingerprint == fingerprint {
+				return "", true
+			}
+		}
+	}
+	for _, p := range d.queueHosts() {
+		ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
+		entries, err := admission.RemoteList(ctx, d.Host, p)
+		cancel()
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.Fingerprint == fingerprint {
+				return p, true
+			}
+		}
+	}
+	return "", false
 }
 
 func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
-	if d.Queue == nil {
-		http.Error(w, "this node does not run the admission queue", http.StatusNotFound)
-		return
-	}
 	var body approveBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -336,12 +398,33 @@ func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := d.Queue.Approve(body.Fingerprint, certBytes); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+	target, found := d.routeToQueue(body.Fingerprint)
+	if !found {
+		http.Error(w, fmt.Sprintf("no pending request %q on any reachable queue", body.Fingerprint), http.StatusNotFound)
 		return
 	}
+	if target == "" {
+		if err := d.Queue.Approve(body.Fingerprint, certBytes); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+	} else {
+		evBytes, err := base64.StdEncoding.DecodeString(body.EventB64)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
+		err = admission.RemoteApprove(ctx, d.Host, target, body.Fingerprint, certBytes, evBytes)
+		cancel()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+	}
 	// Gossip the admission (spec §5 normal path; the auth-handshake
-	// notification remains the suppression backstop).
+	// notification remains the suppression backstop). On the remote path
+	// the queue host ingests too — the event log deduplicates.
 	if err := d.Ingest(ev); err != nil {
 		http.Error(w, "cert delivered, but announcing the admission failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -350,18 +433,29 @@ func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Daemon) handleDeny(w http.ResponseWriter, r *http.Request) {
-	if d.Queue == nil {
-		http.Error(w, "this node does not run the admission queue", http.StatusNotFound)
-		return
-	}
 	var body denyBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := d.Queue.Deny(body.Fingerprint); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+	target, found := d.routeToQueue(body.Fingerprint)
+	if !found {
+		http.Error(w, fmt.Sprintf("no pending request %q on any reachable queue", body.Fingerprint), http.StatusNotFound)
 		return
+	}
+	if target == "" {
+		if err := d.Queue.Deny(body.Fingerprint); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+	} else {
+		ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
+		err := admission.RemoteDeny(ctx, d.Host, target, body.Fingerprint)
+		cancel()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
 	}
 	writeJSON(w, map[string]string{"result": "denied"})
 }

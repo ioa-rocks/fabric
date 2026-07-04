@@ -127,16 +127,51 @@ func New(dir state.Dir) (*Daemon, error) {
 	pingSvc := ping.NewPingService(h)
 	h.SetStreamHandler(ping.ID, d.Auth.RequireMember(pingSvc.PingHandler))
 
-	// The master doubles as the queue host until a lighthouse exists
-	// (spec §6 bootstrap wrinkle). The queue holds no signing material —
-	// approval happens in the CLI process via the control API.
-	if dir.IsMaster() {
+	// The admission queue runs on the master (bootstrap wrinkle, spec §6)
+	// and on any member designated a queue host (`fabric queue on` — the
+	// lighthouse role, spec §1). The queue holds no signing material:
+	// approval happens wherever the root key is, locally via the control
+	// API or remotely over /fabric/queue/1.
+	if dir.IsMaster() || cfg.QueueHost {
 		d.Queue = admission.NewQueue(func(p admission.PendingInfo) {
 			log.Printf("join request pending: %q fingerprint=%s (fabric approve %s)", p.Name, p.Fingerprint, p.Fingerprint)
 		})
 		admission.Attach(h, d.Queue, cfg.NamespaceDID)
+		admission.AttachQueue(h, d.Queue, d.Auth.RequireMember, d.isAdmin, func(eventBytes []byte) error {
+			e, err := event.Unmarshal(eventBytes)
+			if err != nil {
+				return err
+			}
+			if e.Payload.Kind != event.KindAdded {
+				return fmt.Errorf("queue approve carried a %s event", e.Payload.Kind)
+			}
+			return d.Ingest(e)
+		})
 	}
 	return d, nil
+}
+
+// isAdmin reports whether a peer holds an admin-role membership cert.
+func (d *Daemon) isAdmin(p peer.ID) bool {
+	c, ok := d.Store.Cert(p)
+	return ok && c.Payload.Cmd == cert.CmdAdmin
+}
+
+// queueHosts returns the connected members that serve the remote queue
+// protocol (identify tells us who supports it).
+func (d *Daemon) queueHosts() []peer.ID {
+	var hosts []peer.ID
+	now := time.Now()
+	for _, p := range d.Host.Network().Peers() {
+		if !d.Store.IsMember(p, now) {
+			continue
+		}
+		protos, err := d.Host.Peerstore().SupportsProtocols(p, admission.QueueProtocolID)
+		if err == nil && len(protos) > 0 {
+			hosts = append(hosts, p)
+		}
+	}
+	return hosts
 }
 
 // Run serves until the context given to Stop/cancel fires.
