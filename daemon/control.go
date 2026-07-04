@@ -15,9 +15,12 @@ import (
 
 	"aethera.dev/fabric/admission"
 	"aethera.dev/fabric/event"
+	"aethera.dev/fabric/fabricnet"
 	"aethera.dev/fabric/state"
 
 	"github.com/libp2p/go-libp2p/core/network"
+
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 // The control API is a plain HTTP-over-unix-socket surface for the CLI and
@@ -31,6 +34,16 @@ type StatusPeer struct {
 	Member    bool   `json:"member"`
 	Connected bool   `json:"connected"`
 	Revoked   bool   `json:"revoked,omitempty"`
+
+	// Link telemetry — how traffic actually reaches this peer (only set
+	// while connected).
+	Direction string  `json:"direction,omitempty"` // who dialed: "outbound" (we did) / "inbound"
+	Addr      string  `json:"addr,omitempty"`      // the remote multiaddr that won
+	Transport string  `json:"transport,omitempty"` // tcp / quic / …
+	Relayed   bool    `json:"relayed,omitempty"`   // via a circuit relay, not direct
+	RTTMillis float64 `json:"rtt_ms,omitempty"`
+
+	CertExpiry *time.Time `json:"cert_expiry,omitempty"`
 }
 
 // MemberInfo is the machine-facing roster entry: it carries the device
@@ -49,8 +62,17 @@ type StatusReply struct {
 	PeerID       string       `json:"peer_id"`
 	NamespaceDID string       `json:"namespace_did"`
 	Master       bool         `json:"master"`
+	Reachability string       `json:"reachability"` // autonat: public / private / unknown
 	Addrs        []string     `json:"addrs"`
 	Peers        []StatusPeer `json:"peers"`
+}
+
+// EventInfo is a membership event as shown in the activity feed.
+type EventInfo struct {
+	Kind   string    `json:"kind"` // "member-added" / "member-revoked"
+	Name   string    `json:"name,omitempty"`
+	PeerID string    `json:"peer_id"`
+	At     time.Time `json:"at"`
 }
 
 type approveBody struct {
@@ -82,6 +104,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v0/status", d.handleStatus)
 	mux.HandleFunc("GET /v0/members", d.handleMembers)
+	mux.HandleFunc("GET /v0/events", d.handleEvents)
 	mux.HandleFunc("GET /v0/pending", d.handlePending)
 	mux.HandleFunc("POST /v0/approve", d.handleApprove)
 	mux.HandleFunc("POST /v0/deny", d.handleDeny)
@@ -104,6 +127,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		PeerID:       d.Host.ID().String(),
 		NamespaceDID: d.Config.NamespaceDID,
 		Master:       d.Queue != nil,
+		Reachability: d.Reachability(),
 	}
 	for _, a := range d.Host.Addrs() {
 		reply.Addrs = append(reply.Addrs, fmt.Sprintf("%s/p2p/%s", a, d.Host.ID()))
@@ -114,6 +138,17 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		sp := StatusPeer{ID: p.String(), Connected: true, Member: d.Store.IsMember(p, now), Revoked: d.Store.IsRevoked(p, now)}
 		if c, ok := d.Store.Cert(p); ok {
 			sp.Name = c.Payload.Meta.Name
+			exp := c.Expiry()
+			sp.CertExpiry = &exp
+		}
+		if conns := d.Host.Network().ConnsToPeer(p); len(conns) > 0 {
+			c := conns[0]
+			sp.Direction = dirString(c.Stat().Direction)
+			sp.Addr = c.RemoteMultiaddr().String()
+			sp.Transport, sp.Relayed = transportOf(c.RemoteMultiaddr())
+		}
+		if rtt, ok := d.RTT(p); ok {
+			sp.RTTMillis = float64(rtt.Microseconds()) / 1000
 		}
 		reply.Peers = append(reply.Peers, sp)
 		seen[sp.ID] = true
@@ -121,7 +156,8 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	// The event log makes offline members part of the picture too.
 	for p, c := range members {
 		if !seen[p.String()] {
-			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true})
+			exp := c.Expiry()
+			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true, CertExpiry: &exp})
 			seen[p.String()] = true
 		}
 	}
@@ -162,6 +198,71 @@ func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
 		})
 	}
 	writeJSON(w, out)
+}
+
+// handleEvents returns the membership-event feed, newest first — the
+// admission-transparency surface of spec §5.
+func (d *Daemon) handleEvents(w http.ResponseWriter, _ *http.Request) {
+	all := d.Log.All()
+	// Names for revoked devices come from their admission events.
+	names := map[string]string{}
+	for _, e := range all {
+		if e.Payload.Kind == event.KindAdded {
+			if c, err := e.AddedCert(); err == nil {
+				if k, err := c.DeviceKey(); err == nil {
+					names[string(k)] = c.Payload.Meta.Name
+				}
+			}
+		}
+	}
+	out := make([]EventInfo, 0, len(all))
+	for i := len(all) - 1; i >= 0; i-- {
+		e := all[i]
+		devKey, err := e.DeviceKey()
+		if err != nil {
+			continue
+		}
+		info := EventInfo{Kind: e.Payload.Kind, Name: names[string(devKey)], At: e.Time()}
+		if p, err := fabricnet.PeerIDForKey(devKey); err == nil {
+			info.PeerID = p.String()
+		}
+		out = append(out, info)
+	}
+	writeJSON(w, out)
+}
+
+func dirString(dir network.Direction) string {
+	switch dir {
+	case network.DirInbound:
+		return "inbound"
+	case network.DirOutbound:
+		return "outbound"
+	default:
+		return ""
+	}
+}
+
+// transportOf reads the wire path off a multiaddr: which transport carries
+// the connection, and whether it goes through a circuit relay rather than
+// directly.
+func transportOf(addr ma.Multiaddr) (transport string, relayed bool) {
+	for _, p := range addr.Protocols() {
+		switch p.Code {
+		case ma.P_CIRCUIT:
+			relayed = true
+		case ma.P_QUIC_V1:
+			transport = "quic"
+		case ma.P_WEBTRANSPORT:
+			transport = "webtransport"
+		case ma.P_WEBRTC_DIRECT:
+			transport = "webrtc"
+		case ma.P_TCP:
+			if transport == "" {
+				transport = "tcp"
+			}
+		}
+	}
+	return transport, relayed
 }
 
 func (d *Daemon) handleRevoke(w http.ResponseWriter, r *http.Request) {
@@ -327,6 +428,14 @@ func (c *Client) Pending() ([]admission.PendingInfo, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+func (c *Client) Events() ([]EventInfo, error) {
+	var e []EventInfo
+	if err := c.get("/v0/events", &e); err != nil {
+		return nil, err
+	}
+	return e, nil
 }
 
 func (c *Client) Members() ([]MemberInfo, error) {

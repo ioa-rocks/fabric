@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"aethera.dev/fabric/admission"
@@ -16,9 +17,11 @@ import (
 	"aethera.dev/fabric/state"
 
 	"github.com/libp2p/go-libp2p"
+	libp2pevent "github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -42,6 +45,12 @@ type Daemon struct {
 	ownCert *cert.Cert
 	ctx     context.Context
 	cancel  context.CancelFunc
+
+	// Link telemetry for status/UI: RTT per member (refreshed each
+	// reconnect tick) and this node's NAT reachability verdict (autonat).
+	teleMu       sync.Mutex
+	rtt          map[peer.ID]time.Duration
+	reachability string
 }
 
 // New assembles a daemon from a state directory. The node must already hold
@@ -92,7 +101,11 @@ func New(dir state.Dir) (*Daemon, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &Daemon{Dir: dir, Config: cfg, Host: h, Store: store, Log: evLog, ownCert: own, ctx: ctx, cancel: cancel}
+	d := &Daemon{
+		Dir: dir, Config: cfg, Host: h, Store: store, Log: evLog,
+		ownCert: own, ctx: ctx, cancel: cancel,
+		rtt: make(map[peer.ID]time.Duration), reachability: "unknown",
+	}
 	d.hydrateStore()
 
 	// Hard-coded admission transparency (spec §5): every join is announced.
@@ -101,6 +114,11 @@ func New(dir state.Dir) (*Daemon, error) {
 	})
 	d.Sync = fabricnet.NewEventSync(h, evLog, store, d.applyEvent)
 	d.Auth.SetOnAuthenticated(d.Sync.ExchangeAsync)
+
+	// RTT telemetry. The default ping handler answers anyone; re-wrap it so
+	// only members get an answer (spec §4: nothing reachable pre-auth).
+	pingSvc := ping.NewPingService(h)
+	h.SetStreamHandler(ping.ID, d.Auth.RequireMember(pingSvc.PingHandler))
 
 	// The master doubles as the queue host until a lighthouse exists
 	// (spec §6 bootstrap wrinkle). The queue holds no signing material —
@@ -131,9 +149,70 @@ func (d *Daemon) Run() error {
 	defer stopControl()
 
 	go d.reconnectLoop()
+	go d.watchReachability()
 
 	<-d.ctx.Done()
 	return d.Host.Close()
+}
+
+// watchReachability tracks the autonat verdict about this node's NAT
+// situation (public / private / unknown) for the status API.
+func (d *Daemon) watchReachability() {
+	sub, err := d.Host.EventBus().Subscribe(new(libp2pevent.EvtLocalReachabilityChanged))
+	if err != nil {
+		return
+	}
+	defer sub.Close()
+	for {
+		select {
+		case <-d.ctx.Done():
+			return
+		case ev, ok := <-sub.Out():
+			if !ok {
+				return
+			}
+			r := ev.(libp2pevent.EvtLocalReachabilityChanged).Reachability
+			d.teleMu.Lock()
+			d.reachability = r.String()
+			d.teleMu.Unlock()
+		}
+	}
+}
+
+// measureRTT pings every connected member once, in the background.
+func (d *Daemon) measureRTT() {
+	now := time.Now()
+	for _, p := range d.Host.Network().Peers() {
+		if !d.Store.IsMember(p, now) {
+			continue
+		}
+		go func(p peer.ID) {
+			ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
+			defer cancel()
+			res := <-ping.Ping(ctx, d.Host, p)
+			if res.Error != nil {
+				return
+			}
+			d.teleMu.Lock()
+			d.rtt[p] = res.RTT
+			d.teleMu.Unlock()
+		}(p)
+	}
+}
+
+// RTT returns the last measured round-trip time to a peer, if any.
+func (d *Daemon) RTT(p peer.ID) (time.Duration, bool) {
+	d.teleMu.Lock()
+	defer d.teleMu.Unlock()
+	rtt, ok := d.rtt[p]
+	return rtt, ok
+}
+
+// Reachability returns this node's current autonat verdict.
+func (d *Daemon) Reachability() string {
+	d.teleMu.Lock()
+	defer d.teleMu.Unlock()
+	return d.reachability
 }
 
 // Stop shuts the daemon down.
@@ -228,6 +307,7 @@ func (d *Daemon) reconnectLoop() {
 	defer tick.Stop()
 	for {
 		d.connectBootstrap()
+		d.measureRTT()
 		now := time.Now()
 		d.Store.GC(now)
 		d.Log.GC(now)

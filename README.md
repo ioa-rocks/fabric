@@ -5,8 +5,8 @@ libp2p, replacing a hand-rolled Nebula deployment with human-gated,
 certificate-based membership and a topology/admin UI.
 
 Status: **pre-alpha** — daemon, CLI, the join-then-approve admission
-flow, and revocation with membership-event gossip work end-to-end; the
-topology UI and the TUN bridge are not built yet.
+flow, revocation with membership-event gossip, and the topology/admin
+web UI work end-to-end; the TUN bridge is not built yet.
 
 Design documents live in the Aethera project folder
 (`components/fabric/` — security-model spec, ADRs, surveys); this repo is
@@ -96,6 +96,28 @@ revocation records self-delete once the cert they kill would have
 expired anyway. Re-admitting a revoked device means a fresh
 `fabric join`.
 
+## The topology UI
+
+```sh
+fabric ui        # → http://127.0.0.1:4518
+```
+
+A local web view of the mesh *as this node sees it*: the peer graph
+with per-link telemetry (direct vs relayed, transport, who dialed whom,
+RTT, the multiaddr that won), membership states (member / pending /
+offline / revoked / stranger), this node's NAT reachability verdict
+(autonat), cert-expiry warnings, and the membership-event activity
+feed. On the master it is also the admin surface: approve/deny pending
+joins (with the fingerprint displayed for comparison) and revoke
+members.
+
+`fabric ui` is deliberately a separate process from the daemon: the
+root-key passphrase is entered in the browser form, but signing happens
+inside the `fabric ui` process on the master — the daemon never sees
+key or passphrase, same custody model as the CLI. On a non-master node
+the UI is a read-only mesh view. It binds to localhost and has no auth
+of its own; don't point `-listen` at a routable interface.
+
 ## Commands
 
 | Command | Where | What |
@@ -108,6 +130,7 @@ expired anyway. Re-admitting a revoked device means a fresh
 | `fabric approve <fingerprint>` | master | sign a membership cert for a pending request |
 | `fabric deny <fingerprint>` | master | reject a pending request |
 | `fabric revoke <name \| peer-id \| fingerprint>` | master | revoke a member and gossip the cut-off |
+| `fabric ui [-listen 127.0.0.1:4518]` | any member | serve the topology/admin web UI |
 | `fabric peer add <multiaddr>` | any member | add a bootstrap peer |
 
 All commands take `-state <dir>` (default `~/.config/fabric`), so
@@ -141,8 +164,12 @@ scripts).
 - `admission` — the `/fabric/join/1` protocol and the pending queue
   (holds no signing material; certs are handed to it only for delivery).
 - `daemon` — the node process: host wiring, bootstrap reconnect/reauth
-  loop, event-log persistence/replay, control API over a unix socket for
-  the CLI and the future UI.
+  loop, event-log persistence/replay, link telemetry (member-gated ping
+  RTT, autonat reachability), control API over a unix socket for the
+  CLI and UI.
+- `webui` — the topology/admin UI: an embedded no-build-step web app
+  (`fabric ui`) that reads through the control socket and signs
+  approvals/revocations in its own process, never the daemon's.
 - `state` — the state directory: config, device key, own cert,
   keystore path, control socket.
 

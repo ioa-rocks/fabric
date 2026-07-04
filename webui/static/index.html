@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fabric — topology</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='14' fill='%230ca30c'/><circle cx='18' cy='26' r='9' fill='%23888'/><circle cx='82' cy='26' r='9' fill='%23888'/><circle cx='18' cy='78' r='9' fill='%23888'/><circle cx='82' cy='78' r='9' fill='%23888'/></svg>">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">fabric</span>
+    <span id="ns-chip" class="chip mono" title="namespace DID (click to copy)">…</span>
+  </div>
+  <div class="header-right">
+    <span id="self-chip" class="chip">…</span>
+    <span id="reach-chip" class="chip" title="NAT reachability (autonat verdict)">…</span>
+    <button id="theme-toggle" title="toggle light/dark">◐</button>
+  </div>
+</header>
+
+<div id="banner" class="banner" hidden></div>
+
+<main>
+  <section class="card graph-card">
+    <div class="card-head">
+      <h2>Mesh — as seen from this node</h2>
+      <span id="graph-summary" class="muted"></span>
+    </div>
+    <svg id="graph" viewBox="0 0 800 520" role="img" aria-label="peer topology graph"></svg>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <aside>
+    <section class="card" id="details-card">
+      <div class="card-head"><h2>Node</h2></div>
+      <div id="details"><p class="muted">Select a node in the graph.</p></div>
+    </section>
+    <section class="card" id="pending-card" hidden>
+      <div class="card-head"><h2>Pending join requests</h2></div>
+      <div id="pending"></div>
+    </section>
+  </aside>
+</main>
+
+<section class="card feed-card">
+  <div class="card-head"><h2>Activity</h2></div>
+  <ol id="feed"></ol>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>

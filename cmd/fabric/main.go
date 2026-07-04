@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 	"aethera.dev/fabric/event"
 	"aethera.dev/fabric/keystore"
 	"aethera.dev/fabric/state"
+	"aethera.dev/fabric/webui"
 
 	"github.com/libp2p/go-libp2p"
 	"golang.org/x/term"
@@ -57,6 +59,8 @@ func main() {
 		err = cmdDeny(args)
 	case "revoke":
 		err = cmdRevoke(args)
+	case "ui":
+		err = cmdUI(args)
 	case "peer":
 		err = cmdPeer(args)
 	default:
@@ -80,6 +84,7 @@ func usage() {
   approve  approve a pending join request by fingerprint (master)
   deny     deny a pending join request by fingerprint (master)
   revoke   revoke a member by name, peer ID, or fingerprint (master)
+  ui       serve the topology/admin web UI on localhost
   peer     peer add <multiaddr> — add a bootstrap peer
 
 Every command accepts -state <dir> (default `+state.DefaultPath()+`).
@@ -538,6 +543,27 @@ func cmdDeny(args []string) error {
 	}
 	fmt.Println("denied")
 	return nil
+}
+
+func cmdUI(args []string) error {
+	fs := flag.NewFlagSet("ui", flag.ExitOnError)
+	statePath := stateFlag(fs)
+	listen := fs.String("listen", "127.0.0.1:4518", "listen address; keep it on localhost — the UI has no auth of its own")
+	fs.Parse(args)
+
+	dir, err := state.Open(*statePath)
+	if err != nil {
+		return err
+	}
+	if _, err := daemon.NewClient(dir).Status(); err != nil {
+		return fmt.Errorf("daemon check: %w", err)
+	}
+	role := "read-only (no root key here)"
+	if dir.IsMaster() {
+		role = "master — approvals and revocations enabled"
+	}
+	fmt.Printf("topology UI: http://%s  (%s)\n", *listen, role)
+	return http.ListenAndServe(*listen, webui.New(dir).Handler())
 }
 
 func cmdPeer(args []string) error {
