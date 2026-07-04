@@ -67,6 +67,22 @@ func (s *MemberStore) Cert(p peer.ID) (*cert.Cert, bool) {
 	return c, ok
 }
 
+// Snapshot returns copies of the current membership and revocation views —
+// the roster for status displays and the topology UI.
+func (s *MemberStore) Snapshot() (members map[peer.ID]*cert.Cert, revoked map[peer.ID]time.Time) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	members = make(map[peer.ID]*cert.Cert, len(s.members))
+	for p, c := range s.members {
+		members[p] = c
+	}
+	revoked = make(map[peer.ID]time.Time, len(s.revoked))
+	for p, exp := range s.revoked {
+		revoked[p] = exp
+	}
+	return members, revoked
+}
+
 // Revoke marks a peer as revoked until its cert would have expired anyway.
 func (s *MemberStore) Revoke(p peer.ID, now time.Time) {
 	s.mu.Lock()

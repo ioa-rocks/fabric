@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"aethera.dev/fabric/admission"
+	"aethera.dev/fabric/event"
 	"aethera.dev/fabric/state"
 
 	"github.com/libp2p/go-libp2p/core/network"
@@ -29,6 +30,18 @@ type StatusPeer struct {
 	Name      string `json:"name,omitempty"`
 	Member    bool   `json:"member"`
 	Connected bool   `json:"connected"`
+	Revoked   bool   `json:"revoked,omitempty"`
+}
+
+// MemberInfo is the machine-facing roster entry: it carries the device
+// public key so the CLI can sign a revocation for it.
+type MemberInfo struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Fingerprint string    `json:"fingerprint"`
+	DevicePub   []byte    `json:"device_pub"`
+	Expiry      time.Time `json:"expiry"`
+	Connected   bool      `json:"connected"`
 }
 
 type StatusReply struct {
@@ -43,10 +56,15 @@ type StatusReply struct {
 type approveBody struct {
 	Fingerprint string `json:"fingerprint"`
 	CertB64     string `json:"cert_b64"`
+	EventB64    string `json:"event_b64"` // signed MemberAdded event, gossiped
 }
 
 type denyBody struct {
 	Fingerprint string `json:"fingerprint"`
+}
+
+type revokeBody struct {
+	EventB64 string `json:"event_b64"` // signed MemberRevoked event
 }
 
 func (d *Daemon) serveControl() (func(), error) {
@@ -63,9 +81,11 @@ func (d *Daemon) serveControl() (func(), error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v0/status", d.handleStatus)
+	mux.HandleFunc("GET /v0/members", d.handleMembers)
 	mux.HandleFunc("GET /v0/pending", d.handlePending)
 	mux.HandleFunc("POST /v0/approve", d.handleApprove)
 	mux.HandleFunc("POST /v0/deny", d.handleDeny)
+	mux.HandleFunc("POST /v0/revoke", d.handleRevoke)
 
 	srv := &http.Server{Handler: mux}
 	go srv.Serve(l)
@@ -88,16 +108,30 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	for _, a := range d.Host.Addrs() {
 		reply.Addrs = append(reply.Addrs, fmt.Sprintf("%s/p2p/%s", a, d.Host.ID()))
 	}
+	members, revoked := d.Store.Snapshot()
 	seen := map[string]bool{}
 	for _, p := range d.Host.Network().Peers() {
-		sp := StatusPeer{ID: p.String(), Connected: true, Member: d.Store.IsMember(p, now)}
+		sp := StatusPeer{ID: p.String(), Connected: true, Member: d.Store.IsMember(p, now), Revoked: d.Store.IsRevoked(p, now)}
 		if c, ok := d.Store.Cert(p); ok {
 			sp.Name = c.Payload.Meta.Name
 		}
 		reply.Peers = append(reply.Peers, sp)
 		seen[sp.ID] = true
 	}
-	// Known members that are currently offline still belong in the picture.
+	// The event log makes offline members part of the picture too.
+	for p, c := range members {
+		if !seen[p.String()] {
+			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true})
+			seen[p.String()] = true
+		}
+	}
+	for p := range revoked {
+		if !seen[p.String()] {
+			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Revoked: true})
+			seen[p.String()] = true
+		}
+	}
+	// Bootstrap peers we have not yet authenticated with.
 	for _, addr := range d.Config.Bootstrap {
 		if info, err := peerInfo(addr); err == nil && !seen[info.ID.String()] && info.ID != d.Host.ID() {
 			reply.Peers = append(reply.Peers, StatusPeer{
@@ -108,6 +142,61 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	writeJSON(w, reply)
+}
+
+func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
+	members, _ := d.Store.Snapshot()
+	out := make([]MemberInfo, 0, len(members))
+	for p, c := range members {
+		devKey, err := c.DeviceKey()
+		if err != nil {
+			continue
+		}
+		out = append(out, MemberInfo{
+			ID:          p.String(),
+			Name:        c.Payload.Meta.Name,
+			Fingerprint: admission.Fingerprint(devKey),
+			DevicePub:   devKey,
+			Expiry:      c.Expiry(),
+			Connected:   d.Host.Network().Connectedness(p) == network.Connected,
+		})
+	}
+	writeJSON(w, out)
+}
+
+func (d *Daemon) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	var body revokeBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	e, err := decodeEvent(body.EventB64, event.KindRevoked)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Ingest verifies the root-key signature — the daemon takes orders about
+	// membership only from the namespace root key, never from the socket.
+	if err := d.Ingest(e); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]string{"result": "revoked"})
+}
+
+func decodeEvent(b64, wantKind string) (*event.Event, error) {
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, fmt.Errorf("event_b64: %w", err)
+	}
+	e, err := event.Unmarshal(raw)
+	if err != nil {
+		return nil, err
+	}
+	if e.Payload.Kind != wantKind {
+		return nil, fmt.Errorf("expected a %s event, got %q", wantKind, e.Payload.Kind)
+	}
+	return e, nil
 }
 
 func (d *Daemon) handlePending(w http.ResponseWriter, _ *http.Request) {
@@ -133,8 +222,19 @@ func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cert_b64: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	ev, err := decodeEvent(body.EventB64, event.KindAdded)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if err := d.Queue.Approve(body.Fingerprint, certBytes); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	// Gossip the admission (spec §5 normal path; the auth-handshake
+	// notification remains the suppression backstop).
+	if err := d.Ingest(ev); err != nil {
+		http.Error(w, "cert delivered, but announcing the admission failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, map[string]string{"result": "approved"})
@@ -229,10 +329,25 @@ func (c *Client) Pending() ([]admission.PendingInfo, error) {
 	return p, nil
 }
 
-func (c *Client) Approve(fingerprint string, signedCert []byte) error {
+func (c *Client) Members() ([]MemberInfo, error) {
+	var m []MemberInfo
+	if err := c.get("/v0/members", &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *Client) Approve(fingerprint string, signedCert, signedEvent []byte) error {
 	return c.post("/v0/approve", approveBody{
 		Fingerprint: fingerprint,
 		CertB64:     base64.StdEncoding.EncodeToString(signedCert),
+		EventB64:    base64.StdEncoding.EncodeToString(signedEvent),
+	}, nil)
+}
+
+func (c *Client) Revoke(signedEvent []byte) error {
+	return c.post("/v0/revoke", revokeBody{
+		EventB64: base64.StdEncoding.EncodeToString(signedEvent),
 	}, nil)
 }
 

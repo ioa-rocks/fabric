@@ -23,6 +23,12 @@ const (
 	CmdAdmin  = "/fabric/admin"
 )
 
+// DefaultValidity is the standard membership-cert lifetime (spec §5): long,
+// because gossiped revocation handles the real-time cut-off and short certs
+// would force frequent unlocking of the master's cold root key. It also
+// bounds how long a revocation record must be retained.
+const DefaultValidity = 90 * 24 * time.Hour
+
 const nonceSize = 16
 
 // Meta carries non-security-relevant labels.

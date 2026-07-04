@@ -11,6 +11,7 @@ import (
 
 	"aethera.dev/fabric/admission"
 	"aethera.dev/fabric/cert"
+	"aethera.dev/fabric/event"
 	"aethera.dev/fabric/fabricnet"
 	"aethera.dev/fabric/state"
 
@@ -34,6 +35,8 @@ type Daemon struct {
 	Host   host.Host
 	Store  *fabricnet.MemberStore
 	Auth   *fabricnet.AuthService
+	Log    *event.Log // membership events: admissions + revocations (spec §5)
+	Sync   *fabricnet.EventSync
 	Queue  *admission.Queue // nil unless this node runs the admission queue
 
 	ownCert *cert.Cert
@@ -65,6 +68,20 @@ func New(dir state.Dir) (*Daemon, error) {
 	}
 
 	store := fabricnet.NewMemberStore(nsPub)
+
+	// The persisted event log is the durable membership view: it survives
+	// restarts, so a revocation learned yesterday still holds today even if
+	// the master is offline.
+	evLog := event.NewLog(nsPub)
+	if evs, err := dir.LoadEvents(); err != nil {
+		log.Printf("event log unreadable, starting empty: %v", err)
+	} else {
+		now := time.Now()
+		for _, e := range evs {
+			_, _ = evLog.Add(e, now) // stale/invalid entries drop out here
+		}
+	}
+
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
@@ -75,12 +92,15 @@ func New(dir state.Dir) (*Daemon, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &Daemon{Dir: dir, Config: cfg, Host: h, Store: store, ownCert: own, ctx: ctx, cancel: cancel}
+	d := &Daemon{Dir: dir, Config: cfg, Host: h, Store: store, Log: evLog, ownCert: own, ctx: ctx, cancel: cancel}
+	d.hydrateStore()
 
 	// Hard-coded admission transparency (spec §5): every join is announced.
 	d.Auth = fabricnet.NewAuthService(h, store, own, AuthGrace, func(p peer.ID, c *cert.Cert) {
 		log.Printf("member joined: %q (%s)", c.Payload.Meta.Name, p)
 	})
+	d.Sync = fabricnet.NewEventSync(h, evLog, store, d.applyEvent)
+	d.Auth.SetOnAuthenticated(d.Sync.ExchangeAsync)
 
 	// The master doubles as the queue host until a lighthouse exists
 	// (spec §6 bootstrap wrinkle). The queue holds no signing material —
@@ -119,6 +139,88 @@ func (d *Daemon) Run() error {
 // Stop shuts the daemon down.
 func (d *Daemon) Stop() { d.cancel() }
 
+// hydrateStore replays the event log into the member store at startup, in
+// apply order: the roster (including offline members) and standing
+// revocations exist before the first connection does.
+func (d *Daemon) hydrateStore() {
+	now := time.Now()
+	for _, e := range d.Log.All() {
+		devKey, err := e.DeviceKey()
+		if err != nil {
+			continue
+		}
+		p, err := fabricnet.PeerIDForKey(devKey)
+		if err != nil {
+			continue
+		}
+		switch e.Payload.Kind {
+		case event.KindAdded:
+			if c, err := e.AddedCert(); err == nil && p != d.Host.ID() {
+				d.Store.AddMember(p, c)
+			}
+		case event.KindRevoked:
+			d.Store.Revoke(p, now)
+		}
+	}
+}
+
+// applyEvent reacts to one newly learned membership event: update the member
+// store (revocations also cut live connections), surface the spec-§5
+// notification, and persist the log.
+func (d *Daemon) applyEvent(e *event.Event) {
+	devKey, err := e.DeviceKey()
+	if err != nil {
+		return
+	}
+	p, err := fabricnet.PeerIDForKey(devKey)
+	if err != nil {
+		return
+	}
+	switch e.Payload.Kind {
+	case event.KindAdded:
+		if c, err := e.AddedCert(); err == nil && p != d.Host.ID() {
+			_, known := d.Store.Cert(p)
+			d.Store.AddMember(p, c)
+			if !known {
+				log.Printf("member added: %q (%s), approved by master", c.Payload.Meta.Name, p)
+			}
+		}
+	case event.KindRevoked:
+		name := "?"
+		if c, ok := d.Store.Cert(p); ok {
+			name = c.Payload.Meta.Name
+		}
+		d.Auth.Revoke(p)
+		if p == d.Host.ID() {
+			log.Printf("THIS DEVICE'S MEMBERSHIP WAS REVOKED — the mesh will refuse it from now on")
+		} else {
+			log.Printf("member revoked: %q (%s)", name, p)
+		}
+	}
+	d.persistEvents()
+}
+
+// Ingest records a locally created, root-signed membership event: verify
+// into the log, apply, persist, and push to the connected members.
+func (d *Daemon) Ingest(e *event.Event) error {
+	fresh, err := d.Log.Add(e, time.Now())
+	if err != nil {
+		return err
+	}
+	if !fresh {
+		return nil
+	}
+	d.applyEvent(e)
+	d.Sync.Publish([]*event.Event{e})
+	return nil
+}
+
+func (d *Daemon) persistEvents() {
+	if err := d.Dir.SaveEvents(d.Log.All()); err != nil {
+		log.Printf("persisting event log: %v", err)
+	}
+}
+
 // reconnectLoop keeps the node connected and authenticated to its bootstrap
 // peers.
 func (d *Daemon) reconnectLoop() {
@@ -126,6 +228,9 @@ func (d *Daemon) reconnectLoop() {
 	defer tick.Stop()
 	for {
 		d.connectBootstrap()
+		now := time.Now()
+		d.Store.GC(now)
+		d.Log.GC(now)
 		select {
 		case <-d.ctx.Done():
 			return

@@ -40,6 +40,7 @@ type AuthService struct {
 	own       *cert.Cert
 	grace     time.Duration
 	onJoin    JoinObserver
+	onAuth    func(peer.ID)
 	stopWatch func()
 }
 
@@ -54,6 +55,12 @@ func NewAuthService(h host.Host, store *MemberStore, ownCert *cert.Cert, grace t
 	a.stopWatch = func() { h.Network().StopNotify(nb) }
 	return a
 }
+
+// SetOnAuthenticated registers a callback fired after every successful
+// handshake (unlike JoinObserver, repeats included) — the anti-entropy
+// trigger of spec §5: membership events are exchanged on every connect.
+// Must be set before the host sees connections.
+func (a *AuthService) SetOnAuthenticated(f func(peer.ID)) { a.onAuth = f }
 
 // Close detaches the service from the host.
 func (a *AuthService) Close() {
@@ -125,6 +132,9 @@ func (a *AuthService) noteMember(p peer.ID, c *cert.Cert) {
 	if !known && a.onJoin != nil {
 		a.onJoin(p, c)
 	}
+	if a.onAuth != nil {
+		a.onAuth(p)
+	}
 }
 
 // Revoke revokes a peer's membership and — critically — closes its live
@@ -165,7 +175,7 @@ func readAndValidateCert(r io.Reader, namespacePub ed25519.PublicKey, remote pee
 	if err != nil {
 		return nil, err
 	}
-	expected, err := peerIDForKey(devKey)
+	expected, err := PeerIDForKey(devKey)
 	if err != nil {
 		return nil, err
 	}
@@ -175,8 +185,8 @@ func readAndValidateCert(r io.Reader, namespacePub ed25519.PublicKey, remote pee
 	return c, nil
 }
 
-// peerIDForKey maps a raw ed25519 public key to its libp2p peer ID.
-func peerIDForKey(pub ed25519.PublicKey) (peer.ID, error) {
+// PeerIDForKey maps a raw ed25519 public key to its libp2p peer ID.
+func PeerIDForKey(pub ed25519.PublicKey) (peer.ID, error) {
 	pk, err := crypto.UnmarshalEd25519PublicKey(pub)
 	if err != nil {
 		return "", err

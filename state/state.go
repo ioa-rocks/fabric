@@ -4,6 +4,7 @@
 //	config.json        — name, listen addrs, namespace DID, bootstrap peers
 //	device.key         — libp2p ed25519 identity (protobuf), 0600
 //	cert.cbor          — this node's membership certificate
+//	events.cbor        — membership-event log (admissions, revocations)
 //	namespace.key.age  — namespace root seed, master only (see keystore)
 //	control.sock       — daemon control socket, runtime only
 package state
@@ -20,7 +21,9 @@ import (
 	"path/filepath"
 
 	"aethera.dev/fabric/cert"
+	"aethera.dev/fabric/event"
 
+	"github.com/fxamacker/cbor/v2"
 	"github.com/libp2p/go-libp2p/core/crypto"
 )
 
@@ -52,6 +55,7 @@ func Open(path string) (Dir, error) {
 func (d Dir) configPath() string    { return filepath.Join(d.Path, "config.json") }
 func (d Dir) deviceKeyPath() string { return filepath.Join(d.Path, "device.key") }
 func (d Dir) certPath() string      { return filepath.Join(d.Path, "cert.cbor") }
+func (d Dir) eventsPath() string    { return filepath.Join(d.Path, "events.cbor") }
 
 // KeystorePath is where the master's namespace root seed lives.
 func (d Dir) KeystorePath() string { return filepath.Join(d.Path, "namespace.key.age") }
@@ -133,6 +137,32 @@ func (d Dir) SaveCert(c *cert.Cert) error {
 		return err
 	}
 	return os.WriteFile(d.certPath(), data, 0o600)
+}
+
+// SaveEvents persists the membership-event log.
+func (d Dir) SaveEvents(evs []*event.Event) error {
+	data, err := cbor.Marshal(evs)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(d.eventsPath(), data, 0o600)
+}
+
+// LoadEvents returns (nil, nil) when no event log exists yet. Events are
+// untrusted until they pass verification into an event.Log.
+func (d Dir) LoadEvents() ([]*event.Event, error) {
+	data, err := os.ReadFile(d.eventsPath())
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var evs []*event.Event
+	if err := cbor.Unmarshal(data, &evs); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", d.eventsPath(), err)
+	}
+	return evs, nil
 }
 
 // LoadCert returns (nil, nil) when no certificate exists yet.

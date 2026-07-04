@@ -4,9 +4,9 @@ The connectivity layer of [Aethera]: a personal overlay network built on
 libp2p, replacing a hand-rolled Nebula deployment with human-gated,
 certificate-based membership and a topology/admin UI.
 
-Status: **pre-alpha** — daemon, CLI, and the join-then-approve admission
-flow work end-to-end; revocation CLI, membership-event gossip, the
-topology UI, and the TUN bridge are not built yet.
+Status: **pre-alpha** — daemon, CLI, the join-then-approve admission
+flow, and revocation with membership-event gossip work end-to-end; the
+topology UI and the TUN bridge are not built yet.
 
 Design documents live in the Aethera project folder
 (`components/fabric/` — security-model spec, ADRs, surveys); this repo is
@@ -78,6 +78,24 @@ fabric status    # on either device:
 Every node prints a `member joined:` line when a new member first
 appears — admissions are never silent, by design.
 
+## Kicking a device out
+
+```sh
+fabric revoke nas    # on the master; also takes a peer ID or fingerprint
+```
+
+Revocation signs a `MemberRevoked` event with the root key (passphrase
+prompt, same custody as approval) and gossips it: every member that
+hears it drops the peer's live connections and refuses new ones, and
+relays the event on to members the master can't reach directly. Nodes
+that were offline catch up on their next connect — admissions and
+revocations are exchanged peer-to-peer on every connect and persisted,
+so a revocation holds even when the master is asleep. Cert expiry
+(90 days) remains the backstop for devices the gossip never reaches;
+revocation records self-delete once the cert they kill would have
+expired anyway. Re-admitting a revoked device means a fresh
+`fabric join`.
+
 ## Commands
 
 | Command | Where | What |
@@ -89,6 +107,7 @@ appears — admissions are never silent, by design.
 | `fabric pending` | master | list join requests |
 | `fabric approve <fingerprint>` | master | sign a membership cert for a pending request |
 | `fabric deny <fingerprint>` | master | reject a pending request |
+| `fabric revoke <name \| peer-id \| fingerprint>` | master | revoke a member and gossip the cut-off |
 | `fabric peer add <multiaddr>` | any member | add a bootstrap peer |
 
 All commands take `-state <dir>` (default `~/.config/fabric`), so
@@ -108,16 +127,22 @@ scripts).
   (passphrase / scrypt). The seed exists in memory only during a signing
   session — approval happens in the CLI process; the daemon never holds
   the root key.
+- `event` — signed membership events (`MemberAdded` / `MemberRevoked`)
+  and the deduplicating, expiry-GC'd event log they accumulate in: the
+  durable membership view every node carries.
 - `fabricnet` — membership enforcement on a libp2p host, layered:
   a connection gater (hard-denies revoked peers, admits strangers only
   long enough to authenticate), the `/fabric/auth/1` mutual certificate
-  handshake, per-protocol member checks (`RequireMember`), and
-  revocation that closes live connections. First-contact join
-  notifications (admission transparency) surface through `JoinObserver`.
+  handshake, per-protocol member checks (`RequireMember`), revocation
+  that closes live connections, and `/fabric/events/1` gossip — full-log
+  anti-entropy on every connect plus rumor-mill relay of fresh events.
+  First-contact join notifications (admission transparency) surface
+  through `JoinObserver`.
 - `admission` — the `/fabric/join/1` protocol and the pending queue
   (holds no signing material; certs are handed to it only for delivery).
 - `daemon` — the node process: host wiring, bootstrap reconnect/reauth
-  loop, control API over a unix socket for the CLI and the future UI.
+  loop, event-log persistence/replay, control API over a unix socket for
+  the CLI and the future UI.
 - `state` — the state directory: config, device key, own cert,
   keystore path, control socket.
 
