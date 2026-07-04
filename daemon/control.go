@@ -1,0 +1,241 @@
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"time"
+
+	"aethera.dev/fabric/admission"
+	"aethera.dev/fabric/state"
+
+	"github.com/libp2p/go-libp2p/core/network"
+)
+
+// The control API is a plain HTTP-over-unix-socket surface for the CLI and
+// the future topology UI. It is local-trust: anyone who can open the socket
+// (0600, owner-only) speaks for the node's owner. Signing never happens
+// here — approve receives an already-signed cert from the CLI process.
+
+type StatusPeer struct {
+	ID        string `json:"id"`
+	Name      string `json:"name,omitempty"`
+	Member    bool   `json:"member"`
+	Connected bool   `json:"connected"`
+}
+
+type StatusReply struct {
+	Name         string       `json:"name"`
+	PeerID       string       `json:"peer_id"`
+	NamespaceDID string       `json:"namespace_did"`
+	Master       bool         `json:"master"`
+	Addrs        []string     `json:"addrs"`
+	Peers        []StatusPeer `json:"peers"`
+}
+
+type approveBody struct {
+	Fingerprint string `json:"fingerprint"`
+	CertB64     string `json:"cert_b64"`
+}
+
+type denyBody struct {
+	Fingerprint string `json:"fingerprint"`
+}
+
+func (d *Daemon) serveControl() (func(), error) {
+	sock := d.Dir.ControlSocketPath()
+	_ = os.Remove(sock) // stale socket from an unclean shutdown
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		return nil, fmt.Errorf("control socket: %w", err)
+	}
+	if err := os.Chmod(sock, 0o600); err != nil {
+		l.Close()
+		return nil, err
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/status", d.handleStatus)
+	mux.HandleFunc("GET /v0/pending", d.handlePending)
+	mux.HandleFunc("POST /v0/approve", d.handleApprove)
+	mux.HandleFunc("POST /v0/deny", d.handleDeny)
+
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(l)
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		_ = os.Remove(sock)
+	}, nil
+}
+
+func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
+	now := time.Now()
+	reply := StatusReply{
+		Name:         d.Config.Name,
+		PeerID:       d.Host.ID().String(),
+		NamespaceDID: d.Config.NamespaceDID,
+		Master:       d.Queue != nil,
+	}
+	for _, a := range d.Host.Addrs() {
+		reply.Addrs = append(reply.Addrs, fmt.Sprintf("%s/p2p/%s", a, d.Host.ID()))
+	}
+	seen := map[string]bool{}
+	for _, p := range d.Host.Network().Peers() {
+		sp := StatusPeer{ID: p.String(), Connected: true, Member: d.Store.IsMember(p, now)}
+		if c, ok := d.Store.Cert(p); ok {
+			sp.Name = c.Payload.Meta.Name
+		}
+		reply.Peers = append(reply.Peers, sp)
+		seen[sp.ID] = true
+	}
+	// Known members that are currently offline still belong in the picture.
+	for _, addr := range d.Config.Bootstrap {
+		if info, err := peerInfo(addr); err == nil && !seen[info.ID.String()] && info.ID != d.Host.ID() {
+			reply.Peers = append(reply.Peers, StatusPeer{
+				ID:        info.ID.String(),
+				Member:    d.Store.IsMember(info.ID, now),
+				Connected: d.Host.Network().Connectedness(info.ID) == network.Connected,
+			})
+		}
+	}
+	writeJSON(w, reply)
+}
+
+func (d *Daemon) handlePending(w http.ResponseWriter, _ *http.Request) {
+	if d.Queue == nil {
+		http.Error(w, "this node does not run the admission queue", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, d.Queue.List())
+}
+
+func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
+	if d.Queue == nil {
+		http.Error(w, "this node does not run the admission queue", http.StatusNotFound)
+		return
+	}
+	var body approveBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	certBytes, err := base64.StdEncoding.DecodeString(body.CertB64)
+	if err != nil {
+		http.Error(w, "cert_b64: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := d.Queue.Approve(body.Fingerprint, certBytes); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]string{"result": "approved"})
+}
+
+func (d *Daemon) handleDeny(w http.ResponseWriter, r *http.Request) {
+	if d.Queue == nil {
+		http.Error(w, "this node does not run the admission queue", http.StatusNotFound)
+		return
+	}
+	var body denyBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := d.Queue.Deny(body.Fingerprint); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]string{"result": "denied"})
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// --- client side (used by the CLI) ---
+
+// Client talks to a running daemon's control socket.
+type Client struct{ http http.Client }
+
+func NewClient(dir state.Dir) *Client {
+	sock := dir.ControlSocketPath()
+	return &Client{http: http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", sock)
+			},
+		},
+	}}
+}
+
+func (c *Client) get(path string, out any) error {
+	resp, err := c.http.Get("http://fabric" + path)
+	if err != nil {
+		return fmt.Errorf("is the daemon running? %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+		return errors.New(string(bytes.TrimSpace(msg)))
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (c *Client) post(path string, body any, out any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Post("http://fabric"+path, "application/json", bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("is the daemon running? %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+		return errors.New(string(bytes.TrimSpace(msg)))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (c *Client) Status() (*StatusReply, error) {
+	var s StatusReply
+	if err := c.get("/v0/status", &s); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+func (c *Client) Pending() ([]admission.PendingInfo, error) {
+	var p []admission.PendingInfo
+	if err := c.get("/v0/pending", &p); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func (c *Client) Approve(fingerprint string, signedCert []byte) error {
+	return c.post("/v0/approve", approveBody{
+		Fingerprint: fingerprint,
+		CertB64:     base64.StdEncoding.EncodeToString(signedCert),
+	}, nil)
+}
+
+func (c *Client) Deny(fingerprint string) error {
+	return c.post("/v0/deny", denyBody{Fingerprint: fingerprint}, nil)
+}

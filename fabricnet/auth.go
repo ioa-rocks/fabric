@@ -1,16 +1,15 @@
 package fabricnet
 
 import (
-	"bufio"
 	"context"
 	"crypto/ed25519"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"time"
 
 	"aethera.dev/fabric/cert"
+	"aethera.dev/fabric/internal/wire"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -151,7 +150,7 @@ func (a *AuthService) RequireMember(next network.StreamHandler) network.StreamHa
 // readAndValidateCert reads one cert frame and checks both signatures-level
 // validity and the binding to the remote peer's identity key.
 func readAndValidateCert(r io.Reader, namespacePub ed25519.PublicKey, remote peer.ID) (*cert.Cert, error) {
-	data, err := readFrame(r)
+	data, err := wire.ReadFrame(r, maxCertWireSize)
 	if err != nil {
 		return nil, fmt.Errorf("reading cert: %w", err)
 	}
@@ -185,34 +184,10 @@ func peerIDForKey(pub ed25519.PublicKey) (peer.ID, error) {
 	return peer.IDFromPublicKey(pk)
 }
 
-// Frames are uvarint-length-prefixed CBOR blobs.
-
 func writeCert(w io.Writer, c *cert.Cert) error {
 	data, err := c.Marshal()
 	if err != nil {
 		return err
 	}
-	var lenBuf [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(lenBuf[:], uint64(len(data)))
-	if _, err := w.Write(lenBuf[:n]); err != nil {
-		return err
-	}
-	_, err = w.Write(data)
-	return err
-}
-
-func readFrame(r io.Reader) ([]byte, error) {
-	br := bufio.NewReader(r)
-	size, err := binary.ReadUvarint(br)
-	if err != nil {
-		return nil, err
-	}
-	if size > maxCertWireSize {
-		return nil, fmt.Errorf("frame of %d bytes exceeds limit", size)
-	}
-	buf := make([]byte, size)
-	if _, err := io.ReadFull(br, buf); err != nil {
-		return nil, err
-	}
-	return buf, nil
+	return wire.WriteFrame(w, data)
 }

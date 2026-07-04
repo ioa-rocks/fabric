@@ -1,0 +1,148 @@
+// Package state persists a node's identity and configuration in a state
+// directory (default ~/.config/fabric):
+//
+//	config.json        — name, listen addrs, namespace DID, bootstrap peers
+//	device.key         — libp2p ed25519 identity (protobuf), 0600
+//	cert.cbor          — this node's membership certificate
+//	namespace.key.age  — namespace root seed, master only (see keystore)
+//	control.sock       — daemon control socket, runtime only
+package state
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+
+	"aethera.dev/fabric/cert"
+
+	"github.com/libp2p/go-libp2p/core/crypto"
+)
+
+type Config struct {
+	Name         string   `json:"name"`
+	ListenAddrs  []string `json:"listen_addrs"`
+	NamespaceDID string   `json:"namespace_did"`
+	Bootstrap    []string `json:"bootstrap"` // multiaddrs including /p2p/<peer-id>
+}
+
+type Dir struct{ Path string }
+
+// DefaultPath returns ~/.config/fabric (or the OS equivalent).
+func DefaultPath() string {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		base = "."
+	}
+	return filepath.Join(base, "fabric")
+}
+
+func Open(path string) (Dir, error) {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return Dir{}, err
+	}
+	return Dir{Path: path}, nil
+}
+
+func (d Dir) configPath() string    { return filepath.Join(d.Path, "config.json") }
+func (d Dir) deviceKeyPath() string { return filepath.Join(d.Path, "device.key") }
+func (d Dir) certPath() string      { return filepath.Join(d.Path, "cert.cbor") }
+
+// KeystorePath is where the master's namespace root seed lives.
+func (d Dir) KeystorePath() string { return filepath.Join(d.Path, "namespace.key.age") }
+
+// ControlSocketPath is the daemon's local control endpoint. Unix socket
+// paths are capped at ~108 bytes (sun_path); for deep state dirs we fall
+// back to a deterministic short path in the temp dir, derived from the
+// state dir so daemon and CLI agree without coordination.
+func (d Dir) ControlSocketPath() string {
+	p := filepath.Join(d.Path, "control.sock")
+	if len(p) < 100 {
+		return p
+	}
+	abs, err := filepath.Abs(d.Path)
+	if err != nil {
+		abs = d.Path
+	}
+	sum := sha256.Sum256([]byte(abs))
+	return filepath.Join(os.TempDir(), fmt.Sprintf("fabric-%s.sock", hex.EncodeToString(sum[:6])))
+}
+
+// IsMaster reports whether this state dir holds the namespace root seed.
+func (d Dir) IsMaster() bool {
+	_, err := os.Stat(d.KeystorePath())
+	return err == nil
+}
+
+func (d Dir) SaveConfig(c Config) error {
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(d.configPath(), append(data, '\n'), 0o600)
+}
+
+func (d Dir) LoadConfig() (Config, error) {
+	data, err := os.ReadFile(d.configPath())
+	if err != nil {
+		return Config{}, err
+	}
+	var c Config
+	if err := json.Unmarshal(data, &c); err != nil {
+		return Config{}, fmt.Errorf("parsing %s: %w", d.configPath(), err)
+	}
+	return c, nil
+}
+
+// GenerateDeviceKey creates and persists this node's libp2p identity.
+// Refuses to overwrite an existing key.
+func (d Dir) GenerateDeviceKey() (crypto.PrivKey, error) {
+	if _, err := os.Stat(d.deviceKeyPath()); err == nil {
+		return nil, errors.New("device key already exists; refusing to overwrite an identity")
+	}
+	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	data, err := crypto.MarshalPrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(d.deviceKeyPath(), data, 0o600); err != nil {
+		return nil, err
+	}
+	return priv, nil
+}
+
+func (d Dir) LoadDeviceKey() (crypto.PrivKey, error) {
+	data, err := os.ReadFile(d.deviceKeyPath())
+	if err != nil {
+		return nil, err
+	}
+	return crypto.UnmarshalPrivateKey(data)
+}
+
+func (d Dir) SaveCert(c *cert.Cert) error {
+	data, err := c.Marshal()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(d.certPath(), data, 0o600)
+}
+
+// LoadCert returns (nil, nil) when no certificate exists yet.
+func (d Dir) LoadCert() (*cert.Cert, error) {
+	data, err := os.ReadFile(d.certPath())
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return cert.Unmarshal(data)
+}
