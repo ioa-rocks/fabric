@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"aethera.dev/fabric/event"
 	"aethera.dev/fabric/keystore"
 	"aethera.dev/fabric/state"
+	"aethera.dev/fabric/tunbridge"
 	"aethera.dev/fabric/webui"
 
 	"github.com/libp2p/go-libp2p"
@@ -30,10 +32,33 @@ import (
 )
 
 const (
-	version       = "0.0.1"
-	certValidity  = cert.DefaultValidity // spec §5
-	defaultListen = "/ip4/0.0.0.0/tcp/4517"
+	version      = "0.0.1"
+	certValidity = cert.DefaultValidity // spec §5
+
+	// Dual-stack, QUIC + TCP. QUIC gives a UDP underlay (no TCP-over-TCP
+	// under the TUN bridge, and the path future hole-punching needs); TCP
+	// stays as the fallback for UDP-hostile networks.
+	defaultListen = "/ip4/0.0.0.0/udp/4517/quic-v1,/ip6/::/udp/4517/quic-v1,/ip4/0.0.0.0/tcp/4517,/ip6/::/tcp/4517"
 )
+
+// parseListen splits and validates a comma-separated multiaddr list.
+func parseListen(s string) ([]string, error) {
+	var addrs []string
+	for _, a := range strings.Split(s, ",") {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		if _, err := ma.NewMultiaddr(a); err != nil {
+			return nil, fmt.Errorf("listen addr %q: %w", a, err)
+		}
+		addrs = append(addrs, a)
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no listen addresses")
+	}
+	return addrs, nil
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -117,10 +142,22 @@ func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	statePath := stateFlag(fs)
 	name := fs.String("name", "", "human label for this device (required)")
-	listen := fs.String("listen", defaultListen, "listen multiaddr")
+	listen := fs.String("listen", defaultListen, "listen multiaddrs, comma-separated")
+	subnet := fs.String("subnet", "100.64.0.0/24", "overlay subnet for the TUN bridge (empty to disable overlay addressing)")
 	fs.Parse(args)
 	if *name == "" {
 		return fmt.Errorf("init: -name is required")
+	}
+	listenAddrs, err := parseListen(*listen)
+	if err != nil {
+		return err
+	}
+	var masterIP string
+	if *subnet != "" {
+		var err error
+		if masterIP, err = tunbridge.NextFreeIP(*subnet, nil); err != nil {
+			return fmt.Errorf("init: %w", err)
+		}
 	}
 
 	dir, err := state.Open(*statePath)
@@ -154,7 +191,7 @@ func cmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	own, err := cert.Issue(rootPriv, ed25519.PublicKey(devicePubRaw), cert.CmdAdmin, *name, time.Now(), certValidity)
+	own, err := cert.Issue(rootPriv, ed25519.PublicKey(devicePubRaw), cert.CmdAdmin, cert.Meta{Name: *name, IP: masterIP}, time.Now(), certValidity)
 	if err != nil {
 		return err
 	}
@@ -165,14 +202,18 @@ func cmdInit(args []string) error {
 	nsDID := cert.DIDForKey(rootPriv.Public().(ed25519.PublicKey))
 	if err := dir.SaveConfig(state.Config{
 		Name:         *name,
-		ListenAddrs:  []string{*listen},
+		ListenAddrs:  listenAddrs,
 		NamespaceDID: nsDID,
+		Subnet:       *subnet,
 	}); err != nil {
 		return err
 	}
 
 	fmt.Printf("namespace created: %s\n", nsDID)
 	fmt.Printf("this device (%q) is the master and holds the root key\n", *name)
+	if masterIP != "" {
+		fmt.Printf("overlay subnet %s; this device is %s\n", *subnet, masterIP)
+	}
 	fmt.Printf("root-key container: %s — back it up and test the restore\n", dir.KeystorePath())
 	fmt.Printf("start the node with: fabric up -state %s\n", dir.Path)
 	return nil
@@ -181,6 +222,7 @@ func cmdInit(args []string) error {
 func cmdUp(args []string) error {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
 	statePath := stateFlag(fs)
+	noTun := fs.Bool("no-tun", false, "run without the TUN bridge for this run")
 	fs.Parse(args)
 
 	dir, err := state.Open(*statePath)
@@ -191,6 +233,7 @@ func cmdUp(args []string) error {
 	if err != nil {
 		return err
 	}
+	d.DisableTUN = *noTun
 	go func() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
@@ -219,6 +262,13 @@ func cmdStatus(args []string) error {
 	}
 	fmt.Printf("%s (%s)  peer %s\n", s.Name, role, s.PeerID)
 	fmt.Printf("namespace %s\n", s.NamespaceDID)
+	if s.OverlayIP != "" {
+		tun := "tun down (other transports still work)"
+		if s.TUNActive {
+			tun = "tun up (fabric0)"
+		}
+		fmt.Printf("overlay %s — %s\n", s.OverlayIP, tun)
+	}
 	for _, a := range s.Addrs {
 		fmt.Printf("  listen %s\n", a)
 	}
@@ -243,7 +293,11 @@ func cmdStatus(args []string) error {
 		if name == "" {
 			name = "?"
 		}
-		fmt.Printf("  %-16s %-9s %-8s %s\n", name, conn, member, p.ID)
+		ip := p.IP
+		if ip == "" {
+			ip = "-"
+		}
+		fmt.Printf("  %-16s %-9s %-8s %-18s %s\n", name, conn, member, ip, p.ID)
 	}
 	return nil
 }
@@ -253,10 +307,14 @@ func cmdJoin(args []string) error {
 	statePath := stateFlag(fs)
 	name := fs.String("name", "", "human label for this device (required)")
 	bootstrap := fs.String("bootstrap", "", "multiaddr of the queue host, incl. /p2p/<peer-id> (required)")
-	listen := fs.String("listen", defaultListen, "listen multiaddr")
+	listen := fs.String("listen", defaultListen, "listen multiaddrs, comma-separated")
 	fs.Parse(args)
 	if *name == "" || *bootstrap == "" {
 		return fmt.Errorf("join: -name and -bootstrap are required")
+	}
+	listenAddrs, err := parseListen(*listen)
+	if err != nil {
+		return err
 	}
 
 	m, err := ma.NewMultiaddr(*bootstrap)
@@ -342,7 +400,7 @@ approved:
 	}
 	if err := dir.SaveConfig(state.Config{
 		Name:         *name,
-		ListenAddrs:  []string{*listen},
+		ListenAddrs:  listenAddrs,
 		NamespaceDID: resp.NamespaceDID,
 		Bootstrap:    []string{*bootstrap},
 	}); err != nil {
@@ -418,12 +476,24 @@ func cmdApprove(args []string) error {
 
 	// Signing happens here, in the CLI process — the daemon never holds the
 	// root key (spec §1/§3).
+	members, err := client.Members()
+	if err != nil {
+		return err
+	}
+	ip, err := daemon.AllocateOverlayIP(dir, members)
+	if err != nil {
+		return err
+	}
+	if ip != "" {
+		fmt.Printf("assigning overlay address %s\n", ip)
+	}
+
 	rootPriv, err := unlockRootKey(dir)
 	if err != nil {
 		return err
 	}
 	now := time.Now()
-	c, err := cert.Issue(rootPriv, ed25519.PublicKey(match.DevicePub), cert.CmdMember, match.Name, now, certValidity)
+	c, err := cert.Issue(rootPriv, ed25519.PublicKey(match.DevicePub), cert.CmdMember, cert.Meta{Name: match.Name, IP: ip}, now, certValidity)
 	if err != nil {
 		return err
 	}

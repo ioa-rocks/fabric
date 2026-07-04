@@ -14,7 +14,7 @@ import (
 )
 
 func issueTestCert(nsPriv ed25519.PrivateKey, devPub ed25519.PublicKey, name string) (*cert.Cert, error) {
-	return cert.Issue(nsPriv, devPub, cert.CmdMember, name, time.Now(), time.Hour)
+	return cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: name}, time.Now(), time.Hour)
 }
 
 type syncNode struct {

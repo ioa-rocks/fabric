@@ -31,7 +31,9 @@ type Config struct {
 	Name         string   `json:"name"`
 	ListenAddrs  []string `json:"listen_addrs"`
 	NamespaceDID string   `json:"namespace_did"`
-	Bootstrap    []string `json:"bootstrap"` // multiaddrs including /p2p/<peer-id>
+	Bootstrap    []string `json:"bootstrap"`        // multiaddrs including /p2p/<peer-id>
+	Subnet       string   `json:"subnet,omitempty"` // overlay CIDR; master only (allocation)
+	TUN          string   `json:"tun,omitempty"`    // "" = auto (try, fall back), "off"
 }
 
 type Dir struct{ Path string }

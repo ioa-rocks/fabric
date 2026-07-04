@@ -55,7 +55,7 @@ func newNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.PrivateKey, n
 		if err != nil {
 			t.Fatal(err)
 		}
-		own, err = cert.Issue(nsPriv, ed25519.PublicKey(raw), cert.CmdMember, name, time.Now(), 90*24*time.Hour)
+		own, err = cert.Issue(nsPriv, ed25519.PublicKey(raw), cert.CmdMember, cert.Meta{Name: name}, time.Now(), 90*24*time.Hour)
 		if err != nil {
 			t.Fatal(err)
 		}

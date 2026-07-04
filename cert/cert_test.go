@@ -46,7 +46,7 @@ func TestIssueVerifyRoundtrip(t *testing.T) {
 	devPub, _ := genKey(t)
 	now := time.Now()
 
-	c, err := Issue(nsPriv, devPub, CmdMember, "nas", now, 90*24*time.Hour)
+	c, err := Issue(nsPriv, devPub, CmdMember, Meta{Name: "nas"}, now, 90*24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestVerifyRejections(t *testing.T) {
 
 	valid := func(t *testing.T) *Cert {
 		t.Helper()
-		c, err := Issue(nsPriv, devPub, CmdMember, "x", now, time.Hour)
+		c, err := Issue(nsPriv, devPub, CmdMember, Meta{Name: "x"}, now, time.Hour)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -112,7 +112,7 @@ func TestVerifyRejections(t *testing.T) {
 	})
 	t.Run("forged signature", func(t *testing.T) {
 		c := valid(t)
-		forged, err := Issue(otherPriv, devPub, CmdMember, "x", now, time.Hour)
+		forged, err := Issue(otherPriv, devPub, CmdMember, Meta{Name: "x"}, now, time.Hour)
 		if err != nil {
 			t.Fatal(err)
 		}

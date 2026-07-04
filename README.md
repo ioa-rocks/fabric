@@ -5,8 +5,10 @@ libp2p, replacing a hand-rolled Nebula deployment with human-gated,
 certificate-based membership and a topology/admin UI.
 
 Status: **pre-alpha** — daemon, CLI, the join-then-approve admission
-flow, revocation with membership-event gossip, and the topology/admin
-web UI work end-to-end; the TUN bridge is not built yet.
+flow, revocation with membership-event gossip, the topology/admin web
+UI, and the optional TUN bridge (existing TCP/UDP apps over overlay
+IPs) work end-to-end; relay/hole-punching for CGNAT-to-CGNAT paths is
+not built yet.
 
 Design documents live in the Aethera project folder
 (`components/fabric/` — security-model spec, ADRs, surveys); this repo is
@@ -96,6 +98,37 @@ revocation records self-delete once the cert they kill would have
 expired anyway. Re-admitting a revoked device means a fresh
 `fabric join`.
 
+## The TUN bridge — plain IP over the mesh
+
+Every device gets an overlay address at approval time, signed into its
+membership cert (default subnet `100.64.0.0/24`, chosen at `init`).
+Nodes that can create a TUN device bridge it to the mesh: Syncthing,
+SSH, anything-IP reaches peers at their overlay addresses with no app
+changes (deployment mode C, fabric ADRs 0002/0004).
+
+**The bridge is optional per node and needs no root daemon.** Grant
+the capability once per binary:
+
+```sh
+sudo setcap cap_net_admin+ep $(command -v fabric)   # re-run after rebuilds
+fabric up                                           # as your normal user
+```
+
+Without the capability (or on non-Linux, or with `-no-tun`), the node
+logs a note and runs as a full member over the other modes — it keeps
+its overlay address, so TUN-mode peers can still name it consistently
+the moment it gains the capability. Traffic is relayed as raw IP
+packets on a member-gated stream with source-address pinning; nodes
+listen on QUIC (UDP) and TCP, IPv4 and IPv6, so the bridge rides a UDP
+underlay whenever both ends support it.
+
+Certs issued before the bridge existed carry no overlay IP — re-join
+(or re-init a young namespace) to get addressed.
+
+End-to-end proof without touching real interfaces:
+`go build -o fabric ./cmd/fabric && sudo scripts/e2e-tun.sh` — two
+network namespaces, a veth pair, ICMP + TCP across the overlay.
+
 ## The topology UI
 
 ```sh
@@ -170,6 +203,10 @@ scripts).
 - `webui` — the topology/admin UI: an embedded no-build-step web app
   (`fabric ui`) that reads through the control socket and signs
   approvals/revocations in its own process, never the daemon's.
+- `tunbridge` — deployment mode C: overlay-address allocation, the
+  kernel TUN device (Linux, in-process netlink so a file capability
+  suffices), and the L3 packet relay over `/fabric/tun/1` — no
+  userspace TCP/IP stack; both ends' kernels terminate TCP (ADR 0004).
 - `state` — the state directory: config, device key, own cert,
   keystore path, control socket.
 

@@ -43,6 +43,7 @@ type StatusPeer struct {
 	Relayed   bool    `json:"relayed,omitempty"`   // via a circuit relay, not direct
 	RTTMillis float64 `json:"rtt_ms,omitempty"`
 
+	IP         string     `json:"ip,omitempty"` // overlay address from the cert
 	CertExpiry *time.Time `json:"cert_expiry,omitempty"`
 }
 
@@ -53,6 +54,7 @@ type MemberInfo struct {
 	Name        string    `json:"name"`
 	Fingerprint string    `json:"fingerprint"`
 	DevicePub   []byte    `json:"device_pub"`
+	IP          string    `json:"ip,omitempty"` // overlay address from the cert
 	Expiry      time.Time `json:"expiry"`
 	Connected   bool      `json:"connected"`
 }
@@ -63,6 +65,8 @@ type StatusReply struct {
 	NamespaceDID string       `json:"namespace_did"`
 	Master       bool         `json:"master"`
 	Reachability string       `json:"reachability"` // autonat: public / private / unknown
+	OverlayIP    string       `json:"overlay_ip,omitempty"`
+	TUNActive    bool         `json:"tun_active"`
 	Addrs        []string     `json:"addrs"`
 	Peers        []StatusPeer `json:"peers"`
 }
@@ -128,6 +132,8 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		NamespaceDID: d.Config.NamespaceDID,
 		Master:       d.Queue != nil,
 		Reachability: d.Reachability(),
+		OverlayIP:    d.ownCert.Payload.Meta.IP,
+		TUNActive:    d.Bridge != nil,
 	}
 	for _, a := range d.Host.Addrs() {
 		reply.Addrs = append(reply.Addrs, fmt.Sprintf("%s/p2p/%s", a, d.Host.ID()))
@@ -138,6 +144,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		sp := StatusPeer{ID: p.String(), Connected: true, Member: d.Store.IsMember(p, now), Revoked: d.Store.IsRevoked(p, now)}
 		if c, ok := d.Store.Cert(p); ok {
 			sp.Name = c.Payload.Meta.Name
+			sp.IP = c.Payload.Meta.IP
 			exp := c.Expiry()
 			sp.CertExpiry = &exp
 		}
@@ -157,7 +164,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	for p, c := range members {
 		if !seen[p.String()] {
 			exp := c.Expiry()
-			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true, CertExpiry: &exp})
+			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true, IP: c.Payload.Meta.IP, CertExpiry: &exp})
 			seen[p.String()] = true
 		}
 	}
@@ -193,6 +200,7 @@ func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
 			Name:        c.Payload.Meta.Name,
 			Fingerprint: admission.Fingerprint(devKey),
 			DevicePub:   devKey,
+			IP:          c.Payload.Meta.IP,
 			Expiry:      c.Expiry(),
 			Connected:   d.Host.Network().Connectedness(p) == network.Connected,
 		})

@@ -69,7 +69,7 @@ func TestJoinFlow(t *testing.T) {
 	if len(list) != 1 || list[0].Name != "new-laptop" || list[0].Fingerprint != Fingerprint(devicePub) {
 		t.Fatalf("unexpected queue contents: %+v", list)
 	}
-	c, err := cert.Issue(nsPriv, devicePub, cert.CmdMember, "new-laptop", time.Now(), time.Hour)
+	c, err := cert.Issue(nsPriv, devicePub, cert.CmdMember, cert.Meta{Name: "new-laptop"}, time.Now(), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

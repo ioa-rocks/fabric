@@ -24,7 +24,7 @@ func testCert(t *testing.T, rootPriv ed25519.PrivateKey, name string, nbf time.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := cert.Issue(rootPriv, devPub, cert.CmdMember, name, nbf, validity)
+	c, err := cert.Issue(rootPriv, devPub, cert.CmdMember, cert.Meta{Name: name}, nbf, validity)
 	if err != nil {
 		t.Fatal(err)
 	}

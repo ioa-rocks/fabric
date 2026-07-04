@@ -31,9 +31,15 @@ const DefaultValidity = 90 * 24 * time.Hour
 
 const nonceSize = 16
 
-// Meta carries non-security-relevant labels.
+// Meta carries the certificate's attributes beyond identity. IP is the
+// device's overlay address (CIDR notation, e.g. "100.64.0.2/24"): assigned by
+// the master at approval time and signed into the cert, so address ownership
+// is as authoritative as membership itself (the Nebula model). Empty on certs
+// issued before the TUN bridge existed — such members are unreachable via TUN
+// until renewed.
 type Meta struct {
-	Name string `cbor:"name"` // human label, e.g. "nas", "work-laptop"
+	Name string `cbor:"name"`         // human label, e.g. "nas", "work-laptop"
+	IP   string `cbor:"ip,omitempty"` // overlay address, CIDR notation
 }
 
 // Payload is the signed portion of a membership certificate.
@@ -72,7 +78,7 @@ func init() {
 
 // Issue signs a membership certificate for a device key. rootPriv is the
 // namespace root private key; it never leaves the master (spec §1).
-func Issue(rootPriv ed25519.PrivateKey, devicePub ed25519.PublicKey, cmd, name string, nbf time.Time, validity time.Duration) (*Cert, error) {
+func Issue(rootPriv ed25519.PrivateKey, devicePub ed25519.PublicKey, cmd string, meta Meta, nbf time.Time, validity time.Duration) (*Cert, error) {
 	if cmd != CmdMember && cmd != CmdAdmin {
 		return nil, fmt.Errorf("unknown command path %q", cmd)
 	}
@@ -86,7 +92,7 @@ func Issue(rootPriv ed25519.PrivateKey, devicePub ed25519.PublicKey, cmd, name s
 		Aud:   DIDForKey(devicePub),
 		Sub:   rootDID,
 		Cmd:   cmd,
-		Meta:  Meta{Name: name},
+		Meta:  meta,
 		Nbf:   nbf.Unix(),
 		Exp:   nbf.Add(validity).Unix(),
 		Nonce: nonce,

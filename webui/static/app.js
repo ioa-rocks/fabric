@@ -153,7 +153,7 @@ function renderGraph(d, ns) {
     }
   });
 
-  drawNode(svg, cx, cy, { id: "self", name: d.status.name, kind: "self" }, 28);
+  drawNode(svg, cx, cy, { id: "self", name: d.status.name, kind: "self", ip: d.status.overlay_ip }, 28);
   ns.forEach((n, i) => {
     const [x, y] = ringPos(i, ns.length, cx, cy, r);
     drawNode(svg, x, y, n, 24);
@@ -178,7 +178,8 @@ function drawNode(svg, x, y, n, radius) {
     g.append(el("line", { class: "cross", x1: x - o, y1: y + o, x2: x + o, y2: y - o }));
   }
   g.append(el("text", { x, y: y + radius + 16, "text-anchor": "middle" }, n.name || short(n.id)));
-  g.append(el("text", { x, y: y + radius + 30, "text-anchor": "middle", class: "sub" }, KIND_LABEL[n.kind]));
+  const sub = n.ip ? `${n.ip.split("/")[0]} · ${KIND_LABEL[n.kind]}` : KIND_LABEL[n.kind];
+  g.append(el("text", { x, y: y + radius + 30, "text-anchor": "middle", class: "sub" }, sub));
   g.onclick = () => { state.selected = n.id; state.form = null; renderDetails(state.data, nodes()); renderGraph(state.data, nodes()); };
   svg.append(g);
 }
@@ -225,6 +226,7 @@ function renderDetails(d, ns) {
   const kv = document.createElement("dl");
   kv.className = "kv";
   add(kv, "name", n.name || "—");
+  if (n.ip) add(kv, "overlay IP", mono(n.ip.split("/")[0]));
   add(kv, "peer ID", mono(n.id));
   if (n.connected) {
     add(kv, "link", `${n.relayed ? "RELAYED" : "direct"} · ${n.transport || "?"} · ${n.direction === "inbound" ? "they dialed us" : "we dialed them"}`);
@@ -274,6 +276,10 @@ function renderSelf(d, box) {
   kv.className = "kv";
   add(kv, "name", d.status.name);
   add(kv, "role", d.status.master ? "master (holds the root key)" : "member");
+  if (d.status.overlay_ip) {
+    add(kv, "overlay IP", mono(d.status.overlay_ip.split("/")[0]));
+    add(kv, "TUN bridge", d.status.tun_active ? "up (fabric0)" : "down — other transports still work");
+  }
   add(kv, "peer ID", mono(d.status.peer_id));
   add(kv, "NAT", (d.status.reachability || "unknown").toLowerCase());
   for (const a of d.status.addrs || []) add(kv, "listen", mono(a));

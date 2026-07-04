@@ -144,13 +144,23 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusConflict, fmt.Errorf("request is already %s", match.Status))
 		return
 	}
+	members, err := s.client.Members()
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err)
+		return
+	}
+	ip, err := daemon.AllocateOverlayIP(s.dir, members)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
 	rootPriv, err := s.unlock(req.Passphrase)
 	if err != nil {
 		httpError(w, http.StatusForbidden, err)
 		return
 	}
 	now := time.Now()
-	c, err := cert.Issue(rootPriv, ed25519.PublicKey(match.DevicePub), cert.CmdMember, match.Name, now, cert.DefaultValidity)
+	c, err := cert.Issue(rootPriv, ed25519.PublicKey(match.DevicePub), cert.CmdMember, cert.Meta{Name: match.Name, IP: ip}, now, cert.DefaultValidity)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return

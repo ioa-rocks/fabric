@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"aethera.dev/fabric/event"
 	"aethera.dev/fabric/fabricnet"
 	"aethera.dev/fabric/state"
+	"aethera.dev/fabric/tunbridge"
 
 	"github.com/libp2p/go-libp2p"
 	libp2pevent "github.com/libp2p/go-libp2p/core/event"
@@ -41,6 +43,10 @@ type Daemon struct {
 	Log    *event.Log // membership events: admissions + revocations (spec §5)
 	Sync   *fabricnet.EventSync
 	Queue  *admission.Queue // nil unless this node runs the admission queue
+
+	// TUN bridge (mode C) — optional; nil when disabled or unavailable.
+	Bridge     *tunbridge.Bridge
+	DisableTUN bool // set before Run to skip the bridge for this run
 
 	ownCert *cert.Cert
 	ctx     context.Context
@@ -111,6 +117,7 @@ func New(dir state.Dir) (*Daemon, error) {
 	// Hard-coded admission transparency (spec §5): every join is announced.
 	d.Auth = fabricnet.NewAuthService(h, store, own, AuthGrace, func(p peer.ID, c *cert.Cert) {
 		log.Printf("member joined: %q (%s)", c.Payload.Meta.Name, p)
+		d.refreshRoutes()
 	})
 	d.Sync = fabricnet.NewEventSync(h, evLog, store, d.applyEvent)
 	d.Auth.SetOnAuthenticated(d.Sync.ExchangeAsync)
@@ -148,11 +155,61 @@ func (d *Daemon) Run() error {
 	}
 	defer stopControl()
 
+	d.startTUN()
+
 	go d.reconnectLoop()
 	go d.watchReachability()
 
 	<-d.ctx.Done()
+	if d.Bridge != nil {
+		d.Bridge.Close()
+	}
 	return d.Host.Close()
+}
+
+// tunMTU leaves room for the libp2p framing and transport around each
+// packet.
+const tunMTU = 1400
+
+// startTUN brings up the optional mode-C bridge. Every failure is a
+// downgrade, not an error: the node stays a full member over the other
+// modes (ADR 0002 — TUN is one facet, not a requirement).
+func (d *Daemon) startTUN() {
+	switch {
+	case d.DisableTUN || d.Config.TUN == "off":
+		log.Printf("tun: disabled; running without the IP bridge")
+		return
+	case d.ownCert.Payload.Meta.IP == "":
+		log.Printf("tun: this device's cert carries no overlay IP; running without the IP bridge")
+		return
+	}
+	dev, err := tunbridge.OpenDevice("fabric0", d.ownCert.Payload.Meta.IP, tunMTU)
+	if err != nil {
+		log.Printf("tun: %v — running without the IP bridge (grant CAP_NET_ADMIN to enable: sudo setcap cap_net_admin+ep <fabric binary>)", err)
+		return
+	}
+	d.Bridge = tunbridge.New(d.Host, dev, d.Auth.RequireMember)
+	d.refreshRoutes()
+	log.Printf("tun: fabric0 up, this node is %s", d.ownCert.Payload.Meta.IP)
+}
+
+// refreshRoutes rebuilds the overlay routing table from the member store —
+// the cert is the source of address truth.
+func (d *Daemon) refreshRoutes() {
+	if d.Bridge == nil {
+		return
+	}
+	members, _ := d.Store.Snapshot()
+	routes := make(map[netip.Addr]peer.ID, len(members))
+	for p, c := range members {
+		if c.Payload.Meta.IP == "" {
+			continue
+		}
+		if pfx, err := netip.ParsePrefix(c.Payload.Meta.IP); err == nil {
+			routes[pfx.Addr()] = p
+		}
+	}
+	d.Bridge.SetRoutes(routes)
 }
 
 // watchReachability tracks the autonat verdict about this node's NAT
@@ -213,6 +270,31 @@ func (d *Daemon) Reachability() string {
 	d.teleMu.Lock()
 	defer d.teleMu.Unlock()
 	return d.reachability
+}
+
+// AllocateOverlayIP picks the next free overlay address for a new member.
+// Used by the signing side (CLI/UI) at approval time; returns "" when the
+// namespace predates the overlay subnet (certs are then issued without an
+// IP, as before). taken should be the current members' addresses.
+func AllocateOverlayIP(dir state.Dir, members []MemberInfo) (string, error) {
+	cfg, err := dir.LoadConfig()
+	if err != nil {
+		return "", err
+	}
+	if cfg.Subnet == "" {
+		return "", nil
+	}
+	taken := make([]string, 0, len(members)+1)
+	for _, m := range members {
+		if m.IP != "" {
+			taken = append(taken, m.IP)
+		}
+	}
+	// The master's own cert is not in the member store.
+	if own, err := dir.LoadCert(); err == nil && own != nil && own.Payload.Meta.IP != "" {
+		taken = append(taken, own.Payload.Meta.IP)
+	}
+	return tunbridge.NextFreeIP(cfg.Subnet, taken)
 }
 
 // Stop shuts the daemon down.
@@ -276,6 +358,7 @@ func (d *Daemon) applyEvent(e *event.Event) {
 			log.Printf("member revoked: %q (%s)", name, p)
 		}
 	}
+	d.refreshRoutes()
 	d.persistEvents()
 }
 
@@ -308,6 +391,7 @@ func (d *Daemon) reconnectLoop() {
 	for {
 		d.connectBootstrap()
 		d.measureRTT()
+		d.refreshRoutes()
 		now := time.Now()
 		d.Store.GC(now)
 		d.Log.GC(now)
