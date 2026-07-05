@@ -101,6 +101,72 @@ fabric status    # on either device:
 Every node prints a `member joined:` line when a new member first
 appears — admissions are never silent, by design.
 
+## End to end: home + cloud, no inbound ports anywhere
+
+The full runbook from nothing to a mesh spanning a NAT'd home and
+public cloud nodes. Key property: home machines only ever dial *out* —
+no router firewall holes, no DDNS, no stable-address fights.
+
+**1. Master (the machine you sit at):**
+
+```sh
+go build -o fabric ./cmd/fabric
+sudo setcap 'cap_net_admin,cap_net_bind_service+ep' ./fabric
+./fabric init -name desk
+sudo ./fabric dns setup        # once; resolver self-registers from now on
+./fabric up &                  # logs: tun up, dns serving + registered
+./fabric ui &                  # http://127.0.0.1:4518
+```
+
+**2. LAN devices** join directly against the master's LAN address
+(quickstart above): `fabric join -name nas -bootstrap
+/ip4/<master-lan-ip>/tcp/4517/p2p/<master-peer-id>`, approve in the UI
+or CLI, `fabric up`. The name given at join is the device's `.fabric`
+name — `ssh nas.fabric` afterwards.
+
+**3. First cloud node — join through an SSH reverse tunnel.** The
+cloud can't dial into a CGNAT'd/v6-rotating home, and it doesn't need
+to: carry the join through the SSH session you already have.
+
+```sh
+# on the master:
+ssh -R 14517:localhost:4517 you@cloud-a
+
+# on cloud-a, through that tunnel:
+fabric join -name cloud-a -bootstrap /ip4/127.0.0.1/tcp/14517/p2p/<master-peer-id>
+
+# approve on the master (fingerprint comparison as always), then on cloud-a:
+fabric up
+```
+
+The tunnel is only for admission: once `cloud-a` holds a cert, add its
+*public* address on the home nodes (`fabric peer add
+/ip4/<cloud-ip>/udp/4517/quic-v1/p2p/<cloud-peer-id>`, or the /ip6/…
+form) and they maintain direct outbound connections to it.
+
+**4. Promote the cloud node to lighthouse.** On `cloud-a`:
+
+```sh
+fabric queue on    # restart the daemon to apply
+```
+
+**5. Every further node — join via the lighthouse**, no tunnels, no
+master reachability needed:
+
+```sh
+fabric join -name cloud-b -bootstrap /ip4/<cloud-a-ip>/udp/4517/quic-v1/p2p/<cloud-a-peer-id>
+```
+
+The request waits in cloud-a's queue; `fabric pending` / the UI on the
+master shows it (pulled remotely over the admin-gated queue protocol),
+approval signs on the master and delivers through the lighthouse. The
+master can be asleep when joiners knock — they wait in the queue.
+
+Current limitation, honestly: two NAT'd nodes that don't share a LAN
+(laptop in a café ↔ NAS) have no direct path yet — traffic between
+them and the mesh flows only where direct dials exist. Relay fallback
+through lighthouse nodes + hole-punching is the next milestone.
+
 ## Kicking a device out
 
 ```sh
