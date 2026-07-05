@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -76,6 +77,8 @@ func main() {
 		err = cmdUp(args)
 	case "status":
 		err = cmdStatus(args)
+	case "graph":
+		err = cmdGraph(args)
 	case "join":
 		err = cmdJoin(args)
 	case "pending":
@@ -111,6 +114,7 @@ func usage() {
   join     request admission to an existing namespace
   up       run the node daemon
   status   show node, membership, and connection state
+  graph    show the whole mesh's links; -json for machines
   pending  list join requests awaiting approval (master)
   approve  approve a pending join request by fingerprint (master)
   deny     deny a pending join request by fingerprint (master)
@@ -325,6 +329,64 @@ func cmdStatus(args []string) error {
 			ip = "-"
 		}
 		fmt.Printf("  %-16s %-9s %-8s %-18s %s\n", name, conn, member, ip, p.ID)
+	}
+	return nil
+}
+
+// cmdGraph prints the aggregated mesh map — every live link any reachable
+// member reports, with names resolved. -json emits the same for machines.
+func cmdGraph(args []string) error {
+	fs := flag.NewFlagSet("graph", flag.ExitOnError)
+	statePath := stateFlag(fs)
+	jsonOut := fs.Bool("json", false, "machine-readable output")
+	fs.Parse(args)
+
+	dir, err := state.Open(*statePath)
+	if err != nil {
+		return err
+	}
+	client := daemon.NewClient(dir)
+	st, err := client.Status()
+	if err != nil {
+		return err
+	}
+	links, err := client.Graph()
+	if err != nil {
+		return err
+	}
+
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{"self": st.PeerID, "peers": st.Peers, "links": links})
+	}
+
+	names := map[string]string{st.PeerID: st.Name + " (this node)"}
+	for _, p := range st.Peers {
+		if p.Name != "" {
+			names[p.ID] = p.Name
+		}
+	}
+	name := func(id string) string {
+		if n, ok := names[id]; ok {
+			return n
+		}
+		return id[:8] + "…"
+	}
+	if len(links) == 0 {
+		fmt.Println("no live links reported")
+		return nil
+	}
+	for _, l := range links {
+		rtt := "     ?"
+		if l.RTTMillis > 0 {
+			rtt = fmt.Sprintf("%6.1f ms", l.RTTMillis)
+		}
+		kind := l.Transport
+		if l.Relayed {
+			kind += " RELAYED"
+		}
+		fmt.Printf("  %-18s <-> %-18s %s  %s\n", name(l.A), name(l.B), rtt, kind)
 	}
 	return nil
 }

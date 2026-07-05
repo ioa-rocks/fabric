@@ -281,6 +281,7 @@ of its own; don't point `-listen` at a routable interface.
 | `fabric init -name <label>` | first device | mint the namespace, become master |
 | `fabric up` | any member | run the node daemon |
 | `fabric status` | any member | node, membership, and connection state |
+| `fabric graph [-json]` | any member | whole-mesh link map, human or machine readable |
 | `fabric join -name <label> -bootstrap <addr>` | new device | request admission and wait |
 | `fabric pending` | master | list join requests |
 | `fabric approve <fingerprint>` | master | sign a membership cert for a pending request |

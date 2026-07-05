@@ -128,11 +128,17 @@ function renderGraph(d, ns) {
   const W = 800, H = 520, cx = W / 2, cy = H / 2 - 10;
   const r = Math.min(200, 130 + ns.length * 8);
 
-  // positions: self at center, everyone else on the ring
-  const pos = { [d.status.peer_id]: [cx, cy, 28] };
-  ns.forEach((n, i) => {
-    const [x, y] = ringPos(i, ns.length, cx, cy, r);
-    pos[n.id] = [x, y, 24];
+  // Everyone on one ring, self included — with self at the center, a
+  // chord between opposite nodes would run straight through it.
+  const all = [
+    { id: d.status.peer_id, name: d.status.name, kind: "self", ip: d.status.overlay_ip, rad: 28 },
+    ...ns.map(n => ({ ...n, rad: 24 })),
+  ];
+  const ringR = all.length === 1 ? 0 : r;
+  const pos = {};
+  all.forEach((n, i) => {
+    const [x, y] = ringPos(i, all.length, cx, cy, ringR);
+    pos[n.id] = [x, y, n.rad];
   });
 
   // Links: the aggregated whole-mesh view when available (every member
@@ -169,11 +175,10 @@ function renderGraph(d, ns) {
     }
   }
 
-  drawNode(svg, cx, cy, { id: "self", name: d.status.name, kind: "self", ip: d.status.overlay_ip }, 28);
-  ns.forEach((n, i) => {
-    const [x, y] = ringPos(i, ns.length, cx, cy, r);
-    drawNode(svg, x, y, n, 24);
-  });
+  for (const n of all) {
+    const [x, y, rad] = pos[n.id];
+    drawNode(svg, x, y, n.kind === "self" ? { ...n, id: "self" } : n, rad);
+  }
 }
 
 function ringPos(i, n, cx, cy, r) {
