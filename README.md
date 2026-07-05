@@ -16,7 +16,7 @@ implementation only.
 
 ## Build
 
-Requires Go ≥ 1.24.
+Requires Go ≥ 1.25.
 
 ```sh
 go build -o fabric ./cmd/fabric
