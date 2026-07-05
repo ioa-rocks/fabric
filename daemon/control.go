@@ -155,8 +155,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			exp := c.Expiry()
 			sp.CertExpiry = &exp
 		}
-		if conns := d.Host.Network().ConnsToPeer(p); len(conns) > 0 {
-			c := conns[0]
+		if c := bestConn(d.Host.Network().ConnsToPeer(p)); c != nil {
 			sp.Direction = dirString(c.Stat().Direction)
 			sp.Addr = c.RemoteMultiaddr().String()
 			sp.Transport, sp.Relayed = transportOf(c.RemoteMultiaddr())
@@ -250,6 +249,21 @@ func (d *Daemon) handleEvents(w http.ResponseWriter, _ *http.Request) {
 		out = append(out, info)
 	}
 	writeJSON(w, out)
+}
+
+// bestConn prefers a direct connection over a relayed one — during a
+// hole-punch upgrade both can exist at once, and the direct path is the
+// truth worth displaying.
+func bestConn(conns []network.Conn) network.Conn {
+	if len(conns) == 0 {
+		return nil
+	}
+	for _, c := range conns {
+		if _, relayed := transportOf(c.RemoteMultiaddr()); !relayed {
+			return c
+		}
+	}
+	return conns[0]
 }
 
 func dirString(dir network.Direction) string {

@@ -63,8 +63,8 @@ func (d *Daemon) ownLinks() []LinkInfo {
 			continue
 		}
 		l := LinkInfo{A: d.Host.ID().String(), B: p.String()}
-		if conns := d.Host.Network().ConnsToPeer(p); len(conns) > 0 {
-			l.Transport, l.Relayed = transportOf(conns[0].RemoteMultiaddr())
+		if c := bestConn(d.Host.Network().ConnsToPeer(p)); c != nil {
+			l.Transport, l.Relayed = transportOf(c.RemoteMultiaddr())
 		}
 		if rtt, ok := d.RTT(p); ok {
 			l.RTTMillis = float64(rtt.Microseconds()) / 1000

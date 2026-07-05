@@ -6,9 +6,9 @@ certificate-based membership and a topology/admin UI.
 
 Status: **pre-alpha** — daemon, CLI, the join-then-approve admission
 flow, revocation with membership-event gossip, the topology/admin web
-UI, and the optional TUN bridge (existing TCP/UDP apps over overlay
-IPs) work end-to-end; relay/hole-punching for CGNAT-to-CGNAT paths is
-not built yet.
+UI, the optional TUN bridge (existing TCP/UDP apps over overlay IPs),
+self-forming mesh (address gossip), and NAT traversal (members-only
+relay through lighthouses + hole-punching) work end-to-end.
 
 Design documents live in the Aethera project folder
 (`components/fabric/` — security-model spec, ADRs, surveys); this repo is
@@ -79,7 +79,9 @@ a cloud instance — as the **queue host**:
 fabric queue on     # on that member; restart its daemon to apply
 ```
 
-Joiners then bootstrap against the lighthouse's address. The pending
+A queue host is the full lighthouse: admission queue, members-only
+circuit relay, and the autonat service that tells NAT'd members they
+are private. Joiners bootstrap against the lighthouse's address. The pending
 queue lives there, but it holds no signing material: `fabric pending`,
 `fabric approve`, `fabric deny`, and the web UI on the master
 transparently pull the queue over a member- and admin-gated protocol
@@ -167,12 +169,17 @@ master shows it (pulled remotely over the admin-gated queue protocol),
 approval signs on the master and delivers through the lighthouse. The
 master can be asleep when joiners knock — they wait in the queue.
 
-Current limitation, honestly: two NAT'd nodes that don't share a LAN
-(laptop in a café ↔ NAS) still have no path — address gossip lets them
-*try* each other's addresses, but if neither can dial the other,
-nothing connects. Relay fallback through lighthouse nodes +
-hole-punching is the next milestone (relayed addresses will ride the
-same gossiped records).
+**6. NAT'd pairs that can't dial each other** (laptop in a café ↔ NAS
+at home) go **through the lighthouse**: queue hosts also run a
+members-only circuit-relay-v2 service (unlimited — it's your own
+hardware) and the autonat dial-back service. A node that learns it is
+NAT-private reserves a relay slot, its `/p2p-circuit` address rides
+the normal gossiped address record, and peers dial it through the
+relay — shown dashed with "relay" in the UI. Hole-punching (DCUtR)
+then tries to upgrade every relayed connection to a direct one; when
+it succeeds the edge turns solid, when it fails the relay keeps
+carrying the traffic, TUN included. A revoked member loses relay
+privileges with the same gossip that cuts its connections.
 
 ## Kicking a device out
 

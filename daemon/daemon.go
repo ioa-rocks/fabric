@@ -24,6 +24,9 @@ import (
 	"github.com/godbus/dbus/v5"
 	"github.com/libp2p/go-libp2p"
 	libp2pevent "github.com/libp2p/go-libp2p/core/event"
+	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
+	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -105,22 +108,43 @@ func New(dir state.Dir) (*Daemon, error) {
 		}
 	}
 
-	h, err := libp2p.New(
-		libp2p.Identity(priv),
-		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
-		libp2p.ConnectionGater(fabricnet.NewGater(store)),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("starting libp2p host: %w", err)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Daemon{
-		Dir: dir, Config: cfg, Host: h, Store: store, Log: evLog,
+		Dir: dir, Config: cfg, Store: store, Log: evLog,
 		ownCert: own, ctx: ctx, cancel: cancel,
 		rtt: make(map[peer.ID]time.Duration), reachability: "unknown",
 		lastDial: make(map[peer.ID]time.Time),
 	}
+
+	opts := []libp2p.Option{
+		libp2p.Identity(priv),
+		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
+		libp2p.ConnectionGater(fabricnet.NewGater(store)),
+		// NAT traversal (connectivity-model memo): every node can
+		// hole-punch (DCUtR upgrades relayed connections to direct), and
+		// when autonat says we're private, autorelay reserves a slot on a
+		// lighthouse — the /p2p-circuit address then rides our signed
+		// address record like any other.
+		libp2p.EnableHolePunching(),
+		libp2p.EnableAutoRelayWithPeerSource(d.relayCandidates,
+			autorelay.WithMinInterval(30*time.Second)),
+	}
+	if cfg.QueueHost {
+		// The lighthouse is also the mesh's relay and NAT oracle: a
+		// members-only circuit-relay-v2 service (unlimited — it may carry
+		// TUN traffic when a pair cannot hole-punch) and the autonat
+		// dial-back service that lets NAT'd members learn they are
+		// private.
+		opts = append(opts,
+			libp2p.EnableRelayService(relayv2.WithACL(fabricnet.NewRelayACL(store)), relayv2.WithInfiniteLimits()),
+			libp2p.EnableNATService(),
+		)
+	}
+	h, err := libp2p.New(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("starting libp2p host: %w", err)
+	}
+	d.Host = h
 	d.hydrateStore()
 
 	// Hard-coded admission transparency (spec §5): every join is announced.
@@ -573,6 +597,51 @@ func (d *Daemon) connectBootstrap() {
 			cancel()
 		}
 	}
+}
+
+// relayCandidates feeds autorelay with potential relays: the configured
+// bootstrap peers (the pinned lighthouses) plus any connected member that
+// advertises the relay-hop protocol. Called by autorelay only when this
+// node believes it is NAT'd and needs a relay.
+func (d *Daemon) relayCandidates(ctx context.Context, num int) <-chan peer.AddrInfo {
+	out := make(chan peer.AddrInfo, num)
+	go func() {
+		defer close(out)
+		seen := map[peer.ID]bool{}
+		emit := func(ai peer.AddrInfo) bool {
+			if seen[ai.ID] || ai.ID == "" {
+				return true
+			}
+			seen[ai.ID] = true
+			select {
+			case out <- ai:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		for _, addr := range d.Config.Bootstrap {
+			if info, err := peerInfo(addr); err == nil && info.ID != d.Host.ID() {
+				if !emit(*info) {
+					return
+				}
+			}
+		}
+		now := time.Now()
+		for _, p := range d.Host.Network().Peers() {
+			if !d.Store.IsMember(p, now) {
+				continue
+			}
+			protos, err := d.Host.Peerstore().SupportsProtocols(p, proto.ProtoIDv2Hop)
+			if err != nil || len(protos) == 0 {
+				continue
+			}
+			if !emit(peer.AddrInfo{ID: p, Addrs: d.Host.Peerstore().Addrs(p)}) {
+				return
+			}
+		}
+	}()
+	return out
 }
 
 // meshFillBackoff spaces dial attempts to an unreachable member; the mesh
