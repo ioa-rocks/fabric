@@ -35,6 +35,7 @@ type Config struct {
 	Subnet       string   `json:"subnet,omitempty"`     // overlay CIDR; master only (allocation)
 	TUN          string   `json:"tun,omitempty"`        // "" = auto (try, fall back), "off"
 	QueueHost    bool     `json:"queue_host,omitempty"` // run the admission queue (lighthouse role)
+	DNS          string   `json:"dns,omitempty"`        // "" = serve .fabric when TUN is up, "off"
 }
 
 type Dir struct{ Path string }

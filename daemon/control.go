@@ -70,6 +70,7 @@ type StatusReply struct {
 	Reachability string       `json:"reachability"` // autonat: public / private / unknown
 	OverlayIP    string       `json:"overlay_ip,omitempty"`
 	TUNActive    bool         `json:"tun_active"`
+	DNSActive    bool         `json:"dns_active"`
 	Addrs        []string     `json:"addrs"`
 	Peers        []StatusPeer `json:"peers"`
 }
@@ -138,6 +139,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		Reachability: d.Reachability(),
 		OverlayIP:    d.ownCert.Payload.Meta.IP,
 		TUNActive:    d.Bridge != nil,
+		DNSActive:    d.DNS != nil,
 	}
 	for _, a := range d.Host.Addrs() {
 		reply.Addrs = append(reply.Addrs, fmt.Sprintf("%s/p2p/%s", a, d.Host.ID()))

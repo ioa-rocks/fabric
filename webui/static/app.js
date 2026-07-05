@@ -281,6 +281,7 @@ function renderSelf(d, box) {
   if (d.status.overlay_ip) {
     add(kv, "overlay IP", mono(d.status.overlay_ip.split("/")[0]));
     add(kv, "TUN bridge", d.status.tun_active ? "up (fabric0)" : "down — other transports still work");
+    if (d.status.tun_active) add(kv, ".fabric DNS", d.status.dns_active ? "serving" : "not running");
   }
   add(kv, "peer ID", mono(d.status.peer_id));
   add(kv, "NAT", (d.status.reachability || "unknown").toLowerCase());

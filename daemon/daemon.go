@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
 	"aethera.dev/fabric/admission"
 	"aethera.dev/fabric/cert"
 	"aethera.dev/fabric/event"
+	"aethera.dev/fabric/fabricdns"
 	"aethera.dev/fabric/fabricnet"
 	"aethera.dev/fabric/state"
 	"aethera.dev/fabric/tunbridge"
@@ -47,6 +50,7 @@ type Daemon struct {
 	// TUN bridge (mode C) — optional; nil when disabled or unavailable.
 	Bridge     *tunbridge.Bridge
 	DisableTUN bool // set before Run to skip the bridge for this run
+	DNS        *fabricdns.Server // .fabric resolver; nil unless the bridge is up
 
 	ownCert *cert.Cert
 	ctx     context.Context
@@ -196,6 +200,9 @@ func (d *Daemon) Run() error {
 	go d.watchReachability()
 
 	<-d.ctx.Done()
+	if d.DNS != nil {
+		d.DNS.Close()
+	}
 	if d.Bridge != nil {
 		d.Bridge.Close()
 	}
@@ -226,6 +233,71 @@ func (d *Daemon) startTUN() {
 	d.Bridge = tunbridge.New(d.Host, dev, d.Auth.RequireMember)
 	d.refreshRoutes()
 	log.Printf("tun: fabric0 up, this node is %s", d.ownCert.Payload.Meta.IP)
+	d.startDNS()
+}
+
+// startDNS serves `<member>.fabric` on this node's own overlay address —
+// the member store is the zone (names and IPs are in the signed certs).
+// Like the bridge it is a downgrade-not-error feature.
+func (d *Daemon) startDNS() {
+	if d.Config.DNS == "off" {
+		log.Printf("dns: disabled")
+		return
+	}
+	pfx, err := netip.ParsePrefix(d.ownCert.Payload.Meta.IP)
+	if err != nil {
+		return
+	}
+	srv := fabricdns.New(d.dnsLookup)
+	addr := netip.AddrPortFrom(pfx.Addr(), 53).String()
+	if err := srv.Serve(addr); err != nil {
+		log.Printf("dns: %v — running without .fabric names (setcap needs cap_net_bind_service too)", err)
+		return
+	}
+	d.DNS = srv
+	log.Printf("dns: serving *.%s on %s", fabricdns.Suffix, addr)
+	d.registerResolver(pfx.Addr())
+}
+
+// dnsLookup resolves a member name to its overlay address; the node's own
+// name resolves to itself.
+func (d *Daemon) dnsLookup(host string) (netip.Addr, bool) {
+	match := func(c *cert.Cert) (netip.Addr, bool) {
+		if !strings.EqualFold(c.Payload.Meta.Name, host) || c.Payload.Meta.IP == "" {
+			return netip.Addr{}, false
+		}
+		pfx, err := netip.ParsePrefix(c.Payload.Meta.IP)
+		if err != nil {
+			return netip.Addr{}, false
+		}
+		return pfx.Addr(), true
+	}
+	if ip, ok := match(d.ownCert); ok {
+		return ip, true
+	}
+	members, _ := d.Store.Snapshot()
+	for _, c := range members {
+		if ip, ok := match(c); ok {
+			return ip, true
+		}
+	}
+	return netip.Addr{}, false
+}
+
+// registerResolver points systemd-resolved's ~fabric routing domain at us,
+// best-effort: it needs privileges the daemon usually lacks, so on failure
+// we print the one-time commands instead.
+func (d *Daemon) registerResolver(ip netip.Addr) {
+	dnsCmd := exec.Command("resolvectl", "dns", "fabric0", ip.String())
+	domainCmd := exec.Command("resolvectl", "domain", "fabric0", "~"+fabricdns.Suffix)
+	if err := dnsCmd.Run(); err == nil {
+		if err := domainCmd.Run(); err == nil {
+			log.Printf("dns: registered with systemd-resolved (~%s via %s)", fabricdns.Suffix, ip)
+			return
+		}
+	}
+	log.Printf("dns: could not register with systemd-resolved; to enable `ssh <name>.%s`, run once per daemon start:", fabricdns.Suffix)
+	log.Printf("dns:   sudo resolvectl dns fabric0 %s && sudo resolvectl domain fabric0 '~%s'", ip, fabricdns.Suffix)
 }
 
 // refreshRoutes rebuilds the overlay routing table from the member store —

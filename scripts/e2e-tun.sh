@@ -89,6 +89,19 @@ print(s.recv(64).decode().strip())
 echo "client received: $GOT"
 [ "$GOT" = "fabric-tun-e2e-ok" ] || { echo "FAIL: TCP payload mismatch"; exit 1; }
 
+step ".fabric DNS (ask the master's resolver for the peer's name)"
+GOT_IP=$(A python3 -c '
+import socket, struct
+q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + b"\x04peer\x06fabric\x00" + struct.pack(">HH", 1, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5)
+s.sendto(q, ("100.64.0.1", 53))
+r, _ = s.recvfrom(512)
+assert r[3] & 0x0f == 0, "rcode %d" % (r[3] & 0x0f)
+print(socket.inet_ntoa(r[-4:]))
+')
+echo "peer.fabric -> $GOT_IP"
+[ "$GOT_IP" = "100.64.0.2" ] || { echo "FAIL: DNS answered $GOT_IP"; exit 1; }
+
 step "roster as the master sees it"
 "$FABRIC" status -state "$WORK/a"
 

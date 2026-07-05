@@ -128,11 +128,12 @@ SSH, anything-IP reaches peers at their overlay addresses with no app
 changes (deployment mode C, fabric ADRs 0002/0004).
 
 **The bridge is optional per node and needs no root daemon.** Grant
-the capability once per binary:
+the capabilities once per binary (`net_admin` for the TUN device,
+`net_bind_service` for the `.fabric` DNS on port 53):
 
 ```sh
-sudo setcap cap_net_admin+ep $(command -v fabric)   # re-run after rebuilds
-fabric up                                           # as your normal user
+sudo setcap 'cap_net_admin,cap_net_bind_service+ep' $(command -v fabric)   # re-run after rebuilds
+fabric up                                                                  # as your normal user
 ```
 
 Without the capability (or on non-Linux, or with `-no-tun`), the node
@@ -145,6 +146,18 @@ underlay whenever both ends support it.
 
 Certs issued before the bridge existed carry no overlay IP — re-join
 (or re-init a young namespace) to get addressed.
+
+**Names: `ssh nas.fabric`.** When the bridge is up, the daemon serves
+`<member>.fabric` on its own overlay address — the member store is the
+zone, straight from the signed certs; nothing to configure and nothing
+that survives revocation. To make the OS use it, point a routing
+domain at the resolver (the daemon tries this itself and prints the
+command if it lacks the rights):
+
+```sh
+sudo resolvectl dns fabric0 <your-overlay-ip>
+sudo resolvectl domain fabric0 '~fabric'
+```
 
 End-to-end proof without touching real interfaces:
 `go build -o fabric ./cmd/fabric && sudo scripts/e2e-tun.sh` — two
@@ -229,6 +242,9 @@ scripts).
   kernel TUN device (Linux, in-process netlink so a file capability
   suffices), and the L3 packet relay over `/fabric/tun/1` — no
   userspace TCP/IP stack; both ends' kernels terminate TCP (ADR 0004).
+- `fabricdns` — the `.fabric` resolver: authoritative for
+  `<member>.fabric` from the member store, bound to the node's overlay
+  address while the bridge is up.
 - `state` — the state directory: config, device key, own cert,
   keystore path, control socket.
 

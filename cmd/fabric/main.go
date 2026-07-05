@@ -285,6 +285,9 @@ func cmdStatus(args []string) error {
 		tun := "tun down (other transports still work)"
 		if s.TUNActive {
 			tun = "tun up (fabric0)"
+			if s.DNSActive {
+				tun += ", .fabric dns up"
+			}
 		}
 		fmt.Printf("overlay %s — %s\n", s.OverlayIP, tun)
 	}
