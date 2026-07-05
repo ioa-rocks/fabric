@@ -46,8 +46,9 @@ type StatusPeer struct {
 	Relayed   bool    `json:"relayed,omitempty"`   // via a circuit relay, not direct
 	RTTMillis float64 `json:"rtt_ms,omitempty"`
 
-	IP         string     `json:"ip,omitempty"` // overlay address from the cert
-	CertExpiry *time.Time `json:"cert_expiry,omitempty"`
+	IP           string     `json:"ip,omitempty"` // overlay address from the cert
+	CertExpiry   *time.Time `json:"cert_expiry,omitempty"`
+	RevokedUntil *time.Time `json:"revoked_until,omitempty"` // when the tombstone GCs (revoked cert's expiry)
 }
 
 // MemberInfo is the machine-facing roster entry: it carries the device
@@ -188,9 +189,10 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			seen[p.String()] = true
 		}
 	}
-	for p := range revoked {
+	for p, exp := range revoked {
 		if !seen[p.String()] {
-			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Revoked: true})
+			until := exp
+			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Revoked: true, RevokedUntil: &until})
 			seen[p.String()] = true
 		}
 	}

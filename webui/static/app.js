@@ -96,8 +96,12 @@ function render() {
   const ns = nodes();
 
   renderHeader(d);
-  renderGraph(d, ns);
-  renderLegend(ns);
+  // Revoked peers never connect again — they are tombstones, not topology.
+  // The graph shows the live mesh; they get their own list until they GC.
+  const live = ns.filter(n => n.kind !== "revoked");
+  renderGraph(d, live);
+  renderLegend(live);
+  renderRevoked(ns.filter(n => n.kind === "revoked"));
   if (!state.form) {         // don't repaint under an open passphrase form
     renderDetails(d, ns);
     renderPending(d);
@@ -355,6 +359,33 @@ function renderPending(d) {
       );
       item.append(actions);
     }
+    list.append(item);
+  }
+}
+
+/* Revoked tombstones: listed apart from the mesh — they will never show a
+   connection. Each row says when its revocation record garbage-collects
+   (the revoked cert's own expiry) and the row disappears with it. */
+function renderRevoked(revoked) {
+  const card = document.getElementById("revoked-card");
+  const list = document.getElementById("revoked");
+  card.hidden = !revoked.length;
+  if (card.hidden) return;
+  list.innerHTML = "";
+  for (const n of revoked) {
+    const item = document.createElement("div");
+    item.className = "revoked-item";
+    const head = document.createElement("div");
+    head.append(badge("revoked"), " ", strong(n.name || "unknown device"));
+    const id = mono(n.id);      // clicking copies the full peer ID…
+    id.textContent = short(n.id); // …but the row shows the short form
+    const idRow = document.createElement("div");
+    idRow.append(id);
+    item.append(head, idRow);
+    if (n.revoked_until) {
+      item.append(note(`record kept until ${new Date(n.revoked_until).toLocaleDateString()} (the cert's own expiry), then gone`));
+    }
+    item.onclick = () => { state.selected = n.id; state.form = null; renderDetails(state.data, nodes()); renderGraph(state.data, nodes().filter(x => x.kind !== "revoked")); };
     list.append(item);
   }
 }
