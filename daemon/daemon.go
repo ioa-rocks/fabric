@@ -193,6 +193,26 @@ func New(dir state.Dir) (*Daemon, error) {
 	d.Sync = fabricnet.NewEventSync(h, evLog, store, d.applyEvent)
 	d.Auth.SetOnAuthenticated(d.Sync.ExchangeAsync)
 
+	// Self-heal for one-way-known pairs: a dialer that already knows the
+	// peer never initiates the handshake, so a member whose admission event
+	// never reached us would sit unauthenticated until the grace watchdog
+	// cuts it — and reconnect, forever. If a peer we don't know connects
+	// (either direction), initiate the handshake ourselves: its cert settles
+	// who it is. Strangers simply fail it and the watchdog proceeds.
+	h.Network().Notify(&network.NotifyBundle{ConnectedF: func(_ network.Network, c network.Conn) {
+		p := c.RemotePeer()
+		if d.Store.IsMember(p, time.Now()) || d.OwnCert() == nil {
+			return
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
+			defer cancel()
+			if err := d.Auth.Authenticate(ctx, p); err == nil {
+				log.Printf("mesh: authenticated %s on connect (was not in the member store)", p)
+			}
+		}()
+	}})
+
 	// Warm the address book from the persisted record cache: a freshly
 	// restarted node can then dial members (mesh-fill, TUN) without first
 	// re-learning WHERE they are through a live gossip exchange.

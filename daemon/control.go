@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"time"
 
 	"ioa.rocks/fabric/admission"
@@ -49,6 +50,12 @@ type StatusPeer struct {
 	IP           string     `json:"ip,omitempty"` // overlay address from the cert
 	CertExpiry   *time.Time `json:"cert_expiry,omitempty"`
 	RevokedUntil *time.Time `json:"revoked_until,omitempty"` // when the tombstone GCs (revoked cert's expiry)
+
+	// Every address the peerstore holds for this peer — gossiped records,
+	// identify observations, relay circuits — regardless of what (or
+	// whether) a live connection uses. Set for offline members too: it is
+	// where the next dial would go.
+	KnownAddrs []string `json:"known_addrs,omitempty"`
 }
 
 // MemberInfo is the machine-facing roster entry: it carries the device
@@ -178,6 +185,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		if rtt, ok := d.RTT(p); ok {
 			sp.RTTMillis = float64(rtt.Microseconds()) / 1000
 		}
+		sp.KnownAddrs = d.knownAddrs(p)
 		reply.Peers = append(reply.Peers, sp)
 		seen[sp.ID] = true
 	}
@@ -185,7 +193,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	for p, c := range members {
 		if !seen[p.String()] {
 			exp := c.Expiry()
-			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true, IP: c.Payload.Meta.IP, CertExpiry: &exp})
+			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true, IP: c.Payload.Meta.IP, CertExpiry: &exp, KnownAddrs: d.knownAddrs(p)})
 			seen[p.String()] = true
 		}
 	}
@@ -303,6 +311,20 @@ func dirString(dir network.Direction) string {
 	default:
 		return ""
 	}
+}
+
+// knownAddrs is every address the peerstore holds for a peer, sorted for a
+// stable display. Gossiped signed records keep these alive even while the
+// peer is unreachable — for an offline member this is the dial plan, not a
+// connection.
+func (d *Daemon) knownAddrs(p peer.ID) []string {
+	addrs := d.Host.Peerstore().Addrs(p)
+	out := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		out = append(out, a.String())
+	}
+	sort.Strings(out)
+	return out
 }
 
 // transportOf reads the wire path off a multiaddr: which transport carries

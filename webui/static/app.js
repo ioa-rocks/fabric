@@ -258,6 +258,7 @@ function renderDetails(d, ns) {
     add(kv, "address", mono(n.addr || "—"));
     if (n.rtt_ms) add(kv, "RTT", n.rtt_ms.toFixed(2) + " ms");
   }
+  addrList(kv, n);
   if (n.cert_expiry) expiryRow(kv, n.cert_expiry);
   box.append(kv);
 
@@ -289,6 +290,21 @@ function renderDetails(d, ns) {
         () => openForm(box, "revoke", m.fingerprint, `cut “${m.name}” off the mesh immediately`)));
   }
   if (actions.childElementCount) box.append(actions);
+}
+
+/* Every address the daemon's peerstore holds for the peer — gossiped
+   records, identify observations, relay circuits. The live connection's
+   address (shown above) is the winner among these; for an offline member
+   the list is where the next dial would go. */
+function addrList(kv, n) {
+  const addrs = (n.known_addrs || []).filter(a => a !== n.addr);
+  if (!addrs.length) return;
+  const dd = add(kv, n.connected ? "also known" : "known addrs", "");
+  for (const a of addrs) {
+    const row = document.createElement("div");
+    row.append(mono(a));
+    dd.append(row);
+  }
 }
 
 /* Cert-expiry line with the renewal-tier badge (spec §5: warn <90d, alarm <30d). */
