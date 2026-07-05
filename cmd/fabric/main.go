@@ -88,6 +88,8 @@ func main() {
 		err = cmdUI(args)
 	case "queue":
 		err = cmdQueue(args)
+	case "dns":
+		err = cmdDNS(args)
 	case "peer":
 		err = cmdPeer(args)
 	default:
@@ -113,6 +115,7 @@ func usage() {
   revoke   revoke a member by name, peer ID, or fingerprint (master)
   ui       serve the topology/admin web UI on localhost
   queue    queue on|off — run the admission queue on this node (lighthouse)
+  dns      dns on|off — serve .fabric names on this node (default on with TUN)
   peer     peer add <multiaddr> — add a bootstrap peer
 
 Every command accepts -state <dir> (default `+state.DefaultPath()+`).
@@ -686,6 +689,38 @@ func cmdQueue(args []string) error {
 		fmt.Println("joiners bootstrap against this node's address; the master approves from anywhere in the mesh")
 	} else {
 		fmt.Println("admission queue disabled; restart the daemon to apply")
+	}
+	return nil
+}
+
+func cmdDNS(args []string) error {
+	if len(args) < 1 || (args[0] != "on" && args[0] != "off") {
+		return fmt.Errorf("usage: fabric dns on|off [-state <dir>]")
+	}
+	fs := flag.NewFlagSet("dns", flag.ExitOnError)
+	statePath := stateFlag(fs)
+	fs.Parse(args[1:])
+
+	dir, err := state.Open(*statePath)
+	if err != nil {
+		return err
+	}
+	cfg, err := dir.LoadConfig()
+	if err != nil {
+		return err
+	}
+	if args[0] == "off" {
+		cfg.DNS = "off"
+	} else {
+		cfg.DNS = ""
+	}
+	if err := dir.SaveConfig(cfg); err != nil {
+		return err
+	}
+	if cfg.DNS == "off" {
+		fmt.Println(".fabric resolver disabled; restart the daemon to apply")
+	} else {
+		fmt.Println(".fabric resolver enabled (serves whenever the TUN bridge is up); restart the daemon to apply")
 	}
 	return nil
 }
