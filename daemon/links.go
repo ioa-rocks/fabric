@@ -10,7 +10,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
-	"aethera.dev/fabric/internal/wire"
+	"ioa.rocks/fabric/internal/wire"
 )
 
 // LinksProtocolID lets members ask each other "who are you connected to,

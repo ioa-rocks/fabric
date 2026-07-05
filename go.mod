@@ -1,4 +1,4 @@
-module aethera.dev/fabric
+module ioa.rocks/fabric
 
 go 1.25.7
 

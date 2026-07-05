@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"aethera.dev/fabric/cert"
+	"ioa.rocks/fabric/cert"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"

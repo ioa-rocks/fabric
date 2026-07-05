@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"aethera.dev/fabric/cert"
-	"aethera.dev/fabric/event"
+	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/event"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"

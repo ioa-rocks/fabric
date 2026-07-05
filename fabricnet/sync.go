@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"aethera.dev/fabric/event"
-	"aethera.dev/fabric/internal/wire"
+	"ioa.rocks/fabric/event"
+	"ioa.rocks/fabric/internal/wire"
 
 	"github.com/fxamacker/cbor/v2"
 	libp2pevent "github.com/libp2p/go-libp2p/core/event"

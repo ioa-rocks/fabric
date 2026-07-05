@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"aethera.dev/fabric/internal/wire"
+	"ioa.rocks/fabric/internal/wire"
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"

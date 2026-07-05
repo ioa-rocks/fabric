@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"aethera.dev/fabric/cert"
+	"ioa.rocks/fabric/cert"
 )
 
 func testKeys(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {

@@ -16,13 +16,13 @@ import (
 	"net/http"
 	"time"
 
-	"aethera.dev/fabric/admission"
-	"aethera.dev/fabric/cert"
-	"aethera.dev/fabric/daemon"
-	"aethera.dev/fabric/event"
-	"aethera.dev/fabric/fabricnet"
-	"aethera.dev/fabric/keystore"
-	"aethera.dev/fabric/state"
+	"ioa.rocks/fabric/admission"
+	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/daemon"
+	"ioa.rocks/fabric/event"
+	"ioa.rocks/fabric/fabricnet"
+	"ioa.rocks/fabric/keystore"
+	"ioa.rocks/fabric/state"
 )
 
 //go:embed static

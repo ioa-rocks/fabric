@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"aethera.dev/fabric/cert"
+	"ioa.rocks/fabric/cert"
 )
 
 // Renewal correctness: membership events arrive in no particular order

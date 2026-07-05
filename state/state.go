@@ -20,8 +20,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"aethera.dev/fabric/cert"
-	"aethera.dev/fabric/event"
+	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/event"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/libp2p/go-libp2p/core/crypto"

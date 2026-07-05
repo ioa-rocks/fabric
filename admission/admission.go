@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"aethera.dev/fabric/internal/wire"
+	"ioa.rocks/fabric/internal/wire"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/libp2p/go-libp2p/core/host"

@@ -14,11 +14,11 @@ import (
 	"os"
 	"time"
 
-	"aethera.dev/fabric/admission"
-	"aethera.dev/fabric/cert"
-	"aethera.dev/fabric/event"
-	"aethera.dev/fabric/fabricnet"
-	"aethera.dev/fabric/state"
+	"ioa.rocks/fabric/admission"
+	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/event"
+	"ioa.rocks/fabric/fabricnet"
+	"ioa.rocks/fabric/state"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
