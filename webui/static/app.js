@@ -258,6 +258,9 @@ function renderDetails(d, ns) {
     const days = Math.floor((new Date(n.cert_expiry) - Date.now()) / 86400000);
     const ddEl = add(kv, "cert expires", `${new Date(n.cert_expiry).toLocaleDateString()} (${days}d)`);
     if (days < 30) {
+      const b = badge("pending"); b.className = "badge warn"; b.textContent = "renew NOW";
+      ddEl.append(" ", b);
+    } else if (days < 90) {
       const b = badge("pending"); b.className = "badge warn-soft"; b.textContent = "renew soon";
       ddEl.append(" ", b);
     }

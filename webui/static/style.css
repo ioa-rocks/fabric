@@ -120,6 +120,7 @@ dl.kv dd { margin: 0; font-size: 12.5px; overflow-wrap: anywhere; }
 .badge.revoked  { background: color-mix(in srgb, var(--critical) 13%, var(--card)); border-color: color-mix(in srgb, var(--critical) 38%, var(--line)); }
 .badge.offline  { background: var(--surface); border-color: var(--line); color: var(--ink-2); }
 .badge.warn-soft { background: color-mix(in srgb, var(--warn) 16%, var(--card)); border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
+.badge.warn      { background: color-mix(in srgb, var(--critical) 15%, var(--card)); border-color: color-mix(in srgb, var(--critical) 45%, var(--line)); }
 
 .fingerprint {
   font-family: ui-monospace, Menlo, Consolas, monospace;

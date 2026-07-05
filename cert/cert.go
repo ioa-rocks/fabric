@@ -26,8 +26,15 @@ const (
 // DefaultValidity is the standard membership-cert lifetime (spec §5): long,
 // because gossiped revocation handles the real-time cut-off and short certs
 // would force frequent unlocking of the master's cold root key. It also
-// bounds how long a revocation record must be retained.
-const DefaultValidity = 90 * 24 * time.Hour
+// bounds how long a revocation record must be retained. Renewal is expected
+// at half-life (< RenewBelow remaining), so master-down tolerance is six
+// months guaranteed and close to a year in practice.
+const DefaultValidity = 365 * 24 * time.Hour
+
+// RenewBelow is the renewal threshold (spec §5): a signing session re-signs
+// any cert with less than this remaining. UI warning tiers: < 90d visible
+// warning on every node, < 30d loud (desktop notification on the master).
+const RenewBelow = 183 * 24 * time.Hour
 
 const nonceSize = 16
 
