@@ -129,3 +129,51 @@ func TestVerifyRejections(t *testing.T) {
 		}
 	})
 }
+
+func TestRenewPreservesPayload(t *testing.T) {
+	nsPub, nsPriv := genKey(t)
+	devPub, _ := genKey(t)
+	issued := time.Now().Add(-300 * 24 * time.Hour) // deep into its life
+	old, err := Issue(nsPriv, devPub, CmdMember, Meta{Name: "nas", IP: "100.64.0.7/24"}, issued, DefaultValidity)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	renewed, err := Renew(nsPriv, old, now, DefaultValidity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(renewed, nsPub, now); err != nil {
+		t.Fatalf("renewed cert does not verify: %v", err)
+	}
+
+	// Identity, role, and addressing must be untouched — a renewal that
+	// renumbers a node breaks TUN routing and MagicDNS (spec §5).
+	if renewed.Payload.Aud != old.Payload.Aud || renewed.Payload.Iss != old.Payload.Iss ||
+		renewed.Payload.Sub != old.Payload.Sub || renewed.Payload.Cmd != old.Payload.Cmd {
+		t.Fatal("renewal changed identity/role fields")
+	}
+	if renewed.Payload.Meta != old.Payload.Meta {
+		t.Fatalf("renewal changed meta: %+v != %+v", renewed.Payload.Meta, old.Payload.Meta)
+	}
+	if !renewed.Expiry().After(old.Expiry()) {
+		t.Fatalf("renewal did not extend expiry: %v <= %v", renewed.Expiry(), old.Expiry())
+	}
+	if string(renewed.Payload.Nonce) == string(old.Payload.Nonce) {
+		t.Fatal("renewal reused the nonce")
+	}
+}
+
+func TestRenewRejectsForeignRootKey(t *testing.T) {
+	_, nsPriv := genKey(t)
+	_, otherPriv := genKey(t)
+	devPub, _ := genKey(t)
+	old, err := Issue(nsPriv, devPub, CmdMember, Meta{Name: "nas"}, time.Now(), DefaultValidity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Renew(otherPriv, old, time.Now(), DefaultValidity); err == nil {
+		t.Fatal("renewal with a foreign root key unexpectedly succeeded")
+	}
+}

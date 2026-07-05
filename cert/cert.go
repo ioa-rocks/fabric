@@ -112,6 +112,29 @@ func Issue(rootPriv ed25519.PrivateKey, devicePub ed25519.PublicKey, cmd string,
 	return &Cert{Payload: p, Sig: ed25519.Sign(rootPriv, msg)}, nil
 }
 
+// Renew re-issues an existing certificate with a fresh validity window
+// (spec §5). The payload is preserved verbatim — same device key, name,
+// role, and overlay IP: a renewal must never renumber a node — only the
+// validity window and nonce change.
+func Renew(rootPriv ed25519.PrivateKey, old *Cert, nbf time.Time, validity time.Duration) (*Cert, error) {
+	if DIDForKey(rootPriv.Public().(ed25519.PublicKey)) != old.Payload.Iss {
+		return nil, errors.New("renewal key does not match the certificate's namespace")
+	}
+	nonce := make([]byte, nonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("generating nonce: %w", err)
+	}
+	p := old.Payload
+	p.Nbf = nbf.Unix()
+	p.Exp = nbf.Add(validity).Unix()
+	p.Nonce = nonce
+	msg, err := encMode.Marshal(p)
+	if err != nil {
+		return nil, fmt.Errorf("encoding payload: %w", err)
+	}
+	return &Cert{Payload: p, Sig: ed25519.Sign(rootPriv, msg)}, nil
+}
+
 // Verify checks a certificate against the expected namespace root public key
 // at the given time. It returns nil only if the cert is a currently valid
 // membership proof for this namespace.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"aethera.dev/fabric/cert"
@@ -37,11 +38,13 @@ type JoinObserver func(p peer.ID, c *cert.Cert)
 type AuthService struct {
 	h         host.Host
 	store     *MemberStore
-	own       *cert.Cert
 	grace     time.Duration
 	onJoin    JoinObserver
 	onAuth    func(peer.ID)
 	stopWatch func()
+
+	mu  sync.RWMutex
+	own *cert.Cert // presented in handshakes; swapped on renewal (SetOwn)
 }
 
 // NewAuthService wires the handshake handler and the grace-period watchdog
@@ -54,6 +57,20 @@ func NewAuthService(h host.Host, store *MemberStore, ownCert *cert.Cert, grace t
 	h.Network().Notify(nb)
 	a.stopWatch = func() { h.Network().StopNotify(nb) }
 	return a
+}
+
+// SetOwn swaps the certificate this node presents in handshakes — how a
+// renewed cert (spec §5) is adopted live, without a daemon restart.
+func (a *AuthService) SetOwn(c *cert.Cert) {
+	a.mu.Lock()
+	a.own = c
+	a.mu.Unlock()
+}
+
+func (a *AuthService) ownCert() *cert.Cert {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.own
 }
 
 // SetOnAuthenticated registers a callback fired after every successful
@@ -83,7 +100,8 @@ func (a *AuthService) onConnected(_ network.Network, c network.Conn) {
 // Authenticate runs the handshake with a peer as the initiator and records
 // the peer as a member on success.
 func (a *AuthService) Authenticate(ctx context.Context, p peer.ID) error {
-	if a.own == nil {
+	own := a.ownCert()
+	if own == nil {
 		return errors.New("this node holds no membership certificate yet")
 	}
 	s, err := a.h.NewStream(ctx, p, ProtocolID)
@@ -94,7 +112,7 @@ func (a *AuthService) Authenticate(ctx context.Context, p peer.ID) error {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = s.SetDeadline(deadline)
 	}
-	if err := writeCert(s, a.own); err != nil {
+	if err := writeCert(s, own); err != nil {
 		return err
 	}
 	theirs, err := readAndValidateCert(s, a.store.NamespaceKey(), p)
@@ -116,8 +134,8 @@ func (a *AuthService) handleInbound(s network.Stream) {
 		s.Reset()
 		return
 	}
-	if a.own != nil {
-		if err := writeCert(s, a.own); err != nil {
+	if own := a.ownCert(); own != nil {
+		if err := writeCert(s, own); err != nil {
 			s.Reset()
 			return
 		}

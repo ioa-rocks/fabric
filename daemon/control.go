@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"aethera.dev/fabric/admission"
+	"aethera.dev/fabric/cert"
 	"aethera.dev/fabric/event"
 	"aethera.dev/fabric/fabricnet"
 	"aethera.dev/fabric/state"
@@ -50,25 +51,31 @@ type StatusPeer struct {
 }
 
 // MemberInfo is the machine-facing roster entry: it carries the device
-// public key so the CLI can sign a revocation for it.
+// public key so the CLI can sign a revocation for it, and the raw cert so
+// the signing side can re-issue it verbatim at renewal (spec §5 — same
+// payload, fresh validity; parsing-and-rebuilding would drop fields the
+// roster doesn't know about).
 type MemberInfo struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
 	Fingerprint string    `json:"fingerprint"`
 	DevicePub   []byte    `json:"device_pub"`
-	IP          string    `json:"ip,omitempty"` // overlay address from the cert
+	Cert        []byte    `json:"cert,omitempty"` // marshaled signed cert
+	IP          string    `json:"ip,omitempty"`   // overlay address from the cert
 	Expiry      time.Time `json:"expiry"`
 	Connected   bool      `json:"connected"`
+	Self        bool      `json:"self,omitempty"` // the answering daemon's own entry
 }
 
 type StatusReply struct {
 	Name         string       `json:"name"`
 	PeerID       string       `json:"peer_id"`
 	NamespaceDID string       `json:"namespace_did"`
-	Master       bool         `json:"master"`     // holds the namespace root key
-	QueueHost    bool         `json:"queue_host"` // runs the admission queue (lighthouse role)
+	Master       bool         `json:"master"`       // holds the namespace root key
+	QueueHost    bool         `json:"queue_host"`   // runs the admission queue (lighthouse role)
 	Reachability string       `json:"reachability"` // autonat: public / private / unknown
 	OverlayIP    string       `json:"overlay_ip,omitempty"`
+	CertExpiry   *time.Time   `json:"cert_expiry,omitempty"` // this node's own cert
 	TUNActive    bool         `json:"tun_active"`
 	DNSActive    bool         `json:"dns_active"`
 	Addrs        []string     `json:"addrs"`
@@ -97,6 +104,10 @@ type revokeBody struct {
 	EventB64 string `json:"event_b64"` // signed MemberRevoked event
 }
 
+type renewBody struct {
+	EventB64 string `json:"event_b64"` // signed MemberAdded event carrying the re-signed cert
+}
+
 func (d *Daemon) serveControl() (func(), error) {
 	sock := d.Dir.ControlSocketPath()
 	_ = os.Remove(sock) // stale socket from an unclean shutdown
@@ -118,6 +129,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/approve", d.handleApprove)
 	mux.HandleFunc("POST /v0/deny", d.handleDeny)
 	mux.HandleFunc("POST /v0/revoke", d.handleRevoke)
+	mux.HandleFunc("POST /v0/renew", d.handleRenew)
 
 	srv := &http.Server{Handler: mux}
 	go srv.Serve(l)
@@ -138,10 +150,12 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		Master:       d.Dir.IsMaster(),
 		QueueHost:    d.Queue != nil,
 		Reachability: d.Reachability(),
-		OverlayIP:    d.ownCert.Payload.Meta.IP,
+		OverlayIP:    d.OwnCert().Payload.Meta.IP,
 		TUNActive:    d.Bridge != nil,
 		DNSActive:    d.DNS != nil,
 	}
+	ownExp := d.OwnCert().Expiry()
+	reply.CertExpiry = &ownExp
 	for _, a := range d.Host.Addrs() {
 		reply.Addrs = append(reply.Addrs, fmt.Sprintf("%s/p2p/%s", a, d.Host.ID()))
 	}
@@ -201,21 +215,33 @@ func (d *Daemon) handleGraph(w http.ResponseWriter, _ *http.Request) {
 
 func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
 	members, _ := d.Store.Snapshot()
-	out := make([]MemberInfo, 0, len(members))
-	for p, c := range members {
+	out := make([]MemberInfo, 0, len(members)+1)
+	add := func(p peer.ID, c *cert.Cert, self bool) {
 		devKey, err := c.DeviceKey()
 		if err != nil {
-			continue
+			return
+		}
+		raw, err := c.Marshal()
+		if err != nil {
+			return
 		}
 		out = append(out, MemberInfo{
 			ID:          p.String(),
 			Name:        c.Payload.Meta.Name,
 			Fingerprint: admission.Fingerprint(devKey),
 			DevicePub:   devKey,
+			Cert:        raw,
 			IP:          c.Payload.Meta.IP,
 			Expiry:      c.Expiry(),
-			Connected:   d.Host.Network().Connectedness(p) == network.Connected,
+			Connected:   self || d.Host.Network().Connectedness(p) == network.Connected,
+			Self:        self,
 		})
+	}
+	// The store never holds this node's own cert — include it explicitly so
+	// the signing side can renew every member of the mesh, itself included.
+	add(d.Host.ID(), d.OwnCert(), true)
+	for p, c := range members {
+		add(p, c, false)
 	}
 	writeJSON(w, out)
 }
@@ -318,6 +344,29 @@ func (d *Daemon) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{"result": "revoked"})
+}
+
+// handleRenew ingests a re-signed cert for an existing member, wrapped in a
+// MemberAdded event (spec §5: renewal reuses the admission event — stores
+// keep the later-expiring cert, the renewed node adopts its own). Like
+// revoke, the daemon only checks the root-key signature; signing happened
+// in the CLI/UI process.
+func (d *Daemon) handleRenew(w http.ResponseWriter, r *http.Request) {
+	var body renewBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	e, err := decodeEvent(body.EventB64, event.KindAdded)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := d.Ingest(e); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]string{"result": "renewed"})
 }
 
 func decodeEvent(b64, wantKind string) (*event.Event, error) {
@@ -591,6 +640,12 @@ func (c *Client) Approve(fingerprint string, signedCert, signedEvent []byte) err
 
 func (c *Client) Revoke(signedEvent []byte) error {
 	return c.post("/v0/revoke", revokeBody{
+		EventB64: base64.StdEncoding.EncodeToString(signedEvent),
+	}, nil)
+}
+
+func (c *Client) Renew(signedEvent []byte) error {
+	return c.post("/v0/renew", renewBody{
 		EventB64: base64.StdEncoding.EncodeToString(signedEvent),
 	}, nil)
 }

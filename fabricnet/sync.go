@@ -64,8 +64,8 @@ type EventSync struct {
 	cab     peerstore.CertifiedAddrBook
 
 	mu      sync.Mutex
-	ownRec  []byte                 // this host's latest signed peer record
-	lastSeq map[peer.ID]uint64     // highest record seq accepted per peer
+	ownRec  []byte             // this host's latest signed peer record
+	lastSeq map[peer.ID]uint64 // highest record seq accepted per peer
 
 	stop []func()
 }

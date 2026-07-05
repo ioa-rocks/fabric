@@ -24,12 +24,12 @@ import (
 	"github.com/godbus/dbus/v5"
 	"github.com/libp2p/go-libp2p"
 	libp2pevent "github.com/libp2p/go-libp2p/core/event"
-	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
-	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
-	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
+	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 
 	ma "github.com/multiformats/go-multiaddr"
@@ -53,10 +53,11 @@ type Daemon struct {
 
 	// TUN bridge (mode C) — optional; nil when disabled or unavailable.
 	Bridge     *tunbridge.Bridge
-	DisableTUN bool // set before Run to skip the bridge for this run
+	DisableTUN bool              // set before Run to skip the bridge for this run
 	DNS        *fabricdns.Server // .fabric resolver; nil unless the bridge is up
 
-	ownCert *cert.Cert
+	certMu  sync.RWMutex
+	ownCert *cert.Cert // this node's membership cert; swapped on renewal
 	ctx     context.Context
 	cancel  context.CancelFunc
 
@@ -148,7 +149,9 @@ func New(dir state.Dir) (*Daemon, error) {
 	d.hydrateStore()
 
 	// Hard-coded admission transparency (spec §5): every join is announced.
-	d.Auth = fabricnet.NewAuthService(h, store, own, AuthGrace, func(p peer.ID, c *cert.Cert) {
+	// OwnCert, not the loaded `own`: hydrateStore may have adopted a newer
+	// (renewed) cert from the replayed event log.
+	d.Auth = fabricnet.NewAuthService(h, store, d.OwnCert(), AuthGrace, func(p peer.ID, c *cert.Cert) {
 		log.Printf("member joined: %q (%s)", c.Payload.Meta.Name, p)
 		d.refreshRoutes()
 	})
@@ -251,18 +254,18 @@ func (d *Daemon) startTUN() {
 	case d.DisableTUN || d.Config.TUN == "off":
 		log.Printf("tun: disabled; running without the IP bridge")
 		return
-	case d.ownCert.Payload.Meta.IP == "":
+	case d.OwnCert().Payload.Meta.IP == "":
 		log.Printf("tun: this device's cert carries no overlay IP; running without the IP bridge")
 		return
 	}
-	dev, err := tunbridge.OpenDevice("fabric0", d.ownCert.Payload.Meta.IP, tunMTU)
+	dev, err := tunbridge.OpenDevice("fabric0", d.OwnCert().Payload.Meta.IP, tunMTU)
 	if err != nil {
 		log.Printf("tun: %v — running without the IP bridge (grant CAP_NET_ADMIN to enable: sudo setcap cap_net_admin+ep <fabric binary>)", err)
 		return
 	}
 	d.Bridge = tunbridge.New(d.Host, dev, d.Auth.RequireMember)
 	d.refreshRoutes()
-	log.Printf("tun: fabric0 up, this node is %s", d.ownCert.Payload.Meta.IP)
+	log.Printf("tun: fabric0 up, this node is %s", d.OwnCert().Payload.Meta.IP)
 	d.startDNS()
 }
 
@@ -274,7 +277,7 @@ func (d *Daemon) startDNS() {
 		log.Printf("dns: disabled")
 		return
 	}
-	pfx, err := netip.ParsePrefix(d.ownCert.Payload.Meta.IP)
+	pfx, err := netip.ParsePrefix(d.OwnCert().Payload.Meta.IP)
 	if err != nil {
 		return
 	}
@@ -302,7 +305,7 @@ func (d *Daemon) dnsLookup(host string) (netip.Addr, bool) {
 		}
 		return pfx.Addr(), true
 	}
-	if ip, ok := match(d.ownCert); ok {
+	if ip, ok := match(d.OwnCert()); ok {
 		return ip, true
 	}
 	members, _ := d.Store.Snapshot()
@@ -467,6 +470,34 @@ func AllocateOverlayIP(dir state.Dir, members []MemberInfo) (string, error) {
 // Stop shuts the daemon down.
 func (d *Daemon) Stop() { d.cancel() }
 
+// OwnCert returns the membership cert this node currently holds and
+// presents. It can change at runtime when a renewal is adopted.
+func (d *Daemon) OwnCert() *cert.Cert {
+	d.certMu.RLock()
+	defer d.certMu.RUnlock()
+	return d.ownCert
+}
+
+// adoptOwnCert swaps in a re-signed certificate for this device (spec §5
+// renewal): persist it and present it in handshakes from now on — no
+// restart. Only a cert that outlives the current one is adopted.
+func (d *Daemon) adoptOwnCert(c *cert.Cert) {
+	d.certMu.Lock()
+	if d.ownCert != nil && !c.Expiry().After(d.ownCert.Expiry()) {
+		d.certMu.Unlock()
+		return
+	}
+	d.ownCert = c
+	d.certMu.Unlock()
+	if err := d.Dir.SaveCert(c); err != nil {
+		log.Printf("persisting renewed cert: %v", err)
+	}
+	if d.Auth != nil {
+		d.Auth.SetOwn(c)
+	}
+	log.Printf("own certificate renewed — now expires %s", c.Expiry().Format(time.RFC3339))
+}
+
 // hydrateStore replays the event log into the member store at startup, in
 // apply order: the roster (including offline members) and standing
 // revocations exist before the first connection does.
@@ -483,8 +514,14 @@ func (d *Daemon) hydrateStore() {
 		}
 		switch e.Payload.Kind {
 		case event.KindAdded:
-			if c, err := e.AddedCert(); err == nil && p != d.Host.ID() {
-				d.Store.AddMember(p, c)
+			if c, err := e.AddedCert(); err == nil {
+				if p == d.Host.ID() {
+					// A renewal gossiped while cert.cbor lagged behind
+					// (e.g. crash between ingest and adoption).
+					d.adoptOwnCert(c)
+				} else {
+					d.Store.AddMember(p, c)
+				}
 			}
 		case event.KindRevoked:
 			d.Store.Revoke(p, now)
@@ -506,11 +543,20 @@ func (d *Daemon) applyEvent(e *event.Event) {
 	}
 	switch e.Payload.Kind {
 	case event.KindAdded:
-		if c, err := e.AddedCert(); err == nil && p != d.Host.ID() {
-			_, known := d.Store.Cert(p)
+		if c, err := e.AddedCert(); err == nil {
+			if p == d.Host.ID() {
+				d.adoptOwnCert(c)
+				break
+			}
+			old, known := d.Store.Cert(p)
 			d.Store.AddMember(p, c)
-			if !known {
+			// Renewals reuse MemberAdded (spec §5) but must not fire the
+			// "new member" admission-transparency notification.
+			switch {
+			case !known:
 				log.Printf("member added: %q (%s), approved by master", c.Payload.Meta.Name, p)
+			case c.Expiry().After(old.Expiry()):
+				log.Printf("member cert renewed: %q (%s), now expires %s", c.Payload.Meta.Name, p, c.Expiry().Format(time.RFC3339))
 			}
 		}
 	case event.KindRevoked:

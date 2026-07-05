@@ -45,6 +45,12 @@ func (s *MemberStore) AddMember(p peer.ID, c *cert.Cert) {
 	if _, isRevoked := s.revoked[p]; isRevoked {
 		return // a revoked peer cannot re-add itself with an old cert
 	}
+	// Later-expiring cert wins: added-events arrive in no particular order
+	// (gossip, anti-entropy, handshakes), so a stale event must not clobber
+	// a renewed cert.
+	if cur, ok := s.members[p]; ok && c.Expiry().Before(cur.Expiry()) {
+		return
+	}
 	s.members[p] = c
 }
 

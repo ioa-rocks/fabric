@@ -50,6 +50,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/approve", s.handleApprove)
 	mux.HandleFunc("POST /api/deny", s.handleDeny)
 	mux.HandleFunc("POST /api/revoke", s.handleRevoke)
+	mux.HandleFunc("POST /api/renew", s.handleRenew)
 	return mux
 }
 
@@ -59,7 +60,7 @@ type Overview struct {
 	Members []daemon.MemberInfo `json:"members"`
 	Pending []PendingEntry      `json:"pending,omitempty"`
 	Events  []daemon.EventInfo  `json:"events"`
-	Links   []daemon.LinkInfo   `json:"links"` // whole-mesh link state
+	Links   []daemon.LinkInfo   `json:"links"`  // whole-mesh link state
 	Master  bool                `json:"master"` // this UI process can sign
 }
 
@@ -217,7 +218,9 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 	var match *daemon.MemberInfo
 	for i := range members {
-		if members[i].Fingerprint == req.Fingerprint {
+		// Never revoke the daemon's own (master) entry from a misdirected
+		// click — retiring the master is a bigger operation than a button.
+		if members[i].Fingerprint == req.Fingerprint && !members[i].Self {
 			match = &members[i]
 			break
 		}
@@ -246,6 +249,69 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{"result": "revoked", "name": match.Name})
+}
+
+// handleRenew re-signs an existing member's cert with a fresh validity
+// window (spec §5): payload preserved verbatim — the raw cert from the
+// roster is re-signed, so name, role, and overlay IP cannot drift — and
+// delivered as a MemberAdded event. Works on any member, this node
+// included.
+func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
+	var req signedRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, err)
+		return
+	}
+	members, err := s.client.Members()
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err)
+		return
+	}
+	var match *daemon.MemberInfo
+	for i := range members {
+		if members[i].Fingerprint == req.Fingerprint {
+			match = &members[i]
+			break
+		}
+	}
+	if match == nil {
+		httpError(w, http.StatusNotFound, fmt.Errorf("no member with fingerprint %q", req.Fingerprint))
+		return
+	}
+	old, err := cert.Unmarshal(match.Cert)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Errorf("roster cert: %w", err))
+		return
+	}
+	rootPriv, err := s.unlock(req.Passphrase)
+	if err != nil {
+		httpError(w, http.StatusForbidden, err)
+		return
+	}
+	now := time.Now()
+	renewed, err := cert.Renew(rootPriv, old, now, cert.DefaultValidity)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	ev, err := event.NewAdded(rootPriv, renewed, now)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	signedEv, err := ev.Marshal()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.client.Renew(signedEv); err != nil {
+		httpError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, map[string]string{
+		"result": "renewed", "name": match.Name,
+		"expires": renewed.Expiry().Format(time.RFC3339),
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

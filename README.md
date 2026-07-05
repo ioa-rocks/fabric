@@ -181,6 +181,32 @@ it succeeds the edge turns solid, when it fails the relay keeps
 carrying the traffic, TUN included. A revoked member loses relay
 privileges with the same gossip that cuts its connections.
 
+## Renewing certificates
+
+Certs live a year and renew at half-life (spec §5) — renewal re-signs
+the *same* payload (name, role, overlay IP; nothing renumbers) with a
+fresh validity window, so it needs the master:
+
+```sh
+fabric renew nas          # one member (also: peer ID / fingerprint)
+fabric renew -expiring    # everything past half-life, this node included
+```
+
+or the "Renew cert" button on any peer (and on the master's own card)
+in the web UI. The re-signed cert travels as a regular MemberAdded
+event on the existing gossip: every store keeps the later-expiring
+cert regardless of arrival order, and the renewed node adopts its new
+cert live — persisted and presented in handshakes immediately, no
+restart. Renewals log as `cert renewed`, not as a new member joining,
+so the admission-transparency alarm stays meaningful. The UI flags
+certs under 90 days ("renew soon") and under 30 ("renew NOW").
+
+Renew *before* expiry: an expired node can't connect to receive its
+renewal (the mesh refuses it), and its path back is a fresh `fabric
+join`. Renewal is also how members admitted before the TUN bridge
+(certs without an overlay IP) get re-issued — though they currently
+keep their empty IP; assigning one at renewal is a small follow-up.
+
 ## Kicking a device out
 
 ```sh

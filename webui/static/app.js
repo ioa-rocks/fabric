@@ -254,17 +254,7 @@ function renderDetails(d, ns) {
     add(kv, "address", mono(n.addr || "—"));
     if (n.rtt_ms) add(kv, "RTT", n.rtt_ms.toFixed(2) + " ms");
   }
-  if (n.cert_expiry) {
-    const days = Math.floor((new Date(n.cert_expiry) - Date.now()) / 86400000);
-    const ddEl = add(kv, "cert expires", `${new Date(n.cert_expiry).toLocaleDateString()} (${days}d)`);
-    if (days < 30) {
-      const b = badge("pending"); b.className = "badge warn"; b.textContent = "renew NOW";
-      ddEl.append(" ", b);
-    } else if (days < 90) {
-      const b = badge("pending"); b.className = "badge warn-soft"; b.textContent = "renew soon";
-      ddEl.append(" ", b);
-    }
-  }
+  if (n.cert_expiry) expiryRow(kv, n.cert_expiry);
   box.append(kv);
 
   const pend = (d.pending || []).find(p => p.peer_id === n.id && p.status === "pending");
@@ -288,10 +278,26 @@ function renderDetails(d, ns) {
     );
   } else if (n.kind === "member" || n.kind === "offline") {
     const m = (d.members || []).find(m => m.id === n.id);
-    if (m) actions.append(actionButton("Revoke membership", "danger",
-      () => openForm(box, "revoke", m.fingerprint, `cut “${m.name}” off the mesh immediately`)));
+    if (m) actions.append(
+      actionButton("Renew cert", "approve",
+        () => openForm(box, "renew", m.fingerprint, `re-sign “${m.name}”’s cert with a fresh validity window (same name, IP, and role)`)),
+      actionButton("Revoke membership", "danger",
+        () => openForm(box, "revoke", m.fingerprint, `cut “${m.name}” off the mesh immediately`)));
   }
   if (actions.childElementCount) box.append(actions);
+}
+
+/* Cert-expiry line with the renewal-tier badge (spec §5: warn <90d, alarm <30d). */
+function expiryRow(kv, iso) {
+  const days = Math.floor((new Date(iso) - Date.now()) / 86400000);
+  const ddEl = add(kv, "cert expires", `${new Date(iso).toLocaleDateString()} (${days}d)`);
+  if (days < 30) {
+    const b = badge("pending"); b.className = "badge warn"; b.textContent = "renew NOW";
+    ddEl.append(" ", b);
+  } else if (days < 90) {
+    const b = badge("pending"); b.className = "badge warn-soft"; b.textContent = "renew soon";
+    ddEl.append(" ", b);
+  }
 }
 
 function renderSelf(d, box) {
@@ -307,8 +313,19 @@ function renderSelf(d, box) {
   }
   add(kv, "peer ID", mono(d.status.peer_id));
   add(kv, "NAT", (d.status.reachability || "unknown").toLowerCase());
+  if (d.status.cert_expiry) expiryRow(kv, d.status.cert_expiry);
   for (const a of d.status.addrs || []) add(kv, "listen", mono(a));
   box.append(kv);
+  if (d.master) {
+    const me = (d.members || []).find(m => m.self);
+    if (me) {
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      actions.append(actionButton("Renew cert", "approve",
+        () => openForm(box, "renew", me.fingerprint, "re-sign this node's own cert with a fresh validity window")));
+      box.append(actions);
+    }
+  }
 }
 
 /* ---------- pending card ---------- */
@@ -354,7 +371,7 @@ function openForm(host, kind, fingerprint, what) {
     <input type="password" name="pass" placeholder="namespace root key passphrase" autocomplete="off" required>
     <div class="form-error" hidden></div>
     <div class="actions">
-      <button class="action ${kind === "revoke" ? "danger" : "approve"}" type="submit">${kind === "revoke" ? "Sign revocation" : "Sign certificate"}</button>
+      <button class="action ${kind === "revoke" ? "danger" : "approve"}" type="submit">${{ revoke: "Sign revocation", renew: "Sign renewal" }[kind] || "Sign certificate"}</button>
       <button class="action quiet" type="button" data-cancel>Cancel</button>
     </div>`;
   form.querySelector("[data-cancel]").onclick = () => { state.form = null; render(); };

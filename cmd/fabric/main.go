@@ -89,6 +89,8 @@ func main() {
 		err = cmdDeny(args)
 	case "revoke":
 		err = cmdRevoke(args)
+	case "renew":
+		err = cmdRenew(args)
 	case "ui":
 		err = cmdUI(args)
 	case "queue":
@@ -119,6 +121,8 @@ func usage() {
   approve  approve a pending join request by fingerprint (master)
   deny     deny a pending join request by fingerprint (master)
   revoke   revoke a member by name, peer ID, or fingerprint (master)
+  renew    re-sign a member's cert with a fresh validity window (master);
+           -expiring renews everything past half-life, this node included
   ui       serve the topology/admin web UI on localhost
   queue    queue on|off — run the admission queue on this node (lighthouse)
   dns      dns on|off; sudo dns setup — allow resolver self-registration
@@ -660,9 +664,10 @@ func cmdRevoke(args []string) error {
 
 	var matches []daemon.MemberInfo
 	for _, m := range members {
-		if m.Name == target ||
-			(len(target) <= len(m.Fingerprint) && m.Fingerprint[:len(target)] == target) ||
-			(len(target) >= 8 && len(target) <= len(m.ID) && m.ID[:len(target)] == target) {
+		if m.Self {
+			continue // retiring the master is a bigger operation than a one-liner
+		}
+		if memberMatches(m, target) {
 			matches = append(matches, m)
 		}
 	}
@@ -698,6 +703,108 @@ func cmdRevoke(args []string) error {
 		return err
 	}
 	fmt.Printf("revoked: %q is out of the namespace\n", m.Name)
+	return nil
+}
+
+func memberMatches(m daemon.MemberInfo, target string) bool {
+	return m.Name == target ||
+		(len(target) <= len(m.Fingerprint) && m.Fingerprint[:len(target)] == target) ||
+		(len(target) >= 8 && len(target) <= len(m.ID) && m.ID[:len(target)] == target)
+}
+
+// cmdRenew re-signs membership certs with a fresh validity window (spec §5).
+// The payload is preserved verbatim — same device key, name, role, overlay
+// IP — so renewal never renumbers a node. The re-signed cert travels as a
+// MemberAdded event; stores keep the later expiry and the renewed node
+// adopts its own cert live.
+func cmdRenew(args []string) error {
+	fs := flag.NewFlagSet("renew", flag.ExitOnError)
+	statePath := stateFlag(fs)
+	expiring := fs.Bool("expiring", false, "renew every cert past half-life (this node's included)")
+	fs.Parse(args)
+	if *expiring == (fs.NArg() == 1) {
+		return fmt.Errorf("usage: fabric renew <name | peer-id | fingerprint>  |  fabric renew -expiring")
+	}
+
+	dir, err := state.Open(*statePath)
+	if err != nil {
+		return err
+	}
+	if !dir.IsMaster() {
+		return fmt.Errorf("no namespace root key in %s — renewal happens on the master", dir.Path)
+	}
+	client := daemon.NewClient(dir)
+	members, err := client.Members()
+	if err != nil {
+		return err
+	}
+
+	var targets []daemon.MemberInfo
+	if *expiring {
+		for _, m := range members {
+			if time.Until(m.Expiry) < cert.RenewBelow {
+				targets = append(targets, m)
+			}
+		}
+		if len(targets) == 0 {
+			fmt.Printf("nothing to renew: every cert has more than %d days left\n", int(cert.RenewBelow.Hours()/24))
+			return nil
+		}
+	} else {
+		target := fs.Arg(0)
+		var matches []daemon.MemberInfo
+		for _, m := range members {
+			if memberMatches(m, target) {
+				matches = append(matches, m)
+			}
+		}
+		switch len(matches) {
+		case 0:
+			return fmt.Errorf("no member matches %q (see 'fabric status' for the roster)", target)
+		case 1:
+			targets = matches
+		default:
+			for _, m := range matches {
+				fmt.Fprintf(os.Stderr, "  %s  %-16s %s\n", m.Fingerprint, m.Name, m.ID)
+			}
+			return fmt.Errorf("%q is ambiguous — %d members match", target, len(matches))
+		}
+	}
+
+	for _, m := range targets {
+		self := ""
+		if m.Self {
+			self = " (this node)"
+		}
+		fmt.Printf("renewing %q%s — currently expires %s\n", m.Name, self, m.Expiry.Format(time.RFC3339))
+	}
+	rootPriv, err := unlockRootKey(dir)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	for _, m := range targets {
+		old, err := cert.Unmarshal(m.Cert)
+		if err != nil {
+			return fmt.Errorf("roster cert for %q: %w", m.Name, err)
+		}
+		renewed, err := cert.Renew(rootPriv, old, now, cert.DefaultValidity)
+		if err != nil {
+			return fmt.Errorf("renewing %q: %w", m.Name, err)
+		}
+		ev, err := event.NewAdded(rootPriv, renewed, now)
+		if err != nil {
+			return err
+		}
+		signedEv, err := ev.Marshal()
+		if err != nil {
+			return err
+		}
+		if err := client.Renew(signedEv); err != nil {
+			return fmt.Errorf("delivering renewal for %q: %w", m.Name, err)
+		}
+		fmt.Printf("renewed: %q now expires %s\n", m.Name, renewed.Expiry().Format(time.RFC3339))
+	}
 	return nil
 }
 
