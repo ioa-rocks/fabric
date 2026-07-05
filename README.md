@@ -194,7 +194,8 @@ relays the event on to members the master can't reach directly. Nodes
 that were offline catch up on their next connect — admissions and
 revocations are exchanged peer-to-peer on every connect and persisted,
 so a revocation holds even when the master is asleep. Cert expiry
-(90 days) remains the backstop for devices the gossip never reaches;
+(one year, renewed at half-life) remains the backstop for devices the
+gossip never reaches;
 revocation records self-delete once the cert they kill would have
 expired anyway. Re-admitting a revoked device means a fresh
 `fabric join`.
@@ -226,6 +227,44 @@ underlay whenever both ends support it.
 
 Certs issued before the bridge existed carry no overlay IP — re-join
 (or re-init a young namespace) to get addressed.
+
+## Run it as a service
+
+For anything past experiments, run the daemon under systemd so it
+survives reboots and crashes. Pick the mode by **trust boundary**, not
+by whether you happen to have root:
+
+```sh
+sudo ./scripts/install-systemd.sh          # dedicated machines (after init/join)
+./scripts/install-systemd.sh -U            # shared machines (no root needed)
+```
+
+**System service** (machines that are yours alone — desktop, NAS,
+your cloud instances): starts at boot, runs `fabric up` as your
+normal user; the TUN and port-53 capabilities are granted by systemd
+(`AmbientCapabilities`) rather than setcap on the binary, so upgrades
+are just "replace the binary, `sudo systemctl restart fabric`" —
+nothing to re-bless. `-b/-u/-s` override binary, user, and state dir;
+`-n` disables TUN. Logs: `journalctl -u fabric -f`.
+
+**User service** (`-U`, machines other people also use — a shared
+server, a work box): installs to `~/.config/systemd/user/` with zero
+root footprint and runs while you're logged in (`loginctl
+enable-linger` keeps it up across logouts, where allowed). No TUN or
+`.fabric` DNS here — and that's the *point*, not a limitation: a TUN
+device is host-wide, so bridging the overlay on a shared machine
+would hand every user and process on that box an IP route into your
+private network. The node is a full member on the control plane
+(gossip, admission, even lighthouse duty) and carries your traffic
+once the per-user userspace proxy (mode B) lands, which is scoped to
+your processes instead of the whole host. For the same reason, don't
+"fix" a shared machine by setcap'ing the binary — that works
+mechanically, but it bridges your overlay to everyone on the box.
+
+The web UI is deliberately *not* a service: `fabric ui` holds the
+namespace root key (signs approvals, revocations, renewals) and should
+only run interactively on the master, unlocked when you need it —
+that's the cold-key custody model, not an oversight.
 
 **Names: `ssh nas.fabric`.** When the bridge is up, the daemon serves
 `<member>.fabric` on its own overlay address — the member store is the
