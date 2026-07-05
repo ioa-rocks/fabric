@@ -160,23 +160,20 @@ sudo resolvectl domain fabric0 '~fabric'
 ```
 
 The daemon attempts this itself over D-Bus with interactive
-authorization disabled — it will never pop an auth dialog or hang a
-tty. To let it succeed as a normal user (so names configure themselves
-on every start), install a polkit rule once:
+authorization disabled — it never pops an auth dialog or hangs a tty,
+but as a plain user it will be refused until you run, once per
+machine:
 
 ```sh
-sudo tee /etc/polkit-1/rules.d/50-fabric-dns.rules >/dev/null <<'EOF'
-// Allow the fabric daemon (running as this user) to point
-// systemd-resolved's ~fabric routing domain at its own resolver.
-polkit.addRule(function(action, subject) {
-    if ((action.id == "org.freedesktop.resolve1.set-dns-servers" ||
-         action.id == "org.freedesktop.resolve1.set-domains") &&
-        subject.user == "YOUR_USER") {
-        return polkit.Result.YES;
-    }
-});
-EOF
+sudo fabric dns setup
 ```
+
+That installs a polkit rule (`/etc/polkit-1/rules.d/50-fabric-dns.rules`)
+allowing your user's daemon to set resolved's DNS/domain for its own
+link — from then on names configure themselves on every daemon start,
+reboots included — and registers immediately if `fabric0` is already
+up. On nodes that don't need names at all (cloud boxes you only ssh
+*to*), `fabric dns off`.
 
 End-to-end proof without touching real interfaces:
 `go build -o fabric ./cmd/fabric && sudo scripts/e2e-tun.sh` — two
