@@ -115,7 +115,9 @@ func usage() {
 	fmt.Fprint(os.Stderr, `usage: fabric <command> [flags]
 
   init     create a new namespace on this device (it becomes the master)
-  join     request admission to an existing namespace
+  join     request admission to an existing namespace; the bootstrap is a
+           full multiaddr or a bare hostname with a _fabric TXT record
+           (fabric join -name laptop gate.example.com)
   up       run the node daemon
   status   show node, membership, and connection state
   graph    show the whole mesh's links; -json for machines
@@ -130,7 +132,8 @@ func usage() {
   dns      dns on|off; sudo dns setup — allow resolver self-registration
   peer     peer add <multiaddr> — add a bootstrap peer
   announce announce add <multiaddr> — also advertise an address no local
-           interface carries (cloud public IP / DNS name)
+           interface carries (cloud public IP / DNS name);
+           announce txt — print the DNS TXT record for hostname joins
 
 Every command accepts -state <dir> (default `+state.DefaultPath()+`).
 `)
@@ -403,24 +406,40 @@ func cmdJoin(args []string) error {
 	fs := flag.NewFlagSet("join", flag.ExitOnError)
 	statePath := stateFlag(fs)
 	name := fs.String("name", "", "human label for this device (required)")
-	bootstrap := fs.String("bootstrap", "", "multiaddr of the queue host, incl. /p2p/<peer-id> (required)")
+	bootstrap := fs.String("bootstrap", "", "queue host: full multiaddr incl. /p2p/<peer-id>, or bare host[:port] resolved via its _fabric TXT record")
 	listen := fs.String("listen", defaultListen, "listen multiaddrs, comma-separated")
 	fs.Parse(args)
+	if *bootstrap == "" && fs.NArg() == 1 {
+		*bootstrap = fs.Arg(0) // `fabric join -name x gate.example.com`
+	}
 	if *name == "" || *bootstrap == "" {
-		return fmt.Errorf("join: -name and -bootstrap are required")
+		return fmt.Errorf("join: -name and a bootstrap target are required")
 	}
 	listenAddrs, err := parseListen(*listen)
 	if err != nil {
 		return err
 	}
 
-	m, err := ma.NewMultiaddr(*bootstrap)
+	bootAddrs, expectNS, err := resolveBootstrap(*bootstrap)
 	if err != nil {
-		return fmt.Errorf("bootstrap: %w", err)
+		return err
 	}
-	target, err := peerpkg.AddrInfoFromP2pAddr(m)
-	if err != nil {
-		return fmt.Errorf("bootstrap must include /p2p/<peer-id>: %w", err)
+	var target peerpkg.AddrInfo
+	for _, a := range bootAddrs {
+		m, err := ma.NewMultiaddr(a)
+		if err != nil {
+			return fmt.Errorf("bootstrap: %w", err)
+		}
+		info, err := peerpkg.AddrInfoFromP2pAddr(m)
+		if err != nil {
+			return fmt.Errorf("bootstrap must include /p2p/<peer-id>: %w", err)
+		}
+		if target.ID == "" {
+			target.ID = info.ID
+		} else if info.ID != target.ID {
+			return fmt.Errorf("bootstrap addresses disagree on the peer ID")
+		}
+		target.Addrs = append(target.Addrs, info.Addrs...)
 	}
 
 	dir, err := state.Open(*statePath)
@@ -457,10 +476,28 @@ func cmdJoin(args []string) error {
 
 	var resp *admission.JoinResponse
 	lastErr := ""
+	shownNS := false
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		resp, err = admission.Request(ctx, h, target.ID, req)
 		cancel()
+		// The joiner's side of the ceremony: the master's human compares
+		// OUR fingerprint; we get shown the namespace we are about to
+		// trust. A DNS-pinned namespace (ns= in the TXT record) verifies
+		// itself; otherwise it's the human's to check.
+		if err == nil && !shownNS && resp.NamespaceDID != "" {
+			shownNS = true
+			fmt.Printf("\nqueue host serves namespace %s\n", resp.NamespaceDID)
+			switch {
+			case expectNS == "":
+				fmt.Println("verify this matches the namespace on the master (fabric status / UI header) before it approves.")
+			case resp.NamespaceDID != expectNS:
+				return fmt.Errorf("namespace mismatch: the _fabric DNS record promises %s — refusing to join", expectNS)
+			default:
+				fmt.Println("matches the _fabric DNS record — namespace pre-verified.")
+			}
+			fmt.Print("waiting for approval")
+		}
 		switch {
 		case err != nil:
 			// Say why, once per distinct reason — "protocol not supported"
@@ -488,6 +525,9 @@ func cmdJoin(args []string) error {
 
 approved:
 	fmt.Println()
+	if expectNS != "" && resp.NamespaceDID != expectNS {
+		return fmt.Errorf("namespace mismatch: the _fabric DNS record promises %s but the cert came from %s — refusing to join", expectNS, resp.NamespaceDID)
+	}
 	c, err := cert.Unmarshal(resp.Cert)
 	if err != nil {
 		return fmt.Errorf("received cert: %w", err)
@@ -514,13 +554,82 @@ approved:
 		Name:         *name,
 		ListenAddrs:  listenAddrs,
 		NamespaceDID: resp.NamespaceDID,
-		Bootstrap:    []string{*bootstrap},
+		Bootstrap:    bootAddrs,
 	}); err != nil {
 		return err
 	}
 	fmt.Printf("admitted to namespace %s as %q\n", resp.NamespaceDID, *name)
 	fmt.Printf("start the node with: fabric up -state %s\n", dir.Path)
 	return nil
+}
+
+// resolveBootstrap turns the join target into pinned bootstrap multiaddr
+// strings. Two forms:
+//
+//   - a full multiaddr incl. /p2p/<peer-id> — used as-is;
+//   - a bare host[:port] shortcut ("gate.example.com") — the peer-ID pin
+//     then comes from a DNS TXT record at _fabric.<host>:
+//
+//     _fabric.gate.example.com. TXT "v=fabric1; peer=<peer-id>; ns=<did:key:…>"
+//
+//     (`fabric announce txt` on the lighthouse prints that line.) The
+//     optional ns= pre-pins the namespace: the join hard-fails on any
+//     mismatch instead of leaning on the human fingerprint check.
+func resolveBootstrap(arg string) (addrs []string, expectNS string, err error) {
+	if strings.HasPrefix(arg, "/") {
+		return []string{arg}, "", nil // full multiaddr; validated by the caller
+	}
+	host, port := arg, "4517"
+	if h, p, ok := strings.Cut(arg, ":"); ok {
+		host, port = h, p
+	}
+	txts, err := net.LookupTXT("_fabric." + host)
+	peerID, ns := parseFabricTXT(txts)
+	if err != nil || peerID == "" {
+		if err == nil {
+			err = fmt.Errorf("no peer= entry")
+		}
+		return nil, "", fmt.Errorf(`cannot resolve %q as a join shortcut: _fabric.%s TXT lookup: %v
+publish this DNS record (printed by 'fabric announce txt' on the queue host):
+  _fabric.%s. TXT "v=fabric1; peer=<peer-id>; ns=<namespace-did>"
+or pass a full multiaddr including /p2p/<peer-id>`, arg, host, err, host)
+	}
+	comp := "/dns4/" + host
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			comp = "/ip4/" + host
+		} else {
+			comp = "/ip6/" + host
+		}
+	}
+	return []string{
+		fmt.Sprintf("%s/udp/%s/quic-v1/p2p/%s", comp, port, peerID),
+		fmt.Sprintf("%s/tcp/%s/p2p/%s", comp, port, peerID),
+	}, ns, nil
+}
+
+// parseFabricTXT picks the peer-ID and optional namespace DID out of
+// _fabric TXT strings ("v=fabric1; peer=<id>; ns=<did>").
+func parseFabricTXT(txts []string) (peerID, ns string) {
+	for _, txt := range txts {
+		var p, n string
+		for _, f := range strings.FieldsFunc(txt, func(r rune) bool { return r == ';' || r == ' ' }) {
+			k, v, ok := strings.Cut(strings.TrimSpace(f), "=")
+			if !ok {
+				continue
+			}
+			switch k {
+			case "peer":
+				p = v
+			case "ns":
+				n = v
+			}
+		}
+		if p != "" {
+			return p, n
+		}
+	}
+	return "", ""
 }
 
 func cmdPending(args []string) error {
@@ -1004,8 +1113,11 @@ func cmdPeer(args []string) error {
 }
 
 func cmdAnnounce(args []string) error {
+	if len(args) >= 1 && args[0] == "txt" {
+		return cmdAnnounceTXT(args[1:])
+	}
 	if len(args) < 2 || args[0] != "add" {
-		return fmt.Errorf("usage: fabric announce add <multiaddr>")
+		return fmt.Errorf("usage: fabric announce add <multiaddr> | fabric announce txt")
 	}
 	fs := flag.NewFlagSet("announce add", flag.ExitOnError)
 	statePath := stateFlag(fs)
@@ -1037,5 +1149,47 @@ func cmdAnnounce(args []string) error {
 		return err
 	}
 	fmt.Println("announce address added; the daemon picks it up on restart")
+	return nil
+}
+
+// cmdAnnounceTXT prints the DNS TXT record that makes this node joinable
+// by bare hostname (`fabric join <host>` — see resolveBootstrap).
+func cmdAnnounceTXT(args []string) error {
+	fs := flag.NewFlagSet("announce txt", flag.ExitOnError)
+	statePath := stateFlag(fs)
+	fs.Parse(args)
+
+	dir, err := state.Open(*statePath)
+	if err != nil {
+		return err
+	}
+	cfg, err := dir.LoadConfig()
+	if err != nil {
+		return err
+	}
+	priv, err := dir.LoadDeviceKey()
+	if err != nil {
+		return fmt.Errorf("device key: %w", err)
+	}
+	pid, err := peerpkg.IDFromPrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	host := "<this-node's-dns-name>"
+	for _, s := range cfg.AnnounceAddrs {
+		if m, err := ma.NewMultiaddr(s); err == nil {
+			for _, p := range []int{ma.P_DNS4, ma.P_DNS6, ma.P_DNS} {
+				if v, err := m.ValueForProtocol(p); err == nil && v != "" {
+					host = v
+					break
+				}
+			}
+		}
+		if host != "<this-node's-dns-name>" {
+			break
+		}
+	}
+	fmt.Printf("publish this DNS record to enable 'fabric join %s':\n", host)
+	fmt.Printf("_fabric.%s. 300 IN TXT \"v=fabric1; peer=%s; ns=%s\"\n", host, pid, cfg.NamespaceDID)
 	return nil
 }

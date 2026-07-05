@@ -151,8 +151,11 @@ channel as membership events, and every daemon opportunistically dials
 members it knows addresses for but isn't connected to. libp2p races
 all known addresses, so the best real path wins — LAN beats WAN,
 whichever side *can* dial does, and one connection carries both
-directions. `fabric peer add` remains useful for pinning a lighthouse,
-not for wiring up every pair.
+directions. Learned records are **persisted** (`records.cbor`), so a
+restarted node redials its peers from the cache instead of waiting to
+be told where everyone is again — the mesh reforms even when the node
+you originally joined through is down. `fabric peer add` remains
+useful for pinning a lighthouse, not for wiring up every pair.
 
 **4. Promote the cloud node to lighthouse.** Three things make a
 working lighthouse: the queue role, an open port, and an announced
@@ -191,6 +194,28 @@ master reachability needed:
 ```sh
 fabric join -name cloud-b -bootstrap /ip4/<cloud-a-ip>/udp/4517/quic-v1/p2p/<cloud-a-peer-id>
 ```
+
+Or skip the multiaddr entirely: publish the DNS record that `fabric
+announce txt` prints on the lighthouse —
+
+```
+_fabric.gate.example.com. 300 IN TXT "v=fabric1; peer=<peer-id>; ns=<namespace-did>"
+```
+
+— and every future device joins with just:
+
+```sh
+fabric join -name laptop gate.example.com
+```
+
+The TXT record supplies the peer-ID pin, and its `ns=` entry pre-pins
+the namespace: the join hard-fails if the queue host serves a
+different one. Without `ns=` (or when joining by multiaddr), the
+joiner prints the namespace DID it is about to trust — compare it with
+the master's UI header in the same glance that compares the joiner's
+fingerprint. Both checks exist because DNS alone is spoofable: a
+hijacked name must not be able to usher your device into an impostor
+namespace.
 
 The request waits in cloud-a's queue; `fabric pending` / the UI on the
 master shows it (pulled remotely over the admin-gated queue protocol),
@@ -382,7 +407,7 @@ of its own; don't point `-listen` at a routable interface.
 | `fabric up` | any member | run the node daemon |
 | `fabric status` | any member | node, membership, and connection state |
 | `fabric graph [-json]` | any member | whole-mesh link map, human or machine readable |
-| `fabric join -name <label> -bootstrap <addr>` | new device | request admission and wait |
+| `fabric join -name <label> <host \| -bootstrap <addr>>` | new device | request admission and wait; bare hostname resolves via its `_fabric` TXT record |
 | `fabric pending` | master | list join requests |
 | `fabric approve <fingerprint>` | master | sign a membership cert for a pending request |
 | `fabric deny <fingerprint>` | master | reject a pending request |
@@ -391,6 +416,7 @@ of its own; don't point `-listen` at a routable interface.
 | `fabric queue on\|off` | any member | run the admission queue (lighthouse role) |
 | `fabric peer add <multiaddr>` | any member | add a bootstrap peer |
 | `fabric announce add <multiaddr>` | cloud/1:1-NAT nodes | also advertise an address no local interface carries |
+| `fabric announce txt` | lighthouse | print the DNS TXT record enabling hostname joins |
 
 All commands take `-state <dir>` (default `~/.config/fabric`), so
 several nodes can run on one machine for testing. Flags go **before**
