@@ -113,6 +113,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("GET /v0/status", d.handleStatus)
 	mux.HandleFunc("GET /v0/members", d.handleMembers)
 	mux.HandleFunc("GET /v0/events", d.handleEvents)
+	mux.HandleFunc("GET /v0/graph", d.handleGraph)
 	mux.HandleFunc("GET /v0/pending", d.handlePending)
 	mux.HandleFunc("POST /v0/approve", d.handleApprove)
 	mux.HandleFunc("POST /v0/deny", d.handleDeny)
@@ -191,6 +192,12 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	writeJSON(w, reply)
+}
+
+// handleGraph returns the aggregated mesh link state — every live link any
+// reachable member reports, not just this node's own.
+func (d *Daemon) handleGraph(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string][]LinkInfo{"links": d.graphLinks()})
 }
 
 func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
@@ -540,6 +547,16 @@ func (c *Client) Events() ([]EventInfo, error) {
 		return nil, err
 	}
 	return e, nil
+}
+
+func (c *Client) Graph() ([]LinkInfo, error) {
+	var g struct {
+		Links []LinkInfo `json:"links"`
+	}
+	if err := c.get("/v0/graph", &g); err != nil {
+		return nil, err
+	}
+	return g.Links, nil
 }
 
 func (c *Client) Members() ([]MemberInfo, error) {

@@ -63,8 +63,9 @@ type EventSync struct {
 	onApply EventApplied
 	cab     peerstore.CertifiedAddrBook
 
-	mu     sync.Mutex
-	ownRec []byte // this host's latest signed peer record
+	mu      sync.Mutex
+	ownRec  []byte                 // this host's latest signed peer record
+	lastSeq map[peer.ID]uint64     // highest record seq accepted per peer
 
 	stop []func()
 }
@@ -78,7 +79,7 @@ type EventSync struct {
 // (network transitions).
 func NewEventSync(h host.Host, log *event.Log, store *MemberStore, onApply EventApplied) *EventSync {
 	cab, _ := h.Peerstore().(peerstore.CertifiedAddrBook)
-	s := &EventSync{h: h, log: log, store: store, onApply: onApply, cab: cab}
+	s := &EventSync{h: h, log: log, store: store, onApply: onApply, cab: cab, lastSeq: map[peer.ID]uint64{}}
 	h.SetStreamHandler(SyncProtocolID, s.handleSync)
 	h.SetStreamHandler(EventsProtocolID, s.handleV1)
 	nb := &network.NotifyBundle{ConnectedF: func(_ network.Network, c network.Conn) {
@@ -176,7 +177,10 @@ func (s *EventSync) publishExcept(evs []*event.Event, except peer.ID) {
 }
 
 // pushRecordsExcept sends address records to connected members (sync/1
-// speakers only — v1 peers have no record support).
+// speakers only — v1 peers have no record support). Fire-and-forget: the
+// responder's reply is drained but NOT re-applied — pushes must never
+// trigger further pushes, or the mesh feeds itself forever (anti-entropy
+// on connect covers whatever a drained reply might have carried).
 func (s *EventSync) pushRecordsExcept(recs [][]byte, except peer.ID) {
 	if len(recs) == 0 {
 		return
@@ -198,9 +202,7 @@ func (s *EventSync) pushRecordsExcept(recs [][]byte, except peer.ID) {
 				_ = str.SetDeadline(deadline)
 			}
 			if writeSync(str, syncPayload{Records: recs}) == nil {
-				if theirs, err := readSync(str); err == nil {
-					s.applyPayload(theirs, p)
-				}
+				_, _ = readSync(str) // drain so the responder isn't left hanging
 			}
 		}(p)
 	}
@@ -313,9 +315,13 @@ func (s *EventSync) applyPayload(pl syncPayload, from peer.ID) {
 	s.pushRecordsExcept(freshRecords, from)
 }
 
-// consumeRecord verifies and stores one gossiped address record. Only
-// current members' records are kept — the envelope signature proves the
-// device said it, membership decides whether we care.
+// consumeRecord verifies and stores one gossiped address record, reporting
+// whether it was genuinely NEW. Only current members' records are kept —
+// the envelope signature proves the device said it, membership decides
+// whether we care. Freshness is tracked here with a strictly-greater seq
+// check: the peerstore's ConsumePeerRecord accepts equal-seq records as
+// true, and treating those as fresh once caused an infinite re-push storm
+// between nodes.
 func (s *EventSync) consumeRecord(data []byte, now time.Time) bool {
 	if s.cab == nil {
 		return false
@@ -328,8 +334,22 @@ func (s *EventSync) consumeRecord(data []byte, now time.Time) bool {
 	if !ok || rec.PeerID == s.h.ID() || !s.store.IsMember(rec.PeerID, now) {
 		return false
 	}
+	s.mu.Lock()
+	stale := rec.Seq <= s.lastSeq[rec.PeerID]
+	s.mu.Unlock()
+	if stale {
+		return false
+	}
 	accepted, err := s.cab.ConsumePeerRecord(env, addrRecordTTL)
-	return err == nil && accepted
+	if err != nil || !accepted {
+		return false
+	}
+	s.mu.Lock()
+	if rec.Seq > s.lastSeq[rec.PeerID] {
+		s.lastSeq[rec.PeerID] = rec.Seq
+	}
+	s.mu.Unlock()
+	return true
 }
 
 // knownRecords returns our own signed address record plus the freshest

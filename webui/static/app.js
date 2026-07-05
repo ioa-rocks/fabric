@@ -128,23 +128,37 @@ function renderGraph(d, ns) {
   const W = 800, H = 520, cx = W / 2, cy = H / 2 - 10;
   const r = Math.min(200, 130 + ns.length * 8);
 
+  // positions: self at center, everyone else on the ring
+  const pos = { [d.status.peer_id]: [cx, cy, 28] };
+  ns.forEach((n, i) => {
+    const [x, y] = ringPos(i, ns.length, cx, cy, r);
+    pos[n.id] = [x, y, 24];
+  });
+
+  // Links: the aggregated whole-mesh view when available (every member
+  // reports its own connections), else fall back to this node's links.
+  let links = (d.links || []).filter(l => pos[l.a] && pos[l.b]);
+  if (!links.length) {
+    links = ns.filter(n => n.connected).map(n => ({
+      a: d.status.peer_id, b: n.id, rtt_ms: n.rtt_ms, transport: n.transport, relayed: n.relayed,
+    }));
+  }
+
   const summary = document.getElementById("graph-summary");
-  const connected = ns.filter(n => n.connected).length;
-  summary.textContent = `${ns.filter(n => n.kind.startsWith("member") || n.kind === "offline").length + 1} members · ${connected} link${connected === 1 ? "" : "s"} up`;
+  summary.textContent = `${ns.filter(n => n.kind.startsWith("member") || n.kind === "offline").length + 1} members · ${links.length} link${links.length === 1 ? "" : "s"} up`;
 
   // edges first, under the nodes; trimmed to node boundaries so lines and
   // labels never run under a node's own caption
-  ns.forEach((n, i) => {
-    if (!n.connected) return;
-    const [x, y] = ringPos(i, ns.length, cx, cy, r);
-    const len = Math.hypot(x - cx, y - cy) || 1;
-    const ux = (x - cx) / len, uy = (y - cy) / len;
-    const x1 = cx + ux * 36, y1 = cy + uy * 36;
-    const x2 = x - ux * 30, y2 = y - uy * 30;
-    svg.append(el("line", { x1, y1, x2, y2, class: "edge" + (n.relayed ? " relayed" : "") }));
+  for (const l of links) {
+    const [ax, ay, ar] = pos[l.a], [bx, by, br] = pos[l.b];
+    const len = Math.hypot(bx - ax, by - ay) || 1;
+    const ux = (bx - ax) / len, uy = (by - ay) / len;
+    const x1 = ax + ux * (ar + 8), y1 = ay + uy * (ar + 8);
+    const x2 = bx - ux * (br + 6), y2 = by - uy * (br + 6);
+    svg.append(el("line", { x1, y1, x2, y2, class: "edge" + (l.relayed ? " relayed" : "") }));
     const parts = [];
-    if (n.rtt_ms) parts.push(n.rtt_ms < 1 ? n.rtt_ms.toFixed(2) + " ms" : n.rtt_ms.toFixed(1) + " ms");
-    if (n.transport) parts.push(n.transport + (n.relayed ? " · relay" : ""));
+    if (l.rtt_ms) parts.push(l.rtt_ms < 1 ? l.rtt_ms.toFixed(2) + " ms" : l.rtt_ms.toFixed(1) + " ms");
+    if (l.transport) parts.push(l.transport + (l.relayed ? " · relay" : ""));
     if (parts.length) {
       // near-vertical edges get the label fully beside the line; otherwise
       // it sits above the midpoint, pushed out along the perpendicular
@@ -153,7 +167,7 @@ function renderGraph(d, ns) {
       const my = (y1 + y2) / 2 + (vertical ? 4 : ux * 24 + 4);
       svg.append(el("text", { x: mx, y: my, "text-anchor": vertical ? "end" : "middle", class: "edge-label" }, parts.join(" · ")));
     }
-  });
+  }
 
   drawNode(svg, cx, cy, { id: "self", name: d.status.name, kind: "self", ip: d.status.overlay_ip }, 28);
   ns.forEach((n, i) => {

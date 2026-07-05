@@ -63,6 +63,8 @@ type Daemon struct {
 	rtt          map[peer.ID]time.Duration
 	reachability string
 	lastDial     map[peer.ID]time.Time // mesh-fill backoff
+
+	graph graphCache // aggregated mesh link state for the UI
 }
 
 // New assembles a daemon from a state directory. The node must already hold
@@ -133,6 +135,7 @@ func New(dir state.Dir) (*Daemon, error) {
 	// only members get an answer (spec §4: nothing reachable pre-auth).
 	pingSvc := ping.NewPingService(h)
 	h.SetStreamHandler(ping.ID, d.Auth.RequireMember(pingSvc.PingHandler))
+	d.attachLinks()
 
 	// The admission queue runs on the master (bootstrap wrinkle, spec §6)
 	// and on any member designated a queue host (`fabric queue on` — the

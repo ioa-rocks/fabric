@@ -59,6 +59,7 @@ type Overview struct {
 	Members []daemon.MemberInfo `json:"members"`
 	Pending []PendingEntry      `json:"pending,omitempty"`
 	Events  []daemon.EventInfo  `json:"events"`
+	Links   []daemon.LinkInfo   `json:"links"` // whole-mesh link state
 	Master  bool                `json:"master"` // this UI process can sign
 }
 
@@ -86,6 +87,9 @@ func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	o := Overview{Status: st, Members: members, Events: events, Master: s.master}
+	if links, err := s.client.Graph(); err == nil {
+		o.Links = links
+	}
 	if st.Master {
 		if pending, err := s.client.Pending(); err == nil {
 			for _, p := range pending {
