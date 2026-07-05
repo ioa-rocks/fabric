@@ -139,10 +139,15 @@ fabric join -name cloud-a -bootstrap /ip4/127.0.0.1/tcp/14517/p2p/<master-peer-i
 fabric up
 ```
 
-The tunnel is only for admission: once `cloud-a` holds a cert, add its
-*public* address on the home nodes (`fabric peer add
-/ip4/<cloud-ip>/udp/4517/quic-v1/p2p/<cloud-peer-id>`, or the /ip6/…
-form) and they maintain direct outbound connections to it.
+The tunnel is only for admission. From there the mesh forms itself:
+every member gossips a **self-signed address record** (its current
+dialable multiaddrs, sequence-numbered) on the same anti-entropy
+channel as membership events, and every daemon opportunistically dials
+members it knows addresses for but isn't connected to. libp2p races
+all known addresses, so the best real path wins — LAN beats WAN,
+whichever side *can* dial does, and one connection carries both
+directions. `fabric peer add` remains useful for pinning a lighthouse,
+not for wiring up every pair.
 
 **4. Promote the cloud node to lighthouse.** On `cloud-a`:
 
@@ -163,9 +168,11 @@ approval signs on the master and delivers through the lighthouse. The
 master can be asleep when joiners knock — they wait in the queue.
 
 Current limitation, honestly: two NAT'd nodes that don't share a LAN
-(laptop in a café ↔ NAS) have no direct path yet — traffic between
-them and the mesh flows only where direct dials exist. Relay fallback
-through lighthouse nodes + hole-punching is the next milestone.
+(laptop in a café ↔ NAS) still have no path — address gossip lets them
+*try* each other's addresses, but if neither can dial the other,
+nothing connects. Relay fallback through lighthouse nodes +
+hole-punching is the next milestone (relayed addresses will ride the
+same gossiped records).
 
 ## Kicking a device out
 

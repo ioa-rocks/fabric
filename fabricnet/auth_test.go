@@ -24,6 +24,7 @@ type node struct {
 	host  host.Host
 	store *MemberStore
 	auth  *AuthService
+	own   *cert.Cert // nil for strangers
 	joins atomic.Int32
 }
 
@@ -51,18 +52,17 @@ func newNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.PrivateKey, n
 	t.Cleanup(func() { h.Close() })
 	n.host = h
 
-	var own *cert.Cert
 	if member {
 		raw, err := priv.GetPublic().Raw()
 		if err != nil {
 			t.Fatal(err)
 		}
-		own, err = cert.Issue(nsPriv, ed25519.PublicKey(raw), cert.CmdMember, cert.Meta{Name: name}, time.Now(), 90*24*time.Hour)
+		n.own, err = cert.Issue(nsPriv, ed25519.PublicKey(raw), cert.CmdMember, cert.Meta{Name: name}, time.Now(), 90*24*time.Hour)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	n.auth = NewAuthService(h, n.store, own, grace, func(peer.ID, *cert.Cert) {
+	n.auth = NewAuthService(h, n.store, n.own, grace, func(peer.ID, *cert.Cert) {
 		n.joins.Add(1)
 	})
 

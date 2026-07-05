@@ -11,6 +11,8 @@ import (
 	"aethera.dev/fabric/event"
 
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 )
 
 func issueTestCert(nsPriv ed25519.PrivateKey, devPub ed25519.PublicKey, name string) (*cert.Cert, error) {
@@ -104,6 +106,58 @@ func TestAuthTriggersLogExchange(t *testing.T) {
 	waitFor(t, "joiner to receive the master's log", func() bool {
 		return hasEvent(j.log, added.ID())
 	})
+}
+
+// hydrate replays "everyone's admission events were gossiped" — each node
+// knows every other as a member before any connection exists, exactly like
+// a production daemon after event-log hydration.
+func hydrate(nodes ...*syncNode) {
+	for _, n := range nodes {
+		for _, o := range nodes {
+			if o != n {
+				n.store.AddMember(o.host.ID(), o.own)
+			}
+		}
+	}
+}
+
+// Address gossip: m—a—b, where m and b never exchanged addresses out of
+// band. m must learn b's signed address record through a (anti-entropy
+// relay into the certified addr book) and then reach b with nothing but
+// its peerstore — the triangle closes itself.
+func TestAddressGossipClosesTheTriangle(t *testing.T) {
+	nsPub, nsPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newSyncNode(t, nsPub, nsPriv, "master")
+	a := newSyncNode(t, nsPub, nsPriv, "relay")
+	b := newSyncNode(t, nsPub, nsPriv, "far")
+	hydrate(m, a, b)
+
+	connect(t, a.node, b.node)
+	connect(t, m.node, a.node)
+
+	// m must acquire b's addresses purely via gossip…
+	waitFor(t, "master to learn far's addresses via gossip", func() bool {
+		return len(m.host.Peerstore().Addrs(b.host.ID())) > 0
+	})
+
+	// …and the gossiped record must be b's own signed one.
+	cab, ok := m.host.Peerstore().(peerstore.CertifiedAddrBook)
+	if !ok || cab.GetPeerRecord(b.host.ID()) == nil {
+		t.Fatal("no certified (signed) record for far on master")
+	}
+
+	// Mesh-fill's dial: connect using only peerstore knowledge.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.host.Connect(ctx, peer.AddrInfo{ID: b.host.ID()}); err != nil {
+		t.Fatalf("connecting via gossiped addresses: %v", err)
+	}
+	if m.host.Network().Connectedness(b.host.ID()) != network.Connected {
+		t.Fatal("m-b link did not come up")
+	}
 }
 
 // A revocation published by the master must reach a peer it is not directly

@@ -62,6 +62,7 @@ type Daemon struct {
 	teleMu       sync.Mutex
 	rtt          map[peer.ID]time.Duration
 	reachability string
+	lastDial     map[peer.ID]time.Time // mesh-fill backoff
 }
 
 // New assembles a daemon from a state directory. The node must already hold
@@ -116,6 +117,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		Dir: dir, Config: cfg, Host: h, Store: store, Log: evLog,
 		ownCert: own, ctx: ctx, cancel: cancel,
 		rtt: make(map[peer.ID]time.Duration), reachability: "unknown",
+		lastDial: make(map[peer.ID]time.Time),
 	}
 	d.hydrateStore()
 
@@ -528,6 +530,7 @@ func (d *Daemon) reconnectLoop() {
 	defer tick.Stop()
 	for {
 		d.connectBootstrap()
+		d.meshFill()
 		d.measureRTT()
 		d.refreshRoutes()
 		now := time.Now()
@@ -566,6 +569,45 @@ func (d *Daemon) connectBootstrap() {
 			}
 			cancel()
 		}
+	}
+}
+
+// meshFillBackoff spaces dial attempts to an unreachable member; the mesh
+// keeps trying forever, just not on every tick.
+const meshFillBackoff = 2 * time.Minute
+
+// meshFill opportunistically dials members we know addresses for but hold
+// no connection to (connectivity-model memo: the connection plane's lazy
+// side). Addresses come from gossiped signed peer records via the
+// certified addr book; libp2p races all known addresses, so the best
+// path wins — LAN over WAN, whichever side can dial. One connection
+// serves both directions.
+func (d *Daemon) meshFill() {
+	now := time.Now()
+	members, _ := d.Store.Snapshot()
+	for p := range members {
+		if p == d.Host.ID() || d.Host.Network().Connectedness(p) == network.Connected {
+			continue
+		}
+		if len(d.Host.Peerstore().Addrs(p)) == 0 {
+			continue // no known addresses — nothing to try yet
+		}
+		d.teleMu.Lock()
+		recent := now.Sub(d.lastDial[p]) < meshFillBackoff
+		if !recent {
+			d.lastDial[p] = now
+		}
+		d.teleMu.Unlock()
+		if recent {
+			continue
+		}
+		go func(p peer.ID) {
+			ctx, cancel := context.WithTimeout(d.ctx, 15*time.Second)
+			defer cancel()
+			if err := d.Host.Connect(ctx, peer.AddrInfo{ID: p}); err == nil {
+				log.Printf("mesh: connected to %s via gossiped addresses", p)
+			}
+		}(p)
 	}
 }
 
