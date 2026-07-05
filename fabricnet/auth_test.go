@@ -38,9 +38,11 @@ func newNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.PrivateKey, n
 	}
 
 	n := &node{store: NewMemberStore(nsPub)}
+	// QUIC + TCP, like the real daemon — the QUIC path must stay exercised
+	// (a quic-go/Go-toolchain mismatch once panicked only on real dials).
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
-		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
+		libp2p.ListenAddrStrings("/ip4/127.0.0.1/udp/0/quic-v1", "/ip4/127.0.0.1/tcp/0"),
 		libp2p.ConnectionGater(NewGater(n.store)),
 	)
 	if err != nil {
