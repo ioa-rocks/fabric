@@ -386,13 +386,25 @@ func cmdJoin(args []string) error {
 	fmt.Printf("waiting for approval")
 
 	var resp *admission.JoinResponse
+	lastErr := ""
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		resp, err = admission.Request(ctx, h, target.ID, req)
 		cancel()
 		switch {
 		case err != nil:
-			fmt.Print("!") // queue host unreachable; keep trying
+			// Say why, once per distinct reason — "protocol not supported"
+			// means the target runs no admission queue (not master, no
+			// `fabric queue on`); other errors are reachability.
+			if msg := err.Error(); msg != lastErr {
+				lastErr = msg
+				fmt.Printf("\njoin attempt failed (will keep retrying): %v\n", err)
+				if strings.Contains(msg, "protocols not supported") || strings.Contains(msg, "protocol not supported") {
+					fmt.Println("hint: the bootstrap node does not accept join requests — point at the master, or run 'fabric queue on' there")
+				}
+				fmt.Print("waiting")
+			}
+			fmt.Print("!")
 		case resp.Status == admission.StatusApproved:
 			goto approved
 		case resp.Status == admission.StatusDenied:
