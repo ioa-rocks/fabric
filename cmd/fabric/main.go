@@ -8,8 +8,10 @@ import (
 	"crypto/rand"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -115,7 +117,7 @@ func usage() {
   revoke   revoke a member by name, peer ID, or fingerprint (master)
   ui       serve the topology/admin web UI on localhost
   queue    queue on|off — run the admission queue on this node (lighthouse)
-  dns      dns on|off — serve .fabric names on this node (default on with TUN)
+  dns      dns on|off; sudo dns setup — allow resolver self-registration
   peer     peer add <multiaddr> — add a bootstrap peer
 
 Every command accepts -state <dir> (default `+state.DefaultPath()+`).
@@ -693,9 +695,28 @@ func cmdQueue(args []string) error {
 	return nil
 }
 
+// polkitRulePath and the rule let the unprivileged daemon register its
+// .fabric resolver with systemd-resolved on every start, silently.
+const polkitRulePath = "/etc/polkit-1/rules.d/50-fabric-dns.rules"
+
+const polkitRuleTemplate = `// Installed by 'sudo fabric dns setup'.
+// Lets the fabric daemon (running as %[1]q) point systemd-resolved's
+// ~fabric routing domain at its own .fabric resolver.
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.resolve1.set-dns-servers" ||
+         action.id == "org.freedesktop.resolve1.set-domains") &&
+        subject.user == %[1]q) {
+        return polkit.Result.YES;
+    }
+});
+`
+
 func cmdDNS(args []string) error {
+	if len(args) >= 1 && args[0] == "setup" {
+		return dnsSetup(args[1:])
+	}
 	if len(args) < 1 || (args[0] != "on" && args[0] != "off") {
-		return fmt.Errorf("usage: fabric dns on|off [-state <dir>]")
+		return fmt.Errorf("usage: fabric dns on|off  |  sudo fabric dns setup")
 	}
 	fs := flag.NewFlagSet("dns", flag.ExitOnError)
 	statePath := stateFlag(fs)
@@ -721,6 +742,41 @@ func cmdDNS(args []string) error {
 		fmt.Println(".fabric resolver disabled; restart the daemon to apply")
 	} else {
 		fmt.Println(".fabric resolver enabled (serves whenever the TUN bridge is up); restart the daemon to apply")
+	}
+	return nil
+}
+
+// dnsSetup installs the polkit rule (one sudo moment, survives reboots) and
+// registers the resolver right away if the TUN device is already up.
+func dnsSetup(args []string) error {
+	fs := flag.NewFlagSet("dns setup", flag.ExitOnError)
+	user := fs.String("user", os.Getenv("SUDO_USER"), "user the fabric daemon runs as")
+	fs.Parse(args)
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("dns setup writes %s — run it as: sudo fabric dns setup", polkitRulePath)
+	}
+	if *user == "" || *user == "root" {
+		return fmt.Errorf("cannot determine the daemon user; pass -user <name>")
+	}
+	rule := fmt.Sprintf(polkitRuleTemplate, *user)
+	if err := os.WriteFile(polkitRulePath, []byte(rule), 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("installed %s for user %q — the daemon can now register its resolver on every start\n", polkitRulePath, *user)
+
+	// If fabric0 is already up, register now so no daemon restart is needed.
+	if ifc, err := net.InterfaceByName("fabric0"); err == nil {
+		if addrs, err := ifc.Addrs(); err == nil {
+			for _, a := range addrs {
+				if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
+					if exec.Command("resolvectl", "dns", "fabric0", ipn.IP.String()).Run() == nil &&
+						exec.Command("resolvectl", "domain", "fabric0", "~fabric").Run() == nil {
+						fmt.Printf("registered ~fabric via %s with systemd-resolved\n", ipn.IP)
+					}
+					break
+				}
+			}
+		}
 	}
 	return nil
 }
