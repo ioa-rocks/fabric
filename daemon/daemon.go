@@ -7,8 +7,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +21,7 @@ import (
 	"aethera.dev/fabric/state"
 	"aethera.dev/fabric/tunbridge"
 
+	"github.com/godbus/dbus/v5"
 	"github.com/libp2p/go-libp2p"
 	libp2pevent "github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -284,20 +285,50 @@ func (d *Daemon) dnsLookup(host string) (netip.Addr, bool) {
 	return netip.Addr{}, false
 }
 
-// registerResolver points systemd-resolved's ~fabric routing domain at us,
-// best-effort: it needs privileges the daemon usually lacks, so on failure
-// we print the one-time commands instead.
+// registerResolver points systemd-resolved's ~fabric routing domain at
+// this node's resolver, via D-Bus with interactive authorization OFF — a
+// daemon must never pop auth prompts or hang a tty. It succeeds silently
+// when permitted (root, or the polkit rule from the README); otherwise we
+// print what to run instead.
 func (d *Daemon) registerResolver(ip netip.Addr) {
-	dnsCmd := exec.Command("resolvectl", "dns", "fabric0", ip.String())
-	domainCmd := exec.Command("resolvectl", "domain", "fabric0", "~"+fabricdns.Suffix)
-	if err := dnsCmd.Run(); err == nil {
-		if err := domainCmd.Run(); err == nil {
-			log.Printf("dns: registered with systemd-resolved (~%s via %s)", fabricdns.Suffix, ip)
-			return
-		}
+	if err := registerWithResolved(ip); err != nil {
+		log.Printf("dns: not registered with systemd-resolved (%v)", err)
+		log.Printf("dns: to route *.%s names here, run (once per daemon start):", fabricdns.Suffix)
+		log.Printf("dns:   sudo resolvectl dns fabric0 %s && sudo resolvectl domain fabric0 '~%s'", ip, fabricdns.Suffix)
+		log.Printf("dns: or install the polkit rule from the README so the daemon may do this itself")
+		return
 	}
-	log.Printf("dns: could not register with systemd-resolved; to enable `ssh <name>.%s`, run once per daemon start:", fabricdns.Suffix)
-	log.Printf("dns:   sudo resolvectl dns fabric0 %s && sudo resolvectl domain fabric0 '~%s'", ip, fabricdns.Suffix)
+	log.Printf("dns: registered with systemd-resolved (~%s via %s)", fabricdns.Suffix, ip)
+}
+
+func registerWithResolved(ip netip.Addr) error {
+	ifc, err := net.InterfaceByName("fabric0")
+	if err != nil {
+		return err
+	}
+	conn, err := dbus.SystemBus() // shared connection; not ours to close
+	if err != nil {
+		return err
+	}
+	obj := conn.Object("org.freedesktop.resolve1", "/org/freedesktop/resolve1")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	type dnsServer struct {
+		Family  int32
+		Address []byte
+	}
+	call := obj.CallWithContext(ctx, "org.freedesktop.resolve1.Manager.SetLinkDNS", 0,
+		int32(ifc.Index), []dnsServer{{Family: 2 /* AF_INET */, Address: ip.AsSlice()}})
+	if call.Err != nil {
+		return call.Err
+	}
+	type domain struct {
+		Name      string
+		RouteOnly bool
+	}
+	return obj.CallWithContext(ctx, "org.freedesktop.resolve1.Manager.SetLinkDomains", 0,
+		int32(ifc.Index), []domain{{Name: fabricdns.Suffix, RouteOnly: true}}).Err
 }
 
 // refreshRoutes rebuilds the overlay routing table from the member store —

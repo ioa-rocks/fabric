@@ -159,6 +159,25 @@ sudo resolvectl dns fabric0 <your-overlay-ip>
 sudo resolvectl domain fabric0 '~fabric'
 ```
 
+The daemon attempts this itself over D-Bus with interactive
+authorization disabled — it will never pop an auth dialog or hang a
+tty. To let it succeed as a normal user (so names configure themselves
+on every start), install a polkit rule once:
+
+```sh
+sudo tee /etc/polkit-1/rules.d/50-fabric-dns.rules >/dev/null <<'EOF'
+// Allow the fabric daemon (running as this user) to point
+// systemd-resolved's ~fabric routing domain at its own resolver.
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.resolve1.set-dns-servers" ||
+         action.id == "org.freedesktop.resolve1.set-domains") &&
+        subject.user == "YOUR_USER") {
+        return polkit.Result.YES;
+    }
+});
+EOF
+```
+
 End-to-end proof without touching real interfaces:
 `go build -o fabric ./cmd/fabric && sudo scripts/e2e-tun.sh` — two
 network namespaces, a veth pair, ICMP + TCP across the overlay.
