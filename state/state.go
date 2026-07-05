@@ -5,6 +5,7 @@
 //	device.key         — libp2p ed25519 identity (protobuf), 0600
 //	cert.cbor          — this node's membership certificate
 //	events.cbor        — membership-event log (admissions, revocations)
+//	records.cbor       — cached signed peer address records (restart warm-up)
 //	namespace.key.age  — namespace root seed, master only (see keystore)
 //	control.sock       — daemon control socket, runtime only
 package state
@@ -65,6 +66,7 @@ func (d Dir) configPath() string    { return filepath.Join(d.Path, "config.json"
 func (d Dir) deviceKeyPath() string { return filepath.Join(d.Path, "device.key") }
 func (d Dir) certPath() string      { return filepath.Join(d.Path, "cert.cbor") }
 func (d Dir) eventsPath() string    { return filepath.Join(d.Path, "events.cbor") }
+func (d Dir) recordsPath() string   { return filepath.Join(d.Path, "records.cbor") }
 
 // KeystorePath is where the master's namespace root seed lives.
 func (d Dir) KeystorePath() string { return filepath.Join(d.Path, "namespace.key.age") }
@@ -162,6 +164,35 @@ func (d Dir) SaveEvents(evs []*event.Event) error {
 		return err
 	}
 	return os.WriteFile(d.eventsPath(), data, 0o600)
+}
+
+// SaveRecords persists gossiped signed address-record envelopes, so a
+// restarted node can dial members straight away instead of waiting to
+// re-learn WHERE everyone is. The envelopes are signed by their subjects;
+// staleness is bounded by the gossip TTL applied when they are re-consumed.
+func (d Dir) SaveRecords(recs [][]byte) error {
+	data, err := cbor.Marshal(recs)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(d.recordsPath(), data, 0o600)
+}
+
+// LoadRecords returns (nil, nil) when no record cache exists yet. Records
+// are untrusted until their envelope signatures verify on consumption.
+func (d Dir) LoadRecords() ([][]byte, error) {
+	data, err := os.ReadFile(d.recordsPath())
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var recs [][]byte
+	if err := cbor.Unmarshal(data, &recs); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", d.recordsPath(), err)
+	}
+	return recs, nil
 }
 
 // LoadEvents returns (nil, nil) when no event log exists yet. Events are

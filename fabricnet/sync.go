@@ -3,6 +3,7 @@ package fabricnet
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -351,6 +352,26 @@ func (s *EventSync) consumeRecord(data []byte, now time.Time) bool {
 	s.mu.Unlock()
 	return true
 }
+
+// SeedRecords replays persisted address records into the address book —
+// the restart warm-up. Consumption verifies each envelope and checks
+// membership as usual; nothing is pushed (peers get records through the
+// normal anti-entropy on connect).
+func (s *EventSync) SeedRecords(recs [][]byte) {
+	now := time.Now()
+	n := 0
+	for _, data := range recs {
+		if s.consumeRecord(data, now) {
+			n++
+		}
+	}
+	log.Printf("address cache: %d member record(s) restored", n)
+}
+
+// KnownRecords returns this node's own signed address record plus the
+// freshest record held for every current member — the set worth
+// persisting across a restart.
+func (s *EventSync) KnownRecords() [][]byte { return s.knownRecords() }
 
 // knownRecords returns our own signed address record plus the freshest
 // record we hold for every current member.

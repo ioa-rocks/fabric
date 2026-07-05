@@ -4,11 +4,14 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"net"
 	"net/netip"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -67,6 +70,7 @@ type Daemon struct {
 	rtt          map[peer.ID]time.Duration
 	reachability string
 	lastDial     map[peer.ID]time.Time // mesh-fill backoff
+	recordsHash  [32]byte              // last persisted record-cache digest
 
 	graph graphCache // aggregated mesh link state for the UI
 }
@@ -188,6 +192,15 @@ func New(dir state.Dir) (*Daemon, error) {
 	})
 	d.Sync = fabricnet.NewEventSync(h, evLog, store, d.applyEvent)
 	d.Auth.SetOnAuthenticated(d.Sync.ExchangeAsync)
+
+	// Warm the address book from the persisted record cache: a freshly
+	// restarted node can then dial members (mesh-fill, TUN) without first
+	// re-learning WHERE they are through a live gossip exchange.
+	if recs, err := dir.LoadRecords(); err != nil {
+		log.Printf("record cache unreadable, starting cold: %v", err)
+	} else if len(recs) > 0 {
+		d.Sync.SeedRecords(recs)
+	}
 
 	// RTT telemetry. The default ping handler answers anyone; re-wrap it so
 	// only members get an answer (spec §4: nothing reachable pre-auth).
@@ -627,6 +640,27 @@ func (d *Daemon) persistEvents() {
 	}
 }
 
+// persistRecords keeps the on-disk address-record cache in step with the
+// address book, writing only when the set actually changed.
+func (d *Daemon) persistRecords() {
+	recs := d.Sync.KnownRecords()
+	sort.Slice(recs, func(i, j int) bool { return bytes.Compare(recs[i], recs[j]) < 0 })
+	h := sha256.New()
+	for _, r := range recs {
+		h.Write(r)
+	}
+	var sum [sha256.Size]byte
+	h.Sum(sum[:0])
+	if sum == d.recordsHash {
+		return
+	}
+	if err := d.Dir.SaveRecords(recs); err != nil {
+		log.Printf("persisting record cache: %v", err)
+		return
+	}
+	d.recordsHash = sum
+}
+
 // reconnectLoop keeps the node connected and authenticated to its bootstrap
 // peers.
 func (d *Daemon) reconnectLoop() {
@@ -637,6 +671,7 @@ func (d *Daemon) reconnectLoop() {
 		d.meshFill()
 		d.measureRTT()
 		d.refreshRoutes()
+		d.persistRecords()
 		now := time.Now()
 		d.Store.GC(now)
 		d.Log.GC(now)
