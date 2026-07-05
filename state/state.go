@@ -36,6 +36,11 @@ type Config struct {
 	TUN          string   `json:"tun,omitempty"`        // "" = auto (try, fall back), "off"
 	QueueHost    bool     `json:"queue_host,omitempty"` // run the admission queue (lighthouse role)
 	DNS          string   `json:"dns,omitempty"`        // "" = serve .fabric when TUN is up, "off"
+	// AnnounceAddrs are advertised in addition to the interface-derived
+	// addresses — for reachable addresses no local interface carries, e.g.
+	// a cloud instance's 1:1-NAT'd public IP or DNS name. They ride the
+	// signed peer record like any discovered address.
+	AnnounceAddrs []string `json:"announce_addrs,omitempty"`
 }
 
 type Dir struct{ Path string }

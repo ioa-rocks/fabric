@@ -117,6 +117,18 @@ func New(dir state.Dir) (*Daemon, error) {
 		lastDial: make(map[peer.ID]time.Time),
 	}
 
+	// Announce addresses (config) join the advertised set: a node behind
+	// 1:1 NAT (cloud EIP) has no interface carrying its public address, so
+	// interface watching can never discover it — it must be told.
+	var announce []ma.Multiaddr
+	for _, s := range cfg.AnnounceAddrs {
+		m, err := ma.NewMultiaddr(s)
+		if err != nil {
+			return nil, fmt.Errorf("config announce_addrs %q: %w", s, err)
+		}
+		announce = append(announce, m)
+	}
+
 	opts := []libp2p.Option{
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
@@ -129,6 +141,25 @@ func New(dir state.Dir) (*Daemon, error) {
 		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelayWithPeerSource(d.relayCandidates,
 			autorelay.WithMinInterval(30*time.Second)),
+	}
+	if len(announce) > 0 {
+		opts = append(opts, libp2p.AddrsFactory(func(addrs []ma.Multiaddr) []ma.Multiaddr {
+			out := make([]ma.Multiaddr, len(addrs), len(addrs)+len(announce))
+			copy(out, addrs)
+			for _, a := range announce {
+				dup := false
+				for _, have := range addrs {
+					if have.Equal(a) {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					out = append(out, a)
+				}
+			}
+			return out
+		}))
 	}
 	if cfg.QueueHost {
 		// The lighthouse is also the mesh's relay and NAT oracle: a

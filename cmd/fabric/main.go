@@ -99,6 +99,8 @@ func main() {
 		err = cmdDNS(args)
 	case "peer":
 		err = cmdPeer(args)
+	case "announce":
+		err = cmdAnnounce(args)
 	default:
 		usage()
 		os.Exit(2)
@@ -127,6 +129,8 @@ func usage() {
   queue    queue on|off — run the admission queue on this node (lighthouse)
   dns      dns on|off; sudo dns setup — allow resolver self-registration
   peer     peer add <multiaddr> — add a bootstrap peer
+  announce announce add <multiaddr> — also advertise an address no local
+           interface carries (cloud public IP / DNS name)
 
 Every command accepts -state <dir> (default `+state.DefaultPath()+`).
 `)
@@ -996,5 +1000,42 @@ func cmdPeer(args []string) error {
 		return err
 	}
 	fmt.Println("peer added; the daemon picks it up on restart")
+	return nil
+}
+
+func cmdAnnounce(args []string) error {
+	if len(args) < 2 || args[0] != "add" {
+		return fmt.Errorf("usage: fabric announce add <multiaddr>")
+	}
+	fs := flag.NewFlagSet("announce add", flag.ExitOnError)
+	statePath := stateFlag(fs)
+	fs.Parse(args[1:])
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: fabric announce add <multiaddr>")
+	}
+	addr := fs.Arg(0)
+	if _, err := ma.NewMultiaddr(addr); err != nil {
+		return fmt.Errorf("multiaddr: %w", err)
+	}
+
+	dir, err := state.Open(*statePath)
+	if err != nil {
+		return err
+	}
+	cfg, err := dir.LoadConfig()
+	if err != nil {
+		return err
+	}
+	for _, existing := range cfg.AnnounceAddrs {
+		if existing == addr {
+			fmt.Println("announce address already configured")
+			return nil
+		}
+	}
+	cfg.AnnounceAddrs = append(cfg.AnnounceAddrs, addr)
+	if err := dir.SaveConfig(cfg); err != nil {
+		return err
+	}
+	fmt.Println("announce address added; the daemon picks it up on restart")
 	return nil
 }

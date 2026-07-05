@@ -103,11 +103,14 @@ fabric status    # on either device:
 Every node prints a `member joined:` line when a new member first
 appears — admissions are never silent, by design.
 
-## End to end: home + cloud, no inbound ports anywhere
+## End to end: home + cloud, no inbound ports at home
 
 The full runbook from nothing to a mesh spanning a NAT'd home and
 public cloud nodes. Key property: home machines only ever dial *out* —
-no router firewall holes, no DDNS, no stable-address fights.
+no router firewall holes, no DDNS, no stable-address fights. The one
+place that *does* need an open port is the lighthouse (step 4): the
+mesh needs a single publicly dialable anchor, and cloud instances sit
+behind their provider's firewall until told otherwise.
 
 **1. Master (the machine you sit at):**
 
@@ -151,11 +154,36 @@ whichever side *can* dial does, and one connection carries both
 directions. `fabric peer add` remains useful for pinning a lighthouse,
 not for wiring up every pair.
 
-**4. Promote the cloud node to lighthouse.** On `cloud-a`:
+**4. Promote the cloud node to lighthouse.** Three things make a
+working lighthouse: the queue role, an open port, and an announced
+public address.
 
 ```sh
+# on cloud-a:
 fabric queue on    # restart the daemon to apply
 ```
+
+**Open the fabric port** in the provider's firewall (AWS security
+group, GCP firewall rule, …): **UDP 4517** (QUIC, the preferred
+transport) and **TCP 4517** (fallback), source anywhere. Home members
+still need nothing opened — they dial out to the lighthouse, and
+NAT'd pairs meet through it (step 6).
+
+**Announce the public address.** A cloud instance's public IP is 1:1
+NAT at the provider's edge — it is never on an interface inside the
+VM, so the daemon cannot discover it and would otherwise advertise
+only private addresses (if your nodes also share a VPN, the mesh will
+quietly ride *that* instead — every path a node advertises is raced):
+
+```sh
+fabric announce add /dns4/gate.example.com/udp/4517/quic-v1
+fabric announce add /dns4/gate.example.com/tcp/4517
+# (an /ip4/<elastic-ip>/... form works too; DNS survives re-IPs)
+```
+
+The announced addresses join the node's signed address record and
+reach every member over the normal gossip — no per-node `peer add`
+needed once this is set.
 
 **5. Every further node — join via the lighthouse**, no tunnels, no
 master reachability needed:
@@ -362,6 +390,7 @@ of its own; don't point `-listen` at a routable interface.
 | `fabric ui [-listen 127.0.0.1:4518]` | any member | serve the topology/admin web UI |
 | `fabric queue on\|off` | any member | run the admission queue (lighthouse role) |
 | `fabric peer add <multiaddr>` | any member | add a bootstrap peer |
+| `fabric announce add <multiaddr>` | cloud/1:1-NAT nodes | also advertise an address no local interface carries |
 
 All commands take `-state <dir>` (default `~/.config/fabric`), so
 several nodes can run on one machine for testing. Flags go **before**
