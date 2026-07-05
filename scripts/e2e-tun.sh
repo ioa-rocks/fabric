@@ -17,6 +17,9 @@ PIDS=()
 cleanup() {
   set +e
   kill "${PIDS[@]}" 2>/dev/null
+  # killing the `ip netns exec` wrappers orphans the daemons inside —
+  # take those out by their state-dir paths too
+  pkill -f "up -state $WORK" 2>/dev/null
   sleep 0.3
   ip netns del fabA 2>/dev/null
   ip netns del fabB 2>/dev/null
