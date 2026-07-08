@@ -148,21 +148,11 @@ func New(dir state.Dir) (*Daemon, error) {
 	}
 	if len(announce) > 0 {
 		opts = append(opts, libp2p.AddrsFactory(func(addrs []ma.Multiaddr) []ma.Multiaddr {
-			out := make([]ma.Multiaddr, len(addrs), len(addrs)+len(announce))
-			copy(out, addrs)
-			for _, a := range announce {
-				dup := false
-				for _, have := range addrs {
-					if have.Equal(a) {
-						dup = true
-						break
-					}
-				}
-				if !dup {
-					out = append(out, a)
-				}
-			}
-			return out
+			return advertiseAddrs(addrs, announce)
+		}))
+	} else {
+		opts = append(opts, libp2p.AddrsFactory(func(addrs []ma.Multiaddr) []ma.Multiaddr {
+			return advertiseAddrs(addrs, nil)
 		}))
 	}
 	if cfg.QueueHost {
