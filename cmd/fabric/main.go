@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -25,6 +26,8 @@ import (
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
 	"ioa.rocks/fabric/tunbridge"
+	"ioa.rocks/fabric/vault/circle"
+	vaultdaemon "ioa.rocks/fabric/vault/daemon"
 	"ioa.rocks/fabric/webui"
 
 	"github.com/libp2p/go-libp2p"
@@ -259,6 +262,8 @@ func cmdUp(args []string) error {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
 	statePath := stateFlag(fs)
 	noTun := fs.Bool("no-tun", false, "run without the TUN bridge for this run")
+	vaultState := fs.String("vault-state", circle.DefaultPath(), "vault state directory (subsystem activates when a circle exists there)")
+	noVault := fs.Bool("no-vault", false, "run without the vault subsystem for this run")
 	fs.Parse(args)
 
 	dir, err := state.Open(*statePath)
@@ -270,13 +275,38 @@ func cmdUp(args []string) error {
 		return err
 	}
 	d.DisableTUN = *noTun
+
+	// The vault subsystem (ADR 0013): activated only when circle state
+	// exists — a pure-connectivity node never touches it. Attach before
+	// d.Run so handlers and the auth hook are in place for the first peer.
+	var vd *vaultdaemon.Daemon
+	if !*noVault {
+		if _, err := os.Stat(filepath.Join(*vaultState, "config.json")); err == nil {
+			vd, err = vaultdaemon.New(*vaultState, d)
+			if err != nil {
+				return fmt.Errorf("vault subsystem: %w", err)
+			}
+		}
+	}
+
 	go func() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 		<-ch
 		d.Stop()
 	}()
-	return d.Run()
+	if vd == nil {
+		return d.Run()
+	}
+
+	vaultErr := make(chan error, 1)
+	go func() { vaultErr <- vd.Run() }()
+	err = d.Run()
+	vd.Stop()
+	if verr := <-vaultErr; verr != nil && err == nil {
+		err = fmt.Errorf("vault subsystem: %w", verr)
+	}
+	return err
 }
 
 func cmdStatus(args []string) error {

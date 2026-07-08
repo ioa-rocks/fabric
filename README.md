@@ -1,18 +1,24 @@
 # fabric
 
-The connectivity layer of [Aethera]: a personal overlay network built on
-libp2p, replacing a hand-rolled Nebula deployment with human-gated,
-certificate-based membership and a topology/admin UI.
+The node implementation of [Aethera]: a personal overlay network built
+on libp2p — human-gated, certificate-based membership with a
+topology/admin UI — plus, on devices that opt in, **Vault**, the
+synchronized personal object store, as a subsystem of the same daemon
+(one process, one device identity per machine; ADR 0013). See
+[`vault/README.md`](vault/README.md) for the data layer; the rest of
+this README is the connectivity layer.
 
 Status: **pre-alpha** — daemon, CLI, the join-then-approve admission
 flow, revocation with membership-event gossip, the topology/admin web
 UI, the optional TUN bridge (existing TCP/UDP apps over overlay IPs),
 self-forming mesh (address gossip), and NAT traversal (members-only
-relay through lighthouses + hole-punching) work end-to-end.
+relay through lighthouses + hole-punching) work end-to-end. Vault:
+buckets/objects/tags, catalog+index anti-entropy, subscription-driven
+blob transfer over member-gated protocols.
 
 Design documents live in the Aethera project folder
-(`components/fabric/` — security-model spec, ADRs, surveys); this repo is
-implementation only.
+(`components/fabric/` and `components/vault/` — security-model spec,
+bucket-model memo, ADRs, surveys); this repo is implementation only.
 
 ## Build
 
@@ -404,7 +410,7 @@ of its own; don't point `-listen` at a routable interface.
 | Command | Where | What |
 |---|---|---|
 | `fabric init -name <label>` | first device | mint the namespace, become master |
-| `fabric up` | any member | run the node daemon |
+| `fabric up` | any member | run the node daemon (activates the vault subsystem when circle state exists; `-no-vault` / `-vault-state <dir>`) |
 | `fabric status` | any member | node, membership, and connection state |
 | `fabric graph [-json]` | any member | whole-mesh link map, human or machine readable |
 | `fabric join -name <label> <host \| -bootstrap <addr>>` | new device | request admission and wait; bare hostname resolves via its `_fabric` TXT record |
@@ -464,6 +470,9 @@ scripts).
   address while the bridge is up.
 - `state` — the state directory: config, device key, own cert,
   keystore path, control socket.
+- `vault/…` — the data layer: `bucket`, `blobstore`, `index`,
+  `circle`, and the vault subsystem daemon; `cmd/vault` is its data
+  CLI. See [`vault/README.md`](vault/README.md).
 
 ## Development
 
