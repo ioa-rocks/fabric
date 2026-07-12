@@ -32,6 +32,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
+	"github.com/libp2p/go-libp2p/p2p/protocol/autonatv2"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
@@ -184,6 +185,15 @@ func New(dir state.Dir) (*Daemon, error) {
 	h, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("starting libp2p host: %w", err)
+	}
+	if !cfg.QueueHost {
+		// NAT oracles are a lighthouse role, for v2 exactly as for v1: a
+		// same-LAN member dialing our global v6 answers on-link without
+		// ever crossing the router's WAN firewall, and would certify an
+		// address as reachable that the internet cannot reach. Only
+		// off-site queue hosts get to hand out verdicts; every node keeps
+		// the v2 *client* (dial-back handler) so it can be verified.
+		h.RemoveStreamHandler(autonatv2.DialProtocol)
 	}
 	d.Host = h
 	d.hydrateStore()
