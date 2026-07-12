@@ -132,10 +132,10 @@ dl.kv dd { margin: 0; font-size: 12.5px; overflow-wrap: anywhere; }
 .pending-item { border-top: 1px solid var(--line); padding: 10px 0; }
 .pending-item:first-child { border-top: none; padding-top: 2px; }
 
-/* revoked tombstones: present but visually retired */
-.revoked-item { border-top: 1px solid var(--line); padding: 10px 0; opacity: 0.6; cursor: pointer; }
+/* revoked tombstones: present but visually retired and outside the topology */
+.revoked-card { margin-top: 14px; }
+.revoked-item { border-top: 1px solid var(--line); padding: 10px 0; opacity: 0.6; }
 .revoked-item:first-child { border-top: none; padding-top: 2px; }
-.revoked-item:hover { opacity: 1; }
 .revoked-item .muted { margin: 4px 0 0; font-size: 12px; }
 
 button.action {
