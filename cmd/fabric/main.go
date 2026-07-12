@@ -342,6 +342,19 @@ func cmdStatus(args []string) error {
 		}
 		fmt.Printf("overlay %s — %s\n", s.OverlayIP, tun)
 	}
+	if s.Reachability != "" {
+		fmt.Printf("nat %s", strings.ToLower(s.Reachability))
+		if len(s.ReachableAddrs)+len(s.UnreachableAddrs) > 0 {
+			fmt.Printf(" — per address:")
+		}
+		fmt.Println()
+		for _, a := range s.ReachableAddrs {
+			fmt.Printf("  reachable    %s\n", a)
+		}
+		for _, a := range s.UnreachableAddrs {
+			fmt.Printf("  unreachable  %s\n", a)
+		}
+	}
 	for _, a := range s.Addrs {
 		fmt.Printf("  listen %s\n", a)
 	}

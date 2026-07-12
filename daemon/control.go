@@ -81,8 +81,14 @@ type StatusReply struct {
 	NamespaceDID string       `json:"namespace_did"`
 	Master       bool         `json:"master"`       // holds the namespace root key
 	QueueHost    bool         `json:"queue_host"`   // runs the admission queue (lighthouse role)
-	Reachability string       `json:"reachability"` // autonat: public / private / unknown
-	OverlayIP    string       `json:"overlay_ip,omitempty"`
+	Reachability string       `json:"reachability"` // autonat v1 node verdict: public / private / unknown
+	// Per-address verdicts (autonat v2): which public addresses peers
+	// could actually dial back. On dual-stack NAT'd lines these carry the
+	// real story the single word above can't.
+	ReachableAddrs   []string `json:"reachable_addrs,omitempty"`
+	UnreachableAddrs []string `json:"unreachable_addrs,omitempty"`
+	UnverifiedAddrs  []string `json:"unverified_addrs,omitempty"`
+	OverlayIP        string   `json:"overlay_ip,omitempty"`
 	CertExpiry   *time.Time   `json:"cert_expiry,omitempty"` // this node's own cert
 	TUNActive    bool         `json:"tun_active"`
 	DNSActive    bool         `json:"dns_active"`
@@ -162,6 +168,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		TUNActive:    d.Bridge != nil,
 		DNSActive:    d.DNS != nil,
 	}
+	reply.ReachableAddrs, reply.UnreachableAddrs, reply.UnverifiedAddrs = d.AddrReachability()
 	ownExp := d.OwnCert().Expiry()
 	reply.CertExpiry = &ownExp
 	for _, a := range d.Host.Addrs() {

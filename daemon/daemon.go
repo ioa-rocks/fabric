@@ -70,8 +70,11 @@ type Daemon struct {
 	teleMu       sync.Mutex
 	rtt          map[peer.ID]time.Duration
 	reachability string
-	lastDial     map[peer.ID]time.Time // mesh-fill backoff
-	recordsHash  [32]byte              // last persisted record-cache digest
+	// Per-address verdicts (autonat v2): which of our public addresses
+	// peers could actually dial back.
+	reachableAddrs, unreachableAddrs, unknownAddrs []string
+	lastDial    map[peer.ID]time.Time // mesh-fill backoff
+	recordsHash [32]byte              // last persisted record-cache digest
 
 	// Expanded announce set (announce.go); swapped by the re-resolve
 	// watcher, read by the AddrsFactory on every advertisement.
@@ -147,6 +150,13 @@ func New(dir state.Dir) (*Daemon, error) {
 		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelayWithPeerSource(d.relayCandidates,
 			autorelay.WithMinInterval(30*time.Second)),
+		// AutoNAT v2: per-address reachability. v1 above gives the single
+		// node verdict that drives autorelay; v2 answers the question v1
+		// can't — WHICH addresses work. On a CGNAT-v4 + firewalled-v6 home
+		// line the truth is genuinely per-address, and confirmed-dead
+		// addresses are dropped from the gossiped record automatically.
+		// Every node is also a v2 dial-back server for its peers.
+		libp2p.EnableAutoNATv2(),
 		libp2p.AddrsFactory(func(addrs []ma.Multiaddr) []ma.Multiaddr {
 			return advertiseAddrs(addrs, *d.announced.Load())
 		}),
@@ -444,10 +454,15 @@ func (d *Daemon) refreshRoutes() {
 	d.Bridge.SetRoutes(routes)
 }
 
-// watchReachability tracks the autonat verdict about this node's NAT
-// situation (public / private / unknown) for the status API.
+// watchReachability tracks the autonat verdicts for the status API: the
+// node-level v1 verdict (public / private / unknown — what autorelay keys
+// off) and the per-address v2 verdicts (which addresses actually work; on
+// dual-stack NAT'd lines the two differ per address).
 func (d *Daemon) watchReachability() {
-	sub, err := d.Host.EventBus().Subscribe(new(libp2pevent.EvtLocalReachabilityChanged))
+	sub, err := d.Host.EventBus().Subscribe([]any{
+		new(libp2pevent.EvtLocalReachabilityChanged),
+		new(libp2pevent.EvtHostReachableAddrsChanged),
+	})
 	if err != nil {
 		return
 	}
@@ -460,12 +475,32 @@ func (d *Daemon) watchReachability() {
 			if !ok {
 				return
 			}
-			r := ev.(libp2pevent.EvtLocalReachabilityChanged).Reachability
-			d.teleMu.Lock()
-			d.reachability = r.String()
-			d.teleMu.Unlock()
+			switch e := ev.(type) {
+			case libp2pevent.EvtLocalReachabilityChanged:
+				d.teleMu.Lock()
+				d.reachability = e.Reachability.String()
+				d.teleMu.Unlock()
+			case libp2pevent.EvtHostReachableAddrsChanged:
+				d.teleMu.Lock()
+				d.reachableAddrs = addrStrings(e.Reachable)
+				d.unreachableAddrs = addrStrings(e.Unreachable)
+				d.unknownAddrs = addrStrings(e.Unknown)
+				d.teleMu.Unlock()
+			}
 		}
 	}
+}
+
+func addrStrings(addrs []ma.Multiaddr) []string {
+	if len(addrs) == 0 {
+		return nil
+	}
+	out := make([]string, len(addrs))
+	for i, a := range addrs {
+		out[i] = a.String()
+	}
+	sort.Strings(out)
+	return out
 }
 
 // measureRTT pings every connected member once, in the background.
@@ -502,6 +537,15 @@ func (d *Daemon) Reachability() string {
 	d.teleMu.Lock()
 	defer d.teleMu.Unlock()
 	return d.reachability
+}
+
+// AddrReachability returns the per-address autonat v2 verdicts: which of
+// this node's public addresses peers could / could not dial back, and
+// which are still unverified.
+func (d *Daemon) AddrReachability() (reachable, unreachable, unknown []string) {
+	d.teleMu.Lock()
+	defer d.teleMu.Unlock()
+	return d.reachableAddrs, d.unreachableAddrs, d.unknownAddrs
 }
 
 // AllocateOverlayIP picks the next free overlay address for a new member.

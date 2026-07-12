@@ -309,6 +309,10 @@ function addrList(kv, n) {
   for (const a of addrs) {
     const row = document.createElement("div");
     row.append(mono(a));
+    /* A /p2p-circuit entry is the relay fallback: "reach me via this
+       lighthouse" — advertised by NAT'd nodes, upgraded to direct by
+       hole-punching when possible. */
+    if (a.includes("/p2p-circuit")) row.append(" ← relay fallback");
     dd.append(row);
   }
 }
@@ -340,6 +344,12 @@ function renderSelf(d, box) {
   }
   add(kv, "peer ID", mono(d.status.peer_id));
   add(kv, "NAT", (d.status.reachability || "unknown").toLowerCase());
+  /* Per-address verdicts (autonat v2) — on dual-stack NAT'd lines the
+     single word above hides the real story (e.g. v4 reachable through a
+     friendly CGNAT while the global v6 is firewalled). */
+  for (const a of d.status.reachable_addrs || []) add(kv, "· reachable", mono(a));
+  for (const a of d.status.unreachable_addrs || []) add(kv, "· unreachable", mono(a));
+  for (const a of d.status.unverified_addrs || []) add(kv, "· unverified", mono(a));
   if (d.status.cert_expiry) expiryRow(kv, d.status.cert_expiry);
   for (const a of d.status.addrs || []) {
     const parts = a.split("/");
