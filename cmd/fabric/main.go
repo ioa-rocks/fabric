@@ -1152,9 +1152,10 @@ func cmdAnnounce(args []string) error {
 	}
 	fs := flag.NewFlagSet("announce add", flag.ExitOnError)
 	statePath := stateFlag(fs)
+	force := fs.Bool("force", false, "add even when the address verifiably points at a different node")
 	fs.Parse(args[1:])
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: fabric announce add <hostname|ip|multiaddr>")
+		return fmt.Errorf("usage: fabric announce add [-force] <hostname|ip|multiaddr>")
 	}
 	entry := fs.Arg(0)
 	// Operator-friendly forms: a bare DNS name ("gate.example.com"), a bare
@@ -1181,9 +1182,39 @@ func cmdAnnounce(args []string) error {
 			return nil
 		}
 	}
+
+	// Guardrail against announcing someone else's address: dial the
+	// expanded addresses expecting this node's own identity. A verified
+	// mismatch refuses (that record would gossip to every member); mere
+	// silence only warns — the daemon may not be running yet, the
+	// provider firewall may still be closed, or the NAT refuses hairpin.
+	priv, err := dir.LoadDeviceKey()
+	if err != nil {
+		return fmt.Errorf("device key: %w", err)
+	}
+	self, err := peerpkg.IDFromPrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	verified := false
+	switch outcome, detail := daemon.VerifyAnnounce(context.Background(), entry, cfg.ListenAddrs, self); outcome {
+	case daemon.VerifyOK:
+		verified = true
+	case daemon.VerifyMismatch:
+		if !*force {
+			return fmt.Errorf("%s does not route back to this node (%s) — check the DNS record / IP, or -force to add anyway", entry, detail)
+		}
+		fmt.Printf("warning: %s (-force, adding anyway)\n", detail)
+	case daemon.VerifyUnreachable:
+		fmt.Printf("note: could not verify %s routes back here (%s) — daemon not running, port not open yet, or hairpin unsupported; adding anyway\n", entry, detail)
+	}
+
 	cfg.AnnounceAddrs = append(cfg.AnnounceAddrs, entry)
 	if err := dir.SaveConfig(cfg); err != nil {
 		return err
+	}
+	if verified {
+		fmt.Printf("verified: %s routes back to this node\n", entry)
 	}
 	fmt.Printf("announcing %s — the daemon will advertise:\n", entry)
 	for _, m := range daemon.ExpandAnnounce([]string{entry}, cfg.ListenAddrs) {

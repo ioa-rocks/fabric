@@ -190,6 +190,12 @@ fabric announce add gate.example.com
 #  accepted as an escape hatch for unusual ports/transports.)
 ```
 
+The command verifies the name before saving it: it dials the derived
+addresses expecting this node's own identity. A name that verifiably
+points at a *different* machine is refused (`-force` overrides) — a
+wrong record would gossip to every member. Mere silence (daemon not
+started yet, firewall still closed, hairpin-refusing NAT) only warns.
+
 One name is all it takes: the daemon derives ports and transports
 from its listen config, resolves the name into IP-literal addresses
 (and keeps re-resolving while it runs, so dynamic DNS just works),
