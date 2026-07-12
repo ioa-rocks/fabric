@@ -134,8 +134,9 @@ func usage() {
   queue    queue on|off — run the admission queue on this node (lighthouse)
   dns      dns on|off; sudo dns setup — allow resolver self-registration
   peer     peer add <multiaddr> — add a bootstrap peer
-  announce announce add <multiaddr> — also advertise an address no local
-           interface carries (cloud public IP / DNS name);
+  announce announce add <hostname|ip|multiaddr> — also advertise an address
+           no local interface carries (cloud public IP / DNS name); ports,
+           transports, and resolved IPs are derived automatically;
            announce txt — print the DNS TXT record for hostname joins
 
 Every command accepts -state <dir> (default `+state.DefaultPath()+`).
@@ -1147,17 +1148,23 @@ func cmdAnnounce(args []string) error {
 		return cmdAnnounceTXT(args[1:])
 	}
 	if len(args) < 2 || args[0] != "add" {
-		return fmt.Errorf("usage: fabric announce add <multiaddr> | fabric announce txt")
+		return fmt.Errorf("usage: fabric announce add <hostname|ip|multiaddr> | fabric announce txt")
 	}
 	fs := flag.NewFlagSet("announce add", flag.ExitOnError)
 	statePath := stateFlag(fs)
 	fs.Parse(args[1:])
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: fabric announce add <multiaddr>")
+		return fmt.Errorf("usage: fabric announce add <hostname|ip|multiaddr>")
 	}
-	addr := fs.Arg(0)
-	if _, err := ma.NewMultiaddr(addr); err != nil {
-		return fmt.Errorf("multiaddr: %w", err)
+	entry := fs.Arg(0)
+	// Operator-friendly forms: a bare DNS name ("gate.example.com"), a bare
+	// IP, or a full multiaddr as the escape hatch. The daemon derives
+	// ports/transports from its listen config and resolves names into IP
+	// literals itself (daemon/announce.go).
+	if daemon.AnnounceKind(entry) == "host" {
+		if strings.ContainsAny(entry, "/: \t") || entry == "" {
+			return fmt.Errorf("%q is not a hostname, IP, or multiaddr", entry)
+		}
 	}
 
 	dir, err := state.Open(*statePath)
@@ -1169,16 +1176,23 @@ func cmdAnnounce(args []string) error {
 		return err
 	}
 	for _, existing := range cfg.AnnounceAddrs {
-		if existing == addr {
-			fmt.Println("announce address already configured")
+		if existing == entry {
+			fmt.Println("announce entry already configured")
 			return nil
 		}
 	}
-	cfg.AnnounceAddrs = append(cfg.AnnounceAddrs, addr)
+	cfg.AnnounceAddrs = append(cfg.AnnounceAddrs, entry)
 	if err := dir.SaveConfig(cfg); err != nil {
 		return err
 	}
-	fmt.Println("announce address added; the daemon picks it up on restart")
+	fmt.Printf("announcing %s — the daemon will advertise:\n", entry)
+	for _, m := range daemon.ExpandAnnounce([]string{entry}, cfg.ListenAddrs) {
+		fmt.Printf("  %s\n", m)
+	}
+	if daemon.AnnounceKind(entry) == "host" {
+		fmt.Println("(resolved addresses refresh automatically while the daemon runs)")
+	}
+	fmt.Println("restart the daemon to apply")
 	return nil
 }
 
@@ -1207,6 +1221,10 @@ func cmdAnnounceTXT(args []string) error {
 	}
 	host := "<this-node's-dns-name>"
 	for _, s := range cfg.AnnounceAddrs {
+		if daemon.AnnounceKind(s) == "host" {
+			host = s
+			break
+		}
 		if m, err := ma.NewMultiaddr(s); err == nil {
 			for _, p := range []int{ma.P_DNS4, ma.P_DNS6, ma.P_DNS} {
 				if v, err := m.ValueForProtocol(p); err == nil && v != "" {

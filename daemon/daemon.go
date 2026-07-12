@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ioa.rocks/fabric/admission"
@@ -72,6 +73,10 @@ type Daemon struct {
 	lastDial     map[peer.ID]time.Time // mesh-fill backoff
 	recordsHash  [32]byte              // last persisted record-cache digest
 
+	// Expanded announce set (announce.go); swapped by the re-resolve
+	// watcher, read by the AddrsFactory on every advertisement.
+	announced atomic.Pointer[[]ma.Multiaddr]
+
 	graph graphCache // aggregated mesh link state for the UI
 }
 
@@ -123,15 +128,12 @@ func New(dir state.Dir) (*Daemon, error) {
 
 	// Announce addresses (config) join the advertised set: a node behind
 	// 1:1 NAT (cloud EIP) has no interface carrying its public address, so
-	// interface watching can never discover it — it must be told.
-	var announce []ma.Multiaddr
-	for _, s := range cfg.AnnounceAddrs {
-		m, err := ma.NewMultiaddr(s)
-		if err != nil {
-			return nil, fmt.Errorf("config announce_addrs %q: %w", s, err)
-		}
-		announce = append(announce, m)
-	}
+	// interface watching can never discover it — it must be told. Entries
+	// are operator-friendly (bare hostname, bare IP, or full multiaddr —
+	// see announce.go); hostnames also resolve into IP literals and are
+	// re-resolved for the daemon's lifetime.
+	announce := expandAnnounce(cfg.AnnounceAddrs, cfg.ListenAddrs, systemLookup)
+	d.announced.Store(&announce)
 
 	opts := []libp2p.Option{
 		libp2p.Identity(priv),
@@ -145,15 +147,9 @@ func New(dir state.Dir) (*Daemon, error) {
 		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelayWithPeerSource(d.relayCandidates,
 			autorelay.WithMinInterval(30*time.Second)),
-	}
-	if len(announce) > 0 {
-		opts = append(opts, libp2p.AddrsFactory(func(addrs []ma.Multiaddr) []ma.Multiaddr {
-			return advertiseAddrs(addrs, announce)
-		}))
-	} else {
-		opts = append(opts, libp2p.AddrsFactory(func(addrs []ma.Multiaddr) []ma.Multiaddr {
-			return advertiseAddrs(addrs, nil)
-		}))
+		libp2p.AddrsFactory(func(addrs []ma.Multiaddr) []ma.Multiaddr {
+			return advertiseAddrs(addrs, *d.announced.Load())
+		}),
 	}
 	if cfg.QueueHost {
 		// The lighthouse is also the mesh's relay and NAT oracle: a
@@ -165,6 +161,15 @@ func New(dir state.Dir) (*Daemon, error) {
 			libp2p.EnableRelayService(relayv2.WithACL(fabricnet.NewRelayACL(store)), relayv2.WithInfiniteLimits()),
 			libp2p.EnableNATService(),
 		)
+		if len(cfg.AnnounceAddrs) > 0 {
+			// An operator who announces an address is attesting that this
+			// node is publicly reachable — don't wait for another oracle
+			// to confirm it. Without this, a single-lighthouse mesh can
+			// never light its relay: libp2p only starts the relay service
+			// once the host believes itself public, and the only autonat
+			// oracle around is this node itself.
+			opts = append(opts, libp2p.ForceReachabilityPublic())
+		}
 	}
 	h, err := libp2p.New(opts...)
 	if err != nil {
@@ -285,6 +290,9 @@ func (d *Daemon) Run() error {
 
 	go d.reconnectLoop()
 	go d.watchReachability()
+	if hasHostEntries(d.Config.AnnounceAddrs) {
+		go d.watchAnnounce()
+	}
 
 	<-d.ctx.Done()
 	if d.DNS != nil {

@@ -185,10 +185,21 @@ only private addresses (if your nodes also share a VPN, the mesh will
 quietly ride *that* instead — every path a node advertises is raced):
 
 ```sh
-fabric announce add /dns4/gate.example.com/udp/4517/quic-v1
-fabric announce add /dns4/gate.example.com/tcp/4517
-# (an /ip4/<elastic-ip>/... form works too; DNS survives re-IPs)
+fabric announce add gate.example.com
+# (a bare IP works too; DNS survives re-IPs. Full multiaddrs remain
+#  accepted as an escape hatch for unusual ports/transports.)
 ```
+
+One name is all it takes: the daemon derives ports and transports
+from its listen config, resolves the name into IP-literal addresses
+(and keeps re-resolving while it runs, so dynamic DNS just works),
+and advertises both forms. The literals matter: libp2p's autonat
+client only uses peers with a public IP literal as NAT oracles — a
+DNS-only record would leave the whole mesh at "NAT: unknown". An
+announcing queue host also asserts public reachability outright
+(`ForceReachabilityPublic`), which starts its relay service
+immediately instead of waiting for another oracle to confirm what
+the operator already knows.
 
 The announced addresses join the node's signed address record and
 reach every member over the normal gossip — no per-node `peer add`
@@ -421,7 +432,7 @@ of its own; don't point `-listen` at a routable interface.
 | `fabric ui [-listen 127.0.0.1:4518]` | any member | serve the topology/admin web UI |
 | `fabric queue on\|off` | any member | run the admission queue (lighthouse role) |
 | `fabric peer add <multiaddr>` | any member | add a bootstrap peer |
-| `fabric announce add <multiaddr>` | cloud/1:1-NAT nodes | also advertise an address no local interface carries |
+| `fabric announce add <hostname\|ip\|multiaddr>` | cloud/1:1-NAT nodes | also advertise an address no local interface carries; ports, transports, and resolved IPs derived automatically |
 | `fabric announce txt` | lighthouse | print the DNS TXT record enabling hostname joins |
 
 All commands take `-state <dir>` (default `~/.config/fabric`), so
