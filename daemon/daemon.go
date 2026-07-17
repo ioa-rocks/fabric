@@ -74,8 +74,9 @@ type Daemon struct {
 	// Per-address verdicts (autonat v2): which of our public addresses
 	// peers could actually dial back.
 	reachableAddrs, unreachableAddrs, unknownAddrs []string
-	lastDial    map[peer.ID]time.Time // mesh-fill backoff
-	recordsHash [32]byte              // last persisted record-cache digest
+	lastDial                                       map[peer.ID]time.Time // mesh-fill backoff
+	recordsHash                                    [32]byte              // last persisted record-cache digest
+	pinnedBootstrap                                map[string]bool       // queue-host addresses already made durable
 
 	// Expanded announce set (announce.go); swapped by the re-resolve
 	// watcher, read by the AddrsFactory on every advertisement.
@@ -127,7 +128,11 @@ func New(dir state.Dir) (*Daemon, error) {
 		Dir: dir, Config: cfg, Store: store, Log: evLog,
 		ownCert: own, ctx: ctx, cancel: cancel,
 		rtt: make(map[peer.ID]time.Duration), reachability: "unknown",
-		lastDial: make(map[peer.ID]time.Time),
+		lastDial:        make(map[peer.ID]time.Time),
+		pinnedBootstrap: make(map[string]bool),
+	}
+	for _, addr := range cfg.Bootstrap {
+		d.pinnedBootstrap[addr] = true
 	}
 
 	// Announce addresses (config) join the advertised set: a node behind
@@ -744,6 +749,7 @@ func (d *Daemon) reconnectLoop() {
 		d.measureRTT()
 		d.refreshRoutes()
 		d.persistRecords()
+		d.pinQueueHosts()
 		now := time.Now()
 		d.Store.GC(now)
 		d.Log.GC(now)
@@ -753,6 +759,61 @@ func (d *Daemon) reconnectLoop() {
 		case <-tick.C:
 		}
 	}
+}
+
+// pinQueueHosts turns discovered lighthouses into durable recovery paths.
+// Signed address records are useful warm state, but a device that has not
+// received (or has lost) that cache must not become stranded as soon as its
+// original LAN bootstrap is unreachable. Once an authenticated member is
+// identified as a queue host, retain its publicly useful addresses in the
+// bootstrap configuration for future cold starts.
+func (d *Daemon) pinQueueHosts() {
+	cfg := d.Config
+	var added []string
+	for _, p := range d.queueHosts() {
+		for _, addr := range d.Host.Peerstore().Addrs(p) {
+			bootstrap, ok := durableBootstrapAddr(addr, p)
+			if !ok || d.pinnedBootstrap[bootstrap] {
+				continue
+			}
+			// Deduplicate addresses found on multiple connections in this pass.
+			d.pinnedBootstrap[bootstrap] = true
+			added = append(added, bootstrap)
+			cfg.Bootstrap = append(cfg.Bootstrap, bootstrap)
+		}
+	}
+	if len(added) == 0 {
+		return
+	}
+	if err := d.Dir.SaveConfig(cfg); err != nil {
+		for _, addr := range added {
+			delete(d.pinnedBootstrap, addr) // retry on the next reconnect tick
+		}
+		log.Printf("pinning discovered lighthouse: %v", err)
+		return
+	}
+	log.Printf("lighthouse bootstrap: discovered public queue-host addresses saved")
+}
+
+func durableBootstrapAddr(addr ma.Multiaddr, p peer.ID) (string, bool) {
+	if _, err := addr.ValueForProtocol(ma.P_CIRCUIT); err == nil {
+		return "", false
+	}
+	public := false
+	for _, proto := range []int{ma.P_DNS, ma.P_DNS4, ma.P_DNS6, ma.P_DNSADDR} {
+		if _, err := addr.ValueForProtocol(proto); err == nil {
+			public = true
+			break
+		}
+	}
+	if ip, ok := multiaddrIP(addr); ok && ip.IsGlobalUnicast() && !ip.IsPrivate() {
+		public = true
+	}
+	if !public {
+		return "", false
+	}
+	withPeer := addr.Encapsulate(ma.StringCast("/p2p/" + p.String()))
+	return withPeer.String(), true
 }
 
 func (d *Daemon) connectBootstrap() {

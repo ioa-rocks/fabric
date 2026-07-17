@@ -12,6 +12,7 @@ import (
 	"ioa.rocks/fabric/state"
 
 	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 // newTestDaemon fabricates a member's state dir — cert, device key, and an
@@ -98,4 +99,39 @@ func TestSelfHealOneWayKnownPair(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("B never learned A is a member — one-way-known pair did not self-heal")
+}
+
+func TestDurableBootstrapAddr(t *testing.T) {
+	p, err := peer.Decode("12D3KooWDPSPeSFhcubCWGwzsWMVMjfMHVekUGuL1txhm5SkLMXN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		addr string
+		ok   bool
+	}{
+		{"/dns4/gate.example.com/udp/4517/quic-v1", true},
+		{"/ip4/3.133.152.236/tcp/4517", true},
+		{"/ip4/172.31.5.52/tcp/4517", false},
+		{"/ip4/127.0.0.1/tcp/4517", false},
+		{"/dns4/gate.example.com/tcp/4517/p2p-circuit", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.addr, func(t *testing.T) {
+			a, err := ma.NewMultiaddr(tt.addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := durableBootstrapAddr(a, p)
+			if ok != tt.ok {
+				t.Fatalf("ok = %v, want %v (%q)", ok, tt.ok, got)
+			}
+			if ok {
+				want := tt.addr + "/p2p/" + p.String()
+				if got != want {
+					t.Fatalf("got %q, want %q", got, want)
+				}
+			}
+		})
+	}
 }
