@@ -44,11 +44,13 @@ Later:     Subscribe(bucket, mode), Grant(bucket, userKey, caps),
 
 ## Build
 
-Fabric is consumed via a local `replace` directive — check out both
-repos side by side (`…/fabric`, `…/vault`), then:
+The fabric binary carries the data CLI (ADR 0013 — one binary): run it
+as `fabric vault …`, or symlink `vault → fabric` for the plain `vault …`
+spelling — argv[0] dispatch, busybox-style. `cmd/vault` still builds the
+same commands standalone for a data-CLI-only install:
 
 ```sh
-go build -o vault ./cmd/vault
+go build -o fabric ./cmd/fabric && ln -s fabric vault
 go test ./...
 ```
 
@@ -64,7 +66,8 @@ export VAULT_PASSPHRASE=test          # or omit for an interactive prompt
 ```
 
 Default state dir is `~/.config/vault`; every command accepts
-`-state`. (Flags before positional args — Go flag parsing.)
+`-state`. Flags may come before or after positional arguments
+(after `tag`'s `<bucket> <object-ref>`, `-x` means "remove tag x").
 
 ## Daemon & mesh
 
@@ -93,6 +96,23 @@ participation is opt-in per device (memo §5). Vault peers find each
 other among mesh members by the `/vault/hello/1` protocol
 (member-gated; carries circle DID + version). Mesh-level debugging:
 `fabric status`.
+
+**A second device of the same owner** (interim procedure until
+capability grants land — `vault init` would mint a *different* user
+key): copy the circle identity, then restart the daemon so the
+subsystem activates.
+
+```sh
+ssh other 'mkdir -p -m 700 ~/.config/vault'
+scp ~/.config/vault/config.json ~/.config/vault/user.key.age other:.config/vault/
+# on other: restart 'fabric up' (systemctl restart fabric), then
+vault buckets            # catalog arrives via sync (≤30 s after connect)
+vault sub <bucket> full  # and blobs follow
+```
+
+Only those two files — `blobs/`, `buckets/`, and `subs.json` are
+per-device state that sync owns. The key container keeps its
+passphrase.
 
 ## Sync & placement
 

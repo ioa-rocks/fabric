@@ -27,6 +27,7 @@ import (
 	"ioa.rocks/fabric/state"
 	"ioa.rocks/fabric/tunbridge"
 	"ioa.rocks/fabric/vault/circle"
+	vaultcli "ioa.rocks/fabric/vault/cli"
 	vaultdaemon "ioa.rocks/fabric/vault/daemon"
 	"ioa.rocks/fabric/webui"
 
@@ -67,11 +68,19 @@ func parseListen(s string) ([]string, error) {
 }
 
 func main() {
+	// Busybox-style dispatch (ADR 0013, one binary): a "vault" symlink to
+	// this binary is the data CLI.
+	if filepath.Base(os.Args[0]) == "vault" {
+		os.Exit(vaultcli.Main(os.Args[1:]))
+	}
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	if cmd == "vault" {
+		os.Exit(vaultcli.Main(args))
+	}
 	var err error
 	switch cmd {
 	case "init":
@@ -138,6 +147,8 @@ func usage() {
            no local interface carries (cloud public IP / DNS name); ports,
            transports, and resolved IPs are derived automatically;
            announce txt — print the DNS TXT record for hostname joins
+  vault    the data surface ('fabric vault -h'); a "vault" symlink to this
+           binary works too — no separate install needed
 
 Every command accepts -state <dir> (default `+state.DefaultPath()+`).
 `)
@@ -987,6 +998,7 @@ func cmdUI(args []string) error {
 	fs := flag.NewFlagSet("ui", flag.ExitOnError)
 	statePath := stateFlag(fs)
 	listen := fs.String("listen", "127.0.0.1:4518", "listen address; keep it on localhost — the UI has no auth of its own")
+	vaultState := fs.String("vault-state", circle.DefaultPath(), "vault state directory (vault card lights up when its daemon runs)")
 	fs.Parse(args)
 
 	dir, err := state.Open(*statePath)
@@ -1001,7 +1013,7 @@ func cmdUI(args []string) error {
 		role = "master — approvals and revocations enabled"
 	}
 	fmt.Printf("topology UI: http://%s  (%s)\n", *listen, role)
-	return http.ListenAndServe(*listen, webui.New(dir).Handler())
+	return http.ListenAndServe(*listen, webui.New(dir, *vaultState).Handler())
 }
 
 func cmdQueue(args []string) error {

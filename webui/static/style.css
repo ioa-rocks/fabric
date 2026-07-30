@@ -132,6 +132,28 @@ dl.kv dd { margin: 0; font-size: 12.5px; overflow-wrap: anywhere; }
 .pending-item { border-top: 1px solid var(--line); padding: 10px 0; }
 .pending-item:first-child { border-top: none; padding-top: 2px; }
 
+/* vault: buckets + placement */
+.vault-card { margin-top: 14px; }
+table.buckets { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.buckets th {
+  text-align: left; font-size: 11.5px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .05em; color: var(--ink-3); padding: 4px 10px 6px 0; border-bottom: 1px solid var(--line);
+}
+table.buckets td { padding: 7px 10px 7px 0; border-bottom: 1px solid var(--line); vertical-align: middle; }
+table.buckets tr.bucket-row { cursor: pointer; }
+table.buckets tr.bucket-row:hover td { background: color-mix(in srgb, var(--surface) 60%, var(--card)); }
+table.buckets tr:last-child td { border-bottom: none; }
+table.buckets select {
+  border: 1px solid var(--line); border-radius: 8px; padding: 3px 6px;
+  background: var(--card); color: var(--ink); font-size: 12.5px; cursor: pointer;
+}
+.held-ok   { color: var(--good); font-weight: 550; }
+.held-lag  { color: var(--warn); font-weight: 550; }
+.objects-row td { padding: 0 0 8px; border-bottom: 1px solid var(--line); }
+.objects-list { margin: 4px 0 0; padding: 6px 0 0 14px; font-size: 12.5px; }
+.objects-list li { padding: 2px 0; }
+.objects-list .tags { color: var(--ink-2); }
+
 /* revoked tombstones: present but visually retired and outside the topology */
 .revoked-card { margin-top: 14px; }
 .revoked-item { border-top: 1px solid var(--line); padding: 10px 0; opacity: 0.6; }

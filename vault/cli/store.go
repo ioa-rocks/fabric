@@ -2,7 +2,7 @@
 // control-socket client when a daemon is running (which then owns the
 // Pebble locks), a direct circle open otherwise. Same operations, same
 // output — the daemon is a residency change, not a semantics change.
-package main
+package cli
 
 import (
 	"fmt"

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"strings"
 	"time"
 
 	"ioa.rocks/fabric/admission"
@@ -23,6 +24,7 @@ import (
 	"ioa.rocks/fabric/fabricnet"
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
+	vaultdaemon "ioa.rocks/fabric/vault/daemon"
 )
 
 //go:embed static
@@ -30,13 +32,14 @@ var staticFS embed.FS
 
 // Server assembles the UI's HTTP handler around a state dir.
 type Server struct {
-	dir    state.Dir
-	client *daemon.Client
-	master bool
+	dir       state.Dir
+	client    *daemon.Client
+	master    bool
+	vaultPath string // vault state dir; the vault view lights up when a daemon serves its socket
 }
 
-func New(dir state.Dir) *Server {
-	return &Server{dir: dir, client: daemon.NewClient(dir), master: dir.IsMaster()}
+func New(dir state.Dir, vaultPath string) *Server {
+	return &Server{dir: dir, client: daemon.NewClient(dir), master: dir.IsMaster(), vaultPath: vaultPath}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -51,6 +54,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/deny", s.handleDeny)
 	mux.HandleFunc("POST /api/revoke", s.handleRevoke)
 	mux.HandleFunc("POST /api/renew", s.handleRenew)
+	mux.HandleFunc("GET /api/vault/objects", s.handleVaultObjects)
+	mux.HandleFunc("POST /api/vault/sub", s.handleVaultSub)
 	return mux
 }
 
@@ -62,6 +67,15 @@ type Overview struct {
 	Events  []daemon.EventInfo  `json:"events"`
 	Links   []daemon.LinkInfo   `json:"links"`  // whole-mesh link state
 	Master  bool                `json:"master"` // this UI process can sign
+	Vault   *VaultOverview      `json:"vault,omitempty"`
+}
+
+// VaultOverview is the vault subsystem's slice of the poll — present only
+// while a daemon serves the vault control socket (ADR 0013: same process
+// as the mesh daemon, separate front door).
+type VaultOverview struct {
+	Status  *vaultdaemon.StatusReply `json:"status"`
+	Buckets []vaultdaemon.BucketInfo `json:"buckets"`
 }
 
 // PendingEntry adds the would-be peer ID to a queue entry so the UI can
@@ -90,6 +104,15 @@ func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
 	o := Overview{Status: st, Members: members, Events: events, Master: s.master}
 	if links, err := s.client.Graph(); err == nil {
 		o.Links = links
+	}
+	if cl := vaultdaemon.TryClient(s.vaultPath); cl != nil {
+		if vst, err := cl.Status(); err == nil {
+			v := &VaultOverview{Status: vst}
+			if buckets, err := cl.Buckets(); err == nil {
+				v.Buckets = buckets
+			}
+			o.Vault = v
+		}
 	}
 	if st.Master {
 		if pending, err := s.client.Pending(); err == nil {
@@ -312,6 +335,61 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		"result": "renewed", "name": match.Name,
 		"expires": renewed.Expiry().Format(time.RFC3339),
 	})
+}
+
+// handleVaultObjects lists a bucket's objects (?bucket=<ref>&tags=t1,t2).
+// Read-only browse — content stays behind the CLI/API for now.
+func (s *Server) handleVaultObjects(w http.ResponseWriter, r *http.Request) {
+	cl := vaultdaemon.TryClient(s.vaultPath)
+	if cl == nil {
+		httpError(w, http.StatusBadGateway, errors.New("vault daemon not running"))
+		return
+	}
+	bucket := r.URL.Query().Get("bucket")
+	if bucket == "" {
+		httpError(w, http.StatusBadRequest, errors.New("bucket query parameter is required"))
+		return
+	}
+	var tags []string
+	for _, t := range strings.Split(r.URL.Query().Get("tags"), ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			tags = append(tags, t)
+		}
+	}
+	objs, err := cl.List(bucket, tags)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, objs)
+}
+
+// handleVaultSub sets this device's placement commitment for a bucket —
+// the one vault write the UI offers. Not a signing operation: the
+// subscription is per-device state, not circle state.
+func (s *Server) handleVaultSub(w http.ResponseWriter, r *http.Request) {
+	cl := vaultdaemon.TryClient(s.vaultPath)
+	if cl == nil {
+		httpError(w, http.StatusBadGateway, errors.New("vault daemon not running"))
+		return
+	}
+	var req struct {
+		Bucket string `json:"bucket"`
+		Mode   string `json:"mode"` // "full" | "cache" | "none"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Mode != "full" && req.Mode != "cache" && req.Mode != "none" {
+		httpError(w, http.StatusBadRequest, fmt.Errorf("mode %q: want full, cache, or none", req.Mode))
+		return
+	}
+	if err := cl.Sub(req.Bucket, req.Mode); err != nil {
+		httpError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, map[string]string{"result": "subscribed", "bucket": req.Bucket, "mode": req.Mode})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

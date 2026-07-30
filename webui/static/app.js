@@ -11,6 +11,7 @@ const state = {
   selected: null,   // selected node id ('self' or peer id)
   form: null,       // {kind:'approve'|'deny'|'revoke', fp, error, busy}
   failing: false,
+  openBucket: null, // bucket id whose object list is expanded in the vault card
 };
 
 /* ---------- theme ---------- */
@@ -106,7 +107,138 @@ function render() {
     renderDetails(d, ns);
     renderPending(d);
   }
+  renderVault(d);
   renderFeed(d);
+}
+
+/* ---------- vault card ---------- */
+
+/* Buckets + placement. Present only while the daemon runs the vault
+   subsystem (ADR 0013). The one write here is the subscription selector —
+   a per-device commitment, not a signing operation. Clicking a bucket row
+   toggles its object list. */
+function renderVault(d) {
+  const card = document.getElementById("vault-card");
+  card.hidden = !d.vault;
+  if (card.hidden) { state.openBucket = null; return; }
+  const vs = d.vault.status || {};
+  document.getElementById("vault-circle").textContent = vs.name || "?";
+
+  const vaultPeers = (vs.peers || []).filter(p => p.vault).map(p => p.name || short(p.peer_id));
+  const buckets = d.vault.buckets || [];
+  document.getElementById("vault-summary").textContent =
+    `${buckets.length} bucket${buckets.length === 1 ? "" : "s"} · ` +
+    (vaultPeers.length ? `syncing with ${vaultPeers.join(", ")}` : "no vault peers connected");
+
+  const box = document.getElementById("vault-buckets");
+  box.innerHTML = "";
+  if (!buckets.length) {
+    box.append(note("No buckets yet — create one with: vault bucket create <name>"));
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "buckets";
+  table.innerHTML = `<tr><th>bucket</th><th>id</th><th>objects</th><th>held</th><th>placement</th></tr>`;
+  let open = null; // fill the expanded object list only after the table is in the DOM
+  for (const b of buckets) {
+    const tr = document.createElement("tr");
+    tr.className = "bucket-row";
+    const held = document.createElement("td");
+    if (b.sub === "full") {
+      held.textContent = `${b.held}/${b.objects}`;
+      // a full subscription is satisfied when every blob is local
+      held.className = b.held >= b.objects ? "held-ok" : "held-lag";
+      if (b.held < b.objects) held.textContent += " (fetching)";
+    } else {
+      held.textContent = `${b.held}/${b.objects}`;
+    }
+    const sel = document.createElement("select");
+    for (const mode of ["none", "cache", "full"]) {
+      const o = document.createElement("option");
+      o.value = mode; o.textContent = mode;
+      o.selected = (b.sub || "none") === mode;
+      sel.append(o);
+    }
+    sel.onclick = (e) => e.stopPropagation(); // row toggles objects; the selector shouldn't
+    sel.onchange = () => doPost("/api/vault/sub", { bucket: b.id, mode: sel.value })
+      .catch(err => { alert("subscription: " + (err.message || err)); poll(); });
+    const selTd = document.createElement("td");
+    selTd.append(sel);
+    tr.append(
+      td(strong(b.name)),
+      td(mono(b.id.slice(0, 16))),
+      td(String(b.objects)),
+      held,
+      selTd,
+    );
+    tr.onclick = () => toggleObjects(table, tr, b);
+    table.append(tr);
+    if (state.openBucket === b.id) {
+      tr.after(objectsRow(b));
+      open = b;
+    }
+  }
+  box.append(table);
+  if (open) loadObjects(open); // now getElementById can see the list
+}
+
+function td(child) {
+  const c = document.createElement("td");
+  c.append(child);
+  return c;
+}
+
+function toggleObjects(table, tr, b) {
+  if (state.openBucket === b.id) {
+    state.openBucket = null;
+    table.querySelector(".objects-row")?.remove();
+    return;
+  }
+  state.openBucket = b.id;
+  table.querySelector(".objects-row")?.remove();
+  tr.after(objectsRow(b));
+  loadObjects(b);
+}
+
+function objectsRow(b) {
+  const row = document.createElement("tr");
+  row.className = "objects-row";
+  const cell = document.createElement("td");
+  cell.colSpan = 5;
+  cell.innerHTML = `<ul class="objects-list" id="objects-${b.id.slice(0, 16)}"><li class="muted">loading…</li></ul>`;
+  row.append(cell);
+  return row;
+}
+
+async function loadObjects(b) {
+  const list = document.getElementById("objects-" + b.id.slice(0, 16));
+  if (!list) return;
+  try {
+    const r = await fetch("/api/vault/objects?bucket=" + encodeURIComponent(b.id));
+    if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+    const objs = await r.json();
+    list.innerHTML = "";
+    if (!objs.length) { list.innerHTML = `<li class="muted">empty bucket</li>`; return; }
+    for (const o of objs.slice(0, 100)) {
+      const li = document.createElement("li");
+      li.append(mono(o.id.slice(0, 12)), " ", o.name);
+      if (o.tags && o.tags.length) {
+        const t = document.createElement("span");
+        t.className = "tags";
+        t.textContent = "  [" + o.tags.join(" ") + "]";
+        li.append(t);
+      }
+      list.append(li);
+    }
+    if (objs.length > 100) {
+      const more = document.createElement("li");
+      more.className = "muted";
+      more.textContent = `… and ${objs.length - 100} more (vault ls for the full list)`;
+      list.append(more);
+    }
+  } catch (err) {
+    if (list) list.innerHTML = `<li class="muted">objects: ${err.message || err}</li>`;
+  }
 }
 
 function renderHeader(d) {
