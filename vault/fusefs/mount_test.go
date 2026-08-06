@@ -10,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"ioa.rocks/fabric/vault/daemon"
 )
@@ -30,6 +31,14 @@ type memorySource struct {
 
 func newMemorySource() *memorySource {
 	return &memorySource{objects: map[string]daemon.ObjectInfo{}, data: map[string][]byte{}}
+}
+func (s *memorySource) byName(name string) (daemon.ObjectInfo, bool) {
+	for _, o := range s.objects {
+		if o.Name == name {
+			return o, true
+		}
+	}
+	return daemon.ObjectInfo{}, false
 }
 func (s *memorySource) List(string, []string) ([]daemon.ObjectInfo, error) {
 	s.mu.Lock()
@@ -177,12 +186,34 @@ func TestWritableMountLifecycle(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
+	src.mu.Lock()
+	_, publishedEarly := src.byName("2026/shell.txt")
+	src.mu.Unlock()
+	if publishedEarly {
+		t.Fatal("duplicated-descriptor flush published an incomplete file")
+	}
 	dupFile := os.NewFile(uintptr(dup), "shell-dup")
 	if _, err := dupFile.WriteString("shell"); err != nil {
 		t.Fatal(err)
 	}
 	if err := dupFile.Close(); err != nil {
 		t.Fatal(err)
+	}
+	var shellObject daemon.ObjectInfo
+	var shellData string
+	var published bool
+	deadline := time.Now().Add(time.Second)
+	for !published && time.Now().Before(deadline) {
+		src.mu.Lock()
+		shellObject, published = src.byName("2026/shell.txt")
+		shellData = string(src.data[shellObject.ID])
+		src.mu.Unlock()
+		if !published {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if !published || shellData != "shell" {
+		t.Fatalf("final close published=%v data=%q", published, shellData)
 	}
 	if err := os.Remove(mountpoint + "/2026/shell.txt"); err != nil {
 		t.Fatal(err)
@@ -205,11 +236,21 @@ func TestWritableMountLifecycle(t *testing.T) {
 	if err := os.Rename(mountpoint+"/2026/cat.jpg", mountpoint+"/favorite.jpg"); err != nil {
 		t.Fatal(err)
 	}
-	src.mu.Lock()
-	o := src.objects[id]
-	got := string(src.data[id])
-	count := len(src.objects)
-	src.mu.Unlock()
+	var o daemon.ObjectInfo
+	var got string
+	var count int
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		src.mu.Lock()
+		o = src.objects[id]
+		got = string(src.data[id])
+		count = len(src.objects)
+		src.mu.Unlock()
+		if count == 1 && o.Name == "favorite.jpg" && got == "better cat" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if count != 1 || o.Name != "favorite.jpg" || got != "better cat" {
 		t.Fatalf("count=%d object=%+v data=%q", count, o, got)
 	}

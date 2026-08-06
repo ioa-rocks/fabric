@@ -276,7 +276,16 @@ func (h *fileHandle) Fsync(_ context.Context, _ uint32) syscall.Errno {
 	}
 	return h.commit()
 }
-func (h *fileHandle) Flush(context.Context) syscall.Errno { return h.commit() }
+
+// Flush may run once for every close of a duplicated descriptor, before the
+// last writer is finished. Keep it local; final Release (or explicit Fsync)
+// is the atomic publication boundary.
+func (h *fileHandle) Flush(context.Context) syscall.Errno {
+	if err := h.file.Sync(); err != nil {
+		return fs.ToErrno(err)
+	}
+	return 0
+}
 func (h *fileHandle) commit() syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()

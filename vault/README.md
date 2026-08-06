@@ -150,8 +150,8 @@ a connected holder. It is read-only unless `-write` is supplied.
 In a writable mount, directories are ephemeral namespace structure: creating
 an empty directory creates no bucket object, while a file such as
 `AI/performance/mlperf.pdf` becomes one object with that stored name. Writes
-are staged in a local temporary file and published on flush/close, so partial
-copy data is not synced. Overwrite replaces the object's immutable blob while
+are staged in a local temporary file and published on explicit `fsync` or the
+final close, so partial copy/editor data is not synced. Overwrite replaces the object's immutable blob while
 preserving its object ID; file and directory renames update stored names;
 unlink creates the usual Vault tombstone. Files are single-writer within one
 mount. Directory renames currently update their objects one at a time rather
