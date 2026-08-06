@@ -54,13 +54,14 @@ type ObjectInfo struct {
 	Name    string   `json:"name"`
 	Blob    string   `json:"blob"`
 	Size    int64    `json:"size"`
+	Created int64    `json:"created_at"` // Unix nanoseconds
 	Tags    []string `json:"tags,omitempty"`
 	Deleted bool     `json:"deleted,omitempty"`
 }
 
 func Info(o *index.Object) ObjectInfo {
 	tags := o.Tags.List()
-	return ObjectInfo{ID: o.ID, Name: o.Name.V, Blob: o.Blob.V, Size: o.Size, Tags: tags, Deleted: o.IsDeleted()}
+	return ObjectInfo{ID: o.ID, Name: o.Name.V, Blob: o.Blob.V, Size: o.Size, Created: o.CreatedAt, Tags: tags, Deleted: o.IsDeleted()}
 }
 
 // PeerInfo describes one connected mesh member as seen from this vault
@@ -315,8 +316,18 @@ func (d *Daemon) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := []ObjectInfo{}
+	repaired := false
 	for _, o := range objs {
+		if changed, err := h.BackfillSize(o); err != nil {
+			httpErr(w, err)
+			return
+		} else if changed {
+			repaired = true
+		}
 		out = append(out, Info(o))
+	}
+	if repaired {
+		d.kickSync()
 	}
 	writeJSON(w, out)
 }

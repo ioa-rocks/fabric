@@ -101,6 +101,15 @@ func (s *Store) Has(hash string) bool {
 	return err == nil
 }
 
+// Size returns the byte size of a locally held blob.
+func (s *Store) Size(hash string) (int64, error) {
+	info, err := os.Stat(s.path(hash))
+	if err != nil {
+		return 0, fmt.Errorf("blob %s: %w", hash, err)
+	}
+	return info.Size(), nil
+}
+
 // Verify re-hashes a held blob and reports corruption — the scrub primitive
 // (memo §8): bit-rot shows up as a hash mismatch and the blob can be
 // re-fetched from another complete copy.

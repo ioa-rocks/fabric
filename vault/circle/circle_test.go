@@ -66,6 +66,14 @@ func TestCircleLifecycle(t *testing.T) {
 		t.Fatalf("content roundtrip: %q", body)
 	}
 
+	// Records written before size metadata are repaired from a locally held
+	// blob without re-importing content.
+	o1.Size, o1.SizeKnown = 0, false
+	changed, err := h.BackfillSize(o1)
+	if err != nil || !changed || o1.Size != int64(len("cat bytes")) || !o1.SizeKnown {
+		t.Fatalf("size backfill: changed=%v size=%d known=%v err=%v", changed, o1.Size, o1.SizeKnown, err)
+	}
+
 	// Location recorded for this node.
 	locs, err := h.Index.Locations(o1.Blob.V)
 	if err != nil || len(locs) != 1 {

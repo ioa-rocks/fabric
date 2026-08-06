@@ -133,6 +133,9 @@ func (s *directStore) List(bucket string, tags []string) ([]daemon.ObjectInfo, e
 	}
 	var out []daemon.ObjectInfo
 	for _, o := range objs {
+		if _, err := h.BackfillSize(o); err != nil {
+			return nil, err
+		}
 		out = append(out, daemon.Info(o))
 	}
 	return out, nil

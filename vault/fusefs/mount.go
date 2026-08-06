@@ -114,10 +114,18 @@ func (d *dirNode) OnAdd(ctx context.Context) {
 	}
 }
 
-func (d *dirNode) Getattr(context.Context, fs.FileHandle, *fuse.AttrOut) syscall.Errno { return 0 }
+func (d *dirNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	out.Uid, out.Gid = uint32(os.Getuid()), uint32(os.Getgid())
+	return 0
+}
 
 func (f *fileNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode, out.Size = syscall.S_IFREG|0o444, uint64(f.object.Size)
+	out.Uid, out.Gid = uint32(os.Getuid()), uint32(os.Getgid())
+	if f.object.Created > 0 {
+		out.Mtime = uint64(f.object.Created / 1e9)
+		out.Mtimensec = uint32(f.object.Created % 1e9)
+	}
 	return 0
 }
 

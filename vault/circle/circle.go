@@ -410,6 +410,25 @@ func (h *Handle) Get(o *index.Object) (io.ReadCloser, error) {
 	return h.circle.Blobs.Open(o.Blob.V)
 }
 
+// BackfillSize upgrades an object written before size metadata existed. It is
+// intentionally local-only: discovering a legacy remote size must not fetch a
+// whole blob merely to satisfy stat(2). The repaired record syncs normally.
+func (h *Handle) BackfillSize(o *index.Object) (bool, error) {
+	if o.SizeKnown {
+		return false, nil
+	}
+	size, err := h.circle.Blobs.Size(o.Blob.V)
+	if err != nil {
+		return false, nil // not held here; a holder will repair it
+	}
+	o.Size = size
+	o.SizeKnown = true
+	if _, err := h.Index.PutObject(o); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Stats counts a bucket's live objects and how many of their blobs this
 // device holds — the seed of the health view (memo §5): "held < objects"
 // is what a fetch pass or another copy resolves.

@@ -146,11 +146,12 @@ type Object struct {
 	CreatedAt int64  `cbor:"created_at"`
 	CreatedBy string `cbor:"created_by"`
 
-	Name    LWW   `cbor:"name"`
-	Blob    LWW   `cbor:"blob"`           // BLAKE3 hash of current content
-	Size    int64 `cbor:"size,omitempty"` // bytes for the current Blob; zero on legacy records
-	Deleted LWW   `cbor:"deleted"`        // "" live, else tombstone ts marker
-	Tags    ORSet `cbor:"tags"`
+	Name      LWW   `cbor:"name"`
+	Blob      LWW   `cbor:"blob"`           // BLAKE3 hash of current content
+	Size      int64 `cbor:"size,omitempty"` // bytes for the current Blob; zero on legacy records
+	SizeKnown bool  `cbor:"size_known,omitempty"`
+	Deleted   LWW   `cbor:"deleted"` // "" live, else tombstone ts marker
+	Tags      ORSet `cbor:"tags"`
 }
 
 // NewObject mints an object with a fresh random ID.
@@ -166,6 +167,7 @@ func NewObject(name, blob string, size int64, ts int64, by string) *Object {
 		Name:      LWW{V: name, TS: ts, By: by},
 		Blob:      LWW{V: blob, TS: ts, By: by},
 		Size:      size,
+		SizeKnown: true,
 		Tags:      NewORSet(),
 	}
 }
@@ -190,13 +192,13 @@ func Merge(a, b *Object) *Object {
 	// legacy zero-size record after it meets a current record.
 	switch {
 	case out.Blob == a.Blob && out.Blob != b.Blob:
-		out.Size = a.Size
+		out.Size, out.SizeKnown = a.Size, a.SizeKnown
 	case out.Blob == b.Blob && out.Blob != a.Blob:
-		out.Size = b.Size
-	case a.Size > b.Size:
-		out.Size = a.Size
+		out.Size, out.SizeKnown = b.Size, b.SizeKnown
+	case a.SizeKnown:
+		out.Size, out.SizeKnown = a.Size, true
 	default:
-		out.Size = b.Size
+		out.Size, out.SizeKnown = b.Size, b.SizeKnown
 	}
 	out.Deleted = mergeLWW(a.Deleted, b.Deleted)
 	out.Tags = mergeORSet(a.Tags, b.Tags)
