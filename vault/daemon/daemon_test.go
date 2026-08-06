@@ -120,6 +120,15 @@ func TestSoloDaemonAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
+	replaced, err := cl.Replace("photos", o.ID, bytes.NewReader([]byte("new cat")))
+	if err != nil || replaced.ID != o.ID || replaced.Size != 7 {
+		t.Fatalf("Replace: %+v, err=%v", replaced, err)
+	}
+	renamed, err := cl.Rename("photos", o.ID, "2026/best-cat.jpg")
+	if err != nil || renamed.ID != o.ID || renamed.Name != "2026/best-cat.jpg" {
+		t.Fatalf("Rename: %+v, err=%v", renamed, err)
+	}
+	o = renamed
 
 	objs, err := cl.List("photos", []string{"cats"})
 	if err != nil {
@@ -145,7 +154,7 @@ func TestSoloDaemonAPI(t *testing.T) {
 	}
 	got, _ := io.ReadAll(r)
 	r.Close()
-	if !bytes.Equal(got, content) {
+	if !bytes.Equal(got, []byte("new cat")) {
 		t.Errorf("Get returned %q", got)
 	}
 
@@ -157,7 +166,7 @@ func TestSoloDaemonAPI(t *testing.T) {
 	if n != 1 {
 		t.Errorf("projected %d objects", n)
 	}
-	if _, err := os.Stat(filepath.Join(proj, "2026", "cat.jpg")); err != nil {
+	if _, err := os.Stat(filepath.Join(proj, "2026", "best-cat.jpg")); err != nil {
 		t.Errorf("projection file missing: %v", err)
 	}
 

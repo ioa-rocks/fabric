@@ -155,6 +155,30 @@ func (c *Client) Get(bucket, ref string) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
+func (c *Client) Replace(bucket, ref string, r io.Reader) (ObjectInfo, error) {
+	var out ObjectInfo
+	req, err := http.NewRequest(http.MethodPut, "http://vault"+bucketPath(bucket, "/content")+"?ref="+url.QueryEscape(ref), r)
+	if err != nil {
+		return out, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return out, fmt.Errorf("is the daemon running? %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return out, decodeErr(resp)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	return out, err
+}
+
+func (c *Client) Rename(bucket, ref, name string) (ObjectInfo, error) {
+	var out ObjectInfo
+	err := c.post(bucketPath(bucket, "/rename"), renameBody{Ref: ref, Name: name}, &out)
+	return out, err
+}
+
 func (c *Client) Tag(bucket, ref string, add, remove []string) (ObjectInfo, error) {
 	var out ObjectInfo
 	err := c.post(bucketPath(bucket, "/tag"), tagBody{Ref: ref, Add: add, Remove: remove}, &out)

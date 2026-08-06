@@ -496,9 +496,10 @@ func cmdMount(args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	statePath := stateFlag(fs)
 	debug := fs.Bool("debug", false, "show FUSE protocol logging")
+	write := fs.Bool("write", false, "enable staged filesystem writes")
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: vault mount <bucket> <dir> [-debug]")
+		return fmt.Errorf("usage: vault mount <bucket> <dir> [-debug] [-write]")
 	}
 	mountpoint, err := filepath.Abs(pos[1])
 	if err != nil {
@@ -511,11 +512,15 @@ func cmdMount(args []string) error {
 	if cl == nil {
 		return fmt.Errorf("mount requires the running node daemon on %s", daemon.SocketPath(*statePath))
 	}
-	server, err := fusefs.Mount(mountpoint, pos[0], cl, *debug)
+	server, err := fusefs.Mount(mountpoint, pos[0], cl, *debug, *write)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("mounted bucket %q read-only at %s; unmount with Ctrl-C or fusermount3 -u %s\n", pos[0], mountpoint, mountpoint)
+	mode := "read-only"
+	if *write {
+		mode = "writable"
+	}
+	fmt.Printf("mounted bucket %q %s at %s; unmount with Ctrl-C or fusermount3 -u %s\n", pos[0], mode, mountpoint, mountpoint)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	done := make(chan struct{})

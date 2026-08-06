@@ -3,7 +3,7 @@
 An API-first, content-addressed object store for a personal mesh —
 the data layer of the Aethera stack. Apps talk to Vault through its
 API; sync happens at the object level; the filesystem is one
-*surface* (read-only projections now, FUSE later), never the
+*surface* (read-only projections and an opt-in writable FUSE mount), never the
 substrate. Rides [fabric](../fabric) in library mode for membership
 and transport.
 
@@ -38,9 +38,9 @@ Objects:   Put(bucket, name, reader, tags...) -> Object
            Tag(bucket, objectID, +tag/-tag)
            Delete(bucket, objectID)                    // tombstone
 Surfaces:  Project(bucket, dir)                        // read-only materialization
-           Mount(bucket, dir)                          // read-only FUSE view
+           Mount(bucket, dir)                          // FUSE view; writes opt in
 Later:     Subscribe(bucket, mode), Grant(bucket, userKey, caps),
-           serve layer (gallery / URL shares), writable/faceted FUSE
+           serve layer (gallery / URL shares), faceted FUSE
 ```
 
 ## Build
@@ -66,6 +66,8 @@ export VAULT_PASSPHRASE=test          # or omit for an interactive prompt
 ./vault project -state /tmp/v family-photos /tmp/album   # read-only view
 # with `fabric up` running:
 ./vault mount -state /tmp/v family-photos /tmp/album-live
+# opt in to ordinary filesystem writes:
+./vault mount -state /tmp/v -write family-photos /tmp/album-live
 ```
 
 Default state dir is `~/.config/vault`; every command accepts
@@ -140,18 +142,27 @@ mesh lookup, not an error. Transfers are verified by re-hashing
 any authenticated mesh member may sync and fetch; per-circle
 visibility and capability checks arrive with grants.
 
-## Read-only FUSE mount
+## FUSE mount
 
 `vault mount <bucket> <dir>` is the practical access surface for dogfooding
 and legacy consumers. Stored object names appear as ordinary paths; opening a
 file reads through the daemon, so `cache`/`none` can fetch a missing blob from
-a connected holder. The mount rejects writes.
+a connected holder. It is read-only unless `-write` is supplied.
 
-This first cut snapshots names when mounted; remount to see added, renamed, or
-deleted objects. Content is fetched live on every open. Objects imported by an
-older binary may report zero size and should be re-imported for filesystem
-consumers. Duplicate names gain an `~<object-id>` suffix. Requires Linux FUSE
-and a running `fabric up` daemon.
+In a writable mount, directories are ephemeral namespace structure: creating
+an empty directory creates no bucket object, while a file such as
+`AI/performance/mlperf.pdf` becomes one object with that stored name. Writes
+are staged in a local temporary file and published on flush/close, so partial
+copy data is not synced. Overwrite replaces the object's immutable blob while
+preserving its object ID; file and directory renames update stored names;
+unlink creates the usual Vault tombstone. Files are single-writer within one
+mount. Directory renames currently update their objects one at a time rather
+than atomically.
+
+The namespace is snapshotted at mount time; remount to see changes made through
+another client or mount. Content is fetched live on every open. Duplicate names
+gain an `~<object-id>` suffix. Requires Linux FUSE and a running `fabric up`
+daemon.
 
 ## Layout
 

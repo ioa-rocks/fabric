@@ -405,6 +405,32 @@ func (h *Handle) Put(name string, r io.Reader, tags ...string) (*index.Object, e
 	return o, nil
 }
 
+// Replace publishes complete new content for an existing object while
+// preserving its object identity and tags.
+func (h *Handle) Replace(o *index.Object, r io.Reader) (*index.Object, error) {
+	hash, size, err := h.circle.Blobs.Put(r)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UnixNano()
+	o.Blob.Set(hash, now, h.circle.Config.DID)
+	o.Size, o.SizeKnown = size, true
+	o, err = h.Index.PutObject(o)
+	if err != nil {
+		return nil, err
+	}
+	if err := h.Index.PutLocation(index.Location{Blob: hash, Node: h.circle.NodeID, Form: index.FormWhole, TS: now}); err != nil {
+		return nil, err
+	}
+	return o, nil
+}
+
+// Rename changes only the display path; object identity and content survive.
+func (h *Handle) Rename(o *index.Object, name string) (*index.Object, error) {
+	o.Name.Set(name, time.Now().UnixNano(), h.circle.Config.DID)
+	return h.Index.PutObject(o)
+}
+
 // Get opens the current content of an object.
 func (h *Handle) Get(o *index.Object) (io.ReadCloser, error) {
 	return h.circle.Blobs.Open(o.Blob.V)

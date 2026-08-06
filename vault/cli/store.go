@@ -19,6 +19,8 @@ type store interface {
 	List(bucket string, tags []string) ([]daemon.ObjectInfo, error)
 	Put(bucket, name string, r io.Reader, tags []string) (daemon.ObjectInfo, error)
 	Get(bucket, ref string) (io.ReadCloser, error)
+	Replace(bucket, ref string, r io.Reader) (daemon.ObjectInfo, error)
+	Rename(bucket, ref, name string) (daemon.ObjectInfo, error)
 	Tag(bucket, ref string, add, remove []string) (daemon.ObjectInfo, error)
 	Rm(bucket, ref string) (daemon.ObjectInfo, error)
 	Project(bucket, dir string) (int, error)
@@ -163,6 +165,32 @@ func (s *directStore) Get(bucket, ref string) (io.ReadCloser, error) {
 		return nil, err
 	}
 	return h.Get(o)
+}
+
+func (s *directStore) Replace(bucket, ref string, r io.Reader) (daemon.ObjectInfo, error) {
+	h, err := s.handle(bucket)
+	if err != nil {
+		return daemon.ObjectInfo{}, err
+	}
+	o, err := h.ResolveObject(ref)
+	if err != nil {
+		return daemon.ObjectInfo{}, err
+	}
+	o, err = h.Replace(o, r)
+	return daemon.Info(o), err
+}
+
+func (s *directStore) Rename(bucket, ref, name string) (daemon.ObjectInfo, error) {
+	h, err := s.handle(bucket)
+	if err != nil {
+		return daemon.ObjectInfo{}, err
+	}
+	o, err := h.ResolveObject(ref)
+	if err != nil {
+		return daemon.ObjectInfo{}, err
+	}
+	o, err = h.Rename(o, name)
+	return daemon.Info(o), err
 }
 
 func (s *directStore) Tag(bucket, ref string, add, remove []string) (daemon.ObjectInfo, error) {

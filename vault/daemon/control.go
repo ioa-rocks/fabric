@@ -103,6 +103,11 @@ type refBody struct {
 	Ref string `json:"ref"`
 }
 
+type renameBody struct {
+	Ref  string `json:"ref"`
+	Name string `json:"name"`
+}
+
 type projectBody struct {
 	Dir string `json:"dir"`
 }
@@ -130,6 +135,8 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("GET /v0/buckets/{bucket}/objects", d.handleList)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/objects", d.handlePut)
 	mux.HandleFunc("GET /v0/buckets/{bucket}/content", d.handleGet)
+	mux.HandleFunc("PUT /v0/buckets/{bucket}/content", d.handleReplace)
+	mux.HandleFunc("POST /v0/buckets/{bucket}/rename", d.handleRename)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/tag", d.handleTag)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/rm", d.handleRm)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/project", d.handleProject)
@@ -382,6 +389,55 @@ func (d *Daemon) handleGet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Vault-Object", o.ID)
 	w.Header().Set("X-Vault-Name", o.Name.V)
 	_, _ = io.Copy(w, rc)
+}
+
+func (d *Daemon) handleReplace(w http.ResponseWriter, r *http.Request) {
+	h, err := d.handle(r.PathValue("bucket"))
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	o, err := h.ResolveObject(r.URL.Query().Get("ref"))
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	o, err = h.Replace(o, r.Body)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	d.kickSync()
+	writeJSON(w, Info(o))
+}
+
+func (d *Daemon) handleRename(w http.ResponseWriter, r *http.Request) {
+	h, err := d.handle(r.PathValue("bucket"))
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	var body renameBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpErr(w, err)
+		return
+	}
+	if body.Name == "" {
+		httpErr(w, fmt.Errorf("rename: name is required"))
+		return
+	}
+	o, err := h.ResolveObject(body.Ref)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	o, err = h.Rename(o, body.Name)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	d.kickSync()
+	writeJSON(w, Info(o))
 }
 
 func (d *Daemon) handleTag(w http.ResponseWriter, r *http.Request) {
