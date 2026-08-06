@@ -68,11 +68,6 @@ func parseListen(s string) ([]string, error) {
 }
 
 func main() {
-	// Busybox-style dispatch (ADR 0013, one binary): a "vault" symlink to
-	// this binary is the data CLI.
-	if filepath.Base(os.Args[0]) == "vault" {
-		os.Exit(vaultcli.Main(os.Args[1:]))
-	}
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -113,6 +108,8 @@ func main() {
 		err = cmdPeer(args)
 	case "announce":
 		err = cmdAnnounce(args)
+	case "deploy":
+		err = cmdDeploy(args)
 	default:
 		usage()
 		os.Exit(2)
@@ -147,8 +144,8 @@ func usage() {
            no local interface carries (cloud public IP / DNS name); ports,
            transports, and resolved IPs are derived automatically;
            announce txt — print the DNS TXT record for hostname joins
-  vault    the data surface ('fabric vault -h'); a "vault" symlink to this
-           binary works too — no separate install needed
+  deploy   deploy this x86-64 binary to ~/.local/bin on one or more SSH hosts
+  vault    object storage: bucket, put/get, tags, sync placement, and mounts
 
 Every command accepts -state <dir> (default `+state.DefaultPath()+`).
 `)
@@ -622,6 +619,7 @@ approved:
 // strings. Two forms:
 //
 //   - a full multiaddr incl. /p2p/<peer-id> — used as-is;
+//
 //   - a bare host[:port] shortcut ("gate.example.com") — the peer-ID pin
 //     then comes from a DNS TXT record at _fabric.<host>:
 //

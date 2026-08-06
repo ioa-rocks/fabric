@@ -331,7 +331,7 @@ func (c *Circle) ResolveBucketID(ref string) (string, error) {
 	}
 	switch len(ids) {
 	case 0:
-		return "", fmt.Errorf("no bucket matches %q (see 'vault buckets')", ref)
+		return "", fmt.Errorf("no bucket matches %q (see 'fabric vault buckets')", ref)
 	case 1:
 		return ids[0], nil
 	default:

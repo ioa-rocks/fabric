@@ -45,13 +45,11 @@ Later:     Subscribe(bucket, mode), Grant(bucket, userKey, caps),
 
 ## Build
 
-The fabric binary carries the data CLI (ADR 0013 — one binary): run it
-as `fabric vault …`, or symlink `vault → fabric` for the plain `vault …`
-spelling — argv[0] dispatch, busybox-style. `cmd/vault` still builds the
-same commands standalone for a data-CLI-only install:
+The fabric binary carries the data CLI as the `fabric vault …` command
+group (ADR 0013 — one process, one binary, one CLI):
 
 ```sh
-go build -o fabric ./cmd/fabric && ln -s fabric vault
+go build -o fabric ./cmd/fabric
 go test ./...
 ```
 
@@ -59,15 +57,15 @@ Quickstart (throwaway state dir):
 
 ```sh
 export VAULT_PASSPHRASE=test          # or omit for an interactive prompt
-./vault init -state /tmp/v -name alex
-./vault bucket create -state /tmp/v family-photos
-./vault put -state /tmp/v -tag pets,2026 family-photos cat.jpg
-./vault ls  -state /tmp/v -tag pets family-photos
-./vault project -state /tmp/v family-photos /tmp/album   # read-only view
+./fabric vault init -state /tmp/v -name alex
+./fabric vault bucket create -state /tmp/v family-photos
+./fabric vault put -state /tmp/v -tag pets,2026 family-photos cat.jpg
+./fabric vault ls  -state /tmp/v -tag pets family-photos
+./fabric vault project -state /tmp/v family-photos /tmp/album   # read-only view
 # with `fabric up` running:
-./vault mount -state /tmp/v family-photos /tmp/album-live
+./fabric vault mount -state /tmp/v family-photos /tmp/album-live
 # opt in to ordinary filesystem writes:
-./vault mount -state /tmp/v -write family-photos /tmp/album-live
+./fabric vault mount -state /tmp/v -write family-photos /tmp/album-live
 ```
 
 Default state dir is `~/.config/vault`; every command accepts
@@ -93,7 +91,7 @@ Mesh membership is the machine's, managed by the fabric CLI:
 fabric join -name desk /ip4/…/tcp/4517/p2p/12D3Koo…   # approve on the master
 vault init -name alex     # create the circle (once, any device)
 fabric up &               # node daemon; vault subsystem activates
-vault status              # circle, mesh membership, connected vault peers
+fabric vault status       # circle, mesh membership, connected vault peers
 ```
 
 "Which devices run vault" is simply which members have vault state —
@@ -103,7 +101,7 @@ other among mesh members by the `/vault/hello/1` protocol
 `fabric status`.
 
 **A second device of the same owner** (interim procedure until
-capability grants land — `vault init` would mint a *different* user
+capability grants land — `fabric vault init` would mint a *different* user
 key): copy the circle identity, then restart the daemon so the
 subsystem activates.
 
@@ -111,8 +109,8 @@ subsystem activates.
 ssh other 'mkdir -p -m 700 ~/.config/vault'
 scp ~/.config/vault/config.json ~/.config/vault/user.key.age other:.config/vault/
 # on other: restart 'fabric up' (systemctl restart fabric), then
-vault buckets            # catalog arrives via sync (≤30 s after connect)
-vault sub <bucket> full  # and blobs follow
+fabric vault buckets            # catalog arrives via sync (≤30 s after connect)
+fabric vault sub <bucket> full  # and blobs follow
 ```
 
 Only those two files — `blobs/`, `buckets/`, and `subs.json` are
@@ -129,13 +127,13 @@ signature verification. Blobs move separately on `/vault/blob/1`,
 driven by subscriptions (memo §5 — pull, not push):
 
 ```sh
-vault sub photos full    # hold a complete copy; fetch what's missing
-vault sub photos cache   # hold what gets accessed (no eviction yet)
-vault sub photos none    # catalog + index only
-vault buckets            # id, sub mode, held/objects, name
+fabric vault sub photos full    # hold a complete copy; fetch what's missing
+fabric vault sub photos cache   # hold what gets accessed (no eviction yet)
+fabric vault sub photos none    # catalog + index only
+fabric vault buckets            # id, sub mode, held/objects, name
 ```
 
-The creating device subscribes `full` by default. `vault get` works
+The creating device subscribes `full` by default. `fabric vault get` works
 on *any* vault node that can reach a holder — a missing blob is a
 mesh lookup, not an error. Transfers are verified by re-hashing
 (content addressing is the integrity check). Trust boundary today:
@@ -144,7 +142,7 @@ visibility and capability checks arrive with grants.
 
 ## FUSE mount
 
-`vault mount <bucket> <dir>` is the practical access surface for dogfooding
+`fabric vault mount <bucket> <dir>` is the practical access surface for dogfooding
 and legacy consumers. Stored object names appear as ordinary paths; opening a
 file reads through the daemon, so `cache`/`none` can fetch a missing blob from
 a connected holder. It is read-only unless `-write` is supplied.
@@ -173,8 +171,8 @@ daemon.
 - `daemon/` — the vault subsystem: control API (HTTP over unix
   socket), sync/blob/hello protocols; attached to the fabric daemon
   by `cmd/fabric up` (the composition root)
-- `../cmd/vault` — data CLI (daemon client when one is running,
-  direct otherwise)
+- `cli/` — the `fabric vault` command group (daemon client when one is
+  running, direct otherwise)
 
 ## Status
 

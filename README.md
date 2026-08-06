@@ -363,6 +363,21 @@ your processes instead of the whole host. For the same reason, don't
 "fix" a shared machine by setcap'ing the binary — that works
 mechanically, but it bridges your overlay to everyone on the box.
 
+## Deploy to existing nodes
+
+For the current x86-64 Ubuntu fleet, the binary can deploy itself over SSH:
+
+```sh
+fabric deploy kodi
+fabric deploy kodi gate.example.com relay.example.org
+```
+
+It installs atomically at `~/.local/bin/fabric`, migrates the supported legacy
+`~/fabric` service path to that binary, restarts the existing system or user
+unit, and waits for `fabric status` to pass. Run it from the freshly built
+binary you intend to distribute. Release artifacts and mixed-architecture
+fleets remain future deployment work.
+
 The web UI is deliberately *not* a service: `fabric ui` holds the
 namespace root key (signs approvals, revocations, renewals) and should
 only run interactively on the master, unlocked when you need it —
@@ -488,7 +503,7 @@ scripts).
 - `state` — the state directory: config, device key, own cert,
   keystore path, control socket.
 - `vault/…` — the data layer: `bucket`, `blobstore`, `index`,
-  `circle`, and the vault subsystem daemon; `cmd/vault` is its data
+  `circle`, and the vault subsystem daemon; `fabric vault` is its data
   CLI. See [`vault/README.md`](vault/README.md).
 
 ## Development

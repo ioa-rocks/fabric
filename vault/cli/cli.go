@@ -1,4 +1,4 @@
-// Package cli is the vault data CLI ("vault <command> [flags]") — the
+// Package cli is the Vault command group ("fabric vault <command> [flags]") — the
 // CLI over the object-store API. Data commands work against a running
 // daemon's control socket when there is one (the daemon owns the store
 // while it runs) and fall back to opening the state directly — same
@@ -6,9 +6,7 @@
 // this is surface #1).
 //
 // It is a package, not a main, so the one fabric binary can carry it
-// (ADR 0013): cmd/fabric dispatches here on `fabric vault …` or when
-// invoked through a "vault" symlink; cmd/vault stays as a standalone
-// build of the same commands.
+// (ADR 0013): cmd/fabric dispatches here on `fabric vault …`.
 package cli
 
 import (
@@ -74,7 +72,7 @@ func Main(args []string) int {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `usage: vault <command> [flags]
+	fmt.Fprint(os.Stderr, `usage: fabric vault <command> [flags]
 
 The data surface of the node. The node daemon itself is 'fabric up' —
 it activates the vault subsystem when circle state exists (ADR 0013);
@@ -219,13 +217,13 @@ func cmdStatus(args []string) error {
 
 func cmdBucket(args []string) error {
 	if len(args) < 1 || args[0] != "create" {
-		return fmt.Errorf("usage: vault bucket create <name>")
+		return fmt.Errorf("usage: fabric vault bucket create <name>")
 	}
 	fs := flag.NewFlagSet("bucket create", flag.ExitOnError)
 	statePath := stateFlag(fs)
 	pos := parse(fs, args[1:], -1)
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: vault bucket create <name>")
+		return fmt.Errorf("usage: fabric vault bucket create <name>")
 	}
 	// Signing happens here, where the passphrase prompt is — the daemon
 	// only ever receives the signed genesis + policy.
@@ -290,7 +288,7 @@ func cmdSub(args []string) error {
 	statePath := stateFlag(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) < 1 || len(pos) > 2 {
-		return fmt.Errorf("usage: vault sub <bucket> [full|cache|none]")
+		return fmt.Errorf("usage: fabric vault sub <bucket> [full|cache|none]")
 	}
 	st, err := openStore(*statePath)
 	if err != nil {
@@ -338,7 +336,7 @@ func cmdPut(args []string) error {
 	tags := fs.String("tag", "", "comma-separated tags for the new objects")
 	pos := parse(fs, args, -1)
 	if len(pos) < 2 {
-		return fmt.Errorf("usage: vault put <bucket> <file...> [-tag t1,t2]")
+		return fmt.Errorf("usage: fabric vault put <bucket> <file...> [-tag t1,t2]")
 	}
 	st, err := openStore(*statePath)
 	if err != nil {
@@ -367,7 +365,7 @@ func cmdLs(args []string) error {
 	tags := fs.String("tag", "", "comma-separated tags; objects must carry all (facet intersection)")
 	pos := parse(fs, args, -1)
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: vault ls <bucket> [-tag t1,t2]")
+		return fmt.Errorf("usage: fabric vault ls <bucket> [-tag t1,t2]")
 	}
 	st, err := openStore(*statePath)
 	if err != nil {
@@ -391,7 +389,7 @@ func cmdTag(args []string) error {
 	// on "-x" means "remove tag x", not a flag.
 	pos := parse(fs, args, 2)
 	if len(pos) < 3 {
-		return fmt.Errorf("usage: vault tag <bucket> <object-ref> [+tag ...] [-tag ...]")
+		return fmt.Errorf("usage: fabric vault tag <bucket> <object-ref> [+tag ...] [-tag ...]")
 	}
 	var add, remove []string
 	for _, m := range pos[2:] {
@@ -423,7 +421,7 @@ func cmdGet(args []string) error {
 	out := fs.String("o", "", "output file (default: stdout)")
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: vault get <bucket> <object-ref> [-o file]")
+		return fmt.Errorf("usage: fabric vault get <bucket> <object-ref> [-o file]")
 	}
 	st, err := openStore(*statePath)
 	if err != nil {
@@ -453,7 +451,7 @@ func cmdRm(args []string) error {
 	statePath := stateFlag(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: vault rm <bucket> <object-ref>")
+		return fmt.Errorf("usage: fabric vault rm <bucket> <object-ref>")
 	}
 	st, err := openStore(*statePath)
 	if err != nil {
@@ -473,7 +471,7 @@ func cmdProject(args []string) error {
 	statePath := stateFlag(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: vault project <bucket> <dir>")
+		return fmt.Errorf("usage: fabric vault project <bucket> <dir>")
 	}
 	dir, err := filepath.Abs(pos[1])
 	if err != nil {
@@ -499,7 +497,7 @@ func cmdMount(args []string) error {
 	write := fs.Bool("write", false, "enable staged filesystem writes")
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: vault mount <bucket> <dir> [-debug] [-write]")
+		return fmt.Errorf("usage: fabric vault mount <bucket> <dir> [-debug] [-write]")
 	}
 	mountpoint, err := filepath.Abs(pos[1])
 	if err != nil {
