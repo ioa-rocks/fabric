@@ -21,8 +21,8 @@ ctl=systemctl
 [ "$scope" = system ] || ctl="systemctl --user"
 pid=$($ctl show fabric.service -p MainPID --value)
 [ "$pid" -gt 0 ] || { echo "fabric.service is not running" >&2; exit 1; }
-bin=$(readlink -f "/proc/$pid/exe")
-printf '%s\n%s\n%s\n%s\n' "$scope" "$HOME" "$pid" "$bin"`
+exec_start=$($ctl show fabric.service -p ExecStart --value)
+printf '%s\n%s\n%s\n%s\n' "$scope" "$HOME" "$pid" "$exec_start"`
 
 func cmdDeploy(args []string) error {
 	if len(args) == 0 {
@@ -50,7 +50,11 @@ func deployHost(host, local string) error {
 	if len(lines) != 4 {
 		return fmt.Errorf("unexpected service inspection response %q", info)
 	}
-	scope, home, oldPID, oldBin := lines[0], lines[1], lines[2], lines[3]
+	scope, home, oldPID := lines[0], lines[1], lines[2]
+	oldBin, err := executableFromSystemd(lines[3])
+	if err != nil {
+		return err
+	}
 	target := home + "/.local/bin/fabric"
 	legacy := home + "/fabric"
 	if oldBin != target && oldBin != legacy {
@@ -96,6 +100,20 @@ func deployHost(host, local string) error {
 		}
 	}
 	return fmt.Errorf("daemon did not restart; inspect its journal")
+}
+
+func executableFromSystemd(execStart string) (string, error) {
+	const prefix = "{ path="
+	start := strings.Index(execStart, prefix)
+	if start < 0 {
+		return "", fmt.Errorf("cannot parse systemd ExecStart %q", execStart)
+	}
+	rest := execStart[start+len(prefix):]
+	end := strings.Index(rest, " ;")
+	if end < 1 {
+		return "", fmt.Errorf("cannot parse systemd ExecStart %q", execStart)
+	}
+	return rest[:end], nil
 }
 
 func shellQuote(s string) string {
