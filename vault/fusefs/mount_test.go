@@ -267,3 +267,30 @@ func TestWritableMountLifecycle(t *testing.T) {
 		t.Fatalf("objects after delete=%d", count)
 	}
 }
+
+func TestMountedFileRefreshesRemoteSize(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		t.Skip("FUSE unavailable")
+	}
+	src := newMemorySource()
+	o, err := src.Put("photos", "growing.txt", strings.NewReader("a"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mountpoint := t.TempDir()
+	server, err := Mount(mountpoint, "photos", src, false, false)
+	if err != nil {
+		t.Skipf("cannot mount FUSE: %v", err)
+	}
+	defer server.Unmount()
+	if _, err := src.Replace("photos", o.ID, strings.NewReader("complete remote content")); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(mountpoint + "/growing.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := info.Size(), int64(len("complete remote content")); got != want {
+		t.Fatalf("mounted size = %d, want live size %d", got, want)
+	}
+}

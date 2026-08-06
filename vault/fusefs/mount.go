@@ -147,15 +147,43 @@ func (d *dirNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut)
 
 func (f *fileNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	out.Mode, out.Size = syscall.S_IFREG|0o444, uint64(f.object.Size)
+	active := f.handle
+	object := f.object
+	f.mu.Unlock()
+	if active != nil {
+		active.mu.Lock()
+		info, err := active.file.Stat()
+		active.mu.Unlock()
+		if err == nil {
+			object.Size = info.Size()
+		}
+	} else if object.ID != "" {
+		objects, err := f.src.List(f.bucket, nil)
+		if err != nil {
+			return syscall.EIO
+		}
+		found := false
+		for _, current := range objects {
+			if current.ID == object.ID {
+				object, found = current, true
+				break
+			}
+		}
+		if !found {
+			return syscall.ENOENT
+		}
+		f.mu.Lock()
+		f.object = object
+		f.mu.Unlock()
+	}
+	out.Mode, out.Size = syscall.S_IFREG|0o444, uint64(object.Size)
 	if f.writable {
 		out.Mode = syscall.S_IFREG | 0o644
 	}
 	out.Uid, out.Gid = uint32(os.Getuid()), uint32(os.Getgid())
-	if f.object.Created > 0 {
-		out.Mtime = uint64(f.object.Created / 1e9)
-		out.Mtimensec = uint32(f.object.Created % 1e9)
+	if object.Created > 0 {
+		out.Mtime = uint64(object.Created / 1e9)
+		out.Mtimensec = uint32(object.Created % 1e9)
 	}
 	return 0
 }

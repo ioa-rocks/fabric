@@ -157,10 +157,11 @@ unlink creates the usual Vault tombstone. Files are single-writer within one
 mount. Directory renames currently update their objects one at a time rather
 than atomically.
 
-The namespace is snapshotted at mount time; remount to see changes made through
-another client or mount. Content is fetched live on every open. Duplicate names
-gain an `~<object-id>` suffix. Requires Linux FUSE and a running `fabric up`
-daemon.
+The set of names is snapshotted at mount time; remount to see creates, renames,
+or deletes made through another client or mount. Existing files refresh their
+metadata and content through the daemon, so a remotely grown file reports and
+reads its current size. Duplicate names gain an `~<object-id>` suffix. Requires
+Linux FUSE and a running `fabric up` daemon.
 
 ## Layout
 
