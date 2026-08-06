@@ -16,11 +16,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"ioa.rocks/fabric/vault/circle"
 	"ioa.rocks/fabric/vault/daemon"
+	"ioa.rocks/fabric/vault/fusefs"
 
 	"golang.org/x/term"
 )
@@ -56,6 +59,8 @@ func Main(args []string) int {
 		err = cmdSub(rest)
 	case "project":
 		err = cmdProject(rest)
+	case "mount":
+		err = cmdMount(rest)
 	default:
 		usage()
 		return 2
@@ -86,6 +91,7 @@ daemon's control socket, or open the state directly when none runs.
   rm       rm <bucket> <object-ref> — tombstone an object
   sub      sub <bucket> [full|cache|none] — this device's placement commitment
   project  project <bucket> <dir> — materialize a read-only directory view
+  mount    mount <bucket> <dir> — mount a read-only live-content filesystem
 
 Every command accepts -state <dir> (default `+circle.DefaultPath()+`),
 before or after positional arguments. Signing commands read
@@ -482,5 +488,37 @@ func cmdProject(args []string) error {
 		return err
 	}
 	fmt.Printf("projected %d objects into %s (read-only view — edits there are not writes)\n", n, dir)
+	return nil
+}
+
+func cmdMount(args []string) error {
+	fs := flag.NewFlagSet("mount", flag.ExitOnError)
+	statePath := stateFlag(fs)
+	debug := fs.Bool("debug", false, "show FUSE protocol logging")
+	pos := parse(fs, args, -1)
+	if len(pos) != 2 {
+		return fmt.Errorf("usage: vault mount <bucket> <dir> [-debug]")
+	}
+	mountpoint, err := filepath.Abs(pos[1])
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		return err
+	}
+	cl := daemon.TryClient(*statePath)
+	if cl == nil {
+		return fmt.Errorf("mount requires the running node daemon on %s", daemon.SocketPath(*statePath))
+	}
+	server, err := fusefs.Mount(mountpoint, pos[0], cl, *debug)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("mounted bucket %q read-only at %s; unmount with Ctrl-C or fusermount3 -u %s\n", pos[0], mountpoint, mountpoint)
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() { <-sig; _ = server.Unmount() }()
+	server.Wait()
+	signal.Stop(sig)
 	return nil
 }

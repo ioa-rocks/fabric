@@ -38,8 +38,9 @@ Objects:   Put(bucket, name, reader, tags...) -> Object
            Tag(bucket, objectID, +tag/-tag)
            Delete(bucket, objectID)                    // tombstone
 Surfaces:  Project(bucket, dir)                        // read-only materialization
+           Mount(bucket, dir)                          // read-only FUSE view
 Later:     Subscribe(bucket, mode), Grant(bucket, userKey, caps),
-           serve layer (gallery / URL shares), FUSE
+           serve layer (gallery / URL shares), writable/faceted FUSE
 ```
 
 ## Build
@@ -63,6 +64,8 @@ export VAULT_PASSPHRASE=test          # or omit for an interactive prompt
 ./vault put -state /tmp/v -tag pets,2026 family-photos cat.jpg
 ./vault ls  -state /tmp/v -tag pets family-photos
 ./vault project -state /tmp/v family-photos /tmp/album   # read-only view
+# with `fabric up` running:
+./vault mount -state /tmp/v family-photos /tmp/album-live
 ```
 
 Default state dir is `~/.config/vault`; every command accepts
@@ -136,6 +139,19 @@ mesh lookup, not an error. Transfers are verified by re-hashing
 (content addressing is the integrity check). Trust boundary today:
 any authenticated mesh member may sync and fetch; per-circle
 visibility and capability checks arrive with grants.
+
+## Read-only FUSE mount
+
+`vault mount <bucket> <dir>` is the practical access surface for dogfooding
+and legacy consumers. Stored object names appear as ordinary paths; opening a
+file reads through the daemon, so `cache`/`none` can fetch a missing blob from
+a connected holder. The mount rejects writes.
+
+This first cut snapshots names when mounted; remount to see added, renamed, or
+deleted objects. Content is fetched live on every open. Objects imported by an
+older binary may report zero size and should be re-imported for filesystem
+consumers. Duplicate names gain an `~<object-id>` suffix. Requires Linux FUSE
+and a running `fabric up` daemon.
 
 ## Layout
 

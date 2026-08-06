@@ -11,12 +11,12 @@ func TestStoreRoundtripAndFacets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cat := NewObject("cat.jpg", "h-cat", 1000, "did:alex")
+	cat := NewObject("cat.jpg", "h-cat", 1, 1000, "did:alex")
 	cat.Tags.Add("pets", 1000)
 	cat.Tags.Add("2026", 1000)
-	dog := NewObject("dog.jpg", "h-dog", 1001, "did:alex")
+	dog := NewObject("dog.jpg", "h-dog", 1, 1001, "did:alex")
 	dog.Tags.Add("pets", 1001)
-	tax := NewObject("tax.pdf", "h-tax", 1002, "did:alex")
+	tax := NewObject("tax.pdf", "h-tax", 1, 1002, "did:alex")
 	tax.Tags.Add("2026", 1002)
 	for _, o := range []*Object{cat, dog, tax} {
 		if _, err := s.PutObject(o); err != nil {
@@ -99,7 +99,7 @@ func TestPutObjectMerges(t *testing.T) {
 	}
 	defer s.Close()
 
-	o := NewObject("a.jpg", "h1", 1000, "did:alex")
+	o := NewObject("a.jpg", "h1", 1, 1000, "did:alex")
 	if _, err := s.PutObject(o); err != nil {
 		t.Fatal(err)
 	}

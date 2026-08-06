@@ -147,13 +147,14 @@ type Object struct {
 	CreatedBy string `cbor:"created_by"`
 
 	Name    LWW   `cbor:"name"`
-	Blob    LWW   `cbor:"blob"`    // BLAKE3 hash of current content
-	Deleted LWW   `cbor:"deleted"` // "" live, else tombstone ts marker
+	Blob    LWW   `cbor:"blob"`           // BLAKE3 hash of current content
+	Size    int64 `cbor:"size,omitempty"` // bytes for the current Blob; zero on legacy records
+	Deleted LWW   `cbor:"deleted"`        // "" live, else tombstone ts marker
 	Tags    ORSet `cbor:"tags"`
 }
 
 // NewObject mints an object with a fresh random ID.
-func NewObject(name, blob string, ts int64, by string) *Object {
+func NewObject(name, blob string, size int64, ts int64, by string) *Object {
 	idb := make([]byte, 16)
 	if _, err := rand.Read(idb); err != nil {
 		panic(fmt.Sprintf("index: reading randomness: %v", err))
@@ -164,6 +165,7 @@ func NewObject(name, blob string, ts int64, by string) *Object {
 		CreatedBy: by,
 		Name:      LWW{V: name, TS: ts, By: by},
 		Blob:      LWW{V: blob, TS: ts, By: by},
+		Size:      size,
 		Tags:      NewORSet(),
 	}
 }
@@ -183,6 +185,19 @@ func Merge(a, b *Object) *Object {
 	}
 	out.Name = mergeLWW(a.Name, b.Name)
 	out.Blob = mergeLWW(a.Blob, b.Blob)
+	// Size describes Blob, so select it from the replica whose blob register
+	// won. Equal blob hashes necessarily have equal sizes; max also repairs a
+	// legacy zero-size record after it meets a current record.
+	switch {
+	case out.Blob == a.Blob && out.Blob != b.Blob:
+		out.Size = a.Size
+	case out.Blob == b.Blob && out.Blob != a.Blob:
+		out.Size = b.Size
+	case a.Size > b.Size:
+		out.Size = a.Size
+	default:
+		out.Size = b.Size
+	}
 	out.Deleted = mergeLWW(a.Deleted, b.Deleted)
 	out.Tags = mergeORSet(a.Tags, b.Tags)
 	return out

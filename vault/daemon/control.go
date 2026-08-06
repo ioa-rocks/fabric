@@ -53,13 +53,14 @@ type ObjectInfo struct {
 	ID      string   `json:"id"`
 	Name    string   `json:"name"`
 	Blob    string   `json:"blob"`
+	Size    int64    `json:"size"`
 	Tags    []string `json:"tags,omitempty"`
 	Deleted bool     `json:"deleted,omitempty"`
 }
 
 func Info(o *index.Object) ObjectInfo {
 	tags := o.Tags.List()
-	return ObjectInfo{ID: o.ID, Name: o.Name.V, Blob: o.Blob.V, Tags: tags, Deleted: o.IsDeleted()}
+	return ObjectInfo{ID: o.ID, Name: o.Name.V, Blob: o.Blob.V, Size: o.Size, Tags: tags, Deleted: o.IsDeleted()}
 }
 
 // PeerInfo describes one connected mesh member as seen from this vault

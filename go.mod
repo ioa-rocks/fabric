@@ -7,6 +7,7 @@ require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/godbus/dbus/v5 v5.2.2
+	github.com/hanwen/go-fuse/v2 v2.8.0
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/miekg/dns v1.1.72
 	github.com/mr-tron/base58 v1.2.0

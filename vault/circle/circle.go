@@ -387,12 +387,12 @@ func (h *Handle) ID() string { return h.id }
 // Put streams content in as a new object: blob into the content store, a
 // fresh record into the index, a location record for this node.
 func (h *Handle) Put(name string, r io.Reader, tags ...string) (*index.Object, error) {
-	hash, _, err := h.circle.Blobs.Put(r)
+	hash, size, err := h.circle.Blobs.Put(r)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now().UnixNano()
-	o := index.NewObject(name, hash, now, h.circle.Config.DID)
+	o := index.NewObject(name, hash, size, now, h.circle.Config.DID)
 	for _, t := range tags {
 		o.Tags.Add(t, now)
 	}

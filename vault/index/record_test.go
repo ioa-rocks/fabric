@@ -10,7 +10,7 @@ import (
 // the same state regardless of merge order (commutativity) and re-merging
 // must change nothing (idempotence).
 func TestMergeConvergence(t *testing.T) {
-	base := NewObject("cat.jpg", "hash-v1", 1000, "did:alex")
+	base := NewObject("cat.jpg", "hash-v1", 10, 1000, "did:alex")
 
 	// Replica A renames and adds a tag.
 	a := clone(t, base)
@@ -20,6 +20,7 @@ func TestMergeConvergence(t *testing.T) {
 	// Replica B swaps the blob (edit) and adds a different tag.
 	b := clone(t, base)
 	b.Blob.Set("hash-v2", 2500, "did:wife")
+	b.Size = 20
 	b.Tags.Add("2026", 2500)
 
 	ab := Merge(a, b)
@@ -34,6 +35,9 @@ func TestMergeConvergence(t *testing.T) {
 
 	if ab.Name.V != "cat-renamed.jpg" || ab.Blob.V != "hash-v2" {
 		t.Fatalf("LWW fields wrong after merge: name=%q blob=%q", ab.Name.V, ab.Blob.V)
+	}
+	if ab.Size != 20 {
+		t.Fatalf("size did not follow winning blob: %d", ab.Size)
 	}
 	tags := ab.Tags.List()
 	slices.Sort(tags)
@@ -77,7 +81,7 @@ func TestORSetAddWinsOverConcurrentRemove(t *testing.T) {
 }
 
 func TestTombstoneMerges(t *testing.T) {
-	base := NewObject("dog.jpg", "h1", 1000, "did:alex")
+	base := NewObject("dog.jpg", "h1", 1, 1000, "did:alex")
 	a := clone(t, base)
 	a.Deleted.Set("gone", 2000, "did:alex")
 	b := clone(t, base)
