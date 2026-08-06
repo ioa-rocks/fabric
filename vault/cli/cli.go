@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -517,8 +518,35 @@ func cmdMount(args []string) error {
 	fmt.Printf("mounted bucket %q read-only at %s; unmount with Ctrl-C or fusermount3 -u %s\n", pos[0], mountpoint, mountpoint)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	go func() { <-sig; _ = server.Unmount() }()
-	server.Wait()
+	done := make(chan struct{})
+	go func() {
+		server.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-sig:
+		if err := server.Unmount(); err != nil {
+			if lazyErr := lazyUnmount(mountpoint); lazyErr != nil {
+				signal.Stop(sig)
+				return fmt.Errorf("unmount: %w; lazy detach: %v (leave the mount directory and run fusermount3 -u %s)", err, lazyErr, mountpoint)
+			}
+		}
+	}
 	signal.Stop(sig)
 	return nil
+}
+
+// lazyUnmount is the Ctrl-C fallback for EBUSY, most commonly when the
+// invoking shell's working directory is inside the mount. The FUSE helper is
+// needed because an unprivileged mount owner cannot call umount(2) directly.
+func lazyUnmount(mountpoint string) error {
+	for _, name := range []string{"fusermount3", "fusermount"} {
+		bin, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		return exec.Command(bin, "-uz", mountpoint).Run()
+	}
+	return fmt.Errorf("neither fusermount3 nor fusermount is installed")
 }
