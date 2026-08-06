@@ -14,6 +14,16 @@ import (
 	"ioa.rocks/fabric/vault/daemon"
 )
 
+type closeSpy struct {
+	io.Reader
+	closed bool
+}
+
+func (r *closeSpy) Close() error {
+	r.closed = true
+	return nil
+}
+
 // startDaemon plays the composition root (what `fabric up` does in
 // production): if the state dir carries a fabric identity under
 // <state>/fabric, run a fabric daemon and attach the vault subsystem to
@@ -116,13 +126,21 @@ func TestSoloDaemonAPI(t *testing.T) {
 	}
 
 	content := []byte("jpeg bytes")
-	o, err := cl.Put("photos", "2026/cat.jpg", bytes.NewReader(content), []string{"cats"})
+	putBody := &closeSpy{Reader: bytes.NewReader(content)}
+	o, err := cl.Put("photos", "2026/cat.jpg", putBody, []string{"cats"})
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	replaced, err := cl.Replace("photos", o.ID, bytes.NewReader([]byte("new cat")))
+	if putBody.closed {
+		t.Fatal("Put closed its caller-owned reader")
+	}
+	replaceBody := &closeSpy{Reader: bytes.NewReader([]byte("new cat"))}
+	replaced, err := cl.Replace("photos", o.ID, replaceBody)
 	if err != nil || replaced.ID != o.ID || replaced.Size != 7 {
 		t.Fatalf("Replace: %+v, err=%v", replaced, err)
+	}
+	if replaceBody.closed {
+		t.Fatal("Replace closed its caller-owned reader")
 	}
 	renamed, err := cl.Rename("photos", o.ID, "2026/best-cat.jpg")
 	if err != nil || renamed.ID != o.ID || renamed.Name != "2026/best-cat.jpg" {

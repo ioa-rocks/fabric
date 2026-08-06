@@ -130,7 +130,9 @@ func (c *Client) Put(bucket, name string, r io.Reader, tags []string) (ObjectInf
 	if len(tags) > 0 {
 		q += "&tags=" + url.QueryEscape(strings.Join(tags, ","))
 	}
-	resp, err := c.http.Post("http://vault"+bucketPath(bucket, "/objects")+q, "application/octet-stream", r)
+	// The HTTP client always closes request bodies. Wrap the reader so a FUSE
+	// staging file survives an early Flush caused by a duplicated file descriptor.
+	resp, err := c.http.Post("http://vault"+bucketPath(bucket, "/objects")+q, "application/octet-stream", io.NopCloser(r))
 	if err != nil {
 		return out, fmt.Errorf("is the daemon running? %w", err)
 	}
@@ -157,7 +159,7 @@ func (c *Client) Get(bucket, ref string) (io.ReadCloser, error) {
 
 func (c *Client) Replace(bucket, ref string, r io.Reader) (ObjectInfo, error) {
 	var out ObjectInfo
-	req, err := http.NewRequest(http.MethodPut, "http://vault"+bucketPath(bucket, "/content")+"?ref="+url.QueryEscape(ref), r)
+	req, err := http.NewRequest(http.MethodPut, "http://vault"+bucketPath(bucket, "/content")+"?ref="+url.QueryEscape(ref), io.NopCloser(r))
 	if err != nil {
 		return out, err
 	}

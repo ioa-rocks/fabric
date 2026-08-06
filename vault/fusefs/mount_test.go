@@ -164,6 +164,29 @@ func TestWritableMountLifecycle(t *testing.T) {
 	if err := os.WriteFile(mountpoint+"/2026/cat.jpg", []byte("cat"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Shell redirection duplicates the descriptor, which can issue Flush before
+	// the final writer closes. A later write must still reach the staging file.
+	f, err := os.OpenFile(mountpoint+"/2026/shell.txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dup, err := syscall.Dup(int(f.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dupFile := os.NewFile(uintptr(dup), "shell-dup")
+	if _, err := dupFile.WriteString("shell"); err != nil {
+		t.Fatal(err)
+	}
+	if err := dupFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(mountpoint + "/2026/shell.txt"); err != nil {
+		t.Fatal(err)
+	}
 	if got, err := os.ReadFile(mountpoint + "/2026/cat.jpg"); err != nil || string(got) != "cat" {
 		t.Fatalf("read=%q err=%v", got, err)
 	}
