@@ -91,6 +91,15 @@ func (c *Client) Status() (*StatusReply, error) {
 	return &s, nil
 }
 
+// Ping round-trips the control socket to prove the daemon is still serving.
+// It deliberately reuses /v0/status rather than adding an endpoint: status
+// costs the same whatever a bucket holds, and a newer CLI keeps working
+// against a daemon that predates this call.
+func (c *Client) Ping() error {
+	_, err := c.Status()
+	return err
+}
+
 func (c *Client) Buckets() ([]BucketInfo, error) {
 	var out []BucketInfo
 	if err := c.get("/v0/buckets", &out); err != nil {

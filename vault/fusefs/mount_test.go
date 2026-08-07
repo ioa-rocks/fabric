@@ -85,6 +85,7 @@ func (s *memorySource) Rename(_, ref, name string) (daemon.ObjectInfo, error) {
 	s.objects[ref] = o
 	return o, nil
 }
+func (s *memorySource) Ping() error { return nil }
 func (s *memorySource) Rm(_, ref string) (daemon.ObjectInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -368,6 +369,82 @@ func TestStatCoalescesBucketListings(t *testing.T) {
 	}
 }
 
+// downableSource serves a mount and then stops answering, standing in for a
+// daemon that dies or a socket that goes away mid-import.
+type downableSource struct {
+	*memorySource
+	down atomic.Bool
+}
+
+func (s *downableSource) List(b string, tags []string) ([]daemon.ObjectInfo, error) {
+	if s.down.Load() {
+		return nil, errors.New("daemon unreachable")
+	}
+	return s.memorySource.List(b, tags)
+}
+func (s *downableSource) Put(b, n string, r io.Reader, tags []string) (daemon.ObjectInfo, error) {
+	if s.down.Load() {
+		return daemon.ObjectInfo{}, errors.New("daemon unreachable")
+	}
+	return s.memorySource.Put(b, n, r, tags)
+}
+func (s *downableSource) Ping() error {
+	if s.down.Load() {
+		return errors.New("daemon unreachable")
+	}
+	return nil
+}
+
+// The kernel throws away the error Release returns, so publishing only at
+// Release used to make a failed import look exactly like a successful one:
+// close(2) reported success and nothing was stored. close(2) must report the
+// failure, and the bytes the mount accepted must survive on disk.
+func TestFailedPublishIsReportedAndContentKept(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		t.Skip("FUSE unavailable")
+	}
+	src := &downableSource{memorySource: newMemorySource()}
+	stage := t.TempDir()
+	mountpoint := t.TempDir()
+	server, err := Mount(mountpoint, "photos", src, Options{Writable: true, StageDir: stage})
+	if err != nil {
+		t.Skipf("cannot mount FUSE: %v", err)
+	}
+	defer server.Unmount()
+
+	f, err := os.Create(mountpoint + "/holiday.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const content = "irreplaceable photo bytes"
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	// Close immediately: a daemon that died a moment ago is the case worth
+	// catching, so the check must not be satisfied by a recent listing.
+	src.down.Store(true)
+	if err := f.Close(); err == nil {
+		t.Error("close() reported success for content that was never stored")
+	}
+	if objects, _ := src.memorySource.List("photos", nil); len(objects) != 0 {
+		t.Fatalf("bucket holds %d objects, want 0", len(objects))
+	}
+	kept := filepath.Join(stage, "unpublished", "holiday.jpg")
+	deadline := time.Now().Add(5 * time.Second) // Release runs after close returns
+	for {
+		if got, err := os.ReadFile(kept); err == nil {
+			if string(got) != content {
+				t.Fatalf("preserved content = %q, want %q", got, content)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("unpublished content was not preserved at %s", kept)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // Reads and writes buffer whole objects, so they must land in the configured
 // staging area next to the blob store, never in the system temp dir.
 func TestStagedContentUsesStageDir(t *testing.T) {
@@ -398,4 +475,132 @@ func TestStagedContentUsesStageDir(t *testing.T) {
 		t.Errorf("open buffered outside the staging dir %s", stage)
 	}
 	f.Close()
+}
+
+// putFailsSource answers listings normally but refuses to store content, the
+// residual case the close(2) probe cannot catch.
+type putFailsSource struct{ *memorySource }
+
+func (putFailsSource) Put(string, string, io.Reader, []string) (daemon.ObjectInfo, error) {
+	return daemon.ObjectInfo{}, errors.New("bucket policy refused the write")
+}
+
+// When the daemon answers but the publish itself fails, close(2) cannot carry
+// the error. The loss must still be visible: the content is kept on disk and
+// the path stops working instead of pretending to hold a file.
+func TestRefusedPublishLeavesPathBroken(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		t.Skip("FUSE unavailable")
+	}
+	src := putFailsSource{newMemorySource()}
+	stage := t.TempDir()
+	mountpoint := t.TempDir()
+	server, err := Mount(mountpoint, "photos", src, Options{Writable: true, StageDir: stage})
+	if err != nil {
+		t.Skipf("cannot mount FUSE: %v", err)
+	}
+	defer server.Unmount()
+
+	f, err := os.Create(mountpoint + "/holiday.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const content = "irreplaceable photo bytes"
+	if _, err := f.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	kept := filepath.Join(stage, "unpublished", "holiday.jpg")
+	deadline := time.Now().Add(5 * time.Second) // Release runs after close returns
+	for {
+		if got, err := os.ReadFile(kept); err == nil {
+			if string(got) != content {
+				t.Fatalf("preserved content = %q, want %q", got, content)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("unpublished content was not preserved at %s", kept)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(mountpoint + "/holiday.jpg"); !errors.Is(err, syscall.EIO) {
+		t.Errorf("stat of unpublished path = %v, want EIO so the loss is visible", err)
+	}
+}
+
+// The rescue directory holds the only copy of content the mount accepted but
+// could not store, so a second failure under the same stored name must not
+// replace the first — those are two different files.
+func TestUnpublishedRescuesDoNotOverwriteEachOther(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		t.Skip("FUSE unavailable")
+	}
+	src := putFailsSource{newMemorySource()}
+	stage := t.TempDir()
+	mountpoint := t.TempDir()
+	server, err := Mount(mountpoint, "photos", src, Options{Writable: true, StageDir: stage})
+	if err != nil {
+		t.Skipf("cannot mount FUSE: %v", err)
+	}
+	defer server.Unmount()
+
+	// Same stored name twice, different content: an original and a later edit.
+	for _, content := range []string{"original photo", "edited photo"} {
+		f, err := os.Create(mountpoint + "/holiday.jpg")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+		if err := waitFor(func() bool { return len(rescued(t, stage)) > 0 }); err != nil {
+			t.Fatalf("%q was not rescued: %v", content, err)
+		}
+		// Clear the broken path so the next copy can reuse the name.
+		if err := os.Remove(mountpoint + "/holiday.jpg"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var got []string
+	if err := waitFor(func() bool { got = rescued(t, stage); return len(got) == 2 }); err != nil {
+		t.Fatalf("rescued files = %v, want both copies kept: %v", got, err)
+	}
+	found := map[string]bool{}
+	for _, p := range got {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found[string(b)] = true
+	}
+	if !found["original photo"] || !found["edited photo"] {
+		t.Errorf("rescued content = %v, want both the original and the edit", found)
+	}
+}
+
+func rescued(t *testing.T, stage string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(stage, "unpublished", "holiday*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return matches
+}
+
+// waitFor polls a condition, since FUSE runs Release after close(2) returns.
+func waitFor(cond func() bool) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if cond() {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("condition not met before deadline")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

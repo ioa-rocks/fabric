@@ -3,8 +3,10 @@ package fusefs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -27,6 +29,11 @@ type source interface {
 	Replace(bucket, ref string, r io.Reader) (daemon.ObjectInfo, error)
 	Rename(bucket, ref, name string) (daemon.ObjectInfo, error)
 	Rm(bucket, ref string) (daemon.ObjectInfo, error)
+	// Ping must reach the daemon every time it is called. close(2) relies on
+	// it to decide whether staged content can still be published, so a
+	// cached answer would let a close succeed against a daemon that has
+	// already gone away.
+	Ping() error
 }
 
 // DefaultMetadataTTL bounds how stale a mounted file's size may be.
@@ -82,8 +89,10 @@ type mountState struct {
 	writable bool
 
 	// cacheDir holds in-flight read buffers and staged writes; empty means
-	// the system temp dir.
-	cacheDir string
+	// the system temp dir. unpublishedDir receives staged content whose
+	// publish failed, and is never cleaned automatically.
+	cacheDir       string
+	unpublishedDir string
 }
 
 func newMountState(bucket string, src source, seed []daemon.ObjectInfo, opts Options) (*mountState, error) {
@@ -94,6 +103,7 @@ func newMountState(bucket string, src source, seed []daemon.ObjectInfo, opts Opt
 	m := &mountState{bucket: bucket, src: src, cat: newCatalog(src, bucket, ttl, seed), writable: opts.Writable}
 	if opts.StageDir != "" {
 		m.cacheDir = filepath.Join(opts.StageDir, "cache")
+		m.unpublishedDir = filepath.Join(opts.StageDir, "unpublished")
 		if err := os.MkdirAll(m.cacheDir, 0o700); err != nil {
 			return nil, err
 		}
@@ -190,7 +200,11 @@ type fileNode struct {
 	object  daemon.ObjectInfo
 	writing bool
 	removed bool
-	handle  *fileHandle
+	// failed marks content this mount accepted but could not publish. The
+	// staged bytes are kept on disk; the path stops working so the loss is
+	// visible rather than silent.
+	failed bool
+	handle *fileHandle
 }
 
 func newTree(m *mountState, objects []daemon.ObjectInfo) (*dirNode, error) {
@@ -270,8 +284,11 @@ func (d *dirNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut)
 
 func (f *fileNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	f.mu.Lock()
-	active, object := f.handle, f.object
+	failed, active, object := f.failed, f.handle, f.object
 	f.mu.Unlock()
+	if failed {
+		return syscall.EIO
+	}
 	switch {
 	case active != nil:
 		active.mu.Lock()
@@ -311,6 +328,10 @@ func (f *fileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32,
 		return nil, 0, syscall.EROFS
 	}
 	f.mu.Lock()
+	if f.failed {
+		f.mu.Unlock()
+		return nil, 0, syscall.EIO
+	}
 	if write && f.writing {
 		f.mu.Unlock()
 		return nil, 0, syscall.EBUSY
@@ -382,12 +403,70 @@ func (h *fileHandle) Release(context.Context) syscall.Errno {
 	h.mu.Lock()
 	if !h.closed {
 		_ = h.file.Close()
-		_ = os.Remove(h.path)
+		// Staged bytes that never reached the daemon are the user's only
+		// copy: keep them, and let preserve() report where.
+		if errno == 0 {
+			_ = os.Remove(h.path)
+		} else {
+			h.preserveLocked()
+		}
 		h.closed = true
 	}
 	h.mu.Unlock()
 	h.node.cancelWriter(h.writable)
 	return errno
+}
+
+// preserveLocked moves unpublished content out of the scratch area under the
+// name it was meant to have, and says so on stderr. FUSE discards the error
+// Release returns, so this log is the only signal the caller ever gets that
+// a copy into the mount did not actually store anything.
+func (h *fileHandle) preserveLocked() {
+	h.node.mu.Lock()
+	name := h.node.object.Name
+	h.node.mu.Unlock()
+	kept := h.path
+	if dir := h.node.m.unpublishedDir; dir != "" {
+		if dest, err := reserveUnpublished(dir, name); err == nil {
+			if err := os.Rename(h.path, dest); err == nil {
+				kept = dest
+			}
+		}
+	}
+	log.Printf("vault mount: %q was NOT stored in bucket %s; its content is kept at %s", name, h.node.m.bucket, kept)
+	log.Printf("vault mount: recover it with: fabric vault put %s %s", h.node.m.bucket, kept)
+}
+
+// reserveUnpublished claims a free path for rescued content, creating it
+// exclusively so the caller can rename onto its own reservation. Two failed
+// writes to one stored name are two different files here — this directory
+// holds the only copy of each, so it must never overwrite itself. The second
+// arrival keeps its extension and gains a unique infix.
+func reserveUnpublished(dir, name string) (string, error) {
+	parts, err := objectPath(name)
+	if err != nil {
+		return "", err
+	}
+	dest := filepath.Join(append([]string{dir}, parts...)...)
+	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+		return "", err
+	}
+	f, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err == nil {
+		f.Close()
+		return dest, nil
+	}
+	if !errors.Is(err, os.ErrExist) {
+		return "", err
+	}
+	ext := filepath.Ext(dest)
+	f, err = os.CreateTemp(filepath.Dir(dest), strings.TrimSuffix(filepath.Base(dest), ext)+".*"+ext)
+	if err != nil {
+		return "", err
+	}
+	taken := f.Name()
+	f.Close()
+	return taken, nil
 }
 
 var _ fs.NodeOnAdder = (*dirNode)(nil)

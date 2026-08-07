@@ -165,11 +165,27 @@ refresh is a bucket listing shared by every file rather than one listing per
 `stat`. Duplicate names gain an `~<object-id>` suffix. Requires Linux FUSE and
 a running `fabric up` daemon.
 
-**Staging.** Reads and writes buffer whole objects, so they are staged under
-`<vault-state>/mount/cache` — beside the blob store, not in `/tmp`, which is
-commonly a RAM-backed tmpfs that one video can exhaust. Files there belong to
-live opens and are removed on close; anything left behind after an unclean
-shutdown is safe to delete while nothing is mounted.
+**Staging and failed publishes.** Reads and writes buffer whole objects, so
+they are staged under `<vault-state>/mount/cache` — beside the blob store,
+not in `/tmp`, which is commonly a RAM-backed tmpfs that one video can
+exhaust. Files there belong to live opens and are removed on close; anything
+left behind after an unclean shutdown is safe to delete while nothing is
+mounted.
+
+If content cannot be published, `close(2)` reports the failure whenever the
+daemon is the reason: before letting a close on modified content succeed, the
+mount round-trips the control socket. That check is always a live request —
+never a cached verdict — because a daemon that stopped answering a moment ago
+is the case worth catching.
+
+When the daemon answers but the write is refused, the kernel gives `close(2)`
+no way to carry that error, so the loss is made visible instead: the staged
+bytes are moved to `<vault-state>/mount/unpublished/<stored name>`, the path
+reports `EIO` rather than pretending to hold a file, and the recovery command
+is logged. A second failure under the same stored name never replaces the
+first — it keeps its extension and gains a unique infix, since these files are
+the only copy of their content. Nothing under `unpublished/` is ever cleaned
+automatically.
 
 ## Layout
 

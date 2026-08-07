@@ -3,6 +3,7 @@ package fusefs
 import (
 	"context"
 	"io"
+	"log"
 	"path"
 	"strings"
 	"syscall"
@@ -285,11 +286,26 @@ func (h *fileHandle) Fsync(_ context.Context, _ uint32) syscall.Errno {
 }
 
 // Flush may run once for every close of a duplicated descriptor, before the
-// last writer is finished. Keep it local; final Release (or explicit Fsync)
-// is the atomic publication boundary.
+// last writer is finished. Keep publication local to the final Release (or an
+// explicit Fsync), which is the atomic publication boundary — but check that
+// the daemon is still there. The kernel discards Release's error, so without
+// this check a close(2) that stored nothing is indistinguishable from one
+// that worked, and a photo import would report success having saved nothing.
+//
+// The check must be a live round trip, never a cached verdict: a daemon that
+// died a moment ago is exactly the case worth catching.
 func (h *fileHandle) Flush(context.Context) syscall.Errno {
 	if err := h.file.Sync(); err != nil {
 		return fs.ToErrno(err)
+	}
+	h.mu.Lock()
+	pending := h.writable && h.dirty
+	h.mu.Unlock()
+	if !pending {
+		return 0
+	}
+	if err := h.node.m.src.Ping(); err != nil {
+		return syscall.EIO
 	}
 	return 0
 }
@@ -321,11 +337,15 @@ func (h *fileHandle) commit() syscall.Errno {
 		updated, err = h.node.m.src.Replace(h.node.m.bucket, object.ID, h.file)
 	}
 	if err != nil {
+		log.Printf("vault mount: publishing %q to bucket %s failed: %v", object.Name, h.node.m.bucket, err)
+		h.node.mu.Lock()
+		h.node.failed = true
+		h.node.mu.Unlock()
 		return syscall.EIO
 	}
 	h.node.m.cat.update(updated)
 	h.node.mu.Lock()
-	h.node.object = updated
+	h.node.object, h.node.failed = updated, false
 	h.node.mu.Unlock()
 	h.dirty = false
 	return 0
