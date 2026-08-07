@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -27,51 +28,149 @@ type source interface {
 	Rm(bucket, ref string) (daemon.ObjectInfo, error)
 }
 
+// DefaultMetadataTTL bounds how stale a mounted file's size may be.
+const DefaultMetadataTTL = time.Second
+
+// Options configure a mount.
+type Options struct {
+	Debug    bool
+	Writable bool
+
+	// MetadataTTL is the window within which stat(2) may report metadata
+	// read earlier. Zero uses DefaultMetadataTTL.
+	MetadataTTL time.Duration
+}
+
 // Mount attaches a snapshot of the bucket namespace at mountpoint. Contents
 // come from the live daemon on every open, including on-demand peer fetches.
-func Mount(mountpoint, bucket string, src source, debug, writable bool) (*fuse.Server, error) {
+func Mount(mountpoint, bucket string, src source, opts Options) (*fuse.Server, error) {
 	objects, err := src.List(bucket, nil)
 	if err != nil {
 		return nil, err
 	}
-	root, err := newTree(bucket, src, objects, writable)
+	m, err := newMountState(bucket, src, objects, opts)
+	if err != nil {
+		return nil, err
+	}
+	root, err := newTree(m, objects)
 	if err != nil {
 		return nil, err
 	}
 	var mountOptions []string
-	if !writable {
+	if !opts.Writable {
 		mountOptions = []string{"ro"}
 	}
-	opts := &fs.Options{MountOptions: fuse.MountOptions{Debug: debug, FsName: "vault:" + bucket, Name: "vault", Options: mountOptions}}
-	return fs.Mount(mountpoint, root, opts)
+	fuseOpts := &fs.Options{MountOptions: fuse.MountOptions{Debug: opts.Debug, FsName: "vault:" + bucket, Name: "vault", Options: mountOptions}}
+	return fs.Mount(mountpoint, root, fuseOpts)
+}
+
+// mountState is what every node in one mount shares: the lock over the whole
+// node tree, the daemon connection, the metadata cache, and where staged
+// content lands.
+type mountState struct {
+	mu       sync.Mutex
+	bucket   string
+	src      source
+	cat      *catalog
+	writable bool
+}
+
+func newMountState(bucket string, src source, seed []daemon.ObjectInfo, opts Options) (*mountState, error) {
+	ttl := opts.MetadataTTL
+	if ttl <= 0 {
+		ttl = DefaultMetadataTTL
+	}
+	return &mountState{bucket: bucket, src: src, cat: newCatalog(src, bucket, ttl, seed), writable: opts.Writable}, nil
+}
+
+// catalog is a short-lived shared view of the bucket's object list. Every
+// stat(2) wants current metadata, but refreshing per file costs one full
+// listing per file — quadratic on a real bucket, since each listing also
+// carries every object. Coalescing the refreshes into one listing per TTL
+// makes `ls -l` cost a single round trip.
+type catalog struct {
+	src    source
+	bucket string
+	ttl    time.Duration
+
+	mu      sync.Mutex
+	byID    map[string]daemon.ObjectInfo
+	fetched time.Time
+}
+
+func newCatalog(src source, bucket string, ttl time.Duration, seed []daemon.ObjectInfo) *catalog {
+	c := &catalog{src: src, bucket: bucket, ttl: ttl, byID: make(map[string]daemon.ObjectInfo, len(seed))}
+	for _, o := range seed {
+		c.byID[o.ID] = o
+	}
+	c.fetched = time.Now()
+	return c
+}
+
+func (c *catalog) lookup(id string) (daemon.ObjectInfo, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.refreshLocked(); err != nil {
+		return daemon.ObjectInfo{}, false, err
+	}
+	o, ok := c.byID[id]
+	return o, ok, nil
+}
+
+func (c *catalog) refreshLocked() error {
+	if time.Since(c.fetched) < c.ttl {
+		return nil
+	}
+	objects, err := c.src.List(c.bucket, nil)
+	if err != nil {
+		return err
+	}
+	byID := make(map[string]daemon.ObjectInfo, len(objects))
+	for _, o := range objects {
+		byID[o.ID] = o
+	}
+	c.byID, c.fetched = byID, time.Now()
+	return nil
+}
+
+// update and forget keep the cache coherent with writes this mount just
+// made, so a second operation inside the same window does not act on the
+// pre-write name.
+func (c *catalog) update(o daemon.ObjectInfo) {
+	if o.ID == "" {
+		return
+	}
+	c.mu.Lock()
+	c.byID[o.ID] = o
+	c.mu.Unlock()
+}
+
+func (c *catalog) forget(id string) {
+	c.mu.Lock()
+	delete(c.byID, id)
+	c.mu.Unlock()
 }
 
 type dirNode struct {
 	fs.Inode
-	mu       *sync.Mutex
-	prefix   string
-	bucket   string
-	src      source
-	writable bool
-	dirs     map[string]*dirNode
-	files    map[string]*fileNode
+	m      *mountState
+	prefix string
+	dirs   map[string]*dirNode
+	files  map[string]*fileNode
 }
 
 type fileNode struct {
 	fs.Inode
-	mu       sync.Mutex
-	bucket   string
-	object   daemon.ObjectInfo
-	src      source
-	writable bool
-	writing  bool
-	removed  bool
-	handle   *fileHandle
+	mu      sync.Mutex
+	m       *mountState
+	object  daemon.ObjectInfo
+	writing bool
+	removed bool
+	handle  *fileHandle
 }
 
-func newTree(bucket string, src source, objects []daemon.ObjectInfo, writable bool) (*dirNode, error) {
-	common := &sync.Mutex{}
-	root := newDir(common, "", bucket, src, writable)
+func newTree(m *mountState, objects []daemon.ObjectInfo) (*dirNode, error) {
+	root := newDir(m, "")
 	sort.Slice(objects, func(i, j int) bool { return objects[i].ID < objects[j].ID })
 	for _, object := range objects {
 		parts, err := objectPath(object.Name)
@@ -84,7 +183,7 @@ func newTree(bucket string, src source, objects []daemon.ObjectInfo, writable bo
 				return nil, fmt.Errorf("object path conflict: %q is both a file and directory", strings.Join(parts, "/"))
 			}
 			if d.dirs[part] == nil {
-				d.dirs[part] = newDir(common, path.Join(parts[:i+1]...), bucket, src, writable)
+				d.dirs[part] = newDir(m, path.Join(parts[:i+1]...))
 			}
 			d = d.dirs[part]
 		}
@@ -95,13 +194,13 @@ func newTree(bucket string, src source, objects []daemon.ObjectInfo, writable bo
 		if _, exists := d.files[name]; exists {
 			name = disambiguate(name, object.ID)
 		}
-		d.files[name] = &fileNode{bucket: bucket, object: object, src: src, writable: writable}
+		d.files[name] = &fileNode{m: m, object: object}
 	}
 	return root, nil
 }
 
-func newDir(mu *sync.Mutex, prefix, bucket string, src source, writable bool) *dirNode {
-	return &dirNode{mu: mu, prefix: prefix, bucket: bucket, src: src, writable: writable, dirs: map[string]*dirNode{}, files: map[string]*fileNode{}}
+func newDir(m *mountState, prefix string) *dirNode {
+	return &dirNode{m: m, prefix: prefix, dirs: map[string]*dirNode{}, files: map[string]*fileNode{}}
 }
 
 func objectPath(name string) ([]string, error) {
@@ -138,7 +237,7 @@ func (d *dirNode) OnAdd(ctx context.Context) {
 
 func (d *dirNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = syscall.S_IFDIR | 0o555
-	if d.writable {
+	if d.m.writable {
 		out.Mode = syscall.S_IFDIR | 0o755
 	}
 	out.Uid, out.Gid = uint32(os.Getuid()), uint32(os.Getgid())
@@ -147,37 +246,31 @@ func (d *dirNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut)
 
 func (f *fileNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	f.mu.Lock()
-	active := f.handle
-	object := f.object
+	active, object := f.handle, f.object
 	f.mu.Unlock()
-	if active != nil {
+	switch {
+	case active != nil:
 		active.mu.Lock()
 		info, err := active.file.Stat()
 		active.mu.Unlock()
 		if err == nil {
 			object.Size = info.Size()
 		}
-	} else if object.ID != "" {
-		objects, err := f.src.List(f.bucket, nil)
+	case object.ID != "":
+		current, ok, err := f.m.cat.lookup(object.ID)
 		if err != nil {
 			return syscall.EIO
 		}
-		found := false
-		for _, current := range objects {
-			if current.ID == object.ID {
-				object, found = current, true
-				break
-			}
-		}
-		if !found {
+		if !ok {
 			return syscall.ENOENT
 		}
+		object = current
 		f.mu.Lock()
 		f.object = object
 		f.mu.Unlock()
 	}
 	out.Mode, out.Size = syscall.S_IFREG|0o444, uint64(object.Size)
-	if f.writable {
+	if f.m.writable {
 		out.Mode = syscall.S_IFREG | 0o644
 	}
 	out.Uid, out.Gid = uint32(os.Getuid()), uint32(os.Getgid())
@@ -190,7 +283,7 @@ func (f *fileNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut
 
 func (f *fileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	write := flags&(syscall.O_WRONLY|syscall.O_RDWR) != 0
-	if write && !f.writable {
+	if write && !f.m.writable {
 		return nil, 0, syscall.EROFS
 	}
 	f.mu.Lock()
@@ -209,7 +302,7 @@ func (f *fileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32,
 		return nil, 0, syscall.EIO
 	}
 	if flags&syscall.O_TRUNC == 0 && object.ID != "" {
-		r, err := f.src.Get(f.bucket, object.ID)
+		r, err := f.m.src.Get(f.m.bucket, object.ID)
 		if err != nil {
 			tmp.Close()
 			os.Remove(tmp.Name())

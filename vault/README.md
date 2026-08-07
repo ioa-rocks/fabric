@@ -160,8 +160,10 @@ than atomically.
 The set of names is snapshotted at mount time; remount to see creates, renames,
 or deletes made through another client or mount. Existing files refresh their
 metadata and content through the daemon, so a remotely grown file reports and
-reads its current size. Duplicate names gain an `~<object-id>` suffix. Requires
-Linux FUSE and a running `fabric up` daemon.
+reads its current size — within a one-second coherence window, since the
+refresh is a bucket listing shared by every file rather than one listing per
+`stat`. Duplicate names gain an `~<object-id>` suffix. Requires Linux FUSE and
+a running `fabric up` daemon.
 
 ## Layout
 

@@ -510,7 +510,7 @@ func cmdMount(args []string) error {
 	if cl == nil {
 		return fmt.Errorf("mount requires the running node daemon on %s", daemon.SocketPath(*statePath))
 	}
-	server, err := fusefs.Mount(mountpoint, pos[0], cl, *debug, *write)
+	server, err := fusefs.Mount(mountpoint, pos[0], cl, fusefs.Options{Debug: *debug, Writable: *write})
 	if err != nil {
 		return err
 	}

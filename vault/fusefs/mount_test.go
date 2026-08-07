@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -101,12 +102,23 @@ func (fakeSource) Rename(string, string, string) (daemon.ObjectInfo, error) {
 	return daemon.ObjectInfo{}, nil
 }
 func (fakeSource) Rm(string, string) (daemon.ObjectInfo, error) { return daemon.ObjectInfo{}, nil }
+func (fakeSource) Ping() error                                  { return nil }
+
+// testTree builds a node tree without mounting it, for the pure naming tests.
+func testTree(t *testing.T, src source, objects []daemon.ObjectInfo) (*dirNode, error) {
+	t.Helper()
+	m, err := newMountState("photos", src, objects, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newTree(m, objects)
+}
 
 func TestTreePreservesPathsAndDisambiguatesDuplicateNames(t *testing.T) {
-	root, err := newTree("photos", fakeSource{}, []daemon.ObjectInfo{
+	root, err := testTree(t, fakeSource{}, []daemon.ObjectInfo{
 		{ID: "11111111aaaaaaaa", Name: "2026/trip/cat.jpg", Size: 4},
 		{ID: "22222222bbbbbbbb", Name: "2026/trip/cat.jpg", Size: 5},
-	}, false)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +129,7 @@ func TestTreePreservesPathsAndDisambiguatesDuplicateNames(t *testing.T) {
 }
 
 func TestTreeRejectsTraversal(t *testing.T) {
-	_, err := newTree("photos", fakeSource{}, []daemon.ObjectInfo{{ID: "11111111", Name: "../secret"}}, false)
+	_, err := testTree(t, fakeSource{}, []daemon.ObjectInfo{{ID: "11111111", Name: "../secret"}})
 	if err == nil {
 		t.Fatal("accepted path traversal")
 	}
@@ -134,7 +146,7 @@ func TestMountReadsAndRejectsWrites(t *testing.T) {
 		t.Skip("FUSE unavailable")
 	}
 	mountpoint := t.TempDir()
-	server, err := Mount(mountpoint, "photos", mountSource{}, false, false)
+	server, err := Mount(mountpoint, "photos", mountSource{}, Options{})
 	if err != nil {
 		t.Skipf("cannot mount FUSE in this environment: %v", err)
 	}
@@ -162,7 +174,7 @@ func TestWritableMountLifecycle(t *testing.T) {
 	}
 	src := newMemorySource()
 	mountpoint := t.TempDir()
-	server, err := Mount(mountpoint, "photos", src, false, true)
+	server, err := Mount(mountpoint, "photos", src, Options{Writable: true})
 	if err != nil {
 		t.Skipf("cannot mount FUSE: %v", err)
 	}
@@ -278,7 +290,7 @@ func TestMountedFileRefreshesRemoteSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	mountpoint := t.TempDir()
-	server, err := Mount(mountpoint, "photos", src, false, false)
+	server, err := Mount(mountpoint, "photos", src, Options{MetadataTTL: time.Millisecond})
 	if err != nil {
 		t.Skipf("cannot mount FUSE: %v", err)
 	}
@@ -286,11 +298,71 @@ func TestMountedFileRefreshesRemoteSize(t *testing.T) {
 	if _, err := src.Replace("photos", o.ID, strings.NewReader("complete remote content")); err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(5 * time.Millisecond) // past the metadata coherence window
 	info, err := os.Stat(mountpoint + "/growing.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, want := info.Size(), int64(len("complete remote content")); got != want {
 		t.Fatalf("mounted size = %d, want live size %d", got, want)
+	}
+}
+
+// countingSource records how much traffic the mount generates.
+type countingSource struct {
+	*memorySource
+	lists   atomic.Int64
+	records atomic.Int64
+}
+
+func (c *countingSource) List(b string, tags []string) ([]daemon.ObjectInfo, error) {
+	c.lists.Add(1)
+	out, err := c.memorySource.List(b, tags)
+	c.records.Add(int64(len(out)))
+	return out, err
+}
+
+// A stat used to refresh one file by fetching the whole bucket listing, so
+// `ls -l` cost one listing per file and moved O(n^2) records. The shared
+// metadata cache must collapse that to a constant number of listings.
+func TestStatCoalescesBucketListings(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		t.Skip("FUSE unavailable")
+	}
+	const files = 200
+	src := &countingSource{memorySource: newMemorySource()}
+	for i := 0; i < files; i++ {
+		if _, err := src.Put("photos", fmt.Sprintf("img%04d.jpg", i), strings.NewReader("x"), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mountpoint := t.TempDir()
+	server, err := Mount(mountpoint, "photos", src, Options{})
+	if err != nil {
+		t.Skipf("cannot mount FUSE: %v", err)
+	}
+	defer server.Unmount()
+
+	src.lists.Store(0)
+	src.records.Store(0)
+	entries, err := os.ReadDir(mountpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != files {
+		t.Fatalf("listed %d entries, want %d", len(entries), files)
+	}
+	for _, e := range entries { // stat every entry, as `ls -l` does
+		if _, err := e.Info(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One refresh per coherence window, not one per file. Allow a couple in
+	// case the walk straddles a window boundary.
+	if got := src.lists.Load(); got > 3 {
+		t.Errorf("`ls -l` over %d files issued %d bucket listings, want at most 3", files, got)
+	}
+	if got, ceiling := src.records.Load(), int64(3*files); got > ceiling {
+		t.Errorf("`ls -l` transferred %d object records, want at most %d", got, ceiling)
 	}
 }

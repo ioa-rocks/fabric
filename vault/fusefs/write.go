@@ -20,14 +20,14 @@ func validChild(name string) bool {
 }
 
 func (d *dirNode) Setattr(ctx context.Context, _ fs.FileHandle, _ *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
-	if !d.writable {
+	if !d.m.writable {
 		return syscall.EROFS
 	}
 	return d.Getattr(ctx, nil, out)
 }
 
 func (f *fileNode) Setattr(ctx context.Context, handle fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
-	if !f.writable {
+	if !f.m.writable {
 		return syscall.EROFS
 	}
 	if h, ok := handle.(*fileHandle); ok {
@@ -51,42 +51,42 @@ func (f *fileNode) Setattr(ctx context.Context, handle fs.FileHandle, in *fuse.S
 }
 
 func (d *dirNode) Mkdir(ctx context.Context, name string, _ uint32, _ *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	if !d.writable {
+	if !d.m.writable {
 		return nil, syscall.EROFS
 	}
 	if !validChild(name) {
 		return nil, syscall.EINVAL
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.m.mu.Lock()
+	defer d.m.mu.Unlock()
 	if d.dirs[name] != nil || d.files[name] != nil {
 		return nil, syscall.EEXIST
 	}
-	child := newDir(d.mu, path.Join(d.prefix, name), d.bucket, d.src, true)
+	child := newDir(d.m, path.Join(d.prefix, name))
 	d.dirs[name] = child
 	return d.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR}), 0
 }
 
 func (d *dirNode) Create(ctx context.Context, name string, _ uint32, _ uint32, _ *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
-	if !d.writable {
+	if !d.m.writable {
 		return nil, nil, 0, syscall.EROFS
 	}
 	if !validChild(name) {
 		return nil, nil, 0, syscall.EINVAL
 	}
-	d.mu.Lock()
+	d.m.mu.Lock()
 	if d.dirs[name] != nil || d.files[name] != nil {
-		d.mu.Unlock()
+		d.m.mu.Unlock()
 		return nil, nil, 0, syscall.EEXIST
 	}
-	f := &fileNode{bucket: d.bucket, object: daemon.ObjectInfo{Name: path.Join(d.prefix, name)}, src: d.src, writable: true, writing: true}
+	f := &fileNode{m: d.m, object: daemon.ObjectInfo{Name: path.Join(d.prefix, name)}, writing: true}
 	d.files[name] = f
-	d.mu.Unlock()
+	d.m.mu.Unlock()
 	tmp, err := os.CreateTemp("", "vault-fuse-*")
 	if err != nil {
-		d.mu.Lock()
+		d.m.mu.Lock()
 		delete(d.files, name)
-		d.mu.Unlock()
+		d.m.mu.Unlock()
 		return nil, nil, 0, syscall.EIO
 	}
 	inode := d.NewPersistentInode(ctx, f, fs.StableAttr{Mode: syscall.S_IFREG})
@@ -98,11 +98,11 @@ func (d *dirNode) Create(ctx context.Context, name string, _ uint32, _ uint32, _
 }
 
 func (d *dirNode) Unlink(_ context.Context, name string) syscall.Errno {
-	if !d.writable {
+	if !d.m.writable {
 		return syscall.EROFS
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.m.mu.Lock()
+	defer d.m.mu.Unlock()
 	f := d.files[name]
 	if f == nil {
 		return syscall.ENOENT
@@ -112,20 +112,21 @@ func (d *dirNode) Unlink(_ context.Context, name string) syscall.Errno {
 	object := f.object
 	f.mu.Unlock()
 	if object.ID != "" {
-		if _, err := d.src.Rm(d.bucket, object.ID); err != nil {
+		if _, err := d.m.src.Rm(d.m.bucket, object.ID); err != nil {
 			return syscall.EIO
 		}
+		d.m.cat.forget(object.ID)
 	}
 	delete(d.files, name)
 	return 0
 }
 
 func (d *dirNode) Rmdir(_ context.Context, name string) syscall.Errno {
-	if !d.writable {
+	if !d.m.writable {
 		return syscall.EROFS
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.m.mu.Lock()
+	defer d.m.mu.Unlock()
 	child := d.dirs[name]
 	if child == nil {
 		return syscall.ENOENT
@@ -138,18 +139,18 @@ func (d *dirNode) Rmdir(_ context.Context, name string) syscall.Errno {
 }
 
 func (d *dirNode) Rename(_ context.Context, name string, target fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
-	if !d.writable {
+	if !d.m.writable {
 		return syscall.EROFS
 	}
 	if flags != 0 || !validChild(newName) {
 		return syscall.ENOTSUP
 	}
 	to, ok := target.(*dirNode)
-	if !ok || to.mu != d.mu {
+	if !ok || to.m != d.m {
 		return syscall.EXDEV
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.m.mu.Lock()
+	defer d.m.mu.Unlock()
 	if f := d.files[name]; f != nil {
 		return d.renameFile(name, f, to, newName)
 	}
@@ -165,10 +166,11 @@ func (d *dirNode) Rename(_ context.Context, name string, target fs.InodeEmbedder
 		f.mu.Lock()
 		obj := f.object
 		f.mu.Unlock()
-		updated, err := d.src.Rename(d.bucket, obj.ID, newPrefix+strings.TrimPrefix(obj.Name, oldPrefix))
+		updated, err := d.m.src.Rename(d.m.bucket, obj.ID, newPrefix+strings.TrimPrefix(obj.Name, oldPrefix))
 		if err != nil {
 			return syscall.EIO
 		}
+		d.m.cat.update(updated)
 		f.mu.Lock()
 		f.object = updated
 		f.mu.Unlock()
@@ -191,27 +193,33 @@ func (d *dirNode) renameFile(name string, f *fileNode, to *dirNode, newName stri
 	}
 	newPath := path.Join(to.prefix, newName)
 	if dest := to.files[newName]; dest != nil {
-		r, err := d.src.Get(d.bucket, srcObj.ID)
+		dest.mu.Lock()
+		destObj := dest.object
+		dest.mu.Unlock()
+		r, err := d.m.src.Get(d.m.bucket, srcObj.ID)
 		if err != nil {
 			return syscall.EIO
 		}
-		updated, err := d.src.Replace(d.bucket, dest.object.ID, r)
+		updated, err := d.m.src.Replace(d.m.bucket, destObj.ID, r)
 		r.Close()
 		if err != nil {
 			return syscall.EIO
 		}
-		if _, err = d.src.Rm(d.bucket, srcObj.ID); err != nil {
+		if _, err = d.m.src.Rm(d.m.bucket, srcObj.ID); err != nil {
 			return syscall.EIO
 		}
 		updated.Name = newPath
+		d.m.cat.update(updated)
+		d.m.cat.forget(srcObj.ID)
 		f.mu.Lock()
 		f.object = updated
 		f.mu.Unlock()
 	} else {
-		updated, err := d.src.Rename(d.bucket, srcObj.ID, newPath)
+		updated, err := d.m.src.Rename(d.m.bucket, srcObj.ID, newPath)
 		if err != nil {
 			return syscall.EIO
 		}
+		d.m.cat.update(updated)
 		f.mu.Lock()
 		f.object = updated
 		f.mu.Unlock()
@@ -309,13 +317,14 @@ func (h *fileHandle) commit() syscall.Errno {
 	var updated daemon.ObjectInfo
 	var err error
 	if object.ID == "" {
-		updated, err = h.node.src.Put(h.node.bucket, object.Name, h.file, nil)
+		updated, err = h.node.m.src.Put(h.node.m.bucket, object.Name, h.file, nil)
 	} else {
-		updated, err = h.node.src.Replace(h.node.bucket, object.ID, h.file)
+		updated, err = h.node.m.src.Replace(h.node.m.bucket, object.ID, h.file)
 	}
 	if err != nil {
 		return syscall.EIO
 	}
+	h.node.m.cat.update(updated)
 	h.node.mu.Lock()
 	h.node.object = updated
 	h.node.mu.Unlock()
