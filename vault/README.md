@@ -150,7 +150,7 @@ a connected holder. It is read-only unless `-write` is supplied.
 In a writable mount, directories are ephemeral namespace structure: creating
 an empty directory creates no bucket object, while a file such as
 `AI/performance/mlperf.pdf` becomes one object with that stored name. Writes
-are staged in a local temporary file and published on explicit `fsync` or the
+are staged in a local file and published on explicit `fsync` or the
 final close, so partial copy/editor data is not synced. Overwrite replaces the object's immutable blob while
 preserving its object ID; file and directory renames update stored names;
 unlink creates the usual Vault tombstone. Files are single-writer within one
@@ -164,6 +164,12 @@ reads its current size — within a one-second coherence window, since the
 refresh is a bucket listing shared by every file rather than one listing per
 `stat`. Duplicate names gain an `~<object-id>` suffix. Requires Linux FUSE and
 a running `fabric up` daemon.
+
+**Staging.** Reads and writes buffer whole objects, so they are staged under
+`<vault-state>/mount/cache` — beside the blob store, not in `/tmp`, which is
+commonly a RAM-backed tmpfs that one video can exhaust. Files there belong to
+live opens and are removed on close; anything left behind after an unclean
+shutdown is safe to delete while nothing is mounted.
 
 ## Layout
 

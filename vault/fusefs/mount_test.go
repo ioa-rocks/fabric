@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -365,4 +366,36 @@ func TestStatCoalescesBucketListings(t *testing.T) {
 	if got, ceiling := src.records.Load(), int64(3*files); got > ceiling {
 		t.Errorf("`ls -l` transferred %d object records, want at most %d", got, ceiling)
 	}
+}
+
+// Reads and writes buffer whole objects, so they must land in the configured
+// staging area next to the blob store, never in the system temp dir.
+func TestStagedContentUsesStageDir(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		t.Skip("FUSE unavailable")
+	}
+	src := newMemorySource()
+	if _, err := src.Put("photos", "cat.jpg", strings.NewReader("cat"), nil); err != nil {
+		t.Fatal(err)
+	}
+	stage := t.TempDir()
+	mountpoint := t.TempDir()
+	server, err := Mount(mountpoint, "photos", src, Options{Writable: true, StageDir: stage})
+	if err != nil {
+		t.Skipf("cannot mount FUSE: %v", err)
+	}
+	defer server.Unmount()
+
+	f, err := os.Open(mountpoint + "/cat.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := filepath.Glob(filepath.Join(stage, "cache", "vault-fuse-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(staged) == 0 {
+		t.Errorf("open buffered outside the staging dir %s", stage)
+	}
+	f.Close()
 }

@@ -510,7 +510,18 @@ func cmdMount(args []string) error {
 	if cl == nil {
 		return fmt.Errorf("mount requires the running node daemon on %s", daemon.SocketPath(*statePath))
 	}
-	server, err := fusefs.Mount(mountpoint, pos[0], cl, fusefs.Options{Debug: *debug, Writable: *write})
+	state, err := filepath.Abs(*statePath)
+	if err != nil {
+		return err
+	}
+	// Stage beside the blob store rather than in the system temp dir: reads
+	// and writes buffer whole objects, and /tmp is commonly a RAM-backed
+	// tmpfs that one phone video can exhaust.
+	server, err := fusefs.Mount(mountpoint, pos[0], cl, fusefs.Options{
+		Debug:    *debug,
+		Writable: *write,
+		StageDir: filepath.Join(state, "mount"),
+	})
 	if err != nil {
 		return err
 	}

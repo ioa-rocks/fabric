@@ -3,7 +3,6 @@ package fusefs
 import (
 	"context"
 	"io"
-	"os"
 	"path"
 	"strings"
 	"syscall"
@@ -82,7 +81,7 @@ func (d *dirNode) Create(ctx context.Context, name string, _ uint32, _ uint32, _
 	f := &fileNode{m: d.m, object: daemon.ObjectInfo{Name: path.Join(d.prefix, name)}, writing: true}
 	d.files[name] = f
 	d.m.mu.Unlock()
-	tmp, err := os.CreateTemp("", "vault-fuse-*")
+	tmp, err := d.m.stage()
 	if err != nil {
 		d.m.mu.Lock()
 		delete(d.files, name)

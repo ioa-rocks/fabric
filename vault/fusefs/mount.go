@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -35,6 +36,12 @@ const DefaultMetadataTTL = time.Second
 type Options struct {
 	Debug    bool
 	Writable bool
+
+	// StageDir holds read buffers and staged writes. Whole objects land
+	// here, so it belongs beside the blob store rather than in the system
+	// temp dir, which is commonly a RAM-backed tmpfs that a single phone
+	// video can exhaust. Empty falls back to the system temp dir.
+	StageDir string
 
 	// MetadataTTL is the window within which stat(2) may report metadata
 	// read earlier. Zero uses DefaultMetadataTTL.
@@ -73,6 +80,10 @@ type mountState struct {
 	src      source
 	cat      *catalog
 	writable bool
+
+	// cacheDir holds in-flight read buffers and staged writes; empty means
+	// the system temp dir.
+	cacheDir string
 }
 
 func newMountState(bucket string, src source, seed []daemon.ObjectInfo, opts Options) (*mountState, error) {
@@ -80,7 +91,20 @@ func newMountState(bucket string, src source, seed []daemon.ObjectInfo, opts Opt
 	if ttl <= 0 {
 		ttl = DefaultMetadataTTL
 	}
-	return &mountState{bucket: bucket, src: src, cat: newCatalog(src, bucket, ttl, seed), writable: opts.Writable}, nil
+	m := &mountState{bucket: bucket, src: src, cat: newCatalog(src, bucket, ttl, seed), writable: opts.Writable}
+	if opts.StageDir != "" {
+		m.cacheDir = filepath.Join(opts.StageDir, "cache")
+		if err := os.MkdirAll(m.cacheDir, 0o700); err != nil {
+			return nil, err
+		}
+	}
+	return m, nil
+}
+
+// stage opens a scratch file for one open(2): a read buffer, or the staging
+// area a writer publishes from.
+func (m *mountState) stage() (*os.File, error) {
+	return os.CreateTemp(m.cacheDir, "vault-fuse-*")
 }
 
 // catalog is a short-lived shared view of the bucket's object list. Every
@@ -296,7 +320,7 @@ func (f *fileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32,
 	}
 	object := f.object
 	f.mu.Unlock()
-	tmp, err := os.CreateTemp("", "vault-fuse-*")
+	tmp, err := f.m.stage()
 	if err != nil {
 		f.cancelWriter(write)
 		return nil, 0, syscall.EIO
