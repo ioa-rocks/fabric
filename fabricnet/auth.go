@@ -79,6 +79,10 @@ func (a *AuthService) ownCert() *cert.Cert {
 // Must be set before the host sees connections.
 func (a *AuthService) SetOnAuthenticated(f func(peer.ID)) { a.onAuth = f }
 
+// OnAuthenticated returns the installed hook so a subsystem can chain onto
+// it instead of replacing it (fabric, vault, and astral all want a turn).
+func (a *AuthService) OnAuthenticated() func(peer.ID) { return a.onAuth }
+
 // Close detaches the service from the host.
 func (a *AuthService) Close() {
 	a.h.RemoveStreamHandler(ProtocolID)

@@ -1,0 +1,133 @@
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"ioa.rocks/fabric/astral"
+)
+
+// Client is a plane client over a running subsystem's control socket.
+type Client struct{ http http.Client }
+
+// NewClient builds a client for a state dir's control socket.
+func NewClient(statePath string) *Client {
+	sock := SocketPath(statePath)
+	return &Client{http: http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", sock)
+			},
+		},
+	}}
+}
+
+func decodeErr(resp *http.Response) error {
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return errors.New(strings.TrimSpace(string(msg)))
+}
+
+func (c *Client) get(path string, out any) error {
+	resp, err := c.http.Get("http://astral" + path)
+	if err != nil {
+		return fmt.Errorf("is `fabric up` running? %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return decodeErr(resp)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (c *Client) post(path string, body any, out any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Post("http://astral"+path, "application/json", bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("is `fabric up` running? %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return decodeErr(resp)
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// Status reports the subsystem's view.
+func (c *Client) Status() (*StatusReply, error) {
+	var s StatusReply
+	if err := c.get("/v0/status", &s); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// Declare hosts a mailbox or queue here.
+func (c *Client) Declare(name string, accepts []string) error {
+	return c.post("/v0/mailboxes", declareBody{Name: name, Accepts: accepts}, nil)
+}
+
+// SetHost records that member hosts name (registry stub); "" clears.
+func (c *Client) SetHost(name, host string) error {
+	return c.post("/v0/hosts", hostBody{Name: name, Host: host}, nil)
+}
+
+// Append casts an event. Returns the (possibly derived) event ID and
+// whether it was new.
+func (c *Client) Append(name string, ev astral.Event) (id string, fresh bool, err error) {
+	var r appendReply
+	if err := c.post("/v0/append", appendBody{Name: name, Event: ev}, &r); err != nil {
+		return "", false, err
+	}
+	return r.ID, r.Fresh, nil
+}
+
+// Claim leases up to n events for lease seconds.
+func (c *Client) Claim(name, consumer string, leaseS, n int) ([]astral.Claimed, error) {
+	var out []astral.Claimed
+	err := c.post("/v0/claim", claimBody{Name: name, Consumer: consumer, LeaseS: leaseS, N: n}, &out)
+	return out, err
+}
+
+// Ack force-acks an event for consumer.
+func (c *Client) Ack(name, consumer, eventID string) error {
+	return c.post("/v0/ack", ackBody{Name: name, Consumer: consumer, EventID: eventID}, nil)
+}
+
+// Set writes a register.
+func (c *Client) Set(name, value string) error {
+	return c.post("/v0/set", setBody{Name: name, Value: value}, nil)
+}
+
+// Get reads a register; ok=false when unset.
+func (c *Client) Get(name string) (astral.Register, bool, error) {
+	var r astral.Register
+	resp, err := c.http.Get("http://astral/v0/get?name=" + url.QueryEscape(name))
+	if err != nil {
+		return r, false, fmt.Errorf("is `fabric up` running? %w", err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return r, true, json.NewDecoder(resp.Body).Decode(&r)
+	case http.StatusNotFound:
+		return r, false, nil
+	}
+	return r, false, decodeErr(resp)
+}

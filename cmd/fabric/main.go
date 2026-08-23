@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/admission"
+	astralcli "ioa.rocks/fabric/astral/cli"
+	astraldaemon "ioa.rocks/fabric/astral/daemon"
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/event"
@@ -68,18 +70,21 @@ func parseListen(s string) ([]string, error) {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
 	// Busybox-style dispatch (ADR 0013, one binary): a "vault" symlink to
 	// this binary is the data CLI.
 	if filepath.Base(os.Args[0]) == "vault" {
 		os.Exit(vaultcli.Main(os.Args[1:]))
 	}
+	if len(os.Args) < 2 {
+		usage()
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 	if cmd == "vault" {
 		os.Exit(vaultcli.Main(args))
+	}
+	if cmd == "astral" {
+		os.Exit(astralcli.Main(args))
 	}
 	var err error
 	switch cmd {
@@ -87,13 +92,13 @@ func main() {
 		err = cmdInit(args)
 	case "up":
 		err = cmdUp(args)
+	case "deploy":
+		err = cmdDeploy(args)
 	case "status":
 		err = cmdStatus(args)
 	case "graph":
 		err = cmdGraph(args)
 	case "join":
-	case "deploy":
-		err = cmdDeploy(args)
 		err = cmdJoin(args)
 	case "pending":
 		err = cmdPending(args)
@@ -150,7 +155,10 @@ func usage() {
            transports, and resolved IPs are derived automatically;
            announce txt — print the DNS TXT record for hostname joins
   deploy   deploy this x86-64 binary to ~/.local/bin on one or more SSH hosts
-  vault    object storage: bucket, put/get, tags, sync placement, and mounts
+  vault    the data surface ('fabric vault -h'); a "vault" symlink to this
+           binary works too — no separate install needed
+  astral   the coordination plane ('fabric astral -h'): mailboxes, queues,
+           registers — cast/claim/ack over the mesh
 
 Every command accepts -state <dir> (default `+state.DefaultPath()+`).
 `)
@@ -278,6 +286,8 @@ func cmdUp(args []string) error {
 	noTun := fs.Bool("no-tun", false, "run without the TUN bridge for this run")
 	vaultState := fs.String("vault-state", circle.DefaultPath(), "vault state directory (subsystem activates when a circle exists there)")
 	noVault := fs.Bool("no-vault", false, "run without the vault subsystem for this run")
+	astralState := fs.String("astral-state", astraldaemon.DefaultPath(), "astral state directory (the coordination plane; always on)")
+	noAstral := fs.Bool("no-astral", false, "run without the astral subsystem for this run")
 	fs.Parse(args)
 
 	dir, err := state.Open(*statePath)
@@ -303,6 +313,17 @@ func cmdUp(args []string) error {
 		}
 	}
 
+	// The astral subsystem (ADR 0015): the plane exists wherever fabric
+	// runs, so it is on by default; attach after vault so its auth hook
+	// chains onto vault's.
+	var ad *astraldaemon.Daemon
+	if !*noAstral {
+		ad, err = astraldaemon.New(*astralState, d)
+		if err != nil {
+			return fmt.Errorf("astral subsystem: %w", err)
+		}
+	}
+
 	go func() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
@@ -311,7 +332,17 @@ func cmdUp(args []string) error {
 	}()
 
 	vaultErr := make(chan error, 1)
-	go func() { vaultErr <- vd.Run() }()
+	if vd != nil {
+		go func() { vaultErr <- vd.Run() }()
+	} else {
+		vaultErr <- nil
+	}
+	astralErr := make(chan error, 1)
+	if ad != nil {
+		go func() { astralErr <- ad.Run() }()
+	} else {
+		astralErr <- nil
+	}
 	err = d.Run()
 	if vd != nil {
 		vd.Stop()
@@ -321,6 +352,9 @@ func cmdUp(args []string) error {
 	}
 	if verr := <-vaultErr; verr != nil && err == nil {
 		err = fmt.Errorf("vault subsystem: %w", verr)
+	}
+	if aerr := <-astralErr; aerr != nil && err == nil {
+		err = fmt.Errorf("astral subsystem: %w", aerr)
 	}
 	return err
 }
