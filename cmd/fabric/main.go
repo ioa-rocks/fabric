@@ -70,6 +70,11 @@ func parseListen(s string) ([]string, error) {
 func main() {
 	if len(os.Args) < 2 {
 		usage()
+	// Busybox-style dispatch (ADR 0013, one binary): a "vault" symlink to
+	// this binary is the data CLI.
+	if filepath.Base(os.Args[0]) == "vault" {
+		os.Exit(vaultcli.Main(os.Args[1:]))
+	}
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
@@ -87,6 +92,8 @@ func main() {
 	case "graph":
 		err = cmdGraph(args)
 	case "join":
+	case "deploy":
+		err = cmdDeploy(args)
 		err = cmdJoin(args)
 	case "pending":
 		err = cmdPending(args)
@@ -108,8 +115,6 @@ func main() {
 		err = cmdPeer(args)
 	case "announce":
 		err = cmdAnnounce(args)
-	case "deploy":
-		err = cmdDeploy(args)
 	default:
 		usage()
 		os.Exit(2)
@@ -304,14 +309,16 @@ func cmdUp(args []string) error {
 		<-ch
 		d.Stop()
 	}()
-	if vd == nil {
-		return d.Run()
-	}
 
 	vaultErr := make(chan error, 1)
 	go func() { vaultErr <- vd.Run() }()
 	err = d.Run()
-	vd.Stop()
+	if vd != nil {
+		vd.Stop()
+	}
+	if ad != nil {
+		ad.Stop()
+	}
 	if verr := <-vaultErr; verr != nil && err == nil {
 		err = fmt.Errorf("vault subsystem: %w", verr)
 	}

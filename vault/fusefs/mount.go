@@ -55,8 +55,9 @@ type Options struct {
 	MetadataTTL time.Duration
 }
 
-// Mount attaches a snapshot of the bucket namespace at mountpoint. Contents
-// come from the live daemon on every open, including on-demand peer fetches.
+// Mount attaches the bucket namespace at mountpoint. Mounts refresh the
+// namespace on directory reads; contents come from the live daemon on every
+// open, including on-demand peer fetches.
 func Mount(mountpoint, bucket string, src source, opts Options) (*fuse.Server, error) {
 	objects, err := src.List(bucket, nil)
 	if err != nil {
@@ -70,6 +71,7 @@ func Mount(mountpoint, bucket string, src source, opts Options) (*fuse.Server, e
 	if err != nil {
 		return nil, err
 	}
+	m.root = root
 	var mountOptions []string
 	if !opts.Writable {
 		mountOptions = []string{"ro"}
@@ -87,6 +89,12 @@ type mountState struct {
 	src      source
 	cat      *catalog
 	writable bool
+	root     *dirNode
+
+	// namespaceFetched and namespaceKey coalesce directory-triggered namespace
+	// reconciliation and let unchanged listings leave the inode tree alone.
+	namespaceFetched time.Time
+	namespaceKey     string
 
 	// cacheDir holds in-flight read buffers and staged writes; empty means
 	// the system temp dir. unpublishedDir receives staged content whose
@@ -100,7 +108,14 @@ func newMountState(bucket string, src source, seed []daemon.ObjectInfo, opts Opt
 	if ttl <= 0 {
 		ttl = DefaultMetadataTTL
 	}
-	m := &mountState{bucket: bucket, src: src, cat: newCatalog(src, bucket, ttl, seed), writable: opts.Writable}
+	m := &mountState{
+		bucket:           bucket,
+		src:              src,
+		cat:              newCatalog(src, bucket, ttl, seed),
+		writable:         opts.Writable,
+		namespaceFetched: time.Now(),
+		namespaceKey:     namespaceKey(seed),
+	}
 	if opts.StageDir != "" {
 		m.cacheDir = filepath.Join(opts.StageDir, "cache")
 		m.unpublishedDir = filepath.Join(opts.StageDir, "unpublished")
@@ -109,6 +124,107 @@ func newMountState(bucket string, src source, seed []daemon.ObjectInfo, opts Opt
 		}
 	}
 	return m, nil
+}
+
+func namespaceKey(objects []daemon.ObjectInfo) string {
+	parts := make([]string, 0, len(objects))
+	for _, o := range objects {
+		parts = append(parts, o.ID+"\x00"+o.Name)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\x00")
+}
+
+// refreshNamespace replaces the inode tree when synchronized object names
+// change. A writable mount defers while it has staged or failed local content;
+// rebuilding then could hide the only visible handle to bytes not yet safely
+// represented in the bucket.
+func (m *mountState) refreshNamespace(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if time.Since(m.namespaceFetched) < m.cat.ttl {
+		return nil
+	}
+	if m.root.hasLocalContent() {
+		return nil
+	}
+	objects, err := m.src.List(m.bucket, nil)
+	if err != nil {
+		return err
+	}
+	m.namespaceFetched = time.Now()
+	key := namespaceKey(objects)
+	if key == m.namespaceKey {
+		return nil
+	}
+	next, err := newTree(m, objects)
+	if err != nil {
+		return err
+	}
+	// Empty directories have no Vault object and therefore cannot come back
+	// from List. Keep those local namespace placeholders across a refresh when
+	// the synchronized tree has not occupied their path.
+	for _, prefix := range m.root.emptyDirPrefixes() {
+		next.ensureEmptyDir(prefix)
+	}
+	for name, child := range m.root.Children() {
+		_ = m.root.NotifyDelete(name, child)
+		m.root.RmChild(name)
+	}
+	for name, child := range next.dirs {
+		m.root.AddChild(name, m.root.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR}), false)
+		_ = m.root.NotifyEntry(name)
+	}
+	for name, child := range next.files {
+		m.root.AddChild(name, m.root.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG}), false)
+		_ = m.root.NotifyEntry(name)
+	}
+	m.root.dirs, m.root.files = next.dirs, next.files
+	m.namespaceKey = key
+	m.cat.replace(objects)
+	return nil
+}
+
+func (d *dirNode) hasLocalContent() bool {
+	for _, f := range d.files {
+		f.mu.Lock()
+		local := f.object.ID == "" || f.writing || f.failed
+		f.mu.Unlock()
+		if local {
+			return true
+		}
+	}
+	for _, child := range d.dirs {
+		if child.hasLocalContent() {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *dirNode) emptyDirPrefixes() []string {
+	var out []string
+	if d.prefix != "" && len(d.dirs) == 0 && len(d.files) == 0 {
+		out = append(out, d.prefix)
+	}
+	for _, child := range d.dirs {
+		out = append(out, child.emptyDirPrefixes()...)
+	}
+	return out
+}
+
+func (d *dirNode) ensureEmptyDir(prefix string) {
+	parts := strings.Split(prefix, "/")
+	cur := d
+	for i, part := range parts {
+		if cur.files[part] != nil {
+			return
+		}
+		if cur.dirs[part] == nil {
+			cur.dirs[part] = newDir(d.m, path.Join(parts[:i+1]...))
+		}
+		cur = cur.dirs[part]
+	}
 }
 
 // stage opens a scratch file for one open(2): a read buffer, or the staging
@@ -182,6 +298,16 @@ func (c *catalog) update(o daemon.ObjectInfo) {
 func (c *catalog) forget(id string) {
 	c.mu.Lock()
 	delete(c.byID, id)
+	c.mu.Unlock()
+}
+
+func (c *catalog) replace(objects []daemon.ObjectInfo) {
+	byID := make(map[string]daemon.ObjectInfo, len(objects))
+	for _, o := range objects {
+		byID[o.ID] = o
+	}
+	c.mu.Lock()
+	c.byID, c.fetched = byID, time.Now()
 	c.mu.Unlock()
 }
 
@@ -280,6 +406,23 @@ func (d *dirNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut)
 	}
 	out.Uid, out.Gid = uint32(os.Getuid()), uint32(os.Getgid())
 	return 0
+}
+
+func (d *dirNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	if err := d.m.refreshNamespace(ctx); err != nil {
+		return nil, syscall.EIO
+	}
+	children := d.Children()
+	names := make([]string, 0, len(children))
+	for name := range children {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	entries := make([]fuse.DirEntry, 0, len(names))
+	for _, name := range names {
+		entries = append(entries, fuse.DirEntry{Name: name, Mode: children[name].Mode()})
+	}
+	return fs.NewListDirStream(entries), 0
 }
 
 func (f *fileNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -471,6 +614,7 @@ func reserveUnpublished(dir, name string) (string, error) {
 
 var _ fs.NodeOnAdder = (*dirNode)(nil)
 var _ fs.NodeGetattrer = (*dirNode)(nil)
+var _ fs.NodeReaddirer = (*dirNode)(nil)
 var _ fs.NodeGetattrer = (*fileNode)(nil)
 var _ fs.NodeOpener = (*fileNode)(nil)
 var _ fs.FileReader = (*fileHandle)(nil)

@@ -310,6 +310,49 @@ func TestMountedFileRefreshesRemoteSize(t *testing.T) {
 	}
 }
 
+func TestWritableMountRefreshesRemoteNamespace(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		t.Skip("FUSE unavailable")
+	}
+	src := newMemorySource()
+	o, err := src.Put("photos", "before/photo.jpg", strings.NewReader("photo"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mountpoint := t.TempDir()
+	server, err := Mount(mountpoint, "photos", src, Options{Writable: true, MetadataTTL: time.Millisecond})
+	if err != nil {
+		t.Skipf("cannot mount FUSE: %v", err)
+	}
+	defer server.Unmount()
+
+	if _, err := src.Rename("photos", o.ID, "after/photo.jpg"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	entries, err := os.ReadDir(mountpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "after" {
+		t.Fatalf("root entries after remote rename = %v, want [after]", entryNames(entries))
+	}
+	if got, err := os.ReadFile(filepath.Join(mountpoint, "after", "photo.jpg")); err != nil || string(got) != "photo" {
+		t.Fatalf("renamed file read = %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(mountpoint, "before")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old remote directory still visible: %v", err)
+	}
+}
+
+func entryNames(entries []os.DirEntry) []string {
+	names := make([]string, len(entries))
+	for i, entry := range entries {
+		names[i] = entry.Name()
+	}
+	return names
+}
+
 // countingSource records how much traffic the mount generates.
 type countingSource struct {
 	*memorySource

@@ -121,6 +121,56 @@ func hydrate(nodes ...*syncNode) {
 	}
 }
 
+// A node whose addresses never change re-signs nothing, so its record keeps
+// the same seq for its whole life. Once the addresses that record carries age
+// out of the peerstore under addrRecordTTL, that very same record must still
+// be accepted — otherwise the peer can never be re-learned and is undialable
+// for good, which is how an always-on member vanished from the mesh while
+// still sitting connected and visible in the graph.
+func TestExpiredRecordIsRelearnedAtSameSeq(t *testing.T) {
+	nsPub, nsPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newSyncNode(t, nsPub, nsPriv, "watcher")
+	b := newSyncNode(t, nsPub, nsPriv, "always-on")
+	hydrate(a, b)
+
+	// b's own signed record, captured once — b never re-signs it.
+	var rec []byte
+	waitFor(t, "always-on node to sign its own record", func() bool {
+		b.sync.mu.Lock()
+		defer b.sync.mu.Unlock()
+		rec = b.sync.ownRec
+		return rec != nil
+	})
+
+	if !a.sync.consumeRecord(rec, time.Now()) {
+		t.Fatal("first consume rejected")
+	}
+	cab, ok := a.host.Peerstore().(peerstore.CertifiedAddrBook)
+	if !ok || cab.GetPeerRecord(b.host.ID()) == nil {
+		t.Fatal("no certified record after the first consume")
+	}
+
+	// Age those addresses out, exactly as addrRecordTTL does after 48h with
+	// nothing having refreshed them.
+	a.host.Peerstore().UpdateAddrs(b.host.ID(), addrRecordTTL, 0)
+	if len(a.host.Peerstore().Addrs(b.host.ID())) != 0 {
+		t.Fatal("setup: addresses did not expire")
+	}
+
+	// The same record, same seq, must put them back. consumeRecord reports
+	// false here — refreshed but not news, so it is not relayed onward.
+	a.sync.consumeRecord(rec, time.Now())
+	if len(a.host.Peerstore().Addrs(b.host.ID())) == 0 {
+		t.Fatal("expired record was not re-learned: peer is undialable for good")
+	}
+	if cab.GetPeerRecord(b.host.ID()) == nil {
+		t.Fatal("certified record not restored")
+	}
+}
+
 // Address gossip: m—a—b, where m and b never exchanged addresses out of
 // band. m must learn b's signed address record through a (anti-entropy
 // relay into the certified addr book) and then reach b with nothing but

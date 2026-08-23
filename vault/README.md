@@ -3,7 +3,7 @@
 An API-first, content-addressed object store for a personal mesh —
 the data layer of the Aethera stack. Apps talk to Vault through its
 API; sync happens at the object level; the filesystem is one
-*surface* (read-only projections and an opt-in writable FUSE mount), never the
+*surface* (read-only projections now, FUSE later), never the
 substrate. Rides [fabric](../fabric) in library mode for membership
 and transport.
 
@@ -38,18 +38,19 @@ Objects:   Put(bucket, name, reader, tags...) -> Object
            Tag(bucket, objectID, +tag/-tag)
            Delete(bucket, objectID)                    // tombstone
 Surfaces:  Project(bucket, dir)                        // read-only materialization
-           Mount(bucket, dir)                          // FUSE view; writes opt in
 Later:     Subscribe(bucket, mode), Grant(bucket, userKey, caps),
-           serve layer (gallery / URL shares), faceted FUSE
+           serve layer (gallery / URL shares), FUSE
 ```
 
 ## Build
 
-The fabric binary carries the data CLI as the `fabric vault …` command
-group (ADR 0013 — one process, one binary, one CLI):
+The fabric binary carries the data CLI (ADR 0013 — one binary): run it
+as `fabric vault …`, or symlink `vault → fabric` for the plain `vault …`
+spelling — argv[0] dispatch, busybox-style. `cmd/vault` still builds the
+same commands standalone for a data-CLI-only install:
 
 ```sh
-go build -o fabric ./cmd/fabric
+go build -o fabric ./cmd/fabric && ln -s fabric vault
 go test ./...
 ```
 
@@ -57,15 +58,11 @@ Quickstart (throwaway state dir):
 
 ```sh
 export VAULT_PASSPHRASE=test          # or omit for an interactive prompt
-./fabric vault init -state /tmp/v -name alex
-./fabric vault bucket create -state /tmp/v family-photos
-./fabric vault put -state /tmp/v -tag pets,2026 family-photos cat.jpg
-./fabric vault ls  -state /tmp/v -tag pets family-photos
-./fabric vault project -state /tmp/v family-photos /tmp/album   # read-only view
-# with `fabric up` running:
-./fabric vault mount -state /tmp/v family-photos /tmp/album-live
-# opt in to ordinary filesystem writes:
-./fabric vault mount -state /tmp/v -write family-photos /tmp/album-live
+./vault init -state /tmp/v -name alex
+./vault bucket create -state /tmp/v family-photos
+./vault put -state /tmp/v -tag pets,2026 family-photos cat.jpg
+./vault ls  -state /tmp/v -tag pets family-photos
+./vault project -state /tmp/v family-photos /tmp/album   # read-only view
 ```
 
 Default state dir is `~/.config/vault`; every command accepts
@@ -91,7 +88,7 @@ Mesh membership is the machine's, managed by the fabric CLI:
 fabric join -name desk /ip4/…/tcp/4517/p2p/12D3Koo…   # approve on the master
 vault init -name alex     # create the circle (once, any device)
 fabric up &               # node daemon; vault subsystem activates
-fabric vault status       # circle, mesh membership, connected vault peers
+vault status              # circle, mesh membership, connected vault peers
 ```
 
 "Which devices run vault" is simply which members have vault state —
@@ -101,7 +98,7 @@ other among mesh members by the `/vault/hello/1` protocol
 `fabric status`.
 
 **A second device of the same owner** (interim procedure until
-capability grants land — `fabric vault init` would mint a *different* user
+capability grants land — `vault init` would mint a *different* user
 key): copy the circle identity, then restart the daemon so the
 subsystem activates.
 
@@ -109,8 +106,8 @@ subsystem activates.
 ssh other 'mkdir -p -m 700 ~/.config/vault'
 scp ~/.config/vault/config.json ~/.config/vault/user.key.age other:.config/vault/
 # on other: restart 'fabric up' (systemctl restart fabric), then
-fabric vault buckets            # catalog arrives via sync (≤30 s after connect)
-fabric vault sub <bucket> full  # and blobs follow
+vault buckets            # catalog arrives via sync (≤30 s after connect)
+vault sub <bucket> full  # and blobs follow
 ```
 
 Only those two files — `blobs/`, `buckets/`, and `subs.json` are
@@ -127,65 +124,18 @@ signature verification. Blobs move separately on `/vault/blob/1`,
 driven by subscriptions (memo §5 — pull, not push):
 
 ```sh
-fabric vault sub photos full    # hold a complete copy; fetch what's missing
-fabric vault sub photos cache   # hold what gets accessed (no eviction yet)
-fabric vault sub photos none    # catalog + index only
-fabric vault buckets            # id, sub mode, held/objects, name
+vault sub photos full    # hold a complete copy; fetch what's missing
+vault sub photos cache   # hold what gets accessed (no eviction yet)
+vault sub photos none    # catalog + index only
+vault buckets            # id, sub mode, held/objects, name
 ```
 
-The creating device subscribes `full` by default. `fabric vault get` works
+The creating device subscribes `full` by default. `vault get` works
 on *any* vault node that can reach a holder — a missing blob is a
 mesh lookup, not an error. Transfers are verified by re-hashing
 (content addressing is the integrity check). Trust boundary today:
 any authenticated mesh member may sync and fetch; per-circle
 visibility and capability checks arrive with grants.
-
-## FUSE mount
-
-`fabric vault mount <bucket> <dir>` is the practical access surface for dogfooding
-and legacy consumers. Stored object names appear as ordinary paths; opening a
-file reads through the daemon, so `cache`/`none` can fetch a missing blob from
-a connected holder. It is read-only unless `-write` is supplied.
-
-In a writable mount, directories are ephemeral namespace structure: creating
-an empty directory creates no bucket object, while a file such as
-`AI/performance/mlperf.pdf` becomes one object with that stored name. Writes
-are staged in a local file and published on explicit `fsync` or the
-final close, so partial copy/editor data is not synced. Overwrite replaces the object's immutable blob while
-preserving its object ID; file and directory renames update stored names;
-unlink creates the usual Vault tombstone. Files are single-writer within one
-mount. Directory renames currently update their objects one at a time rather
-than atomically.
-
-The set of names is snapshotted at mount time; remount to see creates, renames,
-or deletes made through another client or mount. Existing files refresh their
-metadata and content through the daemon, so a remotely grown file reports and
-reads its current size — within a one-second coherence window, since the
-refresh is a bucket listing shared by every file rather than one listing per
-`stat`. Duplicate names gain an `~<object-id>` suffix. Requires Linux FUSE and
-a running `fabric up` daemon.
-
-**Staging and failed publishes.** Reads and writes buffer whole objects, so
-they are staged under `<vault-state>/mount/cache` — beside the blob store,
-not in `/tmp`, which is commonly a RAM-backed tmpfs that one video can
-exhaust. Files there belong to live opens and are removed on close; anything
-left behind after an unclean shutdown is safe to delete while nothing is
-mounted.
-
-If content cannot be published, `close(2)` reports the failure whenever the
-daemon is the reason: before letting a close on modified content succeed, the
-mount round-trips the control socket. That check is always a live request —
-never a cached verdict — because a daemon that stopped answering a moment ago
-is the case worth catching.
-
-When the daemon answers but the write is refused, the kernel gives `close(2)`
-no way to carry that error, so the loss is made visible instead: the staged
-bytes are moved to `<vault-state>/mount/unpublished/<stored name>`, the path
-reports `EIO` rather than pretending to hold a file, and the recovery command
-is logged. A second failure under the same stored name never replaces the
-first — it keeps its extension and gains a unique infix, since these files are
-the only copy of their content. Nothing under `unpublished/` is ever cleaned
-automatically.
 
 ## Layout
 
@@ -196,8 +146,8 @@ automatically.
 - `daemon/` — the vault subsystem: control API (HTTP over unix
   socket), sync/blob/hello protocols; attached to the fabric daemon
   by `cmd/fabric up` (the composition root)
-- `cli/` — the `fabric vault` command group (daemon client when one is
-  running, direct otherwise)
+- `../cmd/vault` — data CLI (daemon client when one is running,
+  direct otherwise)
 
 ## Status
 

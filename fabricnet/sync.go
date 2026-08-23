@@ -42,8 +42,14 @@ const maxEventsWireSize = 1 << 20
 const exchangeTimeout = 15 * time.Second
 
 // addrRecordTTL bounds how long gossiped addresses are kept without being
-// refreshed; anti-entropy on every connect refreshes them in practice.
+// refreshed.
 const addrRecordTTL = 48 * time.Hour
+
+// recordRepublishInterval re-arms addrRecordTTL well inside the TTL. Connect
+// time anti-entropy alone is not enough: a pair of nodes holding one stable
+// long-lived connection never exchanges again, so nothing refreshes the
+// addresses they hold for each other or for anyone else.
+const recordRepublishInterval = 6 * time.Hour
 
 // syncPayload is one direction of a /fabric/sync/1 exchange.
 type syncPayload struct {
@@ -92,7 +98,37 @@ func NewEventSync(h host.Host, log *event.Log, store *MemberStore, onApply Event
 	h.Network().Notify(nb)
 	s.stop = append(s.stop, func() { h.Network().StopNotify(nb) })
 	s.watchOwnRecord()
+	s.republishRecords()
 	return s
+}
+
+// republishRecords re-pushes every record we hold to connected members on a
+// timer, re-arming addrRecordTTL across the mesh.
+//
+// Without it, addresses only ever refresh on connect. An always-on node sits
+// on one long-lived connection and emits no new EvtLocalAddressesUpdated, so
+// its record keeps the same seq forever and no fresher copy is ever gossiped;
+// 48h later its addresses expire everywhere and it can no longer be dialed,
+// even though it is still connected and visible in the graph.
+//
+// The push is deliberately one hop: a receiver refreshes its own TTL but sees
+// an equal-seq record as "not news" and does not relay it onward, so this
+// costs one small message per connected member per interval and cannot
+// cascade.
+func (s *EventSync) republishRecords() {
+	t := time.NewTicker(recordRepublishInterval)
+	done := make(chan struct{})
+	s.stop = append(s.stop, func() { close(done); t.Stop() })
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				s.pushRecordsExcept(s.knownRecords(), "")
+			}
+		}
+	}()
 }
 
 // Close detaches the service from the host.
@@ -335,21 +371,24 @@ func (s *EventSync) consumeRecord(data []byte, now time.Time) bool {
 	if !ok || rec.PeerID == s.h.ID() || !s.store.IsMember(rec.PeerID, now) {
 		return false
 	}
-	s.mu.Lock()
-	stale := rec.Seq <= s.lastSeq[rec.PeerID]
-	s.mu.Unlock()
-	if stale {
-		return false
-	}
+	// Store first, decide whether to relay second. ConsumePeerRecord accepts
+	// an equal-seq record and re-arms addrRecordTTL on its addresses, and
+	// that refresh is the only thing keeping a peer's addresses alive here.
+	// Skipping it on the seq check let lastSeq — in memory, never expiring —
+	// outlive the peerstore entry, and a peer whose seq never changes (an
+	// always-on node with stable addresses re-signs nothing) could then never
+	// be re-learned: its addresses aged out mesh-wide and it went undialable
+	// while still showing as connected.
 	accepted, err := s.cab.ConsumePeerRecord(env, addrRecordTTL)
 	if err != nil || !accepted {
 		return false
 	}
 	s.mu.Lock()
-	if rec.Seq > s.lastSeq[rec.PeerID] {
-		s.lastSeq[rec.PeerID] = rec.Seq
+	defer s.mu.Unlock()
+	if rec.Seq <= s.lastSeq[rec.PeerID] {
+		return false // refreshed, but not news — relaying it would re-push forever
 	}
-	s.mu.Unlock()
+	s.lastSeq[rec.PeerID] = rec.Seq
 	return true
 }
 
