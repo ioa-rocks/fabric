@@ -39,10 +39,11 @@ type StatusReply struct {
 	Mesh    bool   `json:"mesh"`
 	Member  string `json:"member,omitempty"`
 
-	Hosted    []HostedInfo      `json:"hosted,omitempty"`    // names journaled here
-	Placed    map[string]string `json:"placed,omitempty"`    // remote name → host member
-	Outbox    int               `json:"outbox"`              // parked casts
-	Connected []string          `json:"connected,omitempty"` // member labels reachable now
+	Hosted    []HostedInfo       `json:"hosted,omitempty"`    // names journaled here
+	Placed    map[string]string  `json:"placed,omitempty"`    // remote name → host member
+	Outbox    int                `json:"outbox"`              // parked casts
+	Monitors  []astral.Heartbeat `json:"monitors,omitempty"`  // leases held here
+	Connected []string           `json:"connected,omitempty"` // member labels reachable now
 }
 
 // HostedInfo is one locally hosted name with its backlog.
@@ -84,6 +85,25 @@ type ackBody struct {
 	EventID  string `json:"event_id"`
 }
 
+type waitBody struct {
+	Name     string `json:"name"`
+	TimeoutS int    `json:"timeout_s,omitempty"`
+}
+
+type waitReply struct {
+	Woke Woke `json:"woke"`
+}
+
+type heartbeatBody struct {
+	Entity string `json:"entity"`
+	TTLS   int    `json:"ttl_s,omitempty"`
+}
+
+type watchBody struct {
+	Entity  string `json:"entity"`
+	Watcher string `json:"watcher"`
+}
+
 type setBody struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
@@ -107,6 +127,9 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/ack", d.ctlAck)
 	mux.HandleFunc("POST /v0/set", d.ctlSet)
 	mux.HandleFunc("GET /v0/get", d.ctlGet)
+	mux.HandleFunc("POST /v0/wait", d.ctlWait)
+	mux.HandleFunc("POST /v0/heartbeat", d.ctlHeartbeat)
+	mux.HandleFunc("POST /v0/watch", d.ctlWatch)
 
 	srv := &http.Server{Handler: mux}
 	go func() { _ = srv.Serve(ln) }()
@@ -153,6 +176,7 @@ func (d *Daemon) ctlStatus(w http.ResponseWriter, r *http.Request) {
 		reply.Hosted = append(reply.Hosted, HostedInfo{Mailbox: m, Pending: n})
 	}
 	reply.Placed, _ = d.Store.Hosts()
+	reply.Monitors, _ = d.Store.Heartbeats()
 	ob, _ := d.Store.Outbox()
 	for _, evs := range ob {
 		reply.Outbox += len(evs)
@@ -297,4 +321,59 @@ func (d *Daemon) ctlGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, reg)
+}
+
+func (d *Daemon) ctlWait(w http.ResponseWriter, r *http.Request) {
+	var b waitBody
+	if err := decode(w, r, &b); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if !d.begin() {
+		writeErr(w, errors.New("shutting down"))
+		return
+	}
+	defer d.end()
+	woke, err := d.Wait(r.Context(), b.Name, time.Duration(b.TimeoutS)*time.Second)
+	if err != nil && woke == "" {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, waitReply{Woke: woke})
+}
+
+func (d *Daemon) ctlHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var b heartbeatBody
+	if err := decode(w, r, &b); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if !d.begin() {
+		writeErr(w, errors.New("shutting down"))
+		return
+	}
+	defer d.end()
+	if err := d.Heartbeat(b.Entity, time.Duration(b.TTLS)*time.Second); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (d *Daemon) ctlWatch(w http.ResponseWriter, r *http.Request) {
+	var b watchBody
+	if err := decode(w, r, &b); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if !d.begin() {
+		writeErr(w, errors.New("shutting down"))
+		return
+	}
+	defer d.end()
+	if err := d.Watch(b.Entity, b.Watcher); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }

@@ -23,7 +23,8 @@ type Client struct{ http http.Client }
 func NewClient(statePath string) *Client {
 	sock := SocketPath(statePath)
 	return &Client{http: http.Client{
-		Timeout: 30 * time.Second,
+		// Waits long-poll; the per-call timeout rides the request body.
+		Timeout: 15 * time.Minute,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
@@ -130,4 +131,21 @@ func (c *Client) Get(name string) (astral.Register, bool, error) {
 		return r, false, nil
 	}
 	return r, false, decodeErr(resp)
+}
+
+// Wait parks until name has mail or timeoutS elapses (the timer wake).
+func (c *Client) Wait(name string, timeoutS int) (Woke, error) {
+	var r waitReply
+	err := c.post("/v0/wait", waitBody{Name: name, TimeoutS: timeoutS}, &r)
+	return r.Woke, err
+}
+
+// Heartbeat extends entity's liveness lease by ttlS seconds.
+func (c *Client) Heartbeat(entity string, ttlS int) error {
+	return c.post("/v0/heartbeat", heartbeatBody{Entity: entity, TTLS: ttlS}, nil)
+}
+
+// Watch subscribes watcher (a mailbox) to entity's death notices.
+func (c *Client) Watch(entity, watcher string) error {
+	return c.post("/v0/watch", watchBody{Entity: entity, Watcher: watcher}, nil)
 }

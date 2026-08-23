@@ -63,6 +63,10 @@ const (
 	OpAck    Op = "ack"
 	OpGet    Op = "get"
 	OpSet    Op = "set"
+
+	OpWait      Op = "wait"      // park until mail or LeaseNS timeout
+	OpHeartbeat Op = "heartbeat" // Name = entity, LeaseNS = ttl
+	OpWatch     Op = "watch"     // Name = entity, Consumer = watcher mailbox
 )
 
 type request struct {
@@ -81,6 +85,7 @@ type response struct {
 	Fresh   bool             `cbor:"fresh,omitempty"`
 	Claimed []astral.Claimed `cbor:"claimed,omitempty"`
 	Reg     *astral.Register `cbor:"reg,omitempty"`
+	Woke    string           `cbor:"woke,omitempty"`
 }
 
 // Daemon hosts a journal and routes verbs.
@@ -93,8 +98,10 @@ type Daemon struct {
 	closed bool
 	wg     sync.WaitGroup
 
-	kick chan struct{} // outbox wants a flush
-	done chan struct{} // outbox loop exited
+	kick  chan struct{} // outbox wants a flush
+	done  chan struct{} // outbox loop exited
+	mdone chan struct{} // monitor loop exited
+	wake  *waiters
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -126,8 +133,9 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Daemon{
 		Path: statePath, Store: st,
-		kick: make(chan struct{}, 1), done: make(chan struct{}),
-		ctx: ctx, cancel: cancel,
+		kick: make(chan struct{}, 1), done: make(chan struct{}), mdone: make(chan struct{}),
+		wake: newWaiters(),
+		ctx:  ctx, cancel: cancel,
 	}
 	if fd != nil {
 		fd.Host.SetStreamHandler(Protocol, fd.Auth.RequireMember(d.handleStream))
@@ -159,10 +167,12 @@ func (d *Daemon) Run() error {
 	} else {
 		close(d.done)
 	}
+	go func() { defer close(d.mdone); d.monitorLoop() }()
 
 	<-d.ctx.Done()
 	stopControl()
 	<-d.done
+	<-d.mdone
 	d.mu.Lock()
 	d.closed = true
 	d.mu.Unlock()
@@ -199,7 +209,7 @@ func (d *Daemon) Append(name string, ev astral.Event) (fresh bool, err error) {
 	if _, ok, err := d.Store.Mailbox(name); err != nil {
 		return false, err
 	} else if ok {
-		return d.Store.Append(name, ev)
+		return d.appendLocal(name, ev)
 	}
 	host, ok, err := d.Store.Host(name)
 	if err != nil {
@@ -218,6 +228,15 @@ func (d *Daemon) Append(name string, ev astral.Event) (fresh bool, err error) {
 		return true, nil
 	}
 	return resp.Fresh, nil
+}
+
+// appendLocal journals and wakes parked waiters.
+func (d *Daemon) appendLocal(name string, ev astral.Event) (bool, error) {
+	fresh, err := d.Store.Append(name, ev)
+	if err == nil && fresh {
+		d.wake.notify(name)
+	}
+	return fresh, err
 }
 
 // Claim leases events from a name, wherever it is hosted.
@@ -338,6 +357,9 @@ func (d *Daemon) handleStream(s network.Stream) {
 	if err := cbor.NewDecoder(s).Decode(&req); err != nil {
 		return
 	}
+	if req.Op == OpWait {
+		_ = s.SetDeadline(time.Now().Add(time.Duration(req.LeaseNS) + 15*time.Second))
+	}
 	from := d.peerName(s.Conn().RemotePeer())
 	resp := d.serve(req, from)
 	_ = cbor.NewEncoder(s).Encode(resp)
@@ -348,18 +370,33 @@ func (d *Daemon) serve(req request, from string) (resp response) {
 	// Remote verbs act on names hosted here only — no forwarding chains.
 	if _, ok, err := d.Store.Mailbox(req.Name); err != nil {
 		return fail(err)
-	} else if !ok && req.Op != OpGet && req.Op != OpSet {
+	} else if !ok && req.Op != OpGet && req.Op != OpSet && req.Op != OpHeartbeat && req.Op != OpWatch {
 		return fail(fmt.Errorf("%w: %s not hosted on %s", astral.ErrUnknownMailbox, req.Name, d.MemberName()))
 	}
 	switch req.Op {
 	case OpAppend:
 		ev := req.Event
 		ev.Source = stampSource(ev.Source, from)
-		fresh, err := d.Store.Append(req.Name, ev)
+		fresh, err := d.appendLocal(req.Name, ev)
 		if err != nil {
 			return fail(err)
 		}
 		return response{Fresh: fresh}
+	case OpWait:
+		timeout := time.Duration(req.LeaseNS)
+		if timeout <= 0 || timeout > 10*time.Minute {
+			timeout = 30 * time.Second
+		}
+		woke, err := d.waitLocal(d.ctx, req.Name, timeout)
+		if err != nil {
+			return fail(err)
+		}
+		return response{Woke: string(woke)}
+	case OpHeartbeat:
+		_, err := d.Store.Heartbeat(req.Name, time.Duration(req.LeaseNS))
+		return fail0(err)
+	case OpWatch:
+		return fail0(d.Store.Watch(req.Name, req.Consumer))
 	case OpClaim:
 		c, err := d.Store.Claim(req.Name, req.Consumer+"@"+from, time.Duration(req.LeaseNS), req.N)
 		if err != nil {
@@ -418,6 +455,10 @@ func (d *Daemon) peerByName(name string) (peer.ID, bool) {
 var errNoMesh = errors.New("astral: name is hosted elsewhere but this node is not on a mesh")
 
 func (d *Daemon) remote(host string, req request) (response, error) {
+	return d.remoteWithin(host, req, 15*time.Second)
+}
+
+func (d *Daemon) remoteWithin(host string, req request, within time.Duration) (response, error) {
 	if d.Fabric == nil {
 		return response{}, errNoMesh
 	}
@@ -425,14 +466,14 @@ func (d *Daemon) remote(host string, req request) (response, error) {
 	if !ok {
 		return response{}, fmt.Errorf("astral: host %q not connected", host)
 	}
-	ctx, cancel := context.WithTimeout(d.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(d.ctx, within)
 	defer cancel()
 	s, err := d.Fabric.Host.NewStream(ctx, p, Protocol)
 	if err != nil {
 		return response{}, err
 	}
 	defer s.Close()
-	_ = s.SetDeadline(time.Now().Add(15 * time.Second))
+	_ = s.SetDeadline(time.Now().Add(within))
 	if err := cbor.NewEncoder(s).Encode(req); err != nil {
 		return response{}, err
 	}

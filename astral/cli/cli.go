@@ -22,7 +22,10 @@ const usage = `usage: fabric astral <command> [flags] [args]
   mailbox <name> [-accepts k1,k2]      host a mailbox:<entity> or queue:<name> here
   host <name> <member>                 record that <member> hosts <name> ("" clears)
   append <name> [-kind user] [-source tool] [-id id] [-ref artifact] [-reply target] [-corr id] <content|->
-  claim <name> [-consumer me] [-lease 30] [-n 1]
+  claim <name> [-consumer me] [-lease 30] [-n 1] [-wait 0]
+                                       -wait N parks up to N seconds for mail first
+  heartbeat <entity> [-ttl 30]         extend <entity>'s liveness lease
+  watch <entity> <watcher-mailbox>     cast a system death notice there when the lease lapses
   ack <name> <event-id> [-consumer me]
   set <register:entity/key> <value>
   get <register:entity/key>
@@ -51,6 +54,10 @@ func Main(args []string) int {
 		err = cmdClaim(rest)
 	case "ack":
 		err = cmdAck(rest)
+	case "heartbeat":
+		err = cmdHeartbeat(rest)
+	case "watch":
+		err = cmdWatch(rest)
 	case "set":
 		err = cmdSet(rest)
 	case "get":
@@ -193,11 +200,18 @@ func cmdClaim(args []string) error {
 	consumer := fs.String("consumer", "cli", "consumer identity")
 	lease := fs.Int("lease", 30, "lease seconds")
 	n := fs.Int("n", 1, "max events")
+	wait := fs.Int("wait", 0, "park up to this many seconds for mail before claiming")
 	pos := parse(fs, args)
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: claim <name> [-consumer me] [-lease 30] [-n 1]")
+		return fmt.Errorf("usage: claim <name> [-consumer me] [-lease 30] [-n 1] [-wait 0]")
 	}
-	c, err := daemon.NewClient(*st).Claim(pos[0], *consumer, *lease, *n)
+	cl := daemon.NewClient(*st)
+	if *wait > 0 {
+		if _, err := cl.Wait(pos[0], *wait); err != nil {
+			return err
+		}
+	}
+	c, err := cl.Claim(pos[0], *consumer, *lease, *n)
 	if err != nil {
 		return err
 	}
@@ -244,4 +258,23 @@ func cmdGet(args []string) error {
 	}
 	fmt.Println(r.Value)
 	return nil
+}
+
+func cmdHeartbeat(args []string) error {
+	fs, st := flags("heartbeat")
+	ttl := fs.Int("ttl", 30, "lease seconds")
+	pos := parse(fs, args)
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: heartbeat <entity> [-ttl 30]")
+	}
+	return daemon.NewClient(*st).Heartbeat(pos[0], *ttl)
+}
+
+func cmdWatch(args []string) error {
+	fs, st := flags("watch")
+	pos := parse(fs, args)
+	if len(pos) != 2 {
+		return fmt.Errorf("usage: watch <entity> <watcher-mailbox>")
+	}
+	return daemon.NewClient(*st).Watch(pos[0], pos[1])
 }

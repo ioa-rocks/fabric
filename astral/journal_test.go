@@ -144,3 +144,50 @@ func TestDeriveIDStable(t *testing.T) {
 		t.Fatalf("derived ids differ: %q %q", a.ID, b.ID)
 	}
 }
+
+func TestMonitorGenerations(t *testing.T) {
+	s := openTest(t)
+	if err := s.Watch("child", "mailbox:parent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Watch("child", "mailbox:nope"); err != nil {
+		t.Fatal(err)
+	}
+	h, err := s.Heartbeat("child", 50*time.Millisecond)
+	if err != nil || h.Gen != 1 {
+		t.Fatalf("first heartbeat: %+v err=%v", h, err)
+	}
+	if l, _ := s.Lapsed(time.Now()); len(l) != 0 {
+		t.Fatalf("alive lease reported lapsed: %+v", l)
+	}
+	time.Sleep(80 * time.Millisecond)
+	l, _ := s.Lapsed(time.Now())
+	if len(l) != 1 || l[0].Entity != "child" || l[0].Gen != 1 || len(l[0].Watchers) != 2 {
+		t.Fatalf("lapse: %+v", l)
+	}
+	if err := s.MarkNotified("child", 1); err != nil {
+		t.Fatal(err)
+	}
+	if l, _ := s.Lapsed(time.Now()); len(l) != 0 {
+		t.Fatalf("notified lease reported again: %+v", l)
+	}
+	// Resurrection starts generation 2; marking gen 1 again is a no-op.
+	h, _ = s.Heartbeat("child", time.Minute)
+	if h.Gen != 2 || h.Notified {
+		t.Fatalf("resurrection: %+v", h)
+	}
+	_ = s.MarkNotified("child", 1)
+	hs, _ := s.Heartbeats()
+	if len(hs) != 1 || hs[0].Notified {
+		t.Fatalf("stale mark touched live generation: %+v", hs)
+	}
+	if s.Watch("child", "badname") == nil {
+		t.Fatal("watcher must be a valid mailbox/queue name")
+	}
+	a := deathNoticeID("child", 2)
+	if a != "death-child-2" {
+		t.Fatal(a)
+	}
+}
+
+func deathNoticeID(e string, g uint64) string { return DeathNotice(e, g, 0).ID }
