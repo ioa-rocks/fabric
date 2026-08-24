@@ -1,7 +1,7 @@
 // Package cli is `fabric astral …`: a plane client over the subsystem's
 // control socket. It is deliberately verb-shaped like the contract —
 // append / claim / ack / set / get — plus the host-side declarations
-// (mailbox, host) that stand in for registration until the registry exists.
+// (mailbox, host); host is retained as a manual registry override.
 package cli
 
 import (

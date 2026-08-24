@@ -198,7 +198,7 @@ func (d *Daemon) ctlDeclare(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if err := d.Store.Declare(astral.Mailbox{Name: b.Name, Accepts: b.Accepts}); err != nil {
+	if err := d.Declare(astral.Mailbox{Name: b.Name, Accepts: b.Accepts}); err != nil {
 		writeErr(w, err)
 		return
 	}

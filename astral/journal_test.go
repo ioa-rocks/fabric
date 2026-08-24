@@ -135,6 +135,32 @@ func TestOutboxAndPlacement(t *testing.T) {
 	}
 }
 
+func TestReplaceHost(t *testing.T) {
+	s := openTest(t)
+	if err := s.SetHost("mailbox:old", "nas"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetHost("mailbox:other", "desk"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceHost("nas", []string{"mailbox:new", "queue:work"}); err != nil {
+		t.Fatal(err)
+	}
+	hosts, err := s.Hosts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := hosts["mailbox:old"]; ok {
+		t.Fatal("stale placement survived registry replacement")
+	}
+	if hosts["mailbox:new"] != "nas" || hosts["queue:work"] != "nas" || hosts["mailbox:other"] != "desk" {
+		t.Fatalf("placements: %+v", hosts)
+	}
+	if err := s.ReplaceHost("desk", []string{"mailbox:new"}); !errors.Is(err, ErrNameConflict) {
+		t.Fatalf("duplicate host must fail loudly: %v", err)
+	}
+}
+
 func TestDeriveIDStable(t *testing.T) {
 	a := Event{Kind: "user", Source: "x@y", Content: "c", At: 42}
 	b := a

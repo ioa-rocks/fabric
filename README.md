@@ -437,6 +437,33 @@ key or passphrase, same custody model as the CLI. On a non-master node
 the UI is a read-only mesh view. It binds to localhost and has no auth
 of its own; don't point `-listen` at a routable interface.
 
+## Astral: the coordination plane
+
+`fabric up` also runs Astral, the durable coordination substrate used by
+Nexus-style tools and agents. It provides declared mailboxes, competing-
+consumer queues, latest-value registers, offline delivery, claim leases and
+acknowledgements, wait/timer wake, and heartbeat monitors. The local API is a
+mode-0600 Unix socket; `fabric astral` exposes the same verbs for development
+and inspection.
+
+Mailbox placement is discovered between authenticated Fabric members. A node
+announces the names it hosts on connect and whenever it declares another one;
+peers atomically refresh placements and remove stale names. Conflicting claims
+are rejected loudly. `fabric astral host` remains as a manual/debug override,
+not normal mesh configuration.
+
+The stream protocol is member-gated, but fine-grained delegated capabilities
+are not implemented yet: every namespace member can currently invoke every
+Astral verb. Do not treat a mailbox declaration as an authorization boundary.
+That boundary arrives with Fabric certificate delegation.
+
+```sh
+fabric astral mailbox mailbox:concierge -accepts user,system
+fabric astral append mailbox:concierge -kind user "translate this"
+fabric astral claim mailbox:concierge -consumer concierge -wait 30
+fabric astral status
+```
+
 ## Commands
 
 | Command | Where | What |
@@ -455,6 +482,7 @@ of its own; don't point `-listen` at a routable interface.
 | `fabric peer add <multiaddr>` | any member | add a bootstrap peer |
 | `fabric announce add <hostname\|ip\|multiaddr>` | cloud/1:1-NAT nodes | also advertise an address no local interface carries; ports, transports, and resolved IPs derived automatically |
 | `fabric announce txt` | lighthouse | print the DNS TXT record enabling hostname joins |
+| `fabric astral ...` | any member | inspect and use the coordination plane (`fabric astral -h`) |
 
 All commands take `-state <dir>` (default `~/.config/fabric`), so
 several nodes can run on one machine for testing. Flags go **before**

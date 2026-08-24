@@ -7,8 +7,8 @@
 // Every verb resolves a name first: hosted here → local journal; placed on
 // another member → a stream to that member (a cast that cannot reach its
 // host is parked in the outbox and retried); unknown → loud error. The
-// placement table is a local stub standing in for the registry of
-// namespace-engine instance #2.
+// placement table is refreshed directly between authenticated members; the
+// namespace engine can later become its signed source of truth.
 //
 // With no fabric attached (nil) the subsystem serves local names only —
 // the solo mode the unit tests exercise.
@@ -34,7 +34,7 @@ import (
 )
 
 // Version travels in status replies so mismatched nodes are visible.
-const Version = "0.1-dev"
+const Version = "0.2-dev"
 
 // Protocol is the host protocol: one CBOR request, one CBOR reply per
 // stream, member-gated. `call` in its degenerate form — framing is
@@ -67,6 +67,7 @@ const (
 	OpWait      Op = "wait"      // park until mail or LeaseNS timeout
 	OpHeartbeat Op = "heartbeat" // Name = entity, LeaseNS = ttl
 	OpWatch     Op = "watch"     // Name = entity, Consumer = watcher mailbox
+	OpRegistry  Op = "registry"  // exchange names hosted by each endpoint
 )
 
 type request struct {
@@ -78,6 +79,7 @@ type request struct {
 	N        int          `cbor:"n,omitempty"`
 	EventID  string       `cbor:"event_id,omitempty"`
 	Value    string       `cbor:"value,omitempty"`
+	Names    []string     `cbor:"names,omitempty"`
 }
 
 type response struct {
@@ -86,6 +88,7 @@ type response struct {
 	Claimed []astral.Claimed `cbor:"claimed,omitempty"`
 	Reg     *astral.Register `cbor:"reg,omitempty"`
 	Woke    string           `cbor:"woke,omitempty"`
+	Names   []string         `cbor:"names,omitempty"`
 }
 
 // Daemon hosts a journal and routes verbs.
@@ -98,10 +101,11 @@ type Daemon struct {
 	closed bool
 	wg     sync.WaitGroup
 
-	kick  chan struct{} // outbox wants a flush
-	done  chan struct{} // outbox loop exited
-	mdone chan struct{} // monitor loop exited
-	wake  *waiters
+	kick              chan struct{} // outbox wants a flush
+	done              chan struct{} // outbox loop exited
+	mdone             chan struct{} // monitor loop exited
+	wake              *waiters
+	stopNetworkNotify func()
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -146,15 +150,33 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 			if prev != nil {
 				prev(p)
 			}
-			d.kickOutbox()
+			go d.refreshRegistry(p)
 		})
 		d.Fabric = fd
+		nb := &network.NotifyBundle{ConnectedF: func(_ network.Network, c network.Conn) {
+			go d.refreshRegistry(c.RemotePeer())
+		}}
+		fd.Host.Network().Notify(nb)
+		d.stopNetworkNotify = func() { fd.Host.Network().StopNotify(nb) }
 	}
 	return d, nil
 }
 
+// Declare hosts a name on this node and announces the refreshed local
+// registry view to every connected member.
+func (d *Daemon) Declare(m astral.Mailbox) error {
+	if err := d.Store.Declare(m); err != nil {
+		return err
+	}
+	go d.announceRegistry()
+	return nil
+}
+
 // Run serves the control socket and the outbox loop until Stop.
 func (d *Daemon) Run() error {
+	if d.stopNetworkNotify != nil {
+		defer d.stopNetworkNotify()
+	}
 	stopControl, err := d.serveControl()
 	if err != nil {
 		return err
@@ -370,10 +392,15 @@ func (d *Daemon) serve(req request, from string) (resp response) {
 	// Remote verbs act on names hosted here only — no forwarding chains.
 	if _, ok, err := d.Store.Mailbox(req.Name); err != nil {
 		return fail(err)
-	} else if !ok && req.Op != OpGet && req.Op != OpSet && req.Op != OpHeartbeat && req.Op != OpWatch {
+	} else if !ok && req.Op != OpGet && req.Op != OpSet && req.Op != OpHeartbeat && req.Op != OpWatch && req.Op != OpRegistry {
 		return fail(fmt.Errorf("%w: %s not hosted on %s", astral.ErrUnknownMailbox, req.Name, d.MemberName()))
 	}
 	switch req.Op {
+	case OpRegistry:
+		if err := d.learnRegistry(from, req.Names); err != nil {
+			return fail(err)
+		}
+		return response{Names: d.hostedNames()}
 	case OpAppend:
 		ev := req.Event
 		ev.Source = stampSource(ev.Source, from)
@@ -418,6 +445,57 @@ func (d *Daemon) serve(req request, from string) (resp response) {
 		return resp
 	}
 	return fail(fmt.Errorf("astral: unknown op %q", req.Op))
+}
+
+func (d *Daemon) hostedNames() []string {
+	boxes, err := d.Store.Mailboxes()
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(boxes))
+	for _, box := range boxes {
+		names = append(names, box.Name)
+	}
+	return names
+}
+
+func (d *Daemon) learnRegistry(member string, names []string) error {
+	local := make(map[string]bool)
+	for _, name := range d.hostedNames() {
+		local[name] = true
+	}
+	filtered := names[:0]
+	for _, name := range names {
+		if !local[name] {
+			filtered = append(filtered, name)
+		}
+	}
+	return d.Store.ReplaceHost(member, filtered)
+}
+
+func (d *Daemon) refreshRegistry(p peer.ID) {
+	member := d.peerName(p)
+	resp, err := d.remoteWithin(member, request{Op: OpRegistry, Names: d.hostedNames()}, 15*time.Second)
+	if err != nil {
+		log.Printf("astral: registry refresh from %s: %v", member, err)
+		return
+	}
+	if err := d.learnRegistry(member, resp.Names); err != nil {
+		log.Printf("astral: registry apply from %s: %v", member, err)
+		return
+	}
+	d.kickOutbox()
+}
+
+func (d *Daemon) announceRegistry() {
+	if d.Fabric == nil {
+		return
+	}
+	for _, p := range d.Fabric.Host.Network().Peers() {
+		if _, ok := d.Fabric.Store.Cert(p); ok {
+			go d.refreshRegistry(p)
+		}
+	}
 }
 
 func fail0(err error) response {

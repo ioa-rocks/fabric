@@ -101,6 +101,7 @@ var (
 	ErrUnknownMailbox = errors.New("astral: unknown mailbox (declare it first)")
 	ErrKindRejected   = errors.New("astral: kind not accepted by mailbox")
 	ErrBadName        = errors.New("astral: name must be mailbox:<entity>, queue:<name>, or register:<entity>/<key>")
+	ErrNameConflict   = errors.New("astral: name is already hosted by another member")
 )
 
 // ValidName checks the namespace prefixes.
@@ -425,7 +426,7 @@ func (s *Store) Get(name string) (Register, bool, error) {
 	return r, ok, err
 }
 
-// --- placement (the registry stub until namespace-engine instance #2) ---
+// --- placement (learned registry cache; namespace-engine authority later) ---
 
 // SetHost records which member hosts a remote name; "" clears it.
 func (s *Store) SetHost(name, member string) error {
@@ -460,6 +461,55 @@ func (s *Store) Hosts() (map[string]string, error) {
 		out[string(it.Key())[2:]] = string(it.Value())
 	}
 	return out, nil
+}
+
+// ReplaceHost atomically replaces every placement learned from member with
+// names. Registry refreshes use replacement rather than additive updates so a
+// mailbox that a member stopped hosting does not remain routable forever.
+func (s *Store) ReplaceHost(member string, names []string) error {
+	if member == "" {
+		return errors.New("astral: registry host required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := s.db.NewBatch()
+	defer b.Close()
+	for _, name := range names {
+		if err := ValidName(name); err != nil {
+			return err
+		}
+		raw, closer, err := s.db.Get([]byte("p/" + name))
+		if err == nil {
+			existing := string(raw)
+			closer.Close()
+			if existing != member {
+				return fmt.Errorf("%w: %s is on %s, not %s", ErrNameConflict, name, existing, member)
+			}
+		} else if !errors.Is(err, pebble.ErrNotFound) {
+			return err
+		}
+	}
+	it, err := s.db.NewIter(prefixBounds("p/"))
+	if err != nil {
+		return err
+	}
+	for it.First(); it.Valid(); it.Next() {
+		if string(it.Value()) == member {
+			if err := b.Delete(append([]byte(nil), it.Key()...), nil); err != nil {
+				it.Close()
+				return err
+			}
+		}
+	}
+	if err := it.Close(); err != nil {
+		return err
+	}
+	for _, name := range names {
+		if err := b.Set([]byte("p/"+name), []byte(member), nil); err != nil {
+			return err
+		}
+	}
+	return b.Commit(pebble.Sync)
 }
 
 // --- client outbox: a cast that could not reach its host yet ---

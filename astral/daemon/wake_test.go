@@ -137,12 +137,18 @@ func TestRemoteWaitAndMonitor(t *testing.T) {
 	fdesk := desk.fabric(t, root, "desk", []string{bootstrap}, roster...)
 	startDaemon(t, desk.statePath, fdesk)
 	clDesk := daemon.NewClient(desk.statePath)
-	for _, m := range []string{"mailbox:concierge", "mailbox:parent", "mailbox:child-9"} {
-		if err := clDesk.SetHost(m, "nas"); err != nil {
-			t.Fatal(err)
-		}
-	}
 	waitConnected(t, clDesk, "nas")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s, err := clDesk.Status()
+		if err == nil && s.Placed["mailbox:concierge"] == "nas" && s.Placed["mailbox:parent"] == "nas" && s.Placed["mailbox:child-9"] == "nas" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("registry did not discover nas mailboxes: %+v err=%v", s.Placed, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	// Remote wait, woken by a cast on the host side.
 	res := make(chan daemon.Woke, 1)
