@@ -43,6 +43,7 @@ type StatusReply struct {
 	Placed    map[string]string  `json:"placed,omitempty"`    // remote name → host member
 	Outbox    int                `json:"outbox"`              // parked casts
 	Monitors  []astral.Heartbeat `json:"monitors,omitempty"`  // leases held here
+	Claims    []astral.LeaseInfo `json:"claims,omitempty"`    // active event claim leases
 	Connected []string           `json:"connected,omitempty"` // member labels reachable now
 }
 
@@ -177,6 +178,7 @@ func (d *Daemon) ctlStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	reply.Placed, _ = d.Store.Hosts()
 	reply.Monitors, _ = d.Store.Heartbeats()
+	reply.Claims, _ = d.Store.Leases(time.Now())
 	ob, _ := d.Store.Outbox()
 	for _, evs := range ob {
 		reply.Outbox += len(evs)

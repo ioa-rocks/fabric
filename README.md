@@ -428,7 +428,9 @@ offline / revoked / stranger), this node's NAT reachability verdict
 (autonat), cert-expiry warnings, and the membership-event activity
 feed. On the master it is also the admin surface: approve/deny pending
 joins (with the fingerprint displayed for comparison) and revoke
-members.
+members. Its Astral card shows hosted and remotely placed names, backlog,
+active claim leases, heartbeat monitors, the offline outbox, and the current
+authorization boundary.
 
 `fabric ui` is deliberately a separate process from the daemon: the
 root-key passphrase is entered in the browser form, but signing happens
@@ -463,6 +465,9 @@ fabric astral append mailbox:concierge -kind user "translate this"
 fabric astral claim mailbox:concierge -consumer concierge -wait 30
 fabric astral status
 ```
+
+The same operator state is visible in `fabric ui`; use `-astral-state` when
+the UI and daemon use a non-default Astral state directory.
 
 ## Commands
 

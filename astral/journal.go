@@ -96,6 +96,15 @@ type Claimed struct {
 	Until    int64  `json:"lease_until"` // Unix nanoseconds
 }
 
+// LeaseInfo is an active claim lease surfaced to operators. It deliberately
+// contains no journal sequence: ordering cursors never leave the store.
+type LeaseInfo struct {
+	Name     string `json:"name"`
+	EventID  string `json:"event_id"`
+	Consumer string `json:"consumer"`
+	Until    int64  `json:"until"`
+}
+
 // ErrUnknownMailbox, ErrKindRejected: loud ingress failures by design.
 var (
 	ErrUnknownMailbox = errors.New("astral: unknown mailbox (declare it first)")
@@ -401,6 +410,32 @@ func (s *Store) Pending(name string) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// Leases lists active (not already expired) claim leases.
+func (s *Store) Leases(now time.Time) ([]LeaseInfo, error) {
+	it, err := s.db.NewIter(prefixBounds("l/"))
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var out []LeaseInfo
+	for it.First(); it.Valid(); it.Next() {
+		var l lease
+		if err := json.Unmarshal(it.Value(), &l); err != nil {
+			return nil, err
+		}
+		if l.Until <= now.UnixNano() {
+			continue
+		}
+		key := strings.TrimPrefix(string(it.Key()), "l/")
+		i := strings.LastIndex(key, "/")
+		if i < 0 {
+			continue
+		}
+		out = append(out, LeaseInfo{Name: key[:i], EventID: key[i+1:], Consumer: l.Consumer, Until: l.Until})
+	}
+	return out, nil
 }
 
 // Set writes a register (latest value wins; intermediate values are lost

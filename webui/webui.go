@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/admission"
+	astraldaemon "ioa.rocks/fabric/astral/daemon"
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/event"
@@ -32,14 +33,19 @@ var staticFS embed.FS
 
 // Server assembles the UI's HTTP handler around a state dir.
 type Server struct {
-	dir       state.Dir
-	client    *daemon.Client
-	master    bool
-	vaultPath string // vault state dir; the vault view lights up when a daemon serves its socket
+	dir        state.Dir
+	client     *daemon.Client
+	master     bool
+	vaultPath  string // vault state dir; the vault view lights up when a daemon serves its socket
+	astralPath string // astral state dir; read through its mode-0600 control socket
 }
 
-func New(dir state.Dir, vaultPath string) *Server {
-	return &Server{dir: dir, client: daemon.NewClient(dir), master: dir.IsMaster(), vaultPath: vaultPath}
+func New(dir state.Dir, vaultPath string, astralPaths ...string) *Server {
+	astralPath := astraldaemon.DefaultPath()
+	if len(astralPaths) > 0 && astralPaths[0] != "" {
+		astralPath = astralPaths[0]
+	}
+	return &Server{dir: dir, client: daemon.NewClient(dir), master: dir.IsMaster(), vaultPath: vaultPath, astralPath: astralPath}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -68,6 +74,13 @@ type Overview struct {
 	Links   []daemon.LinkInfo   `json:"links"`  // whole-mesh link state
 	Master  bool                `json:"master"` // this UI process can sign
 	Vault   *VaultOverview      `json:"vault,omitempty"`
+	Astral  *AstralOverview     `json:"astral,omitempty"`
+}
+
+// AstralOverview is the coordination subsystem's read-only operator view.
+type AstralOverview struct {
+	Status     *astraldaemon.StatusReply `json:"status"`
+	Capability string                    `json:"capability"`
 }
 
 // VaultOverview is the vault subsystem's slice of the poll — present only
@@ -112,6 +125,12 @@ func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
 				v.Buckets = buckets
 			}
 			o.Vault = v
+		}
+	}
+	if ast, err := astraldaemon.NewClient(s.astralPath).Status(); err == nil {
+		o.Astral = &AstralOverview{
+			Status:     ast,
+			Capability: "member-wide (delegated capabilities not yet implemented)",
 		}
 	}
 	if st.Master {

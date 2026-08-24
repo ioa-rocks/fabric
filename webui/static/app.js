@@ -108,7 +108,99 @@ function render() {
     renderPending(d);
   }
   renderVault(d);
+  renderAstral(d);
   renderFeed(d);
+}
+
+/* ---------- astral coordination card ---------- */
+
+function renderAstral(d) {
+  const card = document.getElementById("astral-card");
+  card.hidden = !d.astral;
+  if (card.hidden) return;
+
+  const a = d.astral.status || {};
+  const hosted = a.hosted || [];
+  const placed = Object.entries(a.placed || {}).sort((x, y) => x[0].localeCompare(y[0]));
+  const claims = a.claims || [];
+  const monitors = a.monitors || [];
+  const pending = hosted.reduce((n, h) => n + (h.pending || 0), 0);
+  document.getElementById("astral-summary").textContent =
+    `${hosted.length} hosted · ${placed.length} remote · ${pending} pending · ${claims.length} claimed`;
+  document.getElementById("astral-security").textContent =
+    `Authorization: ${d.astral.capability}. Mailbox declarations are routing boundaries, not authorization boundaries.`;
+
+  const box = document.getElementById("astral");
+  box.innerHTML = "";
+  const grid = document.createElement("div");
+  grid.className = "astral-grid";
+  grid.append(
+    astralPanel("Hosted here", hostedTable(hosted)),
+    astralPanel("Placed on peers", placedTable(placed)),
+    astralPanel("Active claims", claimsTable(claims)),
+    astralPanel("Monitors", monitorsTable(monitors)),
+  );
+  box.append(grid);
+  if (a.outbox) box.append(planeAlert(`${a.outbox} cast${a.outbox === 1 ? " is" : "s are"} parked in the offline outbox.`));
+}
+
+function astralPanel(title, content) {
+  const panel = document.createElement("section");
+  panel.className = "astral-panel";
+  const h = document.createElement("h3");
+  h.textContent = title;
+  panel.append(h, content);
+  return panel;
+}
+
+function operatorTable(headers, rows, empty) {
+  if (!rows.length) return note(empty);
+  const table = document.createElement("table");
+  table.className = "operator-table";
+  const head = document.createElement("tr");
+  for (const label of headers) { const th = document.createElement("th"); th.textContent = label; head.append(th); }
+  table.append(head);
+  for (const cells of rows) {
+    const tr = document.createElement("tr");
+    for (const value of cells) tr.append(td(value));
+    table.append(tr);
+  }
+  return table;
+}
+
+function hostedTable(hosted) {
+  return operatorTable(["name", "pending", "accepts"], hosted.map(h => [
+    mono(h.name), String(h.pending || 0), (h.accepts || []).join(", ") || "any kind",
+  ]), "No mailboxes or queues are hosted on this node.");
+}
+
+function placedTable(placed) {
+  return operatorTable(["name", "host"], placed.map(([name, host]) => [mono(name), host]),
+    "No remote placements discovered.");
+}
+
+function claimsTable(claims) {
+  return operatorTable(["name", "consumer", "lease until"], claims.map(c => [
+    mono(c.name), c.consumer, nanosDate(c.until),
+  ]), "No events are currently leased to consumers.");
+}
+
+function monitorsTable(monitors) {
+  return operatorTable(["entity", "generation", "lease"], monitors.map(m => {
+    const expired = Number(m.until) / 1e6 < Date.now();
+    return [mono(m.entity), String(m.gen), expired ? "lapsed" : nanosDate(m.until)];
+  }), "No heartbeat monitors are registered.");
+}
+
+function nanosDate(ns) {
+  return new Date(Number(ns) / 1e6).toLocaleTimeString();
+}
+
+function planeAlert(text) {
+  const p = document.createElement("p");
+  p.className = "plane-alert";
+  p.textContent = text;
+  return p;
 }
 
 /* ---------- vault card ---------- */

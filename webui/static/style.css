@@ -154,6 +154,39 @@ table.buckets select {
 .objects-list li { padding: 2px 0; }
 .objects-list .tags { color: var(--ink-2); }
 
+/* astral: operator-level coordination state */
+.astral-card { margin-top: 14px; }
+.plane-note {
+  margin: 4px 0 12px; padding: 8px 10px; border-radius: 8px;
+  color: var(--ink-2); font-size: 12px;
+  background: color-mix(in srgb, var(--warn) 10%, var(--card));
+  border: 1px solid color-mix(in srgb, var(--warn) 28%, var(--line));
+}
+.astral-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 800px) { .astral-grid { grid-template-columns: 1fr; } }
+.astral-panel { min-width: 0; }
+.astral-panel h3 {
+  margin: 0 0 5px; color: var(--ink-2); font-size: 12px;
+  font-weight: 600; letter-spacing: .03em;
+}
+table.operator-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.operator-table th {
+  text-align: left; color: var(--ink-3); font-size: 10.5px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .04em; padding: 4px 8px 5px 0;
+  border-bottom: 1px solid var(--line);
+}
+table.operator-table td {
+  padding: 6px 8px 6px 0; border-bottom: 1px solid var(--line);
+  vertical-align: top; overflow-wrap: anywhere;
+}
+table.operator-table tr:last-child td { border-bottom: none; }
+.plane-alert {
+  margin: 12px 0 0; padding: 7px 10px; border-radius: 8px;
+  background: color-mix(in srgb, var(--serious) 12%, var(--card));
+  border: 1px solid color-mix(in srgb, var(--serious) 35%, var(--line));
+  font-size: 12.5px;
+}
+
 /* revoked tombstones: present but visually retired and outside the topology */
 .revoked-card { margin-top: 14px; }
 .revoked-item { border-top: 1px solid var(--line); padding: 10px 0; opacity: 0.6; }

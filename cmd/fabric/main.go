@@ -1038,6 +1038,7 @@ func cmdUI(args []string) error {
 	statePath := stateFlag(fs)
 	listen := fs.String("listen", "127.0.0.1:4518", "listen address; keep it on localhost — the UI has no auth of its own")
 	vaultState := fs.String("vault-state", circle.DefaultPath(), "vault state directory (vault card lights up when its daemon runs)")
+	astralState := fs.String("astral-state", astraldaemon.DefaultPath(), "astral state directory (coordination card lights up when its daemon runs)")
 	fs.Parse(args)
 
 	dir, err := state.Open(*statePath)
@@ -1052,7 +1053,7 @@ func cmdUI(args []string) error {
 		role = "master — approvals and revocations enabled"
 	}
 	fmt.Printf("topology UI: http://%s  (%s)\n", *listen, role)
-	return http.ListenAndServe(*listen, webui.New(dir, *vaultState).Handler())
+	return http.ListenAndServe(*listen, webui.New(dir, *vaultState, *astralState).Handler())
 }
 
 func cmdQueue(args []string) error {

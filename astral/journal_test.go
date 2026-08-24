@@ -56,6 +56,10 @@ func TestClaimLeaseAck(t *testing.T) {
 	if err != nil || len(w1) != 2 || w1[0].Event.ID != "a" || w1[1].Event.ID != "b" {
 		t.Fatalf("w1 claim: %+v err=%v", w1, err)
 	}
+	leases, err := s.Leases(time.Now())
+	if err != nil || len(leases) != 2 || leases[0].Name != "queue:ingest" || leases[0].Consumer != "w1" {
+		t.Fatalf("operator leases: %+v err=%v", leases, err)
+	}
 	w2, err := s.Claim("queue:ingest", "w2", time.Minute, 5)
 	if err != nil || len(w2) != 1 || w2[0].Event.ID != "c" {
 		t.Fatalf("w2 claim: %+v err=%v", w2, err)
