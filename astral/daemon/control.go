@@ -59,6 +59,10 @@ type declareBody struct {
 	Accepts  []string        `json:"accepts,omitempty"`
 }
 
+type removeBody struct {
+	Name string `json:"name"`
+}
+
 type hostBody struct {
 	Name string `json:"name"`
 	Host string `json:"host"` // "" clears
@@ -123,6 +127,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v0/status", d.ctlStatus)
 	mux.HandleFunc("POST /v0/subjects", d.ctlDeclare)
+	mux.HandleFunc("POST /v0/remove", d.ctlRemove)
 	mux.HandleFunc("POST /v0/hosts", d.ctlHost)
 	mux.HandleFunc("POST /v0/append", d.ctlAppend)
 	mux.HandleFunc("POST /v0/claim", d.ctlClaim)
@@ -202,6 +207,19 @@ func (d *Daemon) ctlDeclare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := d.Declare(astral.Subject{Name: b.Name, Delivery: b.Delivery, Accepts: b.Accepts}); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]string{"name": b.Name})
+}
+
+func (d *Daemon) ctlRemove(w http.ResponseWriter, r *http.Request) {
+	var b removeBody
+	if err := decode(w, r, &b); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := d.Remove(b.Name); err != nil {
 		writeErr(w, err)
 		return
 	}

@@ -258,6 +258,33 @@ func (s *Store) Subjects() ([]Subject, error) {
 	return out, nil
 }
 
+// Remove deletes a declared subject and every event, index, ack, lease,
+// and parked outbox entry under it. Name validation is deliberately
+// skipped so operators can remove entries that predate the current
+// naming rules.
+func (s *Store) Remove(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var m Subject
+	if ok, err := s.getJSON("m/"+name, &m); err != nil {
+		return err
+	} else if !ok {
+		return ErrUnknownSubject
+	}
+	b := s.db.NewBatch()
+	defer b.Close()
+	if err := b.Delete([]byte("m/"+name), nil); err != nil {
+		return err
+	}
+	for _, prefix := range []string{"e/", "i/", "a/", "l/", "o/"} {
+		bounds := prefixBounds(prefix + name + "/")
+		if err := b.DeleteRange(bounds.LowerBound, bounds.UpperBound, nil); err != nil {
+			return err
+		}
+	}
+	return b.Commit(pebble.Sync)
+}
+
 // Append journals an event. Returns fresh=false when the ID was already
 // present (the idempotent retry case). The event's own ID is honoured;
 // an empty ID is derived.

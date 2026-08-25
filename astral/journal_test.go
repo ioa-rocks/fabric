@@ -1,9 +1,12 @@
 package astral
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/cockroachdb/pebble"
 )
 
 func openTest(t *testing.T) *Store {
@@ -119,6 +122,46 @@ func TestExclusiveRejectsConcurrentConsumer(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 	if got, err := s.Claim("subject:private", "replacement", time.Minute, 1); err != nil || len(got) != 1 {
 		t.Fatalf("replacement after lease lapse: %+v err=%v", got, err)
+	}
+}
+
+func TestRemoveSubjectAndLegacyEntries(t *testing.T) {
+	s := openTest(t)
+	if err := s.Remove("subject:nope"); !errors.Is(err, ErrUnknownSubject) {
+		t.Fatalf("remove of undeclared subject must be loud, got %v", err)
+	}
+	if err := s.Declare(Subject{Name: "subject:gone", Delivery: DeliveryShared}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append("subject:gone", Event{ID: "e1", Kind: "job", Source: "t@a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim("subject:gone", "w1", time.Minute, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove("subject:gone"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.Subject("subject:gone"); ok {
+		t.Fatal("declaration survived remove")
+	}
+	if _, err := s.Append("subject:gone", Event{Kind: "job", Source: "t@a"}); !errors.Is(err, ErrUnknownSubject) {
+		t.Fatalf("append after remove must be loud, got %v", err)
+	}
+	if leases, _ := s.Leases(time.Now()); len(leases) != 0 {
+		t.Fatalf("leases survived remove: %+v", leases)
+	}
+	// A record predating the naming rules is removable even though it can
+	// no longer be declared.
+	raw, _ := json.Marshal(Subject{Name: "mailbox:legacy"})
+	if err := s.db.Set([]byte("m/mailbox:legacy"), raw, pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove("mailbox:legacy"); err != nil {
+		t.Fatalf("legacy entry must be removable: %v", err)
+	}
+	if boxes, _ := s.Subjects(); len(boxes) != 0 {
+		t.Fatalf("store not empty after removes: %+v", boxes)
 	}
 }
 

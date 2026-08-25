@@ -85,6 +85,11 @@ func (c *Client) Declare(name string, delivery astral.Delivery, accepts []string
 	return c.post("/v0/subjects", declareBody{Name: name, Delivery: delivery, Accepts: accepts}, nil)
 }
 
+// Remove drops a subject hosted on this node, journal included.
+func (c *Client) Remove(name string) error {
+	return c.post("/v0/remove", removeBody{Name: name}, nil)
+}
+
 // SetHost records that member hosts name (registry stub); "" clears.
 func (c *Client) SetHost(name, host string) error {
 	return c.post("/v0/hosts", hostBody{Name: name, Host: host}, nil)

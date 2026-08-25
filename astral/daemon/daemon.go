@@ -172,6 +172,16 @@ func (d *Daemon) Declare(m astral.Subject) error {
 	return nil
 }
 
+// Remove drops a subject hosted here (journal included) and announces the
+// refreshed local registry so peers forget the placement.
+func (d *Daemon) Remove(name string) error {
+	if err := d.Store.Remove(name); err != nil {
+		return err
+	}
+	go d.announceRegistry()
+	return nil
+}
+
 // Run serves the control socket and the outbox loop until Stop.
 func (d *Daemon) Run() error {
 	if d.stopNetworkNotify != nil {

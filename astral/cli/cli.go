@@ -20,6 +20,7 @@ const usage = `usage: fabric astral <command> [flags] [args]
 
   status                               hosted names, placements, outbox, connected members
   subject <subject:name> [-delivery exclusive|shared] [-accepts k1,k2]
+  rm <name>                            remove a hosted subject and its journal
   host <name> <member>                 record that <member> hosts <name> ("" clears)
   append <name> [-kind user] [-source tool] [-id id] [-ref artifact] [-reply target] [-corr id] <content|->
   claim <name> [-consumer me] [-lease 30] [-n 1] [-wait 0]
@@ -46,6 +47,8 @@ func Main(args []string) int {
 		err = cmdStatus(rest)
 	case "subject":
 		err = cmdSubject(rest)
+	case "rm":
+		err = cmdRm(rest)
 	case "host":
 		err = cmdHost(rest)
 	case "append":
@@ -150,6 +153,15 @@ func cmdSubject(args []string) error {
 		kinds = strings.Split(*accepts, ",")
 	}
 	return daemon.NewClient(*st).Declare(pos[0], astral.Delivery(*delivery), kinds)
+}
+
+func cmdRm(args []string) error {
+	fs, st := flags("rm")
+	pos := parse(fs, args)
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: rm <name>")
+	}
+	return daemon.NewClient(*st).Remove(pos[0])
 }
 
 func cmdHost(args []string) error {
