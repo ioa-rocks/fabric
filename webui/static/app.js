@@ -128,7 +128,7 @@ function renderAstral(d) {
   document.getElementById("astral-summary").textContent =
     `${hosted.length} hosted · ${placed.length} remote · ${pending} pending · ${claims.length} claimed`;
   document.getElementById("astral-security").textContent =
-    `Authorization: ${d.astral.capability}. Mailbox declarations are routing boundaries, not authorization boundaries.`;
+    `Authorization: ${d.astral.capability}. Subject ACLs and client keys are the next security slice.`;
 
   const box = document.getElementById("astral");
   box.innerHTML = "";
@@ -169,9 +169,9 @@ function operatorTable(headers, rows, empty) {
 }
 
 function hostedTable(hosted) {
-  return operatorTable(["name", "pending", "accepts"], hosted.map(h => [
-    mono(h.name), String(h.pending || 0), (h.accepts || []).join(", ") || "any kind",
-  ]), "No mailboxes or queues are hosted on this node.");
+  return operatorTable(["name", "delivery", "pending", "accepts"], hosted.map(h => [
+    mono(h.name), h.delivery || "exclusive", String(h.pending || 0), (h.accepts || []).join(", ") || "any kind",
+  ]), "No subjects are hosted on this node.");
 }
 
 function placedTable(placed) {

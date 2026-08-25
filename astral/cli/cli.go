@@ -1,7 +1,7 @@
 // Package cli is `fabric astral …`: a plane client over the subsystem's
 // control socket. It is deliberately verb-shaped like the contract —
 // append / claim / ack / set / get — plus the host-side declarations
-// (mailbox, host); host is retained as a manual registry override.
+// (subject, host); host is retained as a manual registry override.
 package cli
 
 import (
@@ -19,13 +19,13 @@ import (
 const usage = `usage: fabric astral <command> [flags] [args]
 
   status                               hosted names, placements, outbox, connected members
-  mailbox <name> [-accepts k1,k2]      host a mailbox:<entity> or queue:<name> here
+  subject <subject:name> [-delivery exclusive|shared] [-accepts k1,k2]
   host <name> <member>                 record that <member> hosts <name> ("" clears)
   append <name> [-kind user] [-source tool] [-id id] [-ref artifact] [-reply target] [-corr id] <content|->
   claim <name> [-consumer me] [-lease 30] [-n 1] [-wait 0]
                                        -wait N parks up to N seconds for mail first
   heartbeat <entity> [-ttl 30]         extend <entity>'s liveness lease
-  watch <entity> <watcher-mailbox>     cast a system death notice there when the lease lapses
+  watch <entity> <watcher-subject>     cast a system death notice there when the lease lapses
   ack <name> <event-id> [-consumer me]
   set <register:entity/key> <value>
   get <register:entity/key>
@@ -44,8 +44,8 @@ func Main(args []string) int {
 	switch cmd {
 	case "status":
 		err = cmdStatus(rest)
-	case "mailbox":
-		err = cmdMailbox(rest)
+	case "subject":
+		err = cmdSubject(rest)
 	case "host":
 		err = cmdHost(rest)
 	case "append":
@@ -137,18 +137,19 @@ func cmdStatus(args []string) error {
 	return nil
 }
 
-func cmdMailbox(args []string) error {
-	fs, st := flags("mailbox")
+func cmdSubject(args []string) error {
+	fs, st := flags("subject")
 	accepts := fs.String("accepts", "", "comma-separated kinds accepted (empty = any)")
+	delivery := fs.String("delivery", string(astral.DeliveryExclusive), "exclusive or shared")
 	pos := parse(fs, args)
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: mailbox <name> [-accepts k1,k2]")
+		return fmt.Errorf("usage: subject <subject:name> [-delivery exclusive|shared] [-accepts k1,k2]")
 	}
 	var kinds []string
 	if *accepts != "" {
 		kinds = strings.Split(*accepts, ",")
 	}
-	return daemon.NewClient(*st).Declare(pos[0], kinds)
+	return daemon.NewClient(*st).Declare(pos[0], astral.Delivery(*delivery), kinds)
 }
 
 func cmdHost(args []string) error {
@@ -274,7 +275,7 @@ func cmdWatch(args []string) error {
 	fs, st := flags("watch")
 	pos := parse(fs, args)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: watch <entity> <watcher-mailbox>")
+		return fmt.Errorf("usage: watch <entity> <watcher-subject>")
 	}
 	return daemon.NewClient(*st).Watch(pos[0], pos[1])
 }

@@ -1,5 +1,5 @@
 // Package daemon is the astral subsystem of the node process (ADR 0013 +
-// ADR 0015): a journal host behind `/astral/mailbox/1` and a local control
+// ADR 0015): a journal host behind `/astral/subject/1` and a local control
 // socket, attached to the fabric daemon that owns the machine's
 // connectivity. `fabric up` activates it on every node — the plane exists
 // wherever fabric runs; what differs per node is which names it *hosts*.
@@ -39,7 +39,7 @@ const Version = "0.2-dev"
 // Protocol is the host protocol: one CBOR request, one CBOR reply per
 // stream, member-gated. `call` in its degenerate form — framing is
 // per-protocol (ADR 0015).
-const Protocol = "/astral/mailbox/1"
+const Protocol = "/astral/subject/1"
 
 // OutboxInterval is the outbox retry timer; auth of a new peer also
 // triggers a flush. Variable so tests can shrink it.
@@ -66,7 +66,7 @@ const (
 
 	OpWait      Op = "wait"      // park until mail or LeaseNS timeout
 	OpHeartbeat Op = "heartbeat" // Name = entity, LeaseNS = ttl
-	OpWatch     Op = "watch"     // Name = entity, Consumer = watcher mailbox
+	OpWatch     Op = "watch"     // Name = entity, Consumer = watcher subject
 	OpRegistry  Op = "registry"  // exchange names hosted by each endpoint
 )
 
@@ -164,7 +164,7 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 
 // Declare hosts a name on this node and announces the refreshed local
 // registry view to every connected member.
-func (d *Daemon) Declare(m astral.Mailbox) error {
+func (d *Daemon) Declare(m astral.Subject) error {
 	if err := d.Store.Declare(m); err != nil {
 		return err
 	}
@@ -228,7 +228,7 @@ func (d *Daemon) Append(name string, ev astral.Event) (fresh bool, err error) {
 		ev.At = time.Now().UnixNano()
 	}
 	ev.DeriveID()
-	if _, ok, err := d.Store.Mailbox(name); err != nil {
+	if _, ok, err := d.Store.Subject(name); err != nil {
 		return false, err
 	} else if ok {
 		return d.appendLocal(name, ev)
@@ -238,7 +238,7 @@ func (d *Daemon) Append(name string, ev astral.Event) (fresh bool, err error) {
 		return false, err
 	}
 	if !ok {
-		return false, astral.ErrUnknownMailbox
+		return false, astral.ErrUnknownSubject
 	}
 	resp, err := d.remote(host, request{Op: OpAppend, Name: name, Event: ev})
 	if err != nil {
@@ -263,7 +263,7 @@ func (d *Daemon) appendLocal(name string, ev astral.Event) (bool, error) {
 
 // Claim leases events from a name, wherever it is hosted.
 func (d *Daemon) Claim(name, consumer string, lease time.Duration, n int) ([]astral.Claimed, error) {
-	if _, ok, err := d.Store.Mailbox(name); err != nil {
+	if _, ok, err := d.Store.Subject(name); err != nil {
 		return nil, err
 	} else if ok {
 		return d.Store.Claim(name, consumer, lease, n)
@@ -281,7 +281,7 @@ func (d *Daemon) Claim(name, consumer string, lease time.Duration, n int) ([]ast
 
 // Ack force-acks an event, wherever the name is hosted.
 func (d *Daemon) Ack(name, consumer, eventID string) error {
-	if _, ok, err := d.Store.Mailbox(name); err != nil {
+	if _, ok, err := d.Store.Subject(name); err != nil {
 		return err
 	} else if ok {
 		return d.Store.Ack(name, consumer, eventID)
@@ -294,9 +294,9 @@ func (d *Daemon) Ack(name, consumer, eventID string) error {
 	return err
 }
 
-// Set writes a register. Registers are hosted beside the mailbox of the
+// Set writes a register. Registers are hosted beside the inbox subject of the
 // entity they describe: `register:<entity>/<key>` follows the placement of
-// `mailbox:<entity>`; an entity with no placed mailbox keeps its registers
+// `subject:<entity>`; an entity with no placed inbox keeps its registers
 // locally.
 func (d *Daemon) Set(name, value string) error {
 	if err := astral.ValidRegister(name); err != nil {
@@ -335,11 +335,11 @@ func (d *Daemon) Get(name string) (astral.Register, bool, error) {
 func (d *Daemon) registerHost(name string) (host string, remote bool, err error) {
 	entity := strings.TrimPrefix(name, "register:")
 	entity = entity[:strings.Index(entity, "/")]
-	mbox := "mailbox:" + entity
-	if _, ok, err := d.Store.Mailbox(mbox); err != nil || ok {
+	inbox := "subject:" + entity
+	if _, ok, err := d.Store.Subject(inbox); err != nil || ok {
 		return "", false, err
 	}
-	host, ok, err := d.Store.Host(mbox)
+	host, ok, err := d.Store.Host(inbox)
 	if err != nil || !ok {
 		return "", false, err
 	}
@@ -350,7 +350,7 @@ func orUnknown(err error) error {
 	if err != nil {
 		return err
 	}
-	return astral.ErrUnknownMailbox
+	return astral.ErrUnknownSubject
 }
 
 // stampSource enforces "<tool>@<member>": the part after '@' is always the
@@ -390,10 +390,10 @@ func (d *Daemon) handleStream(s network.Stream) {
 func (d *Daemon) serve(req request, from string) (resp response) {
 	fail := func(err error) response { return response{Err: err.Error()} }
 	// Remote verbs act on names hosted here only — no forwarding chains.
-	if _, ok, err := d.Store.Mailbox(req.Name); err != nil {
+	if _, ok, err := d.Store.Subject(req.Name); err != nil {
 		return fail(err)
 	} else if !ok && req.Op != OpGet && req.Op != OpSet && req.Op != OpHeartbeat && req.Op != OpWatch && req.Op != OpRegistry {
-		return fail(fmt.Errorf("%w: %s not hosted on %s", astral.ErrUnknownMailbox, req.Name, d.MemberName()))
+		return fail(fmt.Errorf("%w: %s not hosted on %s", astral.ErrUnknownSubject, req.Name, d.MemberName()))
 	}
 	switch req.Op {
 	case OpRegistry:
@@ -448,7 +448,7 @@ func (d *Daemon) serve(req request, from string) (resp response) {
 }
 
 func (d *Daemon) hostedNames() []string {
-	boxes, err := d.Store.Mailboxes()
+	boxes, err := d.Store.Subjects()
 	if err != nil {
 		return nil
 	}

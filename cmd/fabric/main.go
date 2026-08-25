@@ -157,7 +157,7 @@ func usage() {
   deploy   deploy this x86-64 binary to ~/.local/bin on one or more SSH hosts
   vault    the data surface ('fabric vault -h'); a "vault" symlink to this
            binary works too — no separate install needed
-  astral   the coordination plane ('fabric astral -h'): mailboxes, queues,
+  astral   hosted pub/sub subjects ('fabric astral -h'): publish, claim,
            registers — cast/claim/ack over the mesh
 
 Every command accepts -state <dir> (default `+state.DefaultPath()+`).

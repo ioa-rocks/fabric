@@ -15,13 +15,13 @@ func TestWaitWakesOnMailAndTimesOut(t *testing.T) {
 	st := t.TempDir()
 	startDaemon(t, st, nil)
 	cl := daemon.NewClient(st)
-	if err := cl.Declare("mailbox:agent", nil); err != nil {
+	if err := cl.Declare("subject:agent", "", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	// Timer wake: nothing arrives.
 	start := time.Now()
-	woke, err := cl.Wait("mailbox:agent", 1)
+	woke, err := cl.Wait("subject:agent", 1)
 	if err != nil || woke != daemon.WokeTimeout || time.Since(start) < 900*time.Millisecond {
 		t.Fatalf("timeout wake: %q err=%v after %s", woke, err, time.Since(start))
 	}
@@ -29,11 +29,11 @@ func TestWaitWakesOnMailAndTimesOut(t *testing.T) {
 	// Mail wake: append while parked.
 	res := make(chan daemon.Woke, 1)
 	go func() {
-		w, _ := cl.Wait("mailbox:agent", 10)
+		w, _ := cl.Wait("subject:agent", 10)
 		res <- w
 	}()
 	time.Sleep(150 * time.Millisecond)
-	if _, _, err := cl.Append("mailbox:agent", astral.Event{Kind: "user", Content: "wake up"}); err != nil {
+	if _, _, err := cl.Append("subject:agent", astral.Event{Kind: "user", Content: "wake up"}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -47,7 +47,7 @@ func TestWaitWakesOnMailAndTimesOut(t *testing.T) {
 
 	// Pending mail returns immediately without parking.
 	start = time.Now()
-	if w, _ := cl.Wait("mailbox:agent", 10); w != daemon.WokeMail || time.Since(start) > time.Second {
+	if w, _ := cl.Wait("subject:agent", 10); w != daemon.WokeMail || time.Since(start) > time.Second {
 		t.Fatalf("pending mail must not park: %q after %s", w, time.Since(start))
 	}
 }
@@ -57,42 +57,42 @@ func TestMonitorDeathNotice(t *testing.T) {
 	st := t.TempDir()
 	startDaemon(t, st, nil)
 	cl := daemon.NewClient(st)
-	if err := cl.Declare("mailbox:parent", []string{"system", "result"}); err != nil {
+	if err := cl.Declare("subject:parent", "", []string{"system", "result"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := cl.Watch("child-1", "mailbox:parent"); err != nil {
+	if err := cl.Watch("child-1", "subject:parent"); err != nil {
 		t.Fatal(err)
 	}
 	if err := cl.Heartbeat("child-1", 1); err != nil {
 		t.Fatal(err)
 	}
-	// Alive: nothing in the parent's mailbox.
-	if c, _ := cl.Claim("mailbox:parent", "parent", 30, 10); len(c) != 0 {
+	// Alive: nothing in the parent's inbox.
+	if c, _ := cl.Claim("subject:parent", "parent", 30, 10); len(c) != 0 {
 		t.Fatalf("premature notice: %+v", c)
 	}
 	// Let it lapse; the parent wakes on the death notice.
-	woke, err := cl.Wait("mailbox:parent", 5)
+	woke, err := cl.Wait("subject:parent", 5)
 	if err != nil || woke != daemon.WokeMail {
 		t.Fatalf("wait: %q err=%v", woke, err)
 	}
-	c, _ := cl.Claim("mailbox:parent", "parent", 30, 10)
+	c, _ := cl.Claim("subject:parent", "parent", 30, 10)
 	if len(c) != 1 || c[0].Event.Kind != "system" || c[0].Event.CorrelationID != "child-1" || c[0].Event.ID != "death-child-1-1" {
 		t.Fatalf("death notice: %+v", c)
 	}
 	// The sweep keeps running; exactly one notice per generation.
 	time.Sleep(400 * time.Millisecond)
-	if n, _ := daemonPending(cl, "mailbox:parent"); n != 1 {
+	if n, _ := daemonPending(cl, "subject:parent"); n != 1 {
 		t.Fatalf("duplicate notices: pending=%d", n)
 	}
 	// Runner comes back → new generation → lapses again → second notice.
 	if err := cl.Heartbeat("child-1", 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := cl.Ack("mailbox:parent", "parent", c[0].Event.ID); err != nil {
+	if err := cl.Ack("subject:parent", "parent", c[0].Event.ID); err != nil {
 		t.Fatal(err)
 	}
-	woke, _ = cl.Wait("mailbox:parent", 5)
-	c, _ = cl.Claim("mailbox:parent", "parent", 30, 10)
+	woke, _ = cl.Wait("subject:parent", 5)
+	c, _ = cl.Claim("subject:parent", "parent", 30, 10)
 	if woke != daemon.WokeMail || len(c) != 1 || c[0].Event.ID != "death-child-1-2" {
 		t.Fatalf("second generation: woke=%q %+v", woke, c)
 	}
@@ -111,7 +111,7 @@ func daemonPending(cl *daemon.Client, name string) (int, error) {
 	return 0, nil
 }
 
-// TestRemoteWaitAndMonitor: desk parks on a mailbox hosted by nas and is
+// TestRemoteWaitAndMonitor: desk parks on a subject hosted by nas and is
 // woken by a cast from nas; a child heartbeating on desk against its
 // nas-hosted identity dies and the notice lands in a nas-hosted parent.
 func TestRemoteWaitAndMonitor(t *testing.T) {
@@ -127,8 +127,8 @@ func TestRemoteWaitAndMonitor(t *testing.T) {
 	fnas := nas.fabric(t, root, "nas", nil, roster...)
 	dnas := startDaemon(t, nas.statePath, fnas)
 	clNas := daemon.NewClient(nas.statePath)
-	for _, m := range []string{"mailbox:concierge", "mailbox:parent", "mailbox:child-9"} {
-		if err := clNas.Declare(m, nil); err != nil {
+	for _, m := range []string{"subject:concierge", "subject:parent", "subject:child-9"} {
+		if err := clNas.Declare(m, "", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -141,11 +141,11 @@ func TestRemoteWaitAndMonitor(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		s, err := clDesk.Status()
-		if err == nil && s.Placed["mailbox:concierge"] == "nas" && s.Placed["mailbox:parent"] == "nas" && s.Placed["mailbox:child-9"] == "nas" {
+		if err == nil && s.Placed["subject:concierge"] == "nas" && s.Placed["subject:parent"] == "nas" && s.Placed["subject:child-9"] == "nas" {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("registry did not discover nas mailboxes: %+v err=%v", s.Placed, err)
+			t.Fatalf("registry did not discover nas subjects: %+v err=%v", s.Placed, err)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -153,14 +153,14 @@ func TestRemoteWaitAndMonitor(t *testing.T) {
 	// Remote wait, woken by a cast on the host side.
 	res := make(chan daemon.Woke, 1)
 	go func() {
-		w, err := clDesk.Wait("mailbox:concierge", 10)
+		w, err := clDesk.Wait("subject:concierge", 10)
 		if err != nil {
 			t.Errorf("remote wait: %v", err)
 		}
 		res <- w
 	}()
 	time.Sleep(300 * time.Millisecond)
-	if _, _, err := clNas.Append("mailbox:concierge", astral.Event{Kind: "user", Content: "ping"}); err != nil {
+	if _, _, err := clNas.Append("subject:concierge", astral.Event{Kind: "user", Content: "ping"}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -173,16 +173,16 @@ func TestRemoteWaitAndMonitor(t *testing.T) {
 	}
 
 	// Monitor hosted on nas, heartbeat + watch issued from desk.
-	if err := clDesk.Watch("child-9", "mailbox:parent"); err != nil {
+	if err := clDesk.Watch("child-9", "subject:parent"); err != nil {
 		t.Fatal(err)
 	}
 	if err := clDesk.Heartbeat("child-9", 1); err != nil {
 		t.Fatal(err)
 	}
-	if w, _ := clDesk.Wait("mailbox:parent", 5); w != daemon.WokeMail {
+	if w, _ := clDesk.Wait("subject:parent", 5); w != daemon.WokeMail {
 		t.Fatalf("parent not woken by death notice: %q", w)
 	}
-	c, err := clDesk.Claim("mailbox:parent", "parent", 30, 10)
+	c, err := clDesk.Claim("subject:parent", "parent", 30, 10)
 	if err != nil || len(c) != 1 || c[0].Event.ID != "death-child-9-1" || c[0].Event.Source != "astral@nas" {
 		t.Fatalf("death notice via mesh: %+v err=%v", c, err)
 	}

@@ -1,8 +1,8 @@
-// Package astral is the journal behind Nexus's `cast` verb (ADR 0015): the
-// durable store for mailboxes, queues, and registers, placed on a host and
-// drained by whoever holds the capability. It is a storage subsystem — the
-// sibling of vault's object store — and knows nothing about transport; the
-// daemon package puts it behind a stream protocol and a control socket.
+// Package astral is the durable pub/sub journal (ADR 0015): placed subjects
+// with explicit delivery policy, claims, acknowledgements, and compacted
+// register support. It is a storage subsystem beside Vault's object store and
+// knows nothing about transport; daemon puts it behind a stream protocol and
+// control socket.
 //
 // Contract (docs/architecture/components/messaging/coordination-plane.md):
 //
@@ -12,8 +12,8 @@
 //     incorporation;
 //   - ordering is per-source arrival order; the local sequence is an
 //     internal cursor and never leaves this package (the rule that keeps a
-//     leaderless single-owner mailbox possible later);
-//   - there is no silent dump mailbox: a name must be declared before it
+//     alternative placement modes possible later);
+//   - there is no silent dump subject: a name must be declared before it
 //     accepts mail, and an undeclared kind is rejected loudly.
 package astral
 
@@ -38,13 +38,13 @@ type Event struct {
 	Source        string `json:"source"`                   // principal: "<tool>@<member>"
 	Content       string `json:"content,omitempty"`        // short text
 	PayloadRef    string `json:"payload_ref,omitempty"`    // artifact reference
-	ReplyTarget   string `json:"reply_target,omitempty"`   // where a reply should be cast
+	ReplyTarget   string `json:"reply_target,omitempty"`   // subject for a correlated reply
 	CorrelationID string `json:"correlation_id,omitempty"` // spawn/request this answers
 	At            int64  `json:"at"`                       // source clock, Unix nanoseconds
 }
 
 // DeriveID fills ID deterministically from the envelope when the source did
-// not choose one, so a retried cast of the same event dedupes.
+// not choose one, so a retried publication dedupes.
 func (e *Event) DeriveID() {
 	if e.ID != "" {
 		return
@@ -57,16 +57,24 @@ func (e *Event) DeriveID() {
 	e.ID = hex.EncodeToString(h.Sum(nil))[:32]
 }
 
-// Mailbox is a declared name: `mailbox:<entity>` (single owner drains) or
-// `queue:<name>` (a role drains — competing consumers). Accepts is the
-// mechanical kind filter; empty means every kind.
-type Mailbox struct {
-	Name    string   `json:"name"`
-	Accepts []string `json:"accepts,omitempty"`
-	Created int64    `json:"created_at"`
+// Delivery is a subject's consumption policy. Authorization is separate.
+type Delivery string
+
+const (
+	DeliveryExclusive Delivery = "exclusive"
+	DeliveryShared    Delivery = "shared"
+)
+
+// Subject is a placed durable publication journal. Inbox and work queue are
+// subscription policies, not different resource types.
+type Subject struct {
+	Name     string   `json:"name"`
+	Delivery Delivery `json:"delivery"`
+	Accepts  []string `json:"accepts,omitempty"`
+	Created  int64    `json:"created_at"`
 }
 
-func (m Mailbox) accepts(kind string) bool {
+func (m Subject) accepts(kind string) bool {
 	if len(m.Accepts) == 0 {
 		return true
 	}
@@ -77,9 +85,6 @@ func (m Mailbox) accepts(kind string) bool {
 	}
 	return false
 }
-
-// IsQueue reports the competing-consumer ownership shape.
-func (m Mailbox) IsQueue() bool { return strings.HasPrefix(m.Name, "queue:") }
 
 // Register is a latest-value cell: `register:<entity>/<key>`.
 type Register struct {
@@ -105,19 +110,18 @@ type LeaseInfo struct {
 	Until    int64  `json:"until"`
 }
 
-// ErrUnknownMailbox, ErrKindRejected: loud ingress failures by design.
+// ErrUnknownSubject and ErrKindRejected are loud ingress failures by design.
 var (
-	ErrUnknownMailbox = errors.New("astral: unknown mailbox (declare it first)")
-	ErrKindRejected   = errors.New("astral: kind not accepted by mailbox")
-	ErrBadName        = errors.New("astral: name must be mailbox:<entity>, queue:<name>, or register:<entity>/<key>")
-	ErrNameConflict   = errors.New("astral: name is already hosted by another member")
+	ErrUnknownSubject    = errors.New("astral: unknown subject (declare it first)")
+	ErrKindRejected      = errors.New("astral: kind not accepted by subject")
+	ErrExclusiveConsumer = errors.New("astral: exclusive subject already has an active consumer")
+	ErrBadName           = errors.New("astral: name must be subject:<name> or register:<entity>/<key>")
+	ErrNameConflict      = errors.New("astral: name is already hosted by another member")
 )
 
 // ValidName checks the namespace prefixes.
 func ValidName(name string) error {
-	switch {
-	case strings.HasPrefix(name, "mailbox:") && len(name) > 8,
-		strings.HasPrefix(name, "queue:") && len(name) > 6:
+	if strings.HasPrefix(name, "subject:") && len(name) > len("subject:") {
 		return nil
 	}
 	return ErrBadName
@@ -134,14 +138,14 @@ func ValidRegister(name string) error {
 
 // Store is the journal. Key layout (all values JSON):
 //
-//	m/<name>            Mailbox
+//	m/<name>            Subject
 //	e/<name>/<seq>      Event, arrival order (internal cursor)
 //	i/<name>/<id>       seq, for idempotent append
 //	a/<name>/<id>       ack {consumer, at}
 //	l/<name>/<id>       lease {consumer, until}
 //	r/<name>            Register
 //	o/<name>/<id>       outbox: Event waiting for a remote host
-//	p/<name>            placement: member name hosting a remote mailbox
+//	p/<name>            placement: member name hosting a remote subject
 type Store struct {
 	db *pebble.DB
 	mu sync.Mutex // serializes claim (read-modify-write over leases) and seq allocation
@@ -203,12 +207,18 @@ func (s *Store) setJSON(b *pebble.Batch, key string, v any) error {
 	return b.Set([]byte(key), raw, nil)
 }
 
-// Declare creates a mailbox or queue, or updates its accepts list.
-func (s *Store) Declare(m Mailbox) error {
+// Declare creates a subject or updates its policy metadata.
+func (s *Store) Declare(m Subject) error {
 	if err := ValidName(m.Name); err != nil {
 		return err
 	}
-	var prev Mailbox
+	if m.Delivery == "" {
+		m.Delivery = DeliveryExclusive
+	}
+	if m.Delivery != DeliveryExclusive && m.Delivery != DeliveryShared {
+		return fmt.Errorf("astral: invalid delivery %q", m.Delivery)
+	}
+	var prev Subject
 	if ok, err := s.getJSON("m/"+m.Name, &prev); err != nil {
 		return err
 	} else if ok {
@@ -223,23 +233,23 @@ func (s *Store) Declare(m Mailbox) error {
 	return s.db.Set([]byte("m/"+m.Name), raw, pebble.Sync)
 }
 
-// Mailbox looks a declared name up.
-func (s *Store) Mailbox(name string) (Mailbox, bool, error) {
-	var m Mailbox
+// Subject looks a declared subject up.
+func (s *Store) Subject(name string) (Subject, bool, error) {
+	var m Subject
 	ok, err := s.getJSON("m/"+name, &m)
 	return m, ok, err
 }
 
-// Mailboxes lists declared names.
-func (s *Store) Mailboxes() ([]Mailbox, error) {
+// Subjects lists declared names.
+func (s *Store) Subjects() ([]Subject, error) {
 	it, err := s.db.NewIter(prefixBounds("m/"))
 	if err != nil {
 		return nil, err
 	}
 	defer it.Close()
-	var out []Mailbox
+	var out []Subject
 	for it.First(); it.Valid(); it.Next() {
-		var m Mailbox
+		var m Subject
 		if err := json.Unmarshal(it.Value(), &m); err != nil {
 			return nil, err
 		}
@@ -252,12 +262,12 @@ func (s *Store) Mailboxes() ([]Mailbox, error) {
 // present (the idempotent retry case). The event's own ID is honoured;
 // an empty ID is derived.
 func (s *Store) Append(name string, ev Event) (fresh bool, err error) {
-	m, ok, err := s.Mailbox(name)
+	m, ok, err := s.Subject(name)
 	if err != nil {
 		return false, err
 	}
 	if !ok {
-		return false, ErrUnknownMailbox
+		return false, ErrUnknownSubject
 	}
 	if ev.Kind == "" {
 		return false, fmt.Errorf("astral: event kind required")
@@ -316,10 +326,11 @@ func (s *Store) nextSeq(name string) (uint64, error) {
 // A lapsed lease is re-claimable (by anyone holding the drain capability —
 // for a queue that is how a crashed worker's event reaches another).
 func (s *Store) Claim(name, consumer string, d time.Duration, n int) ([]Claimed, error) {
-	if _, ok, err := s.Mailbox(name); err != nil {
+	subject, ok, err := s.Subject(name)
+	if err != nil {
 		return nil, err
 	} else if !ok {
-		return nil, ErrUnknownMailbox
+		return nil, ErrUnknownSubject
 	}
 	if n <= 0 {
 		n = 1
@@ -332,6 +343,29 @@ func (s *Store) Claim(name, consumer string, d time.Duration, n int) ([]Claimed,
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if subject.Delivery == "" {
+		subject.Delivery = DeliveryExclusive // zero value defaults like Declare
+	}
+	if subject.Delivery == DeliveryExclusive {
+		leases, err := s.db.NewIter(prefixBounds("l/" + name + "/"))
+		if err != nil {
+			return nil, err
+		}
+		for leases.First(); leases.Valid(); leases.Next() {
+			var active lease
+			if err := json.Unmarshal(leases.Value(), &active); err != nil {
+				leases.Close()
+				return nil, err
+			}
+			if active.Until > now.UnixNano() && active.Consumer != consumer {
+				leases.Close()
+				return nil, fmt.Errorf("%w: %s is held by %s", ErrExclusiveConsumer, name, active.Consumer)
+			}
+		}
+		if err := leases.Close(); err != nil {
+			return nil, err
+		}
+	}
 	it, err := s.db.NewIter(prefixBounds("e/" + name + "/"))
 	if err != nil {
 		return nil, err
@@ -500,7 +534,7 @@ func (s *Store) Hosts() (map[string]string, error) {
 
 // ReplaceHost atomically replaces every placement learned from member with
 // names. Registry refreshes use replacement rather than additive updates so a
-// mailbox that a member stopped hosting does not remain routable forever.
+// subject that a member stopped hosting does not remain routable forever.
 func (s *Store) ReplaceHost(member string, names []string) error {
 	if member == "" {
 		return errors.New("astral: registry host required")

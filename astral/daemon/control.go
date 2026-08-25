@@ -49,13 +49,14 @@ type StatusReply struct {
 
 // HostedInfo is one locally hosted name with its backlog.
 type HostedInfo struct {
-	astral.Mailbox
+	astral.Subject
 	Pending int `json:"pending"`
 }
 
 type declareBody struct {
-	Name    string   `json:"name"`
-	Accepts []string `json:"accepts,omitempty"`
+	Name     string          `json:"name"`
+	Delivery astral.Delivery `json:"delivery,omitempty"`
+	Accepts  []string        `json:"accepts,omitempty"`
 }
 
 type hostBody struct {
@@ -121,7 +122,7 @@ func (d *Daemon) serveControl() (func(), error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v0/status", d.ctlStatus)
-	mux.HandleFunc("POST /v0/mailboxes", d.ctlDeclare)
+	mux.HandleFunc("POST /v0/subjects", d.ctlDeclare)
 	mux.HandleFunc("POST /v0/hosts", d.ctlHost)
 	mux.HandleFunc("POST /v0/append", d.ctlAppend)
 	mux.HandleFunc("POST /v0/claim", d.ctlClaim)
@@ -148,7 +149,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 func writeErr(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	switch {
-	case errors.Is(err, astral.ErrUnknownMailbox):
+	case errors.Is(err, astral.ErrUnknownSubject):
 		code = http.StatusNotFound
 	case errors.Is(err, astral.ErrKindRejected), errors.Is(err, astral.ErrBadName):
 		code = http.StatusBadRequest
@@ -167,14 +168,14 @@ func (d *Daemon) ctlStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	defer d.end()
 	reply := StatusReply{Version: Version, Path: d.Path, Mesh: d.Fabric != nil, Member: d.MemberName()}
-	boxes, err := d.Store.Mailboxes()
+	boxes, err := d.Store.Subjects()
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	for _, m := range boxes {
 		n, _ := d.Store.Pending(m.Name)
-		reply.Hosted = append(reply.Hosted, HostedInfo{Mailbox: m, Pending: n})
+		reply.Hosted = append(reply.Hosted, HostedInfo{Subject: m, Pending: n})
 	}
 	reply.Placed, _ = d.Store.Hosts()
 	reply.Monitors, _ = d.Store.Heartbeats()
@@ -200,7 +201,7 @@ func (d *Daemon) ctlDeclare(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if err := d.Declare(astral.Mailbox{Name: b.Name, Accepts: b.Accepts}); err != nil {
+	if err := d.Declare(astral.Subject{Name: b.Name, Delivery: b.Delivery, Accepts: b.Accepts}); err != nil {
 		writeErr(w, err)
 		return
 	}

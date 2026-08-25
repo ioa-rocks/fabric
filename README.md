@@ -439,16 +439,16 @@ key or passphrase, same custody model as the CLI. On a non-master node
 the UI is a read-only mesh view. It binds to localhost and has no auth
 of its own; don't point `-listen` at a routable interface.
 
-## Astral: the coordination plane
+## Astral: hosted pub/sub queues
 
-`fabric up` also runs Astral, the durable coordination substrate used by
-Nexus-style tools and agents. It provides declared mailboxes, competing-
-consumer queues, latest-value registers, offline delivery, claim leases and
-acknowledgements, wait/timer wake, and heartbeat monitors. The local API is a
+`fabric up` also runs Astral, the durable pub/sub journal used by tools and
+agents. One internal subject model supports exclusive inboxes and shared
+worker queues through explicit delivery policy, plus offline delivery, claim
+leases and acknowledgements, wait/timer wake, and heartbeat monitors. The local API is a
 mode-0600 Unix socket; `fabric astral` exposes the same verbs for development
 and inspection.
 
-Mailbox placement is discovered between authenticated Fabric members. A node
+Subject placement is discovered between authenticated Fabric members. A node
 announces the names it hosts on connect and whenever it declares another one;
 peers atomically refresh placements and remove stale names. Conflicting claims
 are rejected loudly. `fabric astral host` remains as a manual/debug override,
@@ -456,15 +456,19 @@ not normal mesh configuration.
 
 The stream protocol is member-gated, but fine-grained delegated capabilities
 are not implemented yet: every namespace member can currently invoke every
-Astral verb. Do not treat a mailbox declaration as an authorization boundary.
-That boundary arrives with Fabric certificate delegation.
+Astral verb. Subject ACLs and optional daemon-issued client keys are the next
+security slice; consumer-name strings are not authorization.
 
 ```sh
-fabric astral mailbox mailbox:concierge -accepts user,system
-fabric astral append mailbox:concierge -kind user "translate this"
-fabric astral claim mailbox:concierge -consumer concierge -wait 30
+fabric astral subject subject:queues/agents/concierge/inbox -delivery exclusive -accepts user,system
+fabric astral append subject:queues/agents/concierge/inbox -kind user "translate this"
+fabric astral claim subject:queues/agents/concierge/inbox -consumer concierge -wait 30
 fabric astral status
 ```
+
+`subject:` is currently implementation vocabulary. The intended resource UX
+is `fabric bucket|queue|service`; exposing top-level `fabric queue` first
+requires renaming the existing admission `queue on|off` command.
 
 The same operator state is visible in `fabric ui`; use `-astral-state` when
 the UI and daemon use a non-default Astral state directory.

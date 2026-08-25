@@ -90,7 +90,7 @@ func (d *Daemon) Wait(ctx context.Context, name string, timeout time.Duration) (
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	if _, ok, err := d.Store.Mailbox(name); err != nil {
+	if _, ok, err := d.Store.Subject(name); err != nil {
 		return "", err
 	} else if ok {
 		return d.waitLocal(ctx, name, timeout)
@@ -109,7 +109,7 @@ func (d *Daemon) Wait(ctx context.Context, name string, timeout time.Duration) (
 // --- monitors ---
 
 // Heartbeat extends an entity's liveness lease on the host of
-// mailbox:<entity> (an entity with no placed mailbox is monitored here).
+// subject:<entity> (an entity with no placed inbox is monitored here).
 func (d *Daemon) Heartbeat(entity string, ttl time.Duration) error {
 	host, remote, err := d.entityHost(entity)
 	if err != nil {
@@ -123,7 +123,7 @@ func (d *Daemon) Heartbeat(entity string, ttl time.Duration) error {
 	return err
 }
 
-// Watch subscribes a watcher mailbox to entity's death notices.
+// Watch subscribes a watcher subject to entity's death notices.
 func (d *Daemon) Watch(entity, watcher string) error {
 	host, remote, err := d.entityHost(entity)
 	if err != nil {
@@ -137,11 +137,11 @@ func (d *Daemon) Watch(entity, watcher string) error {
 }
 
 func (d *Daemon) entityHost(entity string) (host string, remote bool, err error) {
-	mbox := "mailbox:" + entity
-	if _, ok, err := d.Store.Mailbox(mbox); err != nil || ok {
+	inbox := "subject:" + entity
+	if _, ok, err := d.Store.Subject(inbox); err != nil || ok {
 		return "", false, err
 	}
-	host, ok, err := d.Store.Host(mbox)
+	host, ok, err := d.Store.Host(inbox)
 	if err != nil || !ok {
 		return "", false, err
 	}

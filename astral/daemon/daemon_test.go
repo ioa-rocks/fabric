@@ -68,31 +68,31 @@ func TestSoloRoundTrip(t *testing.T) {
 	startDaemon(t, st, nil)
 	cl := daemon.NewClient(st)
 
-	if _, _, err := cl.Append("mailbox:concierge", astral.Event{Kind: "user", Content: "x"}); err == nil {
-		t.Fatal("append to undeclared mailbox must fail loudly")
+	if _, _, err := cl.Append("subject:concierge", astral.Event{Kind: "user", Content: "x"}); err == nil {
+		t.Fatal("append to undeclared subject must fail loudly")
 	}
-	if err := cl.Declare("mailbox:concierge", []string{"user"}); err != nil {
+	if err := cl.Declare("subject:concierge", "", []string{"user"}); err != nil {
 		t.Fatal(err)
 	}
-	id, fresh, err := cl.Append("mailbox:concierge", astral.Event{Kind: "user", Source: "screenshot", Content: "translate this", PayloadRef: "blob:abc"})
+	id, fresh, err := cl.Append("subject:concierge", astral.Event{Kind: "user", Source: "screenshot", Content: "translate this", PayloadRef: "blob:abc"})
 	if err != nil || !fresh || id == "" {
 		t.Fatalf("append: id=%q fresh=%v err=%v", id, fresh, err)
 	}
-	if _, fresh, _ := cl.Append("mailbox:concierge", astral.Event{ID: id, Kind: "user", Source: "screenshot", Content: "translate this"}); fresh {
+	if _, fresh, _ := cl.Append("subject:concierge", astral.Event{ID: id, Kind: "user", Source: "screenshot", Content: "translate this"}); fresh {
 		t.Fatal("same id must dedupe")
 	}
-	if _, _, err := cl.Append("mailbox:concierge", astral.Event{Kind: "ambient", Content: "nope"}); err == nil || !strings.Contains(err.Error(), "kind") {
+	if _, _, err := cl.Append("subject:concierge", astral.Event{Kind: "ambient", Content: "nope"}); err == nil || !strings.Contains(err.Error(), "kind") {
 		t.Fatalf("rejected kind must be loud: %v", err)
 	}
 
-	c, err := cl.Claim("mailbox:concierge", "concierge", 30, 10)
+	c, err := cl.Claim("subject:concierge", "concierge", 30, 10)
 	if err != nil || len(c) != 1 || c[0].Event.ID != id || c[0].Event.Source != "screenshot" {
 		t.Fatalf("claim: %+v err=%v", c, err)
 	}
-	if err := cl.Ack("mailbox:concierge", "concierge", id); err != nil {
+	if err := cl.Ack("subject:concierge", "concierge", id); err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := cl.Claim("mailbox:concierge", "concierge", 30, 10); len(c) != 0 {
+	if c, _ := cl.Claim("subject:concierge", "concierge", 30, 10); len(c) != 0 {
 		t.Fatalf("acked event re-claimed: %+v", c)
 	}
 
@@ -196,11 +196,11 @@ func waitConnected(t *testing.T, cl *daemon.Client, member string) {
 	}
 }
 
-// TestCastAcrossMesh: nas hosts mailbox:concierge; desk (a) parks a cast in
+// TestCastAcrossMesh: nas hosts subject:concierge; desk (a) parks a cast in
 // its outbox while nas is unknown, (b) delivers it once connected, (c) casts
 // live with the source stamped by the host from the authenticated peer,
 // (d) claims and acks remotely, (e) reads a register placed beside the
-// mailbox.
+// inbox.
 func TestCastAcrossMesh(t *testing.T) {
 	daemon.OutboxInterval = 300 * time.Millisecond
 	_, root, err := ed25519.GenerateKey(rand.Reader)
@@ -214,19 +214,19 @@ func TestCastAcrossMesh(t *testing.T) {
 	fnas := nas.fabric(t, root, "nas", nil, roster...)
 	dnas := startDaemon(t, nas.statePath, fnas)
 	clNas := daemon.NewClient(nas.statePath)
-	if err := clNas.Declare("mailbox:concierge", nil); err != nil {
+	if err := clNas.Declare("subject:concierge", "", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	// Desk is not on the mesh yet in the sense that nas is unreachable:
-	// start it with no bootstrap, place the mailbox, cast → outbox.
+	// start it with no bootstrap, place the subject, cast → outbox.
 	fdesk := desk.fabric(t, root, "desk", nil, roster...)
 	startDaemon(t, desk.statePath, fdesk)
 	clDesk := daemon.NewClient(desk.statePath)
-	if err := clDesk.SetHost("mailbox:concierge", "nas"); err != nil {
+	if err := clDesk.SetHost("subject:concierge", "nas"); err != nil {
 		t.Fatal(err)
 	}
-	parkedID, _, err := clDesk.Append("mailbox:concierge", astral.Event{Kind: "user", Source: "screenshot", Content: "offline cast"})
+	parkedID, _, err := clDesk.Append("subject:concierge", astral.Event{Kind: "user", Source: "screenshot", Content: "offline cast"})
 	if err != nil {
 		t.Fatalf("offline cast must park, not fail: %v", err)
 	}
@@ -263,14 +263,14 @@ func TestCastAcrossMesh(t *testing.T) {
 	}
 
 	// (c) live cast; source must be re-stamped by the host.
-	liveID, fresh, err := clDesk.Append("mailbox:concierge", astral.Event{Kind: "user", Source: "screenshot@impostor", Content: "live cast"})
+	liveID, fresh, err := clDesk.Append("subject:concierge", astral.Event{Kind: "user", Source: "screenshot@impostor", Content: "live cast"})
 	if err != nil || !fresh {
 		t.Fatalf("live cast: fresh=%v err=%v", fresh, err)
 	}
 
 	// (d) nas-side consumer drains both in order; desk can also claim
 	// remotely and force-ack.
-	c, err := clNas.Claim("mailbox:concierge", "concierge", 30, 10)
+	c, err := clNas.Claim("subject:concierge", "concierge", 30, 10)
 	if err != nil || len(c) != 2 {
 		t.Fatalf("nas claim: %+v err=%v", c, err)
 	}
@@ -282,17 +282,17 @@ func TestCastAcrossMesh(t *testing.T) {
 			t.Fatalf("source not stamped by host: %q", ev.Event.Source)
 		}
 	}
-	if err := clDesk.Ack("mailbox:concierge", "concierge", liveID); err != nil {
+	if err := clDesk.Ack("subject:concierge", "concierge", liveID); err != nil {
 		t.Fatalf("remote force-ack: %v", err)
 	}
-	if err := clNas.Ack("mailbox:concierge", "concierge", parkedID); err != nil {
+	if err := clNas.Ack("subject:concierge", "concierge", parkedID); err != nil {
 		t.Fatal(err)
 	}
 	if s, _ := clNas.Status(); s.Hosted[0].Pending != 0 {
 		t.Fatalf("pending after acks: %d", s.Hosted[0].Pending)
 	}
 
-	// (e) registers follow the mailbox's placement.
+	// (e) registers follow the inbox's placement.
 	if err := clNas.Set("register:concierge/status", "thinking"); err != nil {
 		t.Fatal(err)
 	}

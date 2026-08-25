@@ -12,7 +12,7 @@ import (
 // Monitors (contract §"Spawn and the child contract"): a liveness lease on
 // an entity's identity that the entity's runner heartbeats; when it lapses,
 // the plane casts a `kind: system` death notice into each watcher's
-// mailbox. The notice's ID is deterministic in (entity, generation), so a
+// inbox subject. The notice's ID is deterministic in (entity, generation), so a
 // crashed-and-replayed notifier cannot twin it.
 //
 // A generation starts at the first heartbeat after a lapse (or ever); a
@@ -22,7 +22,7 @@ import (
 // Key layout:
 //
 //	h/<entity>            Heartbeat {until, gen, notified}
-//	w/<entity>/<watcher>  "" (watcher = mailbox name)
+//	w/<entity>/<watcher>  "" (watcher = subject name)
 
 // Heartbeat is an entity's liveness lease.
 type Heartbeat struct {
@@ -32,7 +32,7 @@ type Heartbeat struct {
 	Notified bool   `json:"notified"` // death notice for Gen already cast
 }
 
-// Lapse is one lapsed lease with the mailboxes to notify.
+// Lapse is one lapsed lease with the subjects to notify.
 type Lapse struct {
 	Entity   string
 	Gen      uint64
@@ -79,7 +79,7 @@ func (s *Store) Heartbeat(entity string, ttl time.Duration) (Heartbeat, error) {
 	return h, s.db.Set([]byte("h/"+entity), raw, pebble.Sync)
 }
 
-// Watch subscribes watcher (a mailbox name) to entity's death notices.
+// Watch subscribes watcher (a subject name) to entity's death notices.
 func (s *Store) Watch(entity, watcher string) error {
 	if err := ValidName(watcher); err != nil {
 		return err
@@ -95,7 +95,7 @@ func (s *Store) Unwatch(entity, watcher string) error {
 	return s.db.Delete([]byte("w/"+entity+"/"+watcher), pebble.Sync)
 }
 
-// Watchers lists the mailboxes watching entity.
+// Watchers lists the subjects watching entity.
 func (s *Store) Watchers(entity string) ([]string, error) {
 	it, err := s.db.NewIter(prefixBounds("w/" + entity + "/"))
 	if err != nil {

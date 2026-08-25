@@ -79,9 +79,10 @@ func (c *Client) Status() (*StatusReply, error) {
 	return &s, nil
 }
 
-// Declare hosts a mailbox or queue here.
-func (c *Client) Declare(name string, accepts []string) error {
-	return c.post("/v0/mailboxes", declareBody{Name: name, Accepts: accepts}, nil)
+// Declare hosts a subject here with explicit delivery policy; an empty
+// delivery defaults to exclusive.
+func (c *Client) Declare(name string, delivery astral.Delivery, accepts []string) error {
+	return c.post("/v0/subjects", declareBody{Name: name, Delivery: delivery, Accepts: accepts}, nil)
 }
 
 // SetHost records that member hosts name (registry stub); "" clears.
@@ -145,7 +146,7 @@ func (c *Client) Heartbeat(entity string, ttlS int) error {
 	return c.post("/v0/heartbeat", heartbeatBody{Entity: entity, TTLS: ttlS}, nil)
 }
 
-// Watch subscribes watcher (a mailbox) to entity's death notices.
+// Watch subscribes watcher (a subject) to entity's death notices.
 func (c *Client) Watch(entity, watcher string) error {
 	return c.post("/v0/watch", watchBody{Entity: entity, Watcher: watcher}, nil)
 }
