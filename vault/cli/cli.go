@@ -64,6 +64,7 @@ func Main(args []string) int {
 	case "mounts":
 		err = cmdMounts(rest)
 	default:
+		fmt.Fprintf(os.Stderr, "vault: unknown command %q\n\n", cmd)
 		usage()
 		return 2
 	}
@@ -83,7 +84,7 @@ mesh membership is 'fabric join'. Data commands go through the running
 daemon's control socket, or open the state directly when none runs.
 
   init     create a circle on this device (-name required)
-  status   show daemon state: circle, mesh, connected vault peers
+  status   show daemon state: circle, mesh, vault peers, mounts
   bucket   bucket create <name> — mint a bucket (signs; needs passphrase)
   buckets  list buckets
   put      put <bucket> <file...> [-tag t1,t2] — add objects
@@ -230,8 +231,11 @@ func printStatusMounts(mounts []daemon.MountInfo) {
 }
 
 func cmdBucket(args []string) error {
-	if len(args) < 1 || args[0] != "create" {
+	if len(args) < 1 {
 		return fmt.Errorf("usage: fabric vault bucket create <name>")
+	}
+	if args[0] != "create" {
+		return fmt.Errorf("unknown bucket subcommand %q (usage: fabric vault bucket create <name>)", args[0])
 	}
 	fs := flag.NewFlagSet("bucket create", flag.ExitOnError)
 	statePath := stateFlag(fs)

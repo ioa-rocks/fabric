@@ -122,6 +122,7 @@ func main() {
 	case "announce":
 		err = cmdAnnounce(args)
 	default:
+		fmt.Fprintf(os.Stderr, "fabric: unknown command %q\n\n", cmd)
 		usage()
 		os.Exit(2)
 	}
