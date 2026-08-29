@@ -85,6 +85,16 @@ func (c *Client) Declare(name string, delivery astral.Delivery, accepts []string
 	return c.post("/v0/subjects", declareBody{Name: name, Delivery: delivery, Accepts: accepts}, nil)
 }
 
+// DeclareExpiring is Declare with an explicit lifecycle: idle self-destruct
+// TTL and a total-append cap (zero keeps each unlimited — except for
+// ephemeral `_reply/` names, which default to tight limits either way).
+func (c *Client) DeclareExpiring(name string, delivery astral.Delivery, accepts []string, idle time.Duration, maxEvents int) error {
+	return c.post("/v0/subjects", declareBody{
+		Name: name, Delivery: delivery, Accepts: accepts,
+		IdleS: int(idle / time.Second), MaxEv: maxEvents,
+	}, nil)
+}
+
 // Remove drops a subject hosted on this node, journal included.
 func (c *Client) Remove(name string) error {
 	return c.post("/v0/remove", removeBody{Name: name}, nil)

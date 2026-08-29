@@ -19,7 +19,8 @@ import (
 const usage = `usage: fabric astral <command> [flags] [args]
 
   status                               hosted names, placements, outbox, connected members
-  subject <subject:name> [-delivery exclusive|shared] [-accepts k1,k2]
+  subject <subject:name> [-delivery exclusive|shared] [-accepts k1,k2] [-idle 10m] [-max 100]
+                                       -idle self-destructs after inactivity; -max caps appends
   rm <name>                            remove a hosted subject and its journal
   host <name> <member>                 record that <member> hosts <name> ("" clears)
   append <name> [-kind user] [-source tool] [-id id] [-ref artifact] [-reply target] [-corr id] <content|->
@@ -144,15 +145,21 @@ func cmdSubject(args []string) error {
 	fs, st := flags("subject")
 	accepts := fs.String("accepts", "", "comma-separated kinds accepted (empty = any)")
 	delivery := fs.String("delivery", string(astral.DeliveryExclusive), "exclusive or shared")
+	idle := fs.Duration("idle", 0, "self-destruct after this much inactivity (0 = never; _reply/ names default tight)")
+	maxEvents := fs.Int("max", 0, "cap on total appended events (0 = unlimited; _reply/ names default tight)")
 	pos := parse(fs, args)
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: subject <subject:name> [-delivery exclusive|shared] [-accepts k1,k2]")
+		return fmt.Errorf("usage: subject <subject:name> [-delivery exclusive|shared] [-accepts k1,k2] [-idle 10m] [-max 100]")
 	}
 	var kinds []string
 	if *accepts != "" {
 		kinds = strings.Split(*accepts, ",")
 	}
-	return daemon.NewClient(*st).Declare(pos[0], astral.Delivery(*delivery), kinds)
+	cl := daemon.NewClient(*st)
+	if *idle > 0 || *maxEvents > 0 {
+		return cl.DeclareExpiring(pos[0], astral.Delivery(*delivery), kinds, *idle, *maxEvents)
+	}
+	return cl.Declare(pos[0], astral.Delivery(*delivery), kinds)
 }
 
 func cmdRm(args []string) error {

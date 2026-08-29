@@ -57,6 +57,8 @@ type declareBody struct {
 	Name     string          `json:"name"`
 	Delivery astral.Delivery `json:"delivery,omitempty"`
 	Accepts  []string        `json:"accepts,omitempty"`
+	IdleS    int             `json:"idle_s,omitempty"`      // idle TTL seconds; 0 = never (ephemeral names default)
+	MaxEv    int             `json:"max_events,omitempty"`  // total-append cap; 0 = unlimited (ephemeral names default)
 }
 
 type removeBody struct {
@@ -154,9 +156,12 @@ func writeJSON(w http.ResponseWriter, v any) {
 func writeErr(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	switch {
+	case errors.Is(err, astral.ErrSubjectExpired):
+		code = http.StatusGone
 	case errors.Is(err, astral.ErrUnknownSubject):
 		code = http.StatusNotFound
-	case errors.Is(err, astral.ErrKindRejected), errors.Is(err, astral.ErrBadName):
+	case errors.Is(err, astral.ErrKindRejected), errors.Is(err, astral.ErrBadName),
+		errors.Is(err, astral.ErrSubjectFull):
 		code = http.StatusBadRequest
 	}
 	http.Error(w, err.Error(), code)
@@ -206,7 +211,10 @@ func (d *Daemon) ctlDeclare(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if err := d.Declare(astral.Subject{Name: b.Name, Delivery: b.Delivery, Accepts: b.Accepts}); err != nil {
+	if err := d.Declare(astral.Subject{
+		Name: b.Name, Delivery: b.Delivery, Accepts: b.Accepts,
+		IdleTTLNS: int64(b.IdleS) * int64(time.Second), MaxEvents: b.MaxEv,
+	}); err != nil {
 		writeErr(w, err)
 		return
 	}

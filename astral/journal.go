@@ -72,7 +72,30 @@ type Subject struct {
 	Delivery Delivery `json:"delivery"`
 	Accepts  []string `json:"accepts,omitempty"`
 	Created  int64    `json:"created_at"`
+
+	// IdleTTLNS self-destructs the subject after this much inactivity
+	// (0 = never); appends, claims, acks, and active waits all count as
+	// activity. MaxEvents caps total appends over the subject's lifetime
+	// (0 = unlimited). Ephemeral reply subjects get tight defaults at
+	// Declare (coordination-plane contract: Ephemeral subjects).
+	IdleTTLNS int64 `json:"idle_ttl_ns,omitempty"`
+	MaxEvents int   `json:"max_events,omitempty"`
 }
+
+// EphemeralPrefix marks SDK-created temporary reply subjects. They are
+// unlisted — never announced through the registry (their route travels in
+// the claimed request instead) — and short-lived by default.
+const EphemeralPrefix = "subject:queues/_reply/"
+
+// Ephemeral reports whether a name is a temporary reply subject.
+func Ephemeral(name string) bool { return strings.HasPrefix(name, EphemeralPrefix) }
+
+// Defaults applied to ephemeral subjects declared without explicit policy.
+// Variables so tests can shrink them.
+var (
+	ReplyIdleTTL   = 10 * time.Minute
+	ReplyMaxEvents = 100
+)
 
 func (m Subject) accepts(kind string) bool {
 	if len(m.Accepts) == 0 {
@@ -117,6 +140,13 @@ var (
 	ErrExclusiveConsumer = errors.New("astral: exclusive subject already has an active consumer")
 	ErrBadName           = errors.New("astral: name must be subject:<name> or register:<entity>/<key>")
 	ErrNameConflict      = errors.New("astral: name is already hosted by another member")
+
+	// ErrSubjectExpired is a normal outcome, not a fault: the temporary
+	// subject reached its idle TTL and self-destructed — its declarer is
+	// gone. A late replier must not retry or park this.
+	ErrSubjectExpired = errors.New("astral: subject expired (its declarer is gone; do not retry)")
+	// ErrSubjectFull is the max-events cap rejecting an append.
+	ErrSubjectFull = errors.New("astral: subject is full (max events reached)")
 )
 
 // ValidName checks the namespace prefixes.
@@ -146,6 +176,8 @@ func ValidRegister(name string) error {
 //	r/<name>            Register
 //	o/<name>/<id>       outbox: Event waiting for a remote host
 //	p/<name>            placement: member name hosting a remote subject
+//	t/<name>            last-activity clock, Unix nanoseconds
+//	x/<name>            expiry tombstone: when an idle subject self-destructed
 type Store struct {
 	db *pebble.DB
 	mu sync.Mutex // serializes claim (read-modify-write over leases) and seq allocation
@@ -218,6 +250,14 @@ func (s *Store) Declare(m Subject) error {
 	if m.Delivery != DeliveryExclusive && m.Delivery != DeliveryShared {
 		return fmt.Errorf("astral: invalid delivery %q", m.Delivery)
 	}
+	if Ephemeral(m.Name) {
+		if m.IdleTTLNS == 0 {
+			m.IdleTTLNS = int64(ReplyIdleTTL)
+		}
+		if m.MaxEvents == 0 {
+			m.MaxEvents = ReplyMaxEvents
+		}
+	}
 	var prev Subject
 	if ok, err := s.getJSON("m/"+m.Name, &prev); err != nil {
 		return err
@@ -230,7 +270,47 @@ func (s *Store) Declare(m Subject) error {
 	if err != nil {
 		return err
 	}
-	return s.db.Set([]byte("m/"+m.Name), raw, pebble.Sync)
+	b := s.db.NewBatch()
+	defer b.Close()
+	if err := b.Set([]byte("m/"+m.Name), raw, nil); err != nil {
+		return err
+	}
+	// A redeclared name is a new incarnation: clear any expiry tombstone
+	// and start its activity clock.
+	if err := b.Delete([]byte("x/"+m.Name), nil); err != nil {
+		return err
+	}
+	if err := s.setJSON(b, "t/"+m.Name, time.Now().UnixNano()); err != nil {
+		return err
+	}
+	return b.Commit(pebble.Sync)
+}
+
+// Expired reports whether a name self-destructed after its idle TTL.
+func (s *Store) Expired(name string) (bool, error) {
+	var at int64
+	return s.getJSON("x/"+name, &at)
+}
+
+// unknownOrExpired distinguishes "never declared" from "declared and
+// gone" — the latter is a normal outcome a replier must not retry.
+func (s *Store) unknownOrExpired(name string) error {
+	if exp, err := s.Expired(name); err != nil {
+		return err
+	} else if exp {
+		return fmt.Errorf("%w: %s", ErrSubjectExpired, name)
+	}
+	return ErrUnknownSubject
+}
+
+// Touch records activity on a hosted name (an active wait counts: a
+// parked waiter keeps its reply subject alive).
+func (s *Store) Touch(name string) error {
+	raw, err := json.Marshal(time.Now().UnixNano())
+	if err != nil {
+		return err
+	}
+	return s.db.Set([]byte("t/"+name), raw, pebble.NoSync)
 }
 
 // Subject looks a declared subject up.
@@ -263,6 +343,17 @@ func (s *Store) Subjects() ([]Subject, error) {
 // skipped so operators can remove entries that predate the current
 // naming rules.
 func (s *Store) Remove(name string) error {
+	return s.remove(name, false)
+}
+
+// Expire removes an idle subject and leaves a tombstone, so a late
+// publish gets "expired" — the replier learns the declarer is gone —
+// instead of "unknown".
+func (s *Store) Expire(name string) error {
+	return s.remove(name, true)
+}
+
+func (s *Store) remove(name string, tombstone bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var m Subject
@@ -273,13 +364,67 @@ func (s *Store) Remove(name string) error {
 	}
 	b := s.db.NewBatch()
 	defer b.Close()
-	if err := b.Delete([]byte("m/"+name), nil); err != nil {
-		return err
+	for _, key := range []string{"m/" + name, "t/" + name} {
+		if err := b.Delete([]byte(key), nil); err != nil {
+			return err
+		}
 	}
 	for _, prefix := range []string{"e/", "i/", "a/", "l/", "o/"} {
 		bounds := prefixBounds(prefix + name + "/")
 		if err := b.DeleteRange(bounds.LowerBound, bounds.UpperBound, nil); err != nil {
 			return err
+		}
+	}
+	if tombstone {
+		if err := s.setJSON(b, "x/"+name, time.Now().UnixNano()); err != nil {
+			return err
+		}
+	}
+	return b.Commit(pebble.Sync)
+}
+
+// IdleExpired lists subjects whose idle TTL has elapsed with no appends,
+// claims, acks, or active waits.
+func (s *Store) IdleExpired(now time.Time) ([]string, error) {
+	boxes, err := s.Subjects()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, m := range boxes {
+		if m.IdleTTLNS <= 0 {
+			continue
+		}
+		last := m.Created
+		var t int64
+		if ok, err := s.getJSON("t/"+m.Name, &t); err != nil {
+			return nil, err
+		} else if ok {
+			last = t
+		}
+		if now.UnixNano()-last > m.IdleTTLNS {
+			out = append(out, m.Name)
+		}
+	}
+	return out, nil
+}
+
+// SweepTombstones drops expiry markers older than keep — after that long,
+// "unknown subject" is honest enough.
+func (s *Store) SweepTombstones(now time.Time, keep time.Duration) error {
+	it, err := s.db.NewIter(prefixBounds("x/"))
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	b := s.db.NewBatch()
+	defer b.Close()
+	for it.First(); it.Valid(); it.Next() {
+		var at int64
+		if err := json.Unmarshal(it.Value(), &at); err != nil || now.UnixNano()-at > int64(keep) {
+			if err := b.Delete(append([]byte(nil), it.Key()...), nil); err != nil {
+				return err
+			}
 		}
 	}
 	return b.Commit(pebble.Sync)
@@ -294,7 +439,7 @@ func (s *Store) Append(name string, ev Event) (fresh bool, err error) {
 		return false, err
 	}
 	if !ok {
-		return false, ErrUnknownSubject
+		return false, s.unknownOrExpired(name)
 	}
 	if ev.Kind == "" {
 		return false, fmt.Errorf("astral: event kind required")
@@ -319,12 +464,20 @@ func (s *Store) Append(name string, ev Event) (fresh bool, err error) {
 	if err != nil {
 		return false, err
 	}
+	// Sequences are never reused, so seq counts total appends over the
+	// subject's lifetime — exactly what the cap bounds.
+	if m.MaxEvents > 0 && seq > uint64(m.MaxEvents) {
+		return false, fmt.Errorf("%w: %s capped at %d events", ErrSubjectFull, name, m.MaxEvents)
+	}
 	b := s.db.NewBatch()
 	defer b.Close()
 	if err := s.setJSON(b, eventKey(name, seq), ev); err != nil {
 		return false, err
 	}
 	if err := s.setJSON(b, "i/"+name+"/"+ev.ID, seq); err != nil {
+		return false, err
+	}
+	if err := s.setJSON(b, "t/"+name, time.Now().UnixNano()); err != nil {
 		return false, err
 	}
 	return true, b.Commit(pebble.Sync)
@@ -357,7 +510,10 @@ func (s *Store) Claim(name, consumer string, d time.Duration, n int) ([]Claimed,
 	if err != nil {
 		return nil, err
 	} else if !ok {
-		return nil, ErrUnknownSubject
+		return nil, s.unknownOrExpired(name)
+	}
+	if err := s.Touch(name); err != nil {
+		return nil, err
 	}
 	if n <= 0 {
 		n = 1
@@ -446,6 +602,9 @@ func (s *Store) Ack(name, consumer, eventID string) error {
 		return err
 	}
 	if err := b.Delete([]byte("l/"+name+"/"+eventID), nil); err != nil {
+		return err
+	}
+	if err := s.setJSON(b, "t/"+name, time.Now().UnixNano()); err != nil {
 		return err
 	}
 	return b.Commit(pebble.Sync)
@@ -590,6 +749,11 @@ func (s *Store) ReplaceHost(member string, names []string) error {
 		return err
 	}
 	for it.First(); it.Valid(); it.Next() {
+		// Ephemeral reply routes are learned from claimed requests, not
+		// from announcements — a registry refresh must not wipe them.
+		if Ephemeral(strings.TrimPrefix(string(it.Key()), "p/")) {
+			continue
+		}
 		if string(it.Value()) == member {
 			if err := b.Delete(append([]byte(nil), it.Key()...), nil); err != nil {
 				it.Close()

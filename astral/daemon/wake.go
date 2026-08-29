@@ -59,7 +59,10 @@ func (w *waiters) notify(name string) {
 }
 
 // waitLocal parks until name (hosted here) has pending mail or timeout.
+// An active wait counts as activity: a parked waiter keeps its ephemeral
+// reply subject from idling out under it.
 func (d *Daemon) waitLocal(ctx context.Context, name string, timeout time.Duration) (Woke, error) {
+	_ = d.Store.Touch(name)
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
@@ -148,6 +151,11 @@ func (d *Daemon) entityHost(entity string) (host string, remote bool, err error)
 	return host, true, nil
 }
 
+// TombstoneKeep is how long an expired subject's marker outlives it, so a
+// late replier still gets "expired" rather than "unknown". Variable so
+// tests can shrink it.
+var TombstoneKeep = 24 * time.Hour
+
 func (d *Daemon) monitorLoop() {
 	t := time.NewTicker(MonitorInterval)
 	defer t.Stop()
@@ -158,6 +166,32 @@ func (d *Daemon) monitorLoop() {
 		case <-t.C:
 		}
 		d.sweepMonitors()
+		d.sweepExpired()
+	}
+}
+
+// sweepExpired self-destructs subjects whose idle TTL elapsed, leaving
+// tombstones, and eventually drops the tombstones themselves.
+func (d *Daemon) sweepExpired() {
+	if !d.begin() {
+		return
+	}
+	defer d.end()
+	now := time.Now()
+	names, err := d.Store.IdleExpired(now)
+	if err != nil {
+		log.Printf("astral: expiry sweep: %v", err)
+		return
+	}
+	for _, name := range names {
+		if err := d.Store.Expire(name); err != nil {
+			log.Printf("astral: expiring %s: %v", name, err)
+			continue
+		}
+		log.Printf("astral: subject %s expired (idle)", name)
+	}
+	if err := d.Store.SweepTombstones(now, TombstoneKeep); err != nil {
+		log.Printf("astral: tombstone sweep: %v", err)
 	}
 }
 

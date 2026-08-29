@@ -248,10 +248,26 @@ func (d *Daemon) Append(name string, ev astral.Event) (fresh bool, err error) {
 		return false, err
 	}
 	if !ok {
+		if exp, err := d.Store.Expired(name); err != nil {
+			return false, err
+		} else if exp {
+			return false, fmt.Errorf("%w: %s", astral.ErrSubjectExpired, name)
+		}
 		return false, astral.ErrUnknownSubject
 	}
 	resp, err := d.remote(host, request{Op: OpAppend, Name: name, Event: ev})
 	if err != nil {
+		// The host answered and refused (expired, kind rejected, full):
+		// that is a loud semantic outcome, never parked — the outbox is
+		// for unreachable hosts only, and a refusal would never succeed
+		// on retry. A dead reply route is also dropped here, so learned
+		// ephemeral placements do not outlive their subject.
+		if resp.Err != "" {
+			if astral.Ephemeral(name) && strings.Contains(resp.Err, "expired") {
+				_ = d.Store.SetHost(name, "")
+			}
+			return false, err
+		}
 		// Park it; the outbox loop retries when the host is reachable.
 		if qerr := d.Store.Enqueue(name, ev); qerr != nil {
 			return false, qerr
@@ -276,7 +292,9 @@ func (d *Daemon) Claim(name, consumer string, lease time.Duration, n int) ([]ast
 	if _, ok, err := d.Store.Subject(name); err != nil {
 		return nil, err
 	} else if ok {
-		return d.Store.Claim(name, consumer, lease, n)
+		c, err := d.Store.Claim(name, consumer, lease, n)
+		d.learnReplyRoutes(c)
+		return c, err
 	}
 	host, ok, err := d.Store.Host(name)
 	if err != nil || !ok {
@@ -286,7 +304,32 @@ func (d *Daemon) Claim(name, consumer string, lease time.Duration, n int) ([]ast
 	if err != nil {
 		return nil, err
 	}
+	d.learnReplyRoutes(resp.Claimed)
 	return resp.Claimed, nil
+}
+
+// learnReplyRoutes records placements for ephemeral reply subjects named
+// in claimed requests. Reply subjects are never announced through the
+// registry — possession of the claimed request *is* the route (and, once
+// grants harden, the capability): its authoritative Source names the
+// member whose node declared the reply subject.
+func (d *Daemon) learnReplyRoutes(claimed []astral.Claimed) {
+	for _, c := range claimed {
+		target := c.Event.ReplyTarget
+		if target == "" || !astral.Ephemeral(target) {
+			continue
+		}
+		_, member, ok := strings.Cut(c.Event.Source, "@")
+		if !ok || member == "" || member == d.MemberName() {
+			continue
+		}
+		if _, hosted, err := d.Store.Subject(target); err != nil || hosted {
+			continue
+		}
+		if err := d.Store.SetHost(target, member); err != nil {
+			log.Printf("astral: learning reply route %s → %s: %v", target, member, err)
+		}
+	}
 }
 
 // Ack force-acks an event, wherever the name is hosted.
@@ -403,6 +446,9 @@ func (d *Daemon) serve(req request, from string) (resp response) {
 	if _, ok, err := d.Store.Subject(req.Name); err != nil {
 		return fail(err)
 	} else if !ok && req.Op != OpGet && req.Op != OpSet && req.Op != OpHeartbeat && req.Op != OpWatch && req.Op != OpRegistry {
+		if exp, _ := d.Store.Expired(req.Name); exp {
+			return fail(fmt.Errorf("%w: %s", astral.ErrSubjectExpired, req.Name))
+		}
 		return fail(fmt.Errorf("%w: %s not hosted on %s", astral.ErrUnknownSubject, req.Name, d.MemberName()))
 	}
 	switch req.Op {
@@ -457,6 +503,9 @@ func (d *Daemon) serve(req request, from string) (resp response) {
 	return fail(fmt.Errorf("astral: unknown op %q", req.Op))
 }
 
+// hostedNames lists the names this node announces. Ephemeral reply
+// subjects are deliberately absent: they are unlisted, and their route
+// travels inside the claimed request (learnReplyRoutes).
 func (d *Daemon) hostedNames() []string {
 	boxes, err := d.Store.Subjects()
 	if err != nil {
@@ -464,6 +513,9 @@ func (d *Daemon) hostedNames() []string {
 	}
 	names := make([]string, 0, len(boxes))
 	for _, box := range boxes {
+		if astral.Ephemeral(box.Name) {
+			continue
+		}
 		names = append(names, box.Name)
 	}
 	return names
@@ -476,7 +528,8 @@ func (d *Daemon) learnRegistry(member string, names []string) error {
 	}
 	filtered := names[:0]
 	for _, name := range names {
-		if !local[name] {
+		// Drop ephemeral names a peer running older code still announces.
+		if !local[name] && !astral.Ephemeral(name) {
 			filtered = append(filtered, name)
 		}
 	}
@@ -617,8 +670,14 @@ func (d *Daemon) flushOutbox() {
 			continue
 		}
 		for _, ev := range evs {
-			if _, err := d.remote(host, request{Op: OpAppend, Name: name, Event: ev}); err != nil {
-				break // host still unreachable; keep the rest parked
+			if resp, err := d.remote(host, request{Op: OpAppend, Name: name, Event: ev}); err != nil {
+				if resp.Err == "" {
+					break // host still unreachable; keep the rest parked
+				}
+				// The host refused (expired, kind rejected, full): a retry
+				// can never succeed, so drop the cast loudly instead of
+				// parking it forever.
+				log.Printf("astral: outbox cast %s → %s refused, dropped: %v", ev.ID, name, err)
 			}
 			if err := d.Store.Dequeue(name, ev.ID); err != nil {
 				log.Printf("astral: outbox dequeue %s: %v", ev.ID, err)
