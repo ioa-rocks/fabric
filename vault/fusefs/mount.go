@@ -458,9 +458,16 @@ func (f *fileNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut
 		out.Mode = syscall.S_IFREG | 0o644
 	}
 	out.Uid, out.Gid = uint32(os.Getuid()), uint32(os.Getgid())
-	if object.Created > 0 {
-		out.Mtime = uint64(object.Created / 1e9)
-		out.Mtimensec = uint32(object.Created % 1e9)
+	// Modification time is when the content register last changed, not when
+	// the object was created — a replaced file must look changed, or rsync
+	// -style change detection never re-reads it.
+	mtime := object.Modified
+	if mtime == 0 {
+		mtime = object.Created
+	}
+	if mtime > 0 {
+		out.Mtime = uint64(mtime / 1e9)
+		out.Mtimensec = uint32(mtime % 1e9)
 	}
 	return 0
 }

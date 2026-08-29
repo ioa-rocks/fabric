@@ -50,18 +50,19 @@ type BucketInfo struct {
 // ObjectInfo is the wire form of an object — the API view over the CRDT
 // record (merge internals stay server-side).
 type ObjectInfo struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	Blob    string   `json:"blob"`
-	Size    int64    `json:"size"`
-	Created int64    `json:"created_at"` // Unix nanoseconds
-	Tags    []string `json:"tags,omitempty"`
-	Deleted bool     `json:"deleted,omitempty"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Blob     string   `json:"blob"`
+	Size     int64    `json:"size"`
+	Created  int64    `json:"created_at"`            // Unix nanoseconds
+	Modified int64    `json:"modified_at,omitempty"` // when the content register last won a write
+	Tags     []string `json:"tags,omitempty"`
+	Deleted  bool     `json:"deleted,omitempty"`
 }
 
 func Info(o *index.Object) ObjectInfo {
 	tags := o.Tags.List()
-	return ObjectInfo{ID: o.ID, Name: o.Name.V, Blob: o.Blob.V, Size: o.Size, Created: o.CreatedAt, Tags: tags, Deleted: o.IsDeleted()}
+	return ObjectInfo{ID: o.ID, Name: o.Name.V, Blob: o.Blob.V, Size: o.Size, Created: o.CreatedAt, Modified: o.Blob.TS, Tags: tags, Deleted: o.IsDeleted()}
 }
 
 // PeerInfo describes one connected mesh member as seen from this vault
@@ -82,10 +83,11 @@ type StatusReply struct {
 	Version string `json:"version"`
 	Buckets int    `json:"buckets"`
 
-	Mesh     bool       `json:"mesh"`                // fabric node attached
-	MeshName string     `json:"mesh_name,omitempty"` // this vault node's member label
-	PeerID   string     `json:"peer_id,omitempty"`
-	Peers    []PeerInfo `json:"peers,omitempty"` // connected members
+	Mesh     bool        `json:"mesh"`                // fabric node attached
+	MeshName string      `json:"mesh_name,omitempty"` // this vault node's member label
+	PeerID   string      `json:"peer_id,omitempty"`
+	Peers    []PeerInfo  `json:"peers,omitempty"`  // connected members
+	Mounts   []MountInfo `json:"mounts,omitempty"` // declared FUSE mounts
 }
 
 type createBucketBody struct {
@@ -116,6 +118,16 @@ type subBody struct {
 	Mode string `json:"mode"` // "full" | "cache" | "" (none)
 }
 
+type mountBody struct {
+	Dir    string `json:"dir"`
+	Bucket string `json:"bucket"`
+	Write  bool   `json:"write,omitempty"`
+}
+
+type mountDirBody struct {
+	Dir string `json:"dir"`
+}
+
 func (d *Daemon) serveControl() (func(), error) {
 	sock := SocketPath(d.Circle.Path)
 	_ = os.Remove(sock) // stale socket from an unclean shutdown
@@ -141,6 +153,9 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/buckets/{bucket}/rm", d.handleRm)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/project", d.handleProject)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/sub", d.handleSub)
+	mux.HandleFunc("GET /v0/mounts", d.handleMounts)
+	mux.HandleFunc("POST /v0/mounts", d.handleAddMount)
+	mux.HandleFunc("POST /v0/mounts/remove", d.handleRemoveMount)
 
 	// Every request holds an operation token so shutdown can drain the
 	// in-flight ones before the bucket stores close under them.
@@ -172,6 +187,7 @@ func httpErr(w http.ResponseWriter, err error) {
 	switch {
 	case strings.Contains(msg, "no bucket matches"),
 		strings.Contains(msg, "no object matches"),
+		strings.Contains(msg, "no mount declared"),
 		strings.Contains(msg, "not held here"):
 		code = http.StatusNotFound
 	case strings.Contains(msg, "ambiguous"),
@@ -218,7 +234,75 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
 			s.Peers = append(s.Peers, pi)
 		}
 	}
+	if mounts, err := d.mountInfos(); err == nil {
+		s.Mounts = mounts
+	}
 	writeJSON(w, s)
+}
+
+func (d *Daemon) handleMounts(w http.ResponseWriter, _ *http.Request) {
+	mounts, err := d.mountInfos()
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	writeJSON(w, mounts)
+}
+
+func (d *Daemon) handleAddMount(w http.ResponseWriter, r *http.Request) {
+	var body mountBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpErr(w, err)
+		return
+	}
+	if !filepath.IsAbs(body.Dir) {
+		httpErr(w, fmt.Errorf("mount: dir must be an absolute path (the daemon's cwd is not yours)"))
+		return
+	}
+	if d.Mounter == nil {
+		httpErr(w, fmt.Errorf("mount: this daemon has no mounter wired"))
+		return
+	}
+	id, err := d.Circle.ResolveBucketID(body.Bucket)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	decl := circle.MountDecl{Bucket: id, Write: body.Write}
+	// Redeclaring a directory replaces its mount; release the old one first.
+	if err := d.releaseMount(body.Dir); err != nil {
+		httpErr(w, err)
+		return
+	}
+	if err := d.Circle.SetMount(body.Dir, decl); err != nil {
+		httpErr(w, err)
+		return
+	}
+	if err := d.establishMount(body.Dir, decl); err != nil {
+		// The first attempt fails loudly and withdraws the declaration —
+		// the retry loop must not keep hammering a mistyped directory.
+		_ = d.Circle.RemoveMount(body.Dir)
+		httpErr(w, err)
+		return
+	}
+	writeJSON(w, MountInfo{Dir: body.Dir, Bucket: id, Write: body.Write, Mounted: true})
+}
+
+func (d *Daemon) handleRemoveMount(w http.ResponseWriter, r *http.Request) {
+	var body mountDirBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpErr(w, err)
+		return
+	}
+	if err := d.Circle.RemoveMount(body.Dir); err != nil {
+		httpErr(w, err)
+		return
+	}
+	if err := d.releaseMount(body.Dir); err != nil {
+		httpErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]string{"dir": body.Dir})
 }
 
 func (d *Daemon) handleBuckets(w http.ResponseWriter, _ *http.Request) {

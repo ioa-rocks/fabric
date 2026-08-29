@@ -161,6 +161,70 @@ func (c *Circle) SetSubscription(bucketID, mode string) error {
 	return os.WriteFile(c.subsPath(), raw, 0o600)
 }
 
+// MountDecl is one declared FUSE mount: this device's commitment to keep a
+// bucket visible at a directory. Like subscriptions, declarations persist
+// and the daemon owns their lifecycle — it establishes them at startup and
+// re-establishes them until the declaration is removed (ADR 0016: a mount
+// is state, not a foreground process).
+type MountDecl struct {
+	Bucket string `json:"bucket"` // bucket ID
+	Write  bool   `json:"write,omitempty"`
+}
+
+func (c *Circle) mountsPath() string { return filepath.Join(c.Path, "mounts.json") }
+
+// Mounts returns this device's mountpoint → declaration map. Keys are
+// absolute directories: a directory holds one bucket, while a bucket may
+// be mounted at several directories.
+func (c *Circle) Mounts() (map[string]MountDecl, error) {
+	raw, err := os.ReadFile(c.mountsPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]MountDecl{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var mounts map[string]MountDecl
+	if err := json.Unmarshal(raw, &mounts); err != nil {
+		return nil, fmt.Errorf("reading mounts: %w", err)
+	}
+	return mounts, nil
+}
+
+// SetMount declares a mount at dir (an absolute path).
+func (c *Circle) SetMount(dir string, m MountDecl) error {
+	if !filepath.IsAbs(dir) {
+		return fmt.Errorf("mountpoint must be an absolute path")
+	}
+	mounts, err := c.Mounts()
+	if err != nil {
+		return err
+	}
+	mounts[dir] = m
+	return c.writeMounts(mounts)
+}
+
+// RemoveMount drops the declaration for dir.
+func (c *Circle) RemoveMount(dir string) error {
+	mounts, err := c.Mounts()
+	if err != nil {
+		return err
+	}
+	if _, ok := mounts[dir]; !ok {
+		return fmt.Errorf("no mount declared at %s", dir)
+	}
+	delete(mounts, dir)
+	return c.writeMounts(mounts)
+}
+
+func (c *Circle) writeMounts(mounts map[string]MountDecl) error {
+	raw, err := json.MarshalIndent(mounts, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(c.mountsPath(), raw, 0o600)
+}
+
 func keyPath(path string) string { return filepath.Join(path, "user.key.age") }
 
 // Unlock loads the owner's user key for one signing operation.

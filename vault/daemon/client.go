@@ -206,6 +206,24 @@ func (c *Client) Sub(bucket, mode string) error {
 	return c.post(bucketPath(bucket, "/sub"), subBody{Mode: mode}, nil)
 }
 
+func (c *Client) Mounts() ([]MountInfo, error) {
+	var out []MountInfo
+	if err := c.get("/v0/mounts", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) AddMount(dir, bucket string, write bool) (MountInfo, error) {
+	var out MountInfo
+	err := c.post("/v0/mounts", mountBody{Dir: dir, Bucket: bucket, Write: write}, &out)
+	return out, err
+}
+
+func (c *Client) RemoveMount(dir string) error {
+	return c.post("/v0/mounts/remove", mountDirBody{Dir: dir}, nil)
+}
+
 func (c *Client) Project(bucket, dir string) (int, error) {
 	var out map[string]int
 	if err := c.post(bucketPath(bucket, "/project"), projectBody{Dir: dir}, &out); err != nil {

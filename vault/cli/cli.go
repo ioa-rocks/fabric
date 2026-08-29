@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -60,6 +59,10 @@ func Main(args []string) int {
 		err = cmdProject(rest)
 	case "mount":
 		err = cmdMount(rest)
+	case "unmount":
+		err = cmdUnmount(rest)
+	case "mounts":
+		err = cmdMounts(rest)
 	default:
 		usage()
 		return 2
@@ -90,7 +93,10 @@ daemon's control socket, or open the state directly when none runs.
   rm       rm <bucket> <object-ref> — tombstone an object
   sub      sub <bucket> [full|cache|none] — this device's placement commitment
   project  project <bucket> <dir> — materialize a read-only directory view
-  mount    mount <bucket> <dir> — mount a read-only live-content filesystem
+  mount    mount <bucket> <dir> [-write] — declare a mount; the daemon serves
+           it from now on, across restarts, until 'unmount'
+  unmount  unmount <dir> — remove a mount declaration and release the mount
+  mounts   list declared mounts and whether each is live
 
 Every command accepts -state <dir> (default `+circle.DefaultPath()+`),
 before or after positional arguments. Signing commands read
@@ -196,6 +202,7 @@ func cmdStatus(args []string) error {
 	}
 	fmt.Printf("circle %q  %s\n", s.Name, s.Circle)
 	fmt.Printf("daemon %s, %d bucket(s)\n", s.Version, s.Buckets)
+	printStatusMounts(s.Mounts)
 	if !s.Mesh {
 		fmt.Println("mesh: not joined — 'fabric join' puts this machine on a mesh")
 		return nil
@@ -203,7 +210,6 @@ func cmdStatus(args []string) error {
 	fmt.Printf("mesh: member %q, peer %s\n", s.MeshName, s.PeerID)
 	if len(s.Peers) == 0 {
 		fmt.Println("no members connected")
-		return nil
 	}
 	for _, p := range s.Peers {
 		if p.Vault {
@@ -213,6 +219,14 @@ func cmdStatus(args []string) error {
 		}
 	}
 	return nil
+}
+
+func printStatusMounts(mounts []daemon.MountInfo) {
+	if len(mounts) == 0 {
+		return
+	}
+	fmt.Printf("mounts:\n")
+	printMounts(mounts)
 }
 
 func cmdBucket(args []string) error {
@@ -493,43 +507,127 @@ func cmdProject(args []string) error {
 func cmdMount(args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	statePath := stateFlag(fs)
-	debug := fs.Bool("debug", false, "show FUSE protocol logging")
+	debug := fs.Bool("debug", false, "show FUSE protocol logging (foreground only)")
 	write := fs.Bool("write", false, "enable staged filesystem writes")
+	foreground := fs.Bool("foreground", false, "serve the mount from this process instead of declaring it (debugging; dies with the terminal)")
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: fabric vault mount <bucket> <dir> [-debug] [-write]")
+		return fmt.Errorf("usage: fabric vault mount <bucket> <dir> [-write] [-foreground [-debug]]")
 	}
 	mountpoint, err := filepath.Abs(pos[1])
 	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
 		return err
 	}
 	cl := daemon.TryClient(*statePath)
 	if cl == nil {
 		return fmt.Errorf("mount requires the running node daemon on %s", daemon.SocketPath(*statePath))
 	}
-	state, err := filepath.Abs(*statePath)
+	if *foreground {
+		return foregroundMount(cl, *statePath, pos[0], mountpoint, *write, *debug)
+	}
+	m, err := cl.AddMount(mountpoint, pos[0], *write)
+	if err != nil {
+		return err
+	}
+	mode := "read-only"
+	if m.Write {
+		mode = "writable"
+	}
+	fmt.Printf("mount declared: the daemon serves bucket %.16s %s at %s\n", m.Bucket, mode, m.Dir)
+	fmt.Printf("it persists across daemon restarts; remove with: fabric vault unmount %s\n", m.Dir)
+	return nil
+}
+
+func cmdUnmount(args []string) error {
+	fs := flag.NewFlagSet("unmount", flag.ExitOnError)
+	statePath := stateFlag(fs)
+	pos := parse(fs, args, -1)
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: fabric vault unmount <dir>")
+	}
+	dir, err := filepath.Abs(pos[0])
+	if err != nil {
+		return err
+	}
+	cl := daemon.TryClient(*statePath)
+	if cl == nil {
+		return fmt.Errorf("unmount requires the running node daemon on %s", daemon.SocketPath(*statePath))
+	}
+	if err := cl.RemoveMount(dir); err != nil {
+		return err
+	}
+	fmt.Printf("mount removed: %s\n", dir)
+	return nil
+}
+
+func cmdMounts(args []string) error {
+	fs := flag.NewFlagSet("mounts", flag.ExitOnError)
+	statePath := stateFlag(fs)
+	parse(fs, args, -1)
+	cl := daemon.TryClient(*statePath)
+	if cl == nil {
+		return fmt.Errorf("mounts requires the running node daemon on %s", daemon.SocketPath(*statePath))
+	}
+	mounts, err := cl.Mounts()
+	if err != nil {
+		return err
+	}
+	if len(mounts) == 0 {
+		fmt.Println("no mounts declared — declare one with: fabric vault mount <bucket> <dir>")
+		return nil
+	}
+	printMounts(mounts)
+	return nil
+}
+
+func printMounts(mounts []daemon.MountInfo) {
+	for _, m := range mounts {
+		mode := "ro"
+		if m.Write {
+			mode = "rw"
+		}
+		state := "mounted"
+		switch {
+		case m.Error != "":
+			state = "error: " + m.Error
+		case !m.Mounted:
+			state = "not mounted (daemon will retry)"
+		}
+		name := m.Name
+		if name == "" {
+			name = m.Bucket[:min(16, len(m.Bucket))]
+		}
+		fmt.Printf("  %s  %s  %s  %s\n", m.Dir, mode, name, state)
+	}
+}
+
+// foregroundMount is the pre-ADR-0016 behavior, kept as a debugging escape
+// hatch: the mount is served by this process and dies with it, and is not
+// recorded in the daemon's mount table.
+func foregroundMount(cl *daemon.Client, statePath, bucket, mountpoint string, write, debug bool) error {
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		return err
+	}
+	state, err := filepath.Abs(statePath)
 	if err != nil {
 		return err
 	}
 	// Stage beside the blob store rather than in the system temp dir: reads
 	// and writes buffer whole objects, and /tmp is commonly a RAM-backed
 	// tmpfs that one phone video can exhaust.
-	server, err := fusefs.Mount(mountpoint, pos[0], cl, fusefs.Options{
-		Debug:    *debug,
-		Writable: *write,
+	server, err := fusefs.Mount(mountpoint, bucket, cl, fusefs.Options{
+		Debug:    debug,
+		Writable: write,
 		StageDir: filepath.Join(state, "mount"),
 	})
 	if err != nil {
 		return err
 	}
 	mode := "read-only"
-	if *write {
+	if write {
 		mode = "writable"
 	}
-	fmt.Printf("mounted bucket %q %s at %s; unmount with Ctrl-C or fusermount3 -u %s\n", pos[0], mode, mountpoint, mountpoint)
+	fmt.Printf("mounted bucket %q %s at %s (foreground); unmount with Ctrl-C or fusermount3 -u %s\n", bucket, mode, mountpoint, mountpoint)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	done := make(chan struct{})
@@ -541,7 +639,7 @@ func cmdMount(args []string) error {
 	case <-done:
 	case <-sig:
 		if err := server.Unmount(); err != nil {
-			if lazyErr := lazyUnmount(mountpoint); lazyErr != nil {
+			if lazyErr := daemon.LazyUnmount(mountpoint); lazyErr != nil {
 				signal.Stop(sig)
 				return fmt.Errorf("unmount: %w; lazy detach: %v (leave the mount directory and run fusermount3 -u %s)", err, lazyErr, mountpoint)
 			}
@@ -549,18 +647,4 @@ func cmdMount(args []string) error {
 	}
 	signal.Stop(sig)
 	return nil
-}
-
-// lazyUnmount is the Ctrl-C fallback for EBUSY, most commonly when the
-// invoking shell's working directory is inside the mount. The FUSE helper is
-// needed because an unprivileged mount owner cannot call umount(2) directly.
-func lazyUnmount(mountpoint string) error {
-	for _, name := range []string{"fusermount3", "fusermount"} {
-		bin, err := exec.LookPath(name)
-		if err != nil {
-			continue
-		}
-		return exec.Command(bin, "-uz", mountpoint).Run()
-	}
-	return fmt.Errorf("neither fusermount3 nor fusermount is installed")
 }

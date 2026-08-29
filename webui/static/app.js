@@ -222,6 +222,18 @@ function renderVault(d) {
     `${buckets.length} bucket${buckets.length === 1 ? "" : "s"} · ` +
     (vaultPeers.length ? `syncing with ${vaultPeers.join(", ")}` : "no vault peers connected");
 
+  /* Declared mounts (ADR 0016): daemon-owned, listed with their live state. */
+  const mounts = vs.mounts || [];
+  const mbox = document.getElementById("vault-mounts");
+  mbox.replaceChildren();
+  for (const m of mounts) {
+    const line = document.createElement("div");
+    const state = m.error ? `error: ${m.error}` : (m.mounted ? "mounted" : "not mounted — daemon retries");
+    line.append(mono(m.dir), ` ${m.write ? "rw" : "ro"} · ${m.name || short(m.bucket)} — ${state}`);
+    mbox.append(line);
+  }
+  mbox.hidden = !mounts.length;
+
   const box = document.getElementById("vault-buckets");
   box.innerHTML = "";
   if (!buckets.length) {

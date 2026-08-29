@@ -47,10 +47,19 @@ type Daemon struct {
 	Circle *circle.Circle
 	Fabric *fabricdaemon.Daemon // nil when this machine is not on a mesh
 
+	// Mounter serves declared FUSE mounts (ADR 0016). Set by the
+	// composition root before Run; nil refuses mount declarations.
+	Mounter Mounter
+
 	mu      sync.Mutex
 	handles map[string]*circle.Handle // bucket ID -> open handle
 	closed  bool                      // no new operations; handles about to close
 	wg      sync.WaitGroup            // in-flight operations
+
+	mountMu    sync.Mutex
+	liveMounts map[string]*liveMount // mountpoint -> live mount
+	mountErrs  map[string]string     // mountpoint -> last establish failure
+	mountGen   uint64
 
 	syncKick     chan struct{} // write/subscription events wanting an exchange
 	syncDone     chan struct{} // syncLoop has exited
@@ -93,6 +102,8 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 	d := &Daemon{
 		Circle:       c,
 		handles:      make(map[string]*circle.Handle),
+		liveMounts:   make(map[string]*liveMount),
+		mountErrs:    make(map[string]string),
 		syncKick:     make(chan struct{}, 1),
 		syncDone:     make(chan struct{}),
 		syncInterval: SyncInterval,
@@ -135,10 +146,21 @@ func (d *Daemon) Run() error {
 		log.Printf("no mesh attached — serving the object API solo")
 	}
 
+	mountsDone := make(chan struct{})
+	if d.Mounter != nil {
+		go func() { defer close(mountsDone); d.mountLoop() }()
+	} else {
+		close(mountsDone)
+	}
+
 	<-d.ctx.Done()
-	// Shutdown order matters: stop intake (control socket — the host is
-	// the root's business), drain in-flight operations, then close the
+	// Shutdown order matters: release mounts first while the control
+	// socket still serves (a writable mount flushes staged publishes
+	// through it), then stop intake (control socket — the host is the
+	// root's business), drain in-flight operations, then close the
 	// stores. Stream handlers arriving after this no-op via begin().
+	<-mountsDone
+	d.teardownMounts()
 	stopControl()
 	<-d.syncDone
 	d.mu.Lock()

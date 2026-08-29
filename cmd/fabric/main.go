@@ -31,6 +31,7 @@ import (
 	"ioa.rocks/fabric/vault/circle"
 	vaultcli "ioa.rocks/fabric/vault/cli"
 	vaultdaemon "ioa.rocks/fabric/vault/daemon"
+	vaultfusefs "ioa.rocks/fabric/vault/fusefs"
 	"ioa.rocks/fabric/webui"
 
 	"github.com/libp2p/go-libp2p"
@@ -310,6 +311,9 @@ func cmdUp(args []string) error {
 			if err != nil {
 				return fmt.Errorf("vault subsystem: %w", err)
 			}
+			// Declared mounts are served by this process (ADR 0016); the
+			// daemon package cannot construct the FUSE side itself.
+			vd.Mounter = vaultfusefs.DaemonMounter{StatePath: *vaultState}
 		}
 	}
 
