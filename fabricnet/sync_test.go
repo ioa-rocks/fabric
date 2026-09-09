@@ -13,6 +13,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
+	"github.com/libp2p/go-libp2p/core/record"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 func issueTestCert(nsPriv ed25519.PrivateKey, devPub ed25519.PublicKey, name string) (*cert.Cert, error) {
@@ -251,5 +253,54 @@ func TestRevocationPropagatesAndCuts(t *testing.T) {
 	})
 	if _, err := echo(b.node, a.host.ID(), "post-revocation"); err == nil {
 		t.Fatal("revoked peer still reaches a protected protocol")
+	}
+}
+
+func TestNewerAddressRecordReplacesWithdrawnEndpoints(t *testing.T) {
+	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
+	a, b := newSyncNode(t, nsPub, nsPriv, "laptop"), newSyncNode(t, nsPub, nsPriv, "nas")
+	hydrate(a, b)
+	sign := func(seq uint64, addr string) []byte {
+		t.Helper()
+		env, err := record.Seal(&peer.PeerRecord{PeerID: b.host.ID(), Seq: seq, Addrs: []ma.Multiaddr{ma.StringCast(addr)}}, b.host.Peerstore().PrivKey(b.host.ID()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := env.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	old := sign(100, "/ip4/192.0.2.1/tcp/4517")
+	fresh := sign(101, "/ip4/192.0.2.2/tcp/4517")
+	var updates []uint64
+	a.sync.SetOnRecord(func(p peer.ID, seq uint64) {
+		if p != b.host.ID() {
+			t.Fatal(p)
+		}
+		updates = append(updates, seq)
+	})
+	if !a.sync.consumeRecord(old, time.Now()) || !a.sync.consumeRecord(fresh, time.Now()) {
+		t.Fatal("new record rejected")
+	}
+	addrs := a.host.Peerstore().Addrs(b.host.ID())
+	if len(addrs) != 1 || addrs[0].String() != "/ip4/192.0.2.2/tcp/4517" {
+		t.Fatalf("withdrawn endpoint retained: %v", addrs)
+	}
+	if a.sync.consumeRecord(old, time.Now()) || a.sync.consumeRecord(fresh, time.Now()) {
+		t.Fatal("stale or duplicate version treated as news")
+	}
+	a.host.Peerstore().UpdateAddrs(b.host.ID(), addrRecordTTL, 0)
+	a.sync.consumeRecord(old, time.Now())
+	if len(a.host.Peerstore().Addrs(b.host.ID())) != 0 {
+		t.Fatal("expired cache allowed a version rollback")
+	}
+	a.sync.consumeRecord(fresh, time.Now())
+	if len(a.host.Peerstore().Addrs(b.host.ID())) != 1 {
+		t.Fatal("equal version could not refresh expired cache")
+	}
+	if len(updates) != 2 || updates[0] != 100 || updates[1] != 101 {
+		t.Fatalf("unexpected notifications: %v", updates)
 	}
 }

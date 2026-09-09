@@ -1,6 +1,11 @@
 package tunbridge
 
 import (
+	"context"
+	"fmt"
+	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	ma "github.com/multiformats/go-multiaddr"
 	"net/netip"
 	"testing"
 	"time"
@@ -128,4 +133,77 @@ func TestBridgeRelaysAndPinsSource(t *testing.T) {
 		t.Fatalf("packet to unknown destination delivered: %x", pkt[20])
 	case <-time.After(300 * time.Millisecond):
 	}
+}
+
+// No destination listen address is given to the sender. Delivery must use
+// the relay, including after the destination loses and renews its reservation.
+func TestBridgeRelayRecovery(t *testing.T) {
+	relay, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	service, err := relayv2.New(relay, relayv2.WithInfiniteLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	a := testHost(t)
+	b, err := libp2p.New(libp2p.NoListenAddrs, libp2p.EnableRelay())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ri := peer.AddrInfo{ID: relay.ID(), Addrs: relay.Addrs()}
+	if _, err := client.Reserve(ctx, b, ri); err != nil {
+		t.Fatal(err)
+	}
+	circuit := ma.StringCast(fmt.Sprintf("%s/p2p/%s/p2p-circuit", relay.Addrs()[0], relay.ID()))
+	a.Peerstore().AddAddr(b.ID(), circuit, time.Hour)
+	devA, devB := newFakeDev(), newFakeDev()
+	gate := func(h network.StreamHandler) network.StreamHandler { return h }
+	ba, bb := New(a, devA, gate), New(b, devB, gate)
+	defer ba.Close()
+	defer bb.Close()
+	ba.SetRoutes(map[netip.Addr]peer.ID{netip.MustParseAddr("100.64.0.2"): b.ID()})
+	bb.SetRoutes(map[netip.Addr]peer.ID{netip.MustParseAddr("100.64.0.1"): a.ID()})
+	deliver := func(payload byte) {
+		t.Helper()
+		devA.in <- ipv4Packet("100.64.0.1", "100.64.0.2", payload)
+		select {
+		case packet := <-devB.out:
+			if packet[20] != payload {
+				t.Fatal("wrong payload")
+			}
+		case <-ctx.Done():
+			t.Fatal("relay packet not delivered")
+		}
+		conns := a.Network().ConnsToPeer(b.ID())
+		if len(conns) == 0 {
+			t.Fatal("missing connection")
+		}
+		if _, err := conns[0].RemoteMultiaddr().ValueForProtocol(ma.P_CIRCUIT); err != nil {
+			t.Fatal("delivery bypassed relay")
+		}
+	}
+	deliver(1)
+	// Remove both the old circuit and reservation by restarting only the relay
+	// service. Both endpoints and their bridges stay running.
+	if err := a.Network().ClosePeer(b.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	service, err = relayv2.New(relay, relayv2.WithInfiniteLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	if _, err := client.Reserve(ctx, b, ri); err != nil {
+		t.Fatal(err)
+	}
+	deliver(2)
 }

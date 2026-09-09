@@ -257,6 +257,34 @@ it succeeds the edge turns solid, when it fails the relay keeps
 carrying the traffic, TUN included. A revoked member loses relay
 privileges with the same gossip that cuts its connections.
 
+### Sleep, wake, and address changes
+
+The daemon checks underlay interface addresses every 15 seconds and uses a
+wall-clock gap of 45 seconds to detect likely suspend/resume. These signals
+close old transports and clear dial backoff. Thirty seconds with no connected
+members also clears backoff, then retries that reset at most once a minute.
+Bootstrap addresses are grouped by peer; up to eight peers dial concurrently,
+with ten-second attempt deadlines. Recovery and dial failures appear in the
+service journal, with repeated failures limited to once per peer per minute.
+Autorelay can reserve through the first eligible lighthouse: candidate checks
+are spaced five seconds apart, with a 15-second reservation backoff and a
+ten-second boot fallback. This avoids libp2p's default wait for four candidates
+and three-minute boot fallback in a mesh with only two lighthouses.
+
+Each device publishes its own signed address record when libp2p observes an
+address or relay-reservation change. Records carry an increasing, timestamp-based
+sequence number belonging to that device. Connected members spread new versions;
+reconnecting to a lighthouse exchanges the latest records it holds for other
+members too. Newer records remove withdrawn endpoints and trigger a fresh dial
+to disconnected peers. Equal versions refresh cached addresses without starting
+a gossip loop; older versions cannot roll back the in-memory version watermark.
+
+Overlay delivery needs a connection to the destination, either direct or through
+a valid circuit-relay reservation. A graph path through an arbitrary member does
+not provide IP forwarding. TUN stream opens and writes have five-second deadlines
+so a stale stream cannot stall packet handling indefinitely. A real sleep/wake
+trial is still needed to verify recovery timing on each host and network.
+
 ## Renewing certificates
 
 Certs live a year and renew at half-life (spec §5) — renewal re-signs
@@ -346,7 +374,7 @@ your cloud instances): starts at boot, runs `fabric up` as your
 normal user; the TUN and port-53 capabilities are granted by systemd
 (`AmbientCapabilities`) rather than setcap on the binary, so upgrades
 are just "replace the binary, `sudo systemctl restart fabric`" —
-nothing to re-bless. `-b/-u/-s` override binary, user, and state dir;
+nothing to re-bless. `-b/-u/-s` select the source build, user, and state dir;
 `-n` disables TUN. Logs: `journalctl -u fabric -f`.
 
 **User service** (`-U`, machines other people also use — a shared
@@ -363,6 +391,19 @@ your processes instead of the whole host. For the same reason, don't
 "fix" a shared machine by setcap'ing the binary — that works
 mechanically, but it bridges your overlay to everyone on the box.
 
+The service installer copies the selected build atomically to the service user's
+`~/.local/bin/fabric` and writes that canonical path into `ExecStart`. Re-running
+it reloads and restarts the service. To migrate a dedicated host from `~/fabric`
+or a repository build, run the installer with the existing user and state path:
+
+```sh
+sudo ./scripts/install-systemd.sh -u "$USER" -b "$HOME/fabric" -s "$HOME/.config/fabric"
+```
+
+Use the actual service user/state directory if they differ, and retain `-n` if
+TUN was explicitly disabled. The source build and identity/state files remain
+in place. User services use `-U` instead of sudo and `-u`.
+
 ## Deploy to existing nodes
 
 For the current x86-64 Ubuntu fleet, the binary can deploy itself over SSH:
@@ -373,7 +414,7 @@ fabric deploy kodi gate.example.com relay.example.org
 ```
 
 It installs atomically at `~/.local/bin/fabric`, migrates the supported legacy
-`~/fabric` service path to that binary, restarts the existing system or user
+`~/fabric` service path via a compatibility symlink to that binary, restarts the existing system or user
 unit, and waits for `fabric status` to pass. Run it from the freshly built
 binary you intend to distribute. Release artifacts and mixed-architecture
 fleets remain future deployment work.

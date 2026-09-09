@@ -23,12 +23,40 @@
 #        ./scripts/install-systemd.sh -U [-b bin] [-s statedir] [-n]
 #
 #   -U  user service (no root)
-#   -b  fabric binary (default: `command -v fabric`, else ./fabric)
+#   -b  source binary to install (default: ~/.local/bin/fabric, PATH, ./fabric)
+#       The service always runs the target user's ~/.local/bin/fabric.
 #   -u  user to run as, system mode only (default: $SUDO_USER)
 #   -s  state directory (default: the target user's ~/.config/fabric)
 #   -n  pass -no-tun to the daemon
 set -euo pipefail
 
+# Copy a build into the canonical per-user location. Kept separate from service
+# setup so installation/migration can be tested without touching systemd.
+install_binary() (
+  source_bin=$(readlink -f "$1") || exit 1
+  target_home=$2
+  owner=${3:-}
+  target_bin=$target_home/.local/bin/fabric
+  [ -x "$source_bin" ] || { echo "fabric binary not executable: $source_bin" >&2; exit 1; }
+  if [ -n "$owner" ]; then
+    install -d -o "$owner" "$target_home/.local" "$target_home/.local/bin" || exit 1
+  else
+    install -d "$target_home/.local/bin" || exit 1
+  fi
+  if [ "$source_bin" != "$(readlink -f "$target_bin")" ] || [ -L "$target_bin" ]; then
+    staged=$(mktemp "$target_home/.local/bin/.fabric.XXXXXX") || exit 1
+    trap 'rm -f "$staged"' EXIT
+    if [ -n "$owner" ]; then
+      install -m 0755 -o "$owner" "$source_bin" "$staged" || exit 1
+    else
+      install -m 0755 "$source_bin" "$staged" || exit 1
+    fi
+    mv -f "$staged" "$target_bin" || exit 1
+  fi
+  printf '%s\n' "$target_bin"
+)
+
+main() {
 BIN="" RUN_USER="${SUDO_USER:-}" STATE="" NOTUN="" USERMODE=0
 while getopts "Ub:u:s:nh" opt; do
   case $opt in
@@ -56,8 +84,12 @@ fi
 UNIT=$UNIT_DIR/fabric.service
 
 if [ -z "$BIN" ]; then
-  BIN=$(command -v fabric || true)
-  [ -n "$BIN" ] || BIN=./fabric
+  if [ -x "$HOME_DIR/.local/bin/fabric" ]; then
+    BIN=$HOME_DIR/.local/bin/fabric
+  else
+    BIN=$(command -v fabric || true)
+    [ -n "$BIN" ] || BIN=./fabric
+  fi
 fi
 BIN=$(readlink -f "$BIN")
 [ -x "$BIN" ] || { echo "fabric binary not found/executable: $BIN" >&2; exit 1; }
@@ -68,6 +100,12 @@ BIN=$(readlink -f "$BIN")
   exit 1
 }
 
+# Validate identity/state before installing or changing the service.
+if [ "$USERMODE" -eq 1 ]; then
+  BIN=$(install_binary "$BIN" "$HOME_DIR")
+else
+  BIN=$(install_binary "$BIN" "$HOME_DIR" "$RUN_USER")
+fi
 mkdir -p "$UNIT_DIR"
 
 if [ "$USERMODE" -eq 1 ]; then
@@ -80,7 +118,7 @@ Description=fabric mesh daemon (user)
 
 [Service]
 Type=simple
-ExecStart=$BIN up -state $STATE$NOTUN
+ExecStart="$BIN" up -state "$STATE"$NOTUN
 Restart=on-failure
 RestartSec=5
 
@@ -88,7 +126,8 @@ RestartSec=5
 WantedBy=default.target
 EOF
   systemctl --user daemon-reload
-  systemctl --user enable --now fabric.service
+  systemctl --user enable fabric.service
+  systemctl --user restart fabric.service
   echo "installed $UNIT (state=$STATE)"
   echo "  logs:    journalctl --user -u fabric -f"
   echo "  upgrade: replace $BIN, then: systemctl --user restart fabric"
@@ -104,7 +143,7 @@ After=network-online.target
 [Service]
 Type=simple
 User=$RUN_USER
-ExecStart=$BIN up -state $STATE$NOTUN
+ExecStart="$BIN" up -state "$STATE"$NOTUN
 Restart=on-failure
 RestartSec=5
 
@@ -123,8 +162,15 @@ LockPersonality=true
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now fabric.service
+  systemctl enable fabric.service
+  systemctl restart fabric.service
   echo "installed $UNIT (user=$RUN_USER, state=$STATE)"
   echo "  logs:    journalctl -u fabric -f"
   echo "  upgrade: replace $BIN, then: sudo systemctl restart fabric"
+fi
+
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
 fi

@@ -31,7 +31,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
+
 	"github.com/libp2p/go-libp2p/p2p/protocol/autonatv2"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
@@ -75,8 +75,9 @@ type Daemon struct {
 	// peers could actually dial back.
 	reachableAddrs, unreachableAddrs, unknownAddrs []string
 	lastDial                                       map[peer.ID]time.Time // mesh-fill backoff
-	recordsHash                                    [32]byte              // last persisted record-cache digest
-	pinnedBootstrap                                map[string]bool       // queue-host addresses already made durable
+	dials                                          recoveryDials
+	recordsHash                                    [32]byte        // last persisted record-cache digest
+	pinnedBootstrap                                map[string]bool // queue-host addresses already made durable
 
 	// Expanded announce set (announce.go); swapped by the re-resolve
 	// watcher, read by the AddrsFactory on every advertisement.
@@ -132,6 +133,9 @@ func New(dir state.Dir) (*Daemon, error) {
 		pinnedBootstrap: make(map[string]bool),
 	}
 	for _, addr := range cfg.Bootstrap {
+		if _, err := peerInfo(addr); err != nil {
+			log.Printf("bad bootstrap addr %q: %v", addr, err)
+		}
 		d.pinnedBootstrap[addr] = true
 	}
 
@@ -154,8 +158,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		// lighthouse — the /p2p-circuit address then rides our signed
 		// address record like any other.
 		libp2p.EnableHolePunching(),
-		libp2p.EnableAutoRelayWithPeerSource(d.relayCandidates,
-			autorelay.WithMinInterval(30*time.Second)),
+		libp2p.EnableAutoRelayWithPeerSource(d.relayCandidates, recoveryRelayOptions()...),
 		// AutoNAT v2: per-address reachability. v1 above gives the single
 		// node verdict that drives autorelay; v2 answers the question v1
 		// can't — WHICH addresses work. On a CGNAT-v4 + firewalled-v6 home
@@ -313,6 +316,7 @@ func (d *Daemon) Run() error {
 
 	d.startTUN()
 
+	d.Sync.SetOnRecord(d.addressesUpdated)
 	go d.reconnectLoop()
 	go d.watchReachability()
 	if hasHostEntries(d.Config.AnnounceAddrs) {
@@ -743,14 +747,33 @@ func (d *Daemon) persistRecords() {
 func (d *Daemon) reconnectLoop() {
 	tick := time.NewTicker(reconnectInterval)
 	defer tick.Stop()
+	var recovery recoveryWatch
 	for {
+		if d.ctx.Err() != nil {
+			return
+		}
+		now := time.Now()
+		fingerprint, err := networkFingerprint()
+		if err != nil {
+			fingerprint = recovery.network
+		}
+		connected := false
+		for _, p := range d.Host.Network().Peers() {
+			if d.Store.IsMember(p, now) {
+				connected = true
+				break
+			}
+		}
+		if reason := recovery.observe(now, fingerprint, connected); reason != "" {
+			d.recoverNetwork(reason, reason != "offline")
+		}
 		d.connectBootstrap()
 		d.meshFill()
 		d.measureRTT()
 		d.refreshRoutes()
 		d.persistRecords()
 		d.pinQueueHosts()
-		now := time.Now()
+		now = time.Now()
 		d.Store.GC(now)
 		d.Log.GC(now)
 		select {
@@ -817,29 +840,14 @@ func durableBootstrapAddr(addr ma.Multiaddr, p peer.ID) (string, bool) {
 }
 
 func (d *Daemon) connectBootstrap() {
-	for _, addr := range d.Config.Bootstrap {
-		info, err := peerInfo(addr)
-		if err != nil {
-			log.Printf("bad bootstrap addr %q: %v", addr, err)
-			continue
-		}
-		if info.ID == d.Host.ID() {
-			continue
-		}
-		if d.Host.Network().Connectedness(info.ID) != network.Connected {
-			ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
-			err := d.Host.Connect(ctx, *info)
-			cancel()
-			if err != nil {
-				continue // expected while the peer is down; retry next tick
-			}
-		}
-		if !d.Store.IsMember(info.ID, time.Now()) {
-			ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
-			if err := d.Auth.Authenticate(ctx, info.ID); err != nil {
-				log.Printf("auth with %s failed: %v", info.ID, err)
-			}
-			cancel()
+	infos := groupedBootstrap(d.Config.Bootstrap)
+	// Give peers skipped by the concurrency limit the first slots next tick.
+	d.teleMu.Lock()
+	sort.SliceStable(infos, func(i, j int) bool { return d.lastDial[infos[i].ID].Before(d.lastDial[infos[j].ID]) })
+	d.teleMu.Unlock()
+	for _, info := range infos {
+		if info.ID != d.Host.ID() && (!usableConnection(d.Host.Network().Connectedness(info.ID)) || !d.Store.IsMember(info.ID, time.Now())) {
+			d.startDial(info, "bootstrap")
 		}
 	}
 }
@@ -850,9 +858,14 @@ func (d *Daemon) connectBootstrap() {
 // node believes it is NAT'd and needs a relay.
 func (d *Daemon) relayCandidates(ctx context.Context, num int) <-chan peer.AddrInfo {
 	out := make(chan peer.AddrInfo, num)
+	if num == 0 {
+		close(out)
+		return out
+	}
 	go func() {
 		defer close(out)
 		seen := map[peer.ID]bool{}
+		emitted := 0
 		emit := func(ai peer.AddrInfo) bool {
 			if seen[ai.ID] || ai.ID == "" {
 				return true
@@ -860,14 +873,15 @@ func (d *Daemon) relayCandidates(ctx context.Context, num int) <-chan peer.AddrI
 			seen[ai.ID] = true
 			select {
 			case out <- ai:
-				return true
+				emitted++
+				return emitted < num
 			case <-ctx.Done():
 				return false
 			}
 		}
-		for _, addr := range d.Config.Bootstrap {
-			if info, err := peerInfo(addr); err == nil && info.ID != d.Host.ID() {
-				if !emit(*info) {
+		for _, info := range groupedBootstrap(d.Config.Bootstrap) {
+			if info.ID != d.Host.ID() {
+				if !emit(info) {
 					return
 				}
 			}
@@ -900,31 +914,15 @@ const meshFillBackoff = 2 * time.Minute
 // path wins — LAN over WAN, whichever side can dial. One connection
 // serves both directions.
 func (d *Daemon) meshFill() {
-	now := time.Now()
 	members, _ := d.Store.Snapshot()
 	for p := range members {
-		if p == d.Host.ID() || d.Host.Network().Connectedness(p) == network.Connected {
+		if p == d.Host.ID() || usableConnection(d.Host.Network().Connectedness(p)) {
 			continue
 		}
 		if len(d.Host.Peerstore().Addrs(p)) == 0 {
 			continue // no known addresses — nothing to try yet
 		}
-		d.teleMu.Lock()
-		recent := now.Sub(d.lastDial[p]) < meshFillBackoff
-		if !recent {
-			d.lastDial[p] = now
-		}
-		d.teleMu.Unlock()
-		if recent {
-			continue
-		}
-		go func(p peer.ID) {
-			ctx, cancel := context.WithTimeout(d.ctx, 15*time.Second)
-			defer cancel()
-			if err := d.Host.Connect(ctx, peer.AddrInfo{ID: p}); err == nil {
-				log.Printf("mesh: connected to %s via gossiped addresses", p)
-			}
-		}(p)
+		d.startDial(peer.AddrInfo{ID: p, Addrs: d.Host.Peerstore().Addrs(p)}, "mesh")
 	}
 }
 

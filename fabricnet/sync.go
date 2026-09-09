@@ -70,9 +70,10 @@ type EventSync struct {
 	onApply EventApplied
 	cab     peerstore.CertifiedAddrBook
 
-	mu      sync.Mutex
-	ownRec  []byte             // this host's latest signed peer record
-	lastSeq map[peer.ID]uint64 // highest record seq accepted per peer
+	mu       sync.Mutex
+	ownRec   []byte                // this host's latest signed peer record
+	lastSeq  map[peer.ID]uint64    // highest record seq accepted per peer
+	onRecord func(peer.ID, uint64) // newly accepted address version
 
 	stop []func()
 }
@@ -371,25 +372,59 @@ func (s *EventSync) consumeRecord(data []byte, now time.Time) bool {
 	if !ok || rec.PeerID == s.h.ID() || !s.store.IsMember(rec.PeerID, now) {
 		return false
 	}
-	// Store first, decide whether to relay second. ConsumePeerRecord accepts
-	// an equal-seq record and re-arms addrRecordTTL on its addresses, and
-	// that refresh is the only thing keeping a peer's addresses alive here.
-	// Skipping it on the seq check let lastSeq — in memory, never expiring —
-	// outlive the peerstore entry, and a peer whose seq never changes (an
-	// always-on node with stable addresses re-signs nothing) could then never
-	// be re-learned: its addresses aged out mesh-wide and it went undialable
-	// while still showing as connected.
-	accepted, err := s.cab.ConsumePeerRecord(env, addrRecordTTL)
-	if err != nil || !accepted {
+	// Keep the high-water mark even after the address TTL expires. An equal
+	// version may refresh its TTL, but an older version must never resurrect
+	// endpoints withdrawn by the device.
+	s.mu.Lock()
+	if rec.Seq < s.lastSeq[rec.PeerID] {
+		s.mu.Unlock()
 		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	previous := s.cab.GetPeerRecord(rec.PeerID)
+	accepted, err := s.cab.ConsumePeerRecord(env, addrRecordTTL)
+	if err != nil || !accepted {
+		s.mu.Unlock()
+		return false
+	}
+	if previous != nil {
+		if old, err := previous.Record(); err == nil {
+			if oldRec, ok := old.(*peer.PeerRecord); ok && oldRec.Seq < rec.Seq {
+				// ConsumePeerRecord adds addresses; it does not remove those the
+				// owner withdrew. Remove only addresses from the superseded record.
+				for _, addr := range oldRec.Addrs {
+					retained := false
+					for _, current := range rec.Addrs {
+						if addr.Equal(current) {
+							retained = true
+							break
+						}
+					}
+					if !retained {
+						s.h.Peerstore().SetAddr(rec.PeerID, addr, 0)
+					}
+				}
+			}
+		}
+	}
 	if rec.Seq <= s.lastSeq[rec.PeerID] {
-		return false // refreshed, but not news — relaying it would re-push forever
+		s.mu.Unlock()
+		return false
 	}
 	s.lastSeq[rec.PeerID] = rec.Seq
+	onRecord := s.onRecord
+	s.mu.Unlock()
+	if onRecord != nil {
+		onRecord(rec.PeerID, rec.Seq)
+	}
 	return true
+}
+
+// SetOnRecord installs a callback for strictly newer, verified member address
+// records. It runs outside the sync lock; callers should return promptly.
+func (s *EventSync) SetOnRecord(f func(peer.ID, uint64)) {
+	s.mu.Lock()
+	s.onRecord = f
+	s.mu.Unlock()
 }
 
 // SeedRecords replays persisted address records into the address book —

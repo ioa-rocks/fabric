@@ -21,8 +21,8 @@ import (
 const ProtocolID = "/fabric/tun/1"
 
 const (
-	maxFrameSize = 65600 // one IP packet
-	dialTimeout  = 5 * time.Second
+	maxFrameSize  = 65600 // one IP packet
+	dialTimeout   = 5 * time.Second
 	redialBackoff = 5 * time.Second
 )
 
@@ -32,6 +32,7 @@ type link struct {
 	mu       sync.Mutex
 	s        network.Stream
 	failedAt time.Time
+	loggedAt time.Time
 }
 
 // Bridge pumps packets between a TUN device and per-peer libp2p streams.
@@ -134,20 +135,36 @@ func (b *Bridge) send(p peer.ID, pkt []byte) {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.s != nil && l.s.Conn().IsClosed() {
+		_ = l.s.Reset()
+		l.s = nil
+		l.failedAt = time.Time{}
+	}
 	if l.s == nil {
 		if time.Since(l.failedAt) < redialBackoff {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-		s, err := b.h.NewStream(ctx, p, ProtocolID)
+		started := time.Now()
+		s, err := b.h.NewStream(network.WithAllowLimitedConn(ctx, "fabric TUN"), p, ProtocolID)
 		cancel()
 		if err != nil {
 			l.failedAt = time.Now()
+			if time.Since(l.loggedAt) >= time.Minute {
+				l.loggedAt = time.Now()
+				log.Printf("tun: peer=%s candidates=%v elapsed=%s stream_error=%q", p, b.h.Peerstore().Addrs(p), time.Since(started).Round(time.Millisecond), err)
+			}
 			return
 		}
 		l.s = s
 	}
+	// A stale transport must not block the device read loop indefinitely.
+	_ = l.s.SetWriteDeadline(time.Now().Add(dialTimeout))
 	if err := wire.WriteFrame(l.s, pkt); err != nil {
+		if time.Since(l.loggedAt) >= time.Minute {
+			l.loggedAt = time.Now()
+			log.Printf("tun: peer=%s path=%s write_error=%q", p, l.s.Conn().RemoteMultiaddr(), err)
+		}
 		_ = l.s.Reset()
 		l.s = nil
 		l.failedAt = time.Now()
