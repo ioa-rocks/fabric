@@ -45,6 +45,9 @@ type BucketInfo struct {
 	Sub     string `json:"sub,omitempty"` // this device's subscription mode
 	Objects int    `json:"objects"`       // live objects in the index
 	Held    int    `json:"held"`          // whose blobs this device holds
+
+	Conflicts     int `json:"conflicts,omitempty"`      // rendered conflict copies (ADR 0001 §3)
+	HeldDeletions int `json:"held_deletions,omitempty"` // parked deletions awaiting a decision (§4)
 }
 
 // ObjectInfo is the wire form of an object — the API view over the CRDT
@@ -178,6 +181,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/buckets/{bucket}/rm", d.handleRm)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/project", d.handleProject)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/sub", d.handleSub)
+	d.treeRoutes(mux)
 	mux.HandleFunc("GET /v0/mounts", d.handleMounts)
 	mux.HandleFunc("POST /v0/mounts", d.handleAddMount)
 	mux.HandleFunc("POST /v0/mounts/remove", d.handleRemoveMount)
@@ -345,6 +349,12 @@ func (d *Daemon) handleBuckets(w http.ResponseWriter, _ *http.Request) {
 		info := BucketInfo{ID: id, Name: b.Genesis.Name, Sub: d.Circle.Subscription(id)}
 		if h, err := d.handle(id); err == nil {
 			info.Objects, info.Held, _ = h.Stats()
+			if cs, err := h.Conflicts(); err == nil {
+				info.Conflicts = len(cs)
+			}
+			if set, err := h.Held(); err == nil {
+				info.HeldDeletions = len(set)
+			}
 		}
 		out = append(out, info)
 	}

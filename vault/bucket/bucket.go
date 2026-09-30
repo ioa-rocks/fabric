@@ -25,33 +25,106 @@ const nonceSize = 16
 // free (Name here is the birth name; the current display name lives in
 // policy/metadata land).
 type Genesis struct {
-	Owner     string `cbor:"owner"` // circle owner's user key, did:key
-	Name      string `cbor:"name"`  // birth name; not the identity
-	Nonce     []byte `cbor:"nonce"`
-	CreatedAt int64  `cbor:"created_at"` // unix seconds
+	Owner     string `cbor:"owner" json:"owner"` // circle owner's user key, did:key
+	Name      string `cbor:"name" json:"name"`   // birth name; not the identity
+	Nonce     []byte `cbor:"nonce" json:"nonce"`
+	CreatedAt int64  `cbor:"created_at" json:"created_at"` // unix seconds
 }
 
 // Bucket is a genesis plus the owner's signature over its deterministic
 // encoding.
 type Bucket struct {
-	Genesis Genesis `cbor:"genesis"`
-	Sig     []byte  `cbor:"sig"`
+	Genesis Genesis `cbor:"genesis" json:"genesis"`
+	Sig     []byte  `cbor:"sig" json:"sig"`
 }
 
 // Policy is the v2 slice of the bucket policy axes (memo §4). It is owned
 // and signed by the circle owner; Version orders revisions until the signed
 // event lifecycle lands with sync.
 type Policy struct {
-	Bucket    string `cbor:"bucket"`     // bucket ID this policy governs
-	Version   int64  `cbor:"version"`    // monotonic; higher wins
-	Copies    int    `cbor:"copies"`     // health target: want >= N complete copies
-	TrashDays int    `cbor:"trash_days"` // retention window for tombstoned objects
+	Bucket    string `cbor:"bucket" json:"bucket"`         // bucket ID this policy governs
+	Version   int64  `cbor:"version" json:"version"`       // monotonic; higher wins
+	Copies    int    `cbor:"copies" json:"copies"`         // health target: want >= N complete copies
+	TrashDays int    `cbor:"trash_days" json:"trash_days"` // retention window for tombstoned objects
+
+	// Sync axes (vault ADR 0001 §5): what a tree surface synchronizes is
+	// bucket state, signed like the rest, never a per-device setting.
+	// Zero values read as the defaults below, so policies signed before
+	// these fields existed keep their bytes and their meaning.
+	Ignore      []string `cbor:"ignore,omitempty" json:"ignore"`             // gitignore-style patterns
+	Symlinks    string   `cbor:"symlinks,omitempty" json:"symlinks"`         // SymlinksRecord | SymlinksIgnore
+	NestedRepos string   `cbor:"nested_repos,omitempty" json:"nested_repos"` // NestedReposExclude | NestedReposSync
+	// A change set that tombstones at least HoldMinCount live objects *and*
+	// at least HoldMinPercent of the bucket is held for confirmation instead
+	// of merged (§4). -1 disables the hold.
+	HoldMinCount   int `cbor:"hold_min_count,omitempty" json:"hold_min_count"`
+	HoldMinPercent int `cbor:"hold_min_percent,omitempty" json:"hold_min_percent"`
+}
+
+const (
+	SymlinksRecord     = "record"  // store as link records, never follow (default)
+	SymlinksIgnore     = "ignore"  // skip on scan
+	NestedReposExclude = "exclude" // a directory holding .git is a boundary (default)
+	NestedReposSync    = "sync"
+
+	DefaultHoldMinCount   = 20
+	DefaultHoldMinPercent = 5
+)
+
+// SymlinkMode returns the symlink axis with its default applied.
+func (p Policy) SymlinkMode() string {
+	if p.Symlinks == "" {
+		return SymlinksRecord
+	}
+	return p.Symlinks
+}
+
+// NestedRepoMode returns the nested-repository axis with its default applied.
+func (p Policy) NestedRepoMode() string {
+	if p.NestedRepos == "" {
+		return NestedReposExclude
+	}
+	return p.NestedRepos
+}
+
+// Hold returns the bulk-deletion thresholds with defaults applied, and
+// whether the hold is enabled at all.
+func (p Policy) Hold() (minCount, minPercent int, enabled bool) {
+	if p.HoldMinCount < 0 {
+		return 0, 0, false
+	}
+	minCount, minPercent = p.HoldMinCount, p.HoldMinPercent
+	if minCount == 0 {
+		minCount = DefaultHoldMinCount
+	}
+	if minPercent == 0 {
+		minPercent = DefaultHoldMinPercent
+	}
+	return minCount, minPercent, true
+}
+
+// Validate rejects axis values the code does not know.
+func (p Policy) Validate() error {
+	switch p.Symlinks {
+	case "", SymlinksRecord, SymlinksIgnore:
+	default:
+		return fmt.Errorf("unknown symlinks mode %q", p.Symlinks)
+	}
+	switch p.NestedRepos {
+	case "", NestedReposExclude, NestedReposSync:
+	default:
+		return fmt.Errorf("unknown nested_repos mode %q", p.NestedRepos)
+	}
+	if p.HoldMinPercent < 0 || p.HoldMinPercent > 100 {
+		return fmt.Errorf("hold_min_percent %d out of range", p.HoldMinPercent)
+	}
+	return nil
 }
 
 // SignedPolicy is a policy plus the owner's signature.
 type SignedPolicy struct {
-	Policy Policy `cbor:"policy"`
-	Sig    []byte `cbor:"sig"`
+	Policy Policy `cbor:"policy" json:"policy"`
+	Sig    []byte `cbor:"sig" json:"sig"`
 }
 
 // Deterministic encoding (RFC 8949 core), same discipline as fabric certs:
@@ -147,6 +220,9 @@ func VerifyPolicy(sp *SignedPolicy, b *Bucket) error {
 	}
 	if sp.Policy.Bucket != id {
 		return errors.New("policy is for a different bucket")
+	}
+	if err := sp.Policy.Validate(); err != nil {
+		return err
 	}
 	pub, err := cert.KeyForDID(b.Genesis.Owner)
 	if err != nil {

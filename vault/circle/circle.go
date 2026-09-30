@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"ioa.rocks/fabric/cert"
@@ -315,6 +316,56 @@ func (c *Circle) AdoptBucket(genesisRaw, policyRaw []byte) (*Handle, error) {
 	return c.OpenBucket(id)
 }
 
+// UpdatePolicy installs a newer owner-signed policy revision for an open
+// bucket (ADR 0001 §5): verified against the genesis, accepted only when
+// its Version exceeds the installed one. Returns whether it was installed.
+func (h *Handle) UpdatePolicy(policyRaw []byte) (bool, error) {
+	sp, err := bucket.UnmarshalPolicy(policyRaw)
+	if err != nil {
+		return false, err
+	}
+	if err := bucket.VerifyPolicy(sp, h.Bucket); err != nil {
+		return false, err
+	}
+	h.policyMu.Lock()
+	defer h.policyMu.Unlock()
+	if h.Policy != nil && sp.Policy.Version <= h.Policy.Policy.Version {
+		return false, nil
+	}
+	if err := os.WriteFile(filepath.Join(h.circle.bucketDir(h.id), "policy.cbor"), policyRaw, 0o600); err != nil {
+		return false, err
+	}
+	h.Policy = sp
+	return true, nil
+}
+
+// CurrentPolicy returns the installed policy (defaults when none is stored).
+func (h *Handle) CurrentPolicy() bucket.Policy {
+	h.policyMu.Lock()
+	defer h.policyMu.Unlock()
+	if h.Policy == nil {
+		return bucket.DefaultPolicy(h.id)
+	}
+	return h.Policy.Policy
+}
+
+// SignPolicyRevision signs the next policy version: the current policy
+// with fn applied and Version incremented. Signing stays where the key is.
+func SignPolicyRevision(priv ed25519.PrivateKey, current bucket.Policy, fn func(p *bucket.Policy)) ([]byte, error) {
+	next := current
+	next.Ignore = append([]string(nil), current.Ignore...)
+	fn(&next)
+	next.Version = current.Version + 1
+	if err := next.Validate(); err != nil {
+		return nil, err
+	}
+	sp, err := bucket.SignPolicy(priv, next)
+	if err != nil {
+		return nil, err
+	}
+	return sp.Marshal()
+}
+
 // BucketRaw returns a bucket's stored genesis and policy bytes verbatim —
 // what the sync exchange ships (signatures stay valid only over the exact
 // bytes).
@@ -411,8 +462,11 @@ type Handle struct {
 	Policy *bucket.SignedPolicy
 	Index  *index.Store
 
-	circle *Circle
-	id     string
+	circle        *Circle
+	id            string
+	policyMu      sync.Mutex
+	heldMu        sync.Mutex
+	recentDeletes []int64 // merge times of recent tombstones, for the bulk-hold window
 }
 
 // OpenBucket opens a bucket handle by exact ID.
@@ -602,11 +656,24 @@ func (h *Handle) Stats() (objects, held int, err error) {
 // ResolveObject finds one object by ID prefix (≥8 chars) or exact display
 // name, erroring on ambiguity.
 func (h *Handle) ResolveObject(ref string) (*index.Object, error) {
+	all, err := h.Index.ListObjects()
+	if err != nil {
+		return nil, err
+	}
+	return resolveIn(all, ref)
+}
+
+// ResolveTrashed finds one tombstoned object by ID prefix or exact name.
+func (h *Handle) ResolveTrashed(ref string) (*index.Object, error) {
+	all, err := h.Trash()
+	if err != nil {
+		return nil, err
+	}
+	return resolveIn(all, ref)
+}
+
+func resolveIn(all []*index.Object, ref string) (*index.Object, error) {
 	if len(ref) >= 8 {
-		all, err := h.Index.ListObjects()
-		if err != nil {
-			return nil, err
-		}
 		var byID []*index.Object
 		for _, o := range all {
 			if strings.HasPrefix(o.ID, ref) {
@@ -620,9 +687,11 @@ func (h *Handle) ResolveObject(ref string) (*index.Object, error) {
 			return nil, fmt.Errorf("%q matches %d object IDs", ref, len(byID))
 		}
 	}
-	named, err := h.Index.FindByName(ref)
-	if err != nil {
-		return nil, err
+	var named []*index.Object
+	for _, o := range all {
+		if o.Name.V == ref {
+			named = append(named, o)
+		}
 	}
 	switch len(named) {
 	case 0:

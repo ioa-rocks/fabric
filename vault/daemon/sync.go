@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	SyncProtocol = "/vault/sync/1"
+	SyncProtocol = "/vault/sync/2" // 2: revision heads (ADR 0001); 1 nodes do not interoperate
 	BlobProtocol = "/vault/blob/1"
 )
 
@@ -208,16 +208,25 @@ func (d *Daemon) applyState(msg *syncMsg, from peer.ID) {
 		}
 		if isNew {
 			log.Printf("sync: adopted bucket %q (%s…) from %s", h.Bucket.Genesis.Name, h.ID()[:12], from)
+		} else if updated, err := h.UpdatePolicy(sb.Policy); err != nil {
+			log.Printf("sync: rejecting policy for %q from %s: %v", h.Bucket.Genesis.Name, from, err)
+		} else if updated {
+			log.Printf("sync: bucket %q policy v%d from %s", h.Bucket.Genesis.Name, h.CurrentPolicy().Version, from)
 		}
+		records := make([]*index.Object, 0, len(sb.Objects))
 		for _, raw := range sb.Objects {
 			o, err := index.UnmarshalObject(raw)
 			if err != nil {
 				log.Printf("sync: bad object record from %s: %v", from, err)
 				continue
 			}
-			if _, err := h.Index.PutObject(o); err != nil {
-				log.Printf("sync: merging object: %v", err)
-			}
+			records = append(records, o)
+		}
+		// Bulk deletions are held for the operator, not merged (ADR 0001 §4).
+		if held, err := h.ApplyRecords(records, from.String()); err != nil {
+			log.Printf("sync: merging objects for %q: %v", h.Bucket.Genesis.Name, err)
+		} else if held > 0 {
+			log.Printf("sync: bucket %q: %d deletion(s) from %s held for confirmation (fabric vault held)", h.Bucket.Genesis.Name, held, from)
 		}
 		for _, l := range sb.Locations {
 			if err := h.Index.PutLocation(l); err != nil {

@@ -65,11 +65,24 @@ func (c *Client) get(path string, out any) error {
 }
 
 func (c *Client) post(path string, body any, out any) error {
+	return c.send(http.MethodPost, path, body, out)
+}
+
+func (c *Client) put(path string, body any, out any) error {
+	return c.send(http.MethodPut, path, body, out)
+}
+
+func (c *Client) send(method, path string, body any, out any) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	resp, err := c.http.Post("http://vault"+path, "application/json", bytes.NewReader(data))
+	req, err := http.NewRequest(method, "http://vault"+path, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("is the daemon running? %w", err)
 	}
