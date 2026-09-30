@@ -111,11 +111,12 @@ type StatusReply struct {
 	Version string `json:"version"`
 	Buckets int    `json:"buckets"`
 
-	Mesh     bool        `json:"mesh"`                // fabric node attached
-	MeshName string      `json:"mesh_name,omitempty"` // this vault node's member label
-	PeerID   string      `json:"peer_id,omitempty"`
-	Peers    []PeerInfo  `json:"peers,omitempty"`  // connected members
-	Mounts   []MountInfo `json:"mounts,omitempty"` // declared FUSE mounts
+	Mesh     bool         `json:"mesh"`                // fabric node attached
+	MeshName string       `json:"mesh_name,omitempty"` // this vault node's member label
+	PeerID   string       `json:"peer_id,omitempty"`
+	Peers    []PeerInfo   `json:"peers,omitempty"`   // connected members
+	Mounts   []MountInfo  `json:"mounts,omitempty"`  // declared FUSE mounts
+	Folders  []FolderInfo `json:"folders,omitempty"` // declared folder replicas
 }
 
 type createBucketBody struct {
@@ -182,6 +183,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/buckets/{bucket}/project", d.handleProject)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/sub", d.handleSub)
 	d.treeRoutes(mux)
+	d.folderRoutes(mux)
 	mux.HandleFunc("GET /v0/mounts", d.handleMounts)
 	mux.HandleFunc("POST /v0/mounts", d.handleAddMount)
 	mux.HandleFunc("POST /v0/mounts/remove", d.handleRemoveMount)
@@ -262,6 +264,9 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
 			}
 			s.Peers = append(s.Peers, pi)
 		}
+	}
+	if folders, err := d.folderInfos(); err == nil {
+		s.Folders = folders
 	}
 	if mounts, err := d.mountInfos(); err == nil {
 		s.Mounts = mounts

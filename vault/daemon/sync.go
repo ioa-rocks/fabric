@@ -236,6 +236,7 @@ func (d *Daemon) applyState(msg *syncMsg, from peer.ID) {
 		if d.Circle.Subscription(h.ID()) == circle.SubFull {
 			go d.fetchMissing(h)
 		}
+		d.kickFolders(h.ID())
 	}
 }
 

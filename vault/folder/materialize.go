@@ -34,6 +34,12 @@ func (r *Replica) Materialize() (Report, error) {
 	for rel, e := range entries {
 		byObject[e.ObjectID] = append(byObject[e.ObjectID], rel)
 	}
+	// Objects whose deletion is parked stay as the operator left them until
+	// accept or reject decides (ADR 0001 §4).
+	held, err := r.Handle.Held()
+	if err != nil {
+		return rep, err
+	}
 	type want struct {
 		rel        string
 		objectID   string
@@ -42,6 +48,9 @@ func (r *Replica) Materialize() (Report, error) {
 	}
 	var wants []want
 	for _, o := range objs {
+		if _, parked := held[o.ID]; parked {
+			continue
+		}
 		if o.IsDeleted() {
 			// Everything the folder holds for a tombstoned object goes to the
 			// shadow store.
@@ -117,6 +126,9 @@ func (r *Replica) place(rel, objectID string, rev index.Revision, conflictOf str
 	exists := statErr == nil
 	if have && exists && !e.unchanged(si) && !si.isDir {
 		return false, nil // local change pending; Scan owns it
+	}
+	if have && !exists {
+		return false, nil // deleted locally since the last scan; Scan owns it
 	}
 	if !have && exists && !si.isDir {
 		return false, nil // a local file the scanner has not seen yet

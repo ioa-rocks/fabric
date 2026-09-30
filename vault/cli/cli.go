@@ -63,6 +63,12 @@ func Main(args []string) int {
 		err = cmdUnmount(rest)
 	case "mounts":
 		err = cmdMounts(rest)
+	case "folder":
+		err = cmdFolder(rest)
+	case "unfolder":
+		err = cmdUnfolder(rest)
+	case "folders":
+		err = cmdFolders(rest)
 	case "policy":
 		err = cmdPolicy(rest)
 	case "trash":
@@ -110,6 +116,10 @@ daemon's control socket, or open the state directly when none runs.
            it from now on, across restarts, until 'unmount'
   unmount  unmount <dir> — remove a mount declaration and release the mount
   mounts   list declared mounts and whether each is live
+  folder   folder <bucket> <dir> — keep a bucket as a real directory (the
+           daemon scans it, materializes it and serves it from now on)
+  unfolder unfolder <dir> — stop; the directory is left as it is
+  folders  folders [-rescan <dir>] — state per folder: pending, conflicts, held
   policy   policy <bucket> [set key=value ...] — show or sign a policy revision
            (copies trash_days ignore symlinks nested_repos hold_min_count hold_min_percent)
   trash    trash <bucket> — list tombstoned objects
@@ -223,6 +233,19 @@ func cmdStatus(args []string) error {
 	fmt.Printf("circle %q  %s\n", s.Name, s.Circle)
 	fmt.Printf("daemon %s, %d bucket(s)\n", s.Version, s.Buckets)
 	printStatusMounts(s.Mounts)
+	if len(s.Folders) > 0 {
+		fmt.Printf("folders:\n")
+		for _, f := range s.Folders {
+			state := "closed"
+			switch {
+			case f.Open && f.Available:
+				state = fmt.Sprintf("open  files %d  down %d  up %d  conflicts %d  held %d", f.Files, f.PendingDown, f.PendingUp, f.Conflicts, f.Held)
+			case f.Open:
+				state = "unavailable"
+			}
+			fmt.Printf("  %s  %q  %s\n", f.Dir, f.Name, state)
+		}
+	}
 	if !s.Mesh {
 		fmt.Println("mesh: not joined — 'fabric join' puts this machine on a mesh")
 		return nil

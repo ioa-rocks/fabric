@@ -56,6 +56,10 @@ type Daemon struct {
 	closed  bool                      // no new operations; handles about to close
 	wg      sync.WaitGroup            // in-flight operations
 
+	folderMu    sync.Mutex
+	liveFolders map[string]*liveFolder // directory -> open folder replica
+	folderErrs  map[string]string      // directory -> last open failure
+
 	mountMu    sync.Mutex
 	liveMounts map[string]*liveMount // mountpoint -> live mount
 	mountErrs  map[string]string     // mountpoint -> last establish failure
@@ -104,6 +108,8 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		handles:      make(map[string]*circle.Handle),
 		liveMounts:   make(map[string]*liveMount),
 		mountErrs:    make(map[string]string),
+		liveFolders:  make(map[string]*liveFolder),
+		folderErrs:   make(map[string]string),
 		syncKick:     make(chan struct{}, 1),
 		syncDone:     make(chan struct{}),
 		syncInterval: SyncInterval,
@@ -152,6 +158,8 @@ func (d *Daemon) Run() error {
 	} else {
 		close(mountsDone)
 	}
+	foldersDone := make(chan struct{})
+	go func() { defer close(foldersDone); d.folderLoop() }()
 
 	<-d.ctx.Done()
 	// Shutdown order matters: release mounts first while the control
@@ -161,6 +169,8 @@ func (d *Daemon) Run() error {
 	// stores. Stream handlers arriving after this no-op via begin().
 	<-mountsDone
 	d.teardownMounts()
+	<-foldersDone
+	d.teardownFolders()
 	stopControl()
 	<-d.syncDone
 	d.mu.Lock()
