@@ -21,8 +21,8 @@ import (
 	"strings"
 	"time"
 
-	"ioa.rocks/fabric/vault/circle"
 	"ioa.rocks/fabric/vault/index"
+	"ioa.rocks/fabric/vault/store"
 )
 
 // SocketPath is the daemon's control endpoint for a state dir. Unix socket
@@ -164,7 +164,7 @@ type mountDirBody struct {
 }
 
 func (d *Daemon) serveControl() (func(), error) {
-	sock := SocketPath(d.Circle.Path)
+	sock := SocketPath(d.Store.Path)
 	_ = os.Remove(sock) // stale socket from an unclean shutdown
 	l, err := net.Listen("unix", sock)
 	if err != nil {
@@ -236,14 +236,14 @@ func httpErr(w http.ResponseWriter, err error) {
 }
 
 func (d *Daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
-	buckets, err := d.Circle.Buckets()
+	buckets, err := d.Store.Buckets()
 	if err != nil {
 		httpErr(w, err)
 		return
 	}
 	s := StatusReply{
-		Circle:  d.Circle.Config.DID,
-		Name:    d.Circle.Config.Name,
+		Circle:  d.Store.Circle.Config.DID,
+		Name:    d.Store.Circle.Config.Name,
 		Version: Version,
 		Buckets: len(buckets),
 		Mesh:    d.Fabric != nil,
@@ -303,25 +303,25 @@ func (d *Daemon) handleAddMount(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, fmt.Errorf("mount: this daemon has no mounter wired"))
 		return
 	}
-	id, err := d.Circle.ResolveBucketID(body.Bucket)
+	id, err := d.Store.ResolveBucketID(body.Bucket)
 	if err != nil {
 		httpErr(w, err)
 		return
 	}
-	decl := circle.MountDecl{Bucket: id, Write: body.Write}
+	decl := store.MountDecl{Bucket: id, Write: body.Write}
 	// Redeclaring a directory replaces its mount; release the old one first.
 	if err := d.releaseMount(body.Dir); err != nil {
 		httpErr(w, err)
 		return
 	}
-	if err := d.Circle.SetMount(body.Dir, decl); err != nil {
+	if err := d.Store.SetMount(body.Dir, decl); err != nil {
 		httpErr(w, err)
 		return
 	}
 	if err := d.establishMount(body.Dir, decl); err != nil {
 		// The first attempt fails loudly and withdraws the declaration —
 		// the retry loop must not keep hammering a mistyped directory.
-		_ = d.Circle.RemoveMount(body.Dir)
+		_ = d.Store.RemoveMount(body.Dir)
 		httpErr(w, err)
 		return
 	}
@@ -334,7 +334,7 @@ func (d *Daemon) handleRemoveMount(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
-	if err := d.Circle.RemoveMount(body.Dir); err != nil {
+	if err := d.Store.RemoveMount(body.Dir); err != nil {
 		httpErr(w, err)
 		return
 	}
@@ -346,20 +346,20 @@ func (d *Daemon) handleRemoveMount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Daemon) handleBuckets(w http.ResponseWriter, _ *http.Request) {
-	buckets, err := d.Circle.Buckets()
+	buckets, err := d.Store.Buckets()
 	if err != nil {
 		httpErr(w, err)
 		return
 	}
-	folders, _ := d.Circle.Folders()
-	mounts, _ := d.Circle.Mounts()
+	folders, _ := d.Store.Folders()
+	mounts, _ := d.Store.Mounts()
 	out := []BucketInfo{}
 	for _, b := range buckets {
 		id, err := b.ID()
 		if err != nil {
 			continue
 		}
-		info := BucketInfo{ID: id, Name: b.Genesis.Name, Sub: d.Circle.Subscription(id)}
+		info := BucketInfo{ID: id, Name: b.Genesis.Name, Sub: d.Store.Subscription(id)}
 		for dir, f := range folders {
 			if f.Bucket == id {
 				info.Folder = dir
@@ -393,18 +393,18 @@ func (d *Daemon) handleSub(w http.ResponseWriter, r *http.Request) {
 	}
 	mode := body.Mode
 	if mode == "none" {
-		mode = circle.SubNone
+		mode = store.SubNone
 	}
-	id, err := d.Circle.ResolveBucketID(r.PathValue("bucket"))
+	id, err := d.Store.ResolveBucketID(r.PathValue("bucket"))
 	if err != nil {
 		httpErr(w, err)
 		return
 	}
-	if err := d.Circle.SetSubscription(id, mode); err != nil {
+	if err := d.Store.SetSubscription(id, mode); err != nil {
 		httpErr(w, err)
 		return
 	}
-	if mode == circle.SubFull {
+	if mode == store.SubFull {
 		if h, err := d.handle(id); err == nil {
 			go d.fetchMissing(h) // start honoring the commitment now
 		}
@@ -436,9 +436,9 @@ func (d *Daemon) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
 	// The creating device subscribes full by default — it is about to hold
 	// the data it puts (memo §6's "offer the circle's defaults" UX, reduced
 	// to the one sane default we have).
-	_ = d.Circle.SetSubscription(h.ID(), circle.SubFull)
+	_ = d.Store.SetSubscription(h.ID(), store.SubFull)
 	d.kickSync()
-	writeJSON(w, BucketInfo{ID: h.ID(), Name: h.Bucket.Genesis.Name, Sub: circle.SubFull})
+	writeJSON(w, BucketInfo{ID: h.ID(), Name: h.Bucket.Genesis.Name, Sub: store.SubFull})
 }
 
 func splitTags(s string) []string {

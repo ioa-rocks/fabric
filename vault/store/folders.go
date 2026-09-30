@@ -1,4 +1,4 @@
-package circle
+package store
 
 import (
 	"encoding/json"
@@ -15,17 +15,17 @@ type FolderDecl struct {
 	Bucket string `json:"bucket"` // bucket ID
 }
 
-func (c *Circle) foldersPath() string { return filepath.Join(c.Path, "folders.json") }
+func (c *Store) foldersPath() string { return filepath.Join(c.Path, "folders.json") }
 
 // FolderStateDir is where a folder replica keeps its scan database and
 // shadow store: <state>/folders/<bucket-id>.
-func (c *Circle) FolderStateDir(bucketID string) string {
+func (c *Store) FolderStateDir(bucketID string) string {
 	return filepath.Join(c.Path, "folders", bucketID)
 }
 
 // Folders returns directory → declaration. One bucket may be declared at
 // one directory per device.
-func (c *Circle) Folders() (map[string]FolderDecl, error) {
+func (c *Store) Folders() (map[string]FolderDecl, error) {
 	raw, err := os.ReadFile(c.foldersPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return map[string]FolderDecl{}, nil
@@ -41,7 +41,7 @@ func (c *Circle) Folders() (map[string]FolderDecl, error) {
 }
 
 // SetFolder declares a folder replica at dir.
-func (c *Circle) SetFolder(dir string, f FolderDecl) error {
+func (c *Store) SetFolder(dir string, f FolderDecl) error {
 	if !filepath.IsAbs(dir) {
 		return fmt.Errorf("folder must be an absolute path")
 	}
@@ -59,7 +59,7 @@ func (c *Circle) SetFolder(dir string, f FolderDecl) error {
 }
 
 // RemoveFolder drops the declaration for dir; the directory is left as is.
-func (c *Circle) RemoveFolder(dir string) error {
+func (c *Store) RemoveFolder(dir string) error {
 	folders, err := c.Folders()
 	if err != nil {
 		return err
@@ -71,7 +71,7 @@ func (c *Circle) RemoveFolder(dir string) error {
 	return c.writeFolders(folders)
 }
 
-func (c *Circle) writeFolders(folders map[string]FolderDecl) error {
+func (c *Store) writeFolders(folders map[string]FolderDecl) error {
 	raw, err := json.MarshalIndent(folders, "", "  ")
 	if err != nil {
 		return err

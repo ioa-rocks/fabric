@@ -1,4 +1,4 @@
-package circle
+package store
 
 import (
 	"io"
@@ -6,23 +6,34 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"ioa.rocks/fabric/circle"
 )
 
 const pass = "test-passphrase"
 
+// initStore mints a circle under dir and opens a store beside it.
+func initStore(dir, name, pass string) (*Store, error) {
+	c, err := circle.Init(filepath.Join(dir, "circle"), name, pass)
+	if err != nil {
+		return nil, err
+	}
+	return Open(dir, c)
+}
+
 func TestCircleLifecycle(t *testing.T) {
 	dir := t.TempDir()
-	c, err := Init(dir, "alex", pass)
+	c, err := initStore(dir, "alex", pass)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Config.DID == "" || !strings.HasPrefix(c.Config.DID, "did:key:") {
-		t.Fatalf("bad DID: %q", c.Config.DID)
+	if c.Circle.Config.DID == "" || !strings.HasPrefix(c.Circle.Config.DID, "did:key:") {
+		t.Fatalf("bad DID: %q", c.Circle.Config.DID)
 	}
-	if _, err := Init(dir, "alex", pass); err == nil {
+	if _, err := initStore(dir, "alex", pass); err == nil {
 		t.Fatal("double init unexpectedly succeeded")
 	}
-	if _, err := c.Unlock("wrong"); err == nil {
+	if _, err := c.Circle.Unlock("wrong"); err == nil {
 		t.Fatal("wrong passphrase unexpectedly unlocked the user key")
 	}
 
@@ -99,7 +110,7 @@ func TestCircleLifecycle(t *testing.T) {
 	h.Close()
 
 	// Reopen by name and by ID prefix; state persists.
-	c2, err := Open(dir)
+	c2, err := Open(dir, c.Circle)
 	if err != nil {
 		t.Fatal(err)
 	}

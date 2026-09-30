@@ -16,7 +16,7 @@ import (
 
 	"ioa.rocks/fabric/vault/blobstore"
 	"ioa.rocks/fabric/vault/bucket"
-	"ioa.rocks/fabric/vault/circle"
+	"ioa.rocks/fabric/vault/store"
 )
 
 // Marker is the file inside a folder that names its bucket. A scan that
@@ -51,7 +51,7 @@ type Fetcher func(hash string) error
 // Replica is one bucket placed as a directory.
 type Replica struct {
 	Dir    string
-	Handle *circle.Handle
+	Handle *store.Handle
 	Fetch  Fetcher
 	// Log receives one-line notes about held and skipped work; nil discards.
 	Log func(format string, args ...any)
@@ -71,7 +71,7 @@ type Replica struct {
 // directory is created if absent and the marker written if the directory
 // is empty; a directory that has content but no marker is adopted (that is
 // how a Syncthing folder migrates) and the marker is added.
-func Open(dir, stateDir string, h *circle.Handle) (*Replica, error) {
+func Open(dir, stateDir string, h *store.Handle) (*Replica, error) {
 	if !filepath.IsAbs(dir) {
 		return nil, fmt.Errorf("folder must be an absolute path")
 	}

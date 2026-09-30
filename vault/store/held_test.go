@@ -1,4 +1,4 @@
-package circle
+package store
 
 import (
 	"fmt"
@@ -13,7 +13,7 @@ import (
 // merged; a small deletion merges as usual; reject restores everywhere and
 // accept applies (vault ADR 0001 §4).
 func TestBulkDeletionIsHeld(t *testing.T) {
-	c, err := Init(t.TempDir(), "alex", pass)
+	c, err := initStore(t.TempDir(), "alex", pass)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestBulkDeletionIsHeld(t *testing.T) {
 	// Trickle: one tombstone per exchange still adds up to a hold once the
 	// window holds enough of them.
 	h.recentDeletes = nil
-	c2, _ := Init(t.TempDir(), "alex", pass)
+	c2, _ := initStore(t.TempDir(), "alex", pass)
 	c2.NodeID = "dev:local"
 	h2, _ := c2.CreateBucket("trickle", pass)
 	var tobjs []*index.Object
@@ -148,7 +148,7 @@ func TestBulkDeletionIsHeld(t *testing.T) {
 	}
 
 	// Policy can disable the hold.
-	priv, _ := c.Unlock(pass)
+	priv, _ := c.Circle.Unlock(pass)
 	raw, err := SignPolicyRevision(priv, h.CurrentPolicy(), func(p *bucket.Policy) { p.HoldMinCount = -1 })
 	if err != nil {
 		t.Fatal(err)

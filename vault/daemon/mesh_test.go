@@ -10,7 +10,6 @@ import (
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/event"
 	fabricstate "ioa.rocks/fabric/state"
-	"ioa.rocks/fabric/vault/circle"
 	"ioa.rocks/fabric/vault/daemon"
 )
 
@@ -27,9 +26,7 @@ type meshNode struct {
 func newMeshNode(t *testing.T, root ed25519.PrivateKey, circleName, memberName string) *meshNode {
 	t.Helper()
 	statePath := t.TempDir()
-	if _, err := circle.Init(statePath, circleName, "pw"); err != nil {
-		t.Fatalf("circle.Init: %v", err)
-	}
+	initCircle(t, statePath, circleName)
 	dir, err := fabricstate.Open(filepath.Join(statePath, "fabric"))
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)

@@ -698,7 +698,7 @@ func (h *fileHandle) preserveLocked() {
 		}
 	}
 	log.Printf("vault mount: %q was NOT stored in bucket %s; its content is kept at %s", name, h.node.m.bucket, kept)
-	log.Printf("vault mount: recover it with: fabric vault put %s %s", h.node.m.bucket, kept)
+	log.Printf("vault mount: recover it with: fabric bucket put %s %s", h.node.m.bucket, kept)
 }
 
 // reserveUnpublished claims a free path for rescued content, creating it

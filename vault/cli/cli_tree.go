@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/vault/bucket"
-	"ioa.rocks/fabric/vault/circle"
+	"ioa.rocks/fabric/vault/store"
 )
 
 // Commands for vault ADR 0001: policy, trash/restore, conflicts/resolve,
@@ -16,12 +16,12 @@ import (
 
 func cmdPolicy(args []string) error {
 	fs := flag.NewFlagSet("policy", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	pth := pathFlags(fs)
 	pos := parse(fs, args, 2)
 	if len(pos) < 1 {
-		return fmt.Errorf("usage: fabric vault policy <bucket> [set key=value ...]")
+		return fmt.Errorf("usage: fabric bucket policy <bucket> [set key=value ...]")
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
@@ -35,14 +35,14 @@ func cmdPolicy(args []string) error {
 		return nil
 	}
 	if pos[1] != "set" || len(pos) < 3 {
-		return fmt.Errorf("usage: fabric vault policy <bucket> set key=value ... (keys: copies trash_days ignore symlinks nested_repos hold_min_count hold_min_percent)")
+		return fmt.Errorf("usage: fabric bucket policy <bucket> set key=value ... (keys: copies trash_days ignore symlinks nested_repos hold_min_count hold_min_percent)")
 	}
 	// Signing happens here, where the passphrase prompt is.
-	c, err := circle.Open(*statePath)
+	c, err := pth.openCircle()
 	if err != nil {
 		return err
 	}
-	pass, err := passphrase()
+	pass, err := Passphrase()
 	if err != nil {
 		return err
 	}
@@ -51,7 +51,7 @@ func cmdPolicy(args []string) error {
 		return err
 	}
 	var applyErr error
-	raw, err := circle.SignPolicyRevision(priv, p, func(np *bucket.Policy) {
+	raw, err := store.SignPolicyRevision(priv, p, func(np *bucket.Policy) {
 		for _, kv := range pos[2:] {
 			k, v, ok := strings.Cut(kv, "=")
 			if !ok {
@@ -127,12 +127,12 @@ func printPolicy(p bucket.Policy) {
 
 func cmdTrash(args []string) error {
 	fs := flag.NewFlagSet("trash", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	pth := pathFlags(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: fabric vault trash <bucket>")
+		return fmt.Errorf("usage: fabric bucket trash <bucket>")
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
@@ -153,12 +153,12 @@ func cmdTrash(args []string) error {
 
 func cmdRestore(args []string) error {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	pth := pathFlags(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: fabric vault restore <bucket> <object-ref>")
+		return fmt.Errorf("usage: fabric bucket restore <bucket> <object-ref>")
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
@@ -173,12 +173,12 @@ func cmdRestore(args []string) error {
 
 func cmdConflicts(args []string) error {
 	fs := flag.NewFlagSet("conflicts", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	pth := pathFlags(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: fabric vault conflicts <bucket>")
+		return fmt.Errorf("usage: fabric bucket conflicts <bucket>")
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
@@ -196,18 +196,18 @@ func cmdConflicts(args []string) error {
 			c.Object.ID[:12], c.Object.Name, c.Object.Blob, c.Object.Size, time.Unix(0, c.Object.Modified).Format(time.RFC3339),
 			c.Copy.Name, c.Copy.Blob, c.Copy.Size, c.Copy.By)
 	}
-	fmt.Println("resolve in favor of the kept version: fabric vault resolve <bucket> <object-ref>")
+	fmt.Println("resolve in favor of the kept version: fabric bucket resolve <bucket> <object-ref>")
 	return nil
 }
 
 func cmdResolve(args []string) error {
 	fs := flag.NewFlagSet("resolve", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	pth := pathFlags(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: fabric vault resolve <bucket> <object-ref>")
+		return fmt.Errorf("usage: fabric bucket resolve <bucket> <object-ref>")
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
@@ -222,12 +222,12 @@ func cmdResolve(args []string) error {
 
 func cmdHeld(args []string) error {
 	fs := flag.NewFlagSet("held", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	pth := pathFlags(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) < 1 || len(pos) > 2 {
-		return fmt.Errorf("usage: fabric vault held <bucket> [accept|reject]")
+		return fmt.Errorf("usage: fabric bucket held <bucket> [accept|reject]")
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
@@ -246,7 +246,7 @@ func cmdHeld(args []string) error {
 				fmt.Printf("rejected: %d object(s) kept; the deleting device converges on the restore\n", n)
 			}
 		default:
-			err = fmt.Errorf("usage: fabric vault held <bucket> [accept|reject]")
+			err = fmt.Errorf("usage: fabric bucket held <bucket> [accept|reject]")
 		}
 		return err
 	}
@@ -261,6 +261,6 @@ func cmdHeld(args []string) error {
 	for _, e := range list {
 		fmt.Printf("%s  %s  from %s  since %s\n", e.ID[:12], e.Name, e.From, time.Unix(0, e.FirstSeen).Format(time.RFC3339))
 	}
-	fmt.Printf("%d deletion(s) held — fabric vault held <bucket> accept|reject\n", len(list))
+	fmt.Printf("%d deletion(s) held — fabric bucket held <bucket> accept|reject\n", len(list))
 	return nil
 }

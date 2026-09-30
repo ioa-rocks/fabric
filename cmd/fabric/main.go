@@ -1,5 +1,6 @@
 // fabric is the node CLI: init a namespace (master), join an existing one,
-// run the daemon, and drive the admission queue.
+// run the daemon, drive the admission queue, and own the circle and
+// buckets that ride the node (one noun per command group, each once).
 package main
 
 import (
@@ -9,6 +10,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -23,15 +25,16 @@ import (
 	astralcli "ioa.rocks/fabric/astral/cli"
 	astraldaemon "ioa.rocks/fabric/astral/daemon"
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
 	"ioa.rocks/fabric/tunbridge"
-	"ioa.rocks/fabric/vault/circle"
 	vaultcli "ioa.rocks/fabric/vault/cli"
 	vaultdaemon "ioa.rocks/fabric/vault/daemon"
 	vaultfusefs "ioa.rocks/fabric/vault/fusefs"
+	vaultstore "ioa.rocks/fabric/vault/store"
 	"ioa.rocks/fabric/webui"
 
 	"github.com/libp2p/go-libp2p"
@@ -72,7 +75,7 @@ func parseListen(s string) ([]string, error) {
 
 func main() {
 	// Busybox-style dispatch (ADR 0013, one binary): a "vault" symlink to
-	// this binary is the data CLI.
+	// this binary is the bucket CLI.
 	if filepath.Base(os.Args[0]) == "vault" {
 		os.Exit(vaultcli.Main(os.Args[1:]))
 	}
@@ -81,8 +84,12 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
-	if cmd == "vault" {
+	if cmd == "bucket" {
 		os.Exit(vaultcli.Main(args))
+	}
+	if cmd == "vault" {
+		fmt.Fprintln(os.Stderr, "fabric: the vault command group is gone — the circle is 'fabric circle', its buckets are 'fabric bucket' (init → circle init, buckets → bucket list, sub/folder → bucket place)")
+		os.Exit(2)
 	}
 	if cmd == "astral" {
 		os.Exit(astralcli.Main(args))
@@ -121,6 +128,8 @@ func main() {
 		err = cmdPeer(args)
 	case "announce":
 		err = cmdAnnounce(args)
+	case "circle":
+		err = cmdCircle(args)
 	default:
 		fmt.Fprintf(os.Stderr, "fabric: unknown command %q\n\n", cmd)
 		usage()
@@ -157,8 +166,13 @@ func usage() {
            transports, and resolved IPs are derived automatically;
            announce txt — print the DNS TXT record for hostname joins
   deploy   deploy this x86-64 binary to ~/.local/bin on one or more SSH hosts
-  vault    the data surface ('fabric vault -h'); a "vault" symlink to this
-           binary works too — no separate install needed
+  circle   circle init -name <label> — mint this node's circle (the owner's
+           user key: what buckets and, next, subjects belong to)
+           circle export <file> / circle join <file> — a second device of
+           the same owner; circle status — circle, buckets served, peers
+  bucket   buckets of the circle ('fabric bucket -h'): create, list, place
+           (full|cache|none|folder <dir>), mount, put/ls/get/rm, policy…;
+           a "vault" symlink to this binary is the same group
   astral   hosted pub/sub subjects ('fabric astral -h'): publish, claim,
            registers — cast/claim/ack over the mesh
 
@@ -286,7 +300,7 @@ func cmdUp(args []string) error {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
 	statePath := stateFlag(fs)
 	noTun := fs.Bool("no-tun", false, "run without the TUN bridge for this run")
-	vaultState := fs.String("vault-state", circle.DefaultPath(), "vault state directory (subsystem activates when a circle exists there)")
+	vaultState := fs.String("vault-state", vaultstore.DefaultPath(), "vault store directory (buckets are served when the node has a circle)")
 	noVault := fs.Bool("no-vault", false, "run without the vault subsystem for this run")
 	astralState := fs.String("astral-state", astraldaemon.DefaultPath(), "astral state directory (the coordination plane; always on)")
 	noAstral := fs.Bool("no-astral", false, "run without the astral subsystem for this run")
@@ -302,13 +316,29 @@ func cmdUp(args []string) error {
 	}
 	d.DisableTUN = *noTun
 
-	// The vault subsystem (ADR 0013): activated only when circle state
-	// exists — a pure-connectivity node never touches it. Attach before
+	// The vault subsystem (ADR 0013): activated only when the node has a
+	// circle — a pure-connectivity node never touches it. Attach before
 	// d.Run so handlers and the auth hook are in place for the first peer.
+	// A pre-hoist circle still living in the store directory is adopted
+	// into the node's state first (ADR 0017: the circle is fabric's).
 	var vd *vaultdaemon.Daemon
 	if !*noVault {
-		if _, err := os.Stat(filepath.Join(*vaultState, "config.json")); err == nil {
-			vd, err = vaultdaemon.New(*vaultState, d)
+		circleDir := circle.Dir(*statePath)
+		if did, err := circle.Migrate(circleDir, *vaultState); err != nil {
+			return fmt.Errorf("adopting the circle from %s: %w", *vaultState, err)
+		} else if did {
+			log.Printf("circle adopted from %s into %s (the old copy is left in place, unused)", *vaultState, circleDir)
+		}
+		if circle.Exists(circleDir) {
+			c, err := circle.Open(circleDir)
+			if err != nil {
+				return fmt.Errorf("vault subsystem: %w", err)
+			}
+			st, err := vaultstore.Open(*vaultState, c)
+			if err != nil {
+				return fmt.Errorf("vault subsystem: %w", err)
+			}
+			vd, err = vaultdaemon.New(st, d)
 			if err != nil {
 				return fmt.Errorf("vault subsystem: %w", err)
 			}
@@ -1042,7 +1072,7 @@ func cmdUI(args []string) error {
 	fs := flag.NewFlagSet("ui", flag.ExitOnError)
 	statePath := stateFlag(fs)
 	listen := fs.String("listen", "127.0.0.1:4518", "listen address; keep it on localhost — the UI has no auth of its own")
-	vaultState := fs.String("vault-state", circle.DefaultPath(), "vault state directory (vault card lights up when its daemon runs)")
+	vaultState := fs.String("vault-state", vaultstore.DefaultPath(), "vault store directory (vault card lights up when its daemon runs)")
 	astralState := fs.String("astral-state", astraldaemon.DefaultPath(), "astral state directory (coordination card lights up when its daemon runs)")
 	fs.Parse(args)
 

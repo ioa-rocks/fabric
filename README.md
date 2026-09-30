@@ -507,9 +507,10 @@ fabric astral claim subject:queues/agents/concierge/inbox -consumer concierge -w
 fabric astral status
 ```
 
-`subject:` is currently implementation vocabulary. The intended resource UX
-is `fabric bucket|queue|service`; exposing top-level `fabric queue` first
-requires renaming the existing admission `queue on|off` command.
+`subject:` is currently implementation vocabulary. The resource UX is
+`fabric bucket|queue|service`, one noun each (fabric ADR 0006); buckets
+already follow it. Exposing top-level `fabric queue` first requires renaming
+the existing admission `queue on|off` command.
 
 The same operator state is visible in `fabric ui`; use `-astral-state` when
 the UI and daemon use a non-default Astral state directory.
@@ -519,7 +520,7 @@ the UI and daemon use a non-default Astral state directory.
 | Command | Where | What |
 |---|---|---|
 | `fabric init -name <label>` | first device | mint the namespace, become master |
-| `fabric up` | any member | run the node daemon (activates the vault subsystem when circle state exists; `-no-vault` / `-vault-state <dir>`) |
+| `fabric up` | any member | run the node daemon (serves buckets when the node has a circle; `-no-vault` / `-vault-state <dir>`) |
 | `fabric status` | any member | node, membership, and connection state |
 | `fabric graph [-json]` | any member | whole-mesh link map, human or machine readable |
 | `fabric join -name <label> <host \| -bootstrap <addr>>` | new device | request admission and wait; bare hostname resolves via its `_fabric` TXT record |
@@ -532,13 +533,19 @@ the UI and daemon use a non-default Astral state directory.
 | `fabric peer add <multiaddr>` | any member | add a bootstrap peer |
 | `fabric announce add <hostname\|ip\|multiaddr>` | cloud/1:1-NAT nodes | also advertise an address no local interface carries; ports, transports, and resolved IPs derived automatically |
 | `fabric announce txt` | lighthouse | print the DNS TXT record enabling hostname joins |
+| `fabric circle init -name <label>` | one device per owner | mint the circle — the owner's user key, what buckets (and next, subjects) belong to; lives in `<state>/circle` |
+| `fabric circle export <file>` / `fabric circle join <file>` | second device | carry the same circle to another device (interim until sub-key grants) |
+| `fabric circle status` | any member | circle, buckets served, mounts, folders, mesh, vault peers |
+| `fabric bucket ...` | any member | the circle's buckets: `create`, `list`, `place <b> full\|cache\|none\|folder <dir>`, `mount`, `put/ls/get/rm/…` (`fabric bucket -h`; a `vault` symlink means the same) |
 | `fabric astral ...` | any member | inspect and use the coordination plane (`fabric astral -h`) |
 
-All commands take `-state <dir>` (default `~/.config/fabric`), so
-several nodes can run on one machine for testing. Flags go **before**
-positional arguments (`fabric approve -state DIR FP`). Set
-`FABRIC_PASSPHRASE` to skip the interactive passphrase prompt (CI,
-scripts).
+All commands take `-state <dir>` (default `~/.config/fabric`; for the
+`bucket` group it is the store, default `~/.config/vault`, with
+`-circle-state` for the circle), so several nodes can run on one machine
+for testing. Flags go **before** positional arguments (`fabric approve
+-state DIR FP`; the bucket group also accepts them after). Set
+`FABRIC_PASSPHRASE` (namespace root key) and `CIRCLE_PASSPHRASE` (circle
+user key) to skip the interactive prompts (CI, scripts).
 
 ## Packages
 
@@ -580,9 +587,14 @@ scripts).
   address while the bridge is up.
 - `state` — the state directory: config, device key, own cert,
   keystore path, control socket.
-- `vault/…` — the data layer: `bucket`, `blobstore`, `index`,
-  `circle`, and the vault subsystem daemon; `fabric vault` is its data
-  CLI. See [`vault/README.md`](vault/README.md).
+- `circle` — the ownership layer (ADR 0017): the owner's user key
+  (age container, same keystore discipline as the root key), its DID,
+  and the export/join bundle. Below vault and astral; `fabric circle`
+  manages it. One circle per node today.
+- `vault/…` — the data layer: `bucket`, `blobstore`, `index`, `store`
+  (the device's store, opened against a circle), `folder`, and the
+  vault subsystem daemon; `fabric bucket` is its CLI. See
+  [`vault/README.md`](vault/README.md).
 
 ## Development
 

@@ -14,8 +14,8 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"ioa.rocks/fabric/vault/circle"
 	"ioa.rocks/fabric/vault/folder"
+	"ioa.rocks/fabric/vault/store"
 )
 
 // Tunables, variables so tests can shrink them.
@@ -49,7 +49,7 @@ type FolderInfo struct {
 
 type liveFolder struct {
 	rep      *folder.Replica
-	decl     circle.FolderDecl
+	decl     store.FolderDecl
 	watcher  *fsnotify.Watcher
 	watched  map[string]bool // directories with a live watch
 	degraded bool            // a watch could not be added; scanning periodically
@@ -77,7 +77,7 @@ func (d *Daemon) folderLoop() {
 // reconcileFolders opens every declared folder that is not open and closes
 // every open folder whose declaration is gone.
 func (d *Daemon) reconcileFolders() {
-	decls, err := d.Circle.Folders()
+	decls, err := d.Store.Folders()
 	if err != nil {
 		log.Printf("vault folders: reading declarations: %v", err)
 		return
@@ -109,12 +109,12 @@ func (d *Daemon) reconcileFolders() {
 	}
 }
 
-func (d *Daemon) openFolder(dir string, decl circle.FolderDecl) error {
+func (d *Daemon) openFolder(dir string, decl store.FolderDecl) error {
 	h, err := d.handle(decl.Bucket)
 	if err != nil {
 		return err
 	}
-	rep, err := folder.Open(dir, d.Circle.FolderStateDir(decl.Bucket), h)
+	rep, err := folder.Open(dir, d.Store.FolderStateDir(decl.Bucket), h)
 	if err != nil {
 		return err
 	}
@@ -329,12 +329,12 @@ func (d *Daemon) teardownFolders() {
 
 // folderInfos merges declarations with live state.
 func (d *Daemon) folderInfos() ([]FolderInfo, error) {
-	decls, err := d.Circle.Folders()
+	decls, err := d.Store.Folders()
 	if err != nil {
 		return nil, err
 	}
 	names := map[string]string{}
-	if buckets, err := d.Circle.Buckets(); err == nil {
+	if buckets, err := d.Store.Buckets(); err == nil {
 		for _, b := range buckets {
 			if id, err := b.ID(); err == nil {
 				names[id] = b.Genesis.Name

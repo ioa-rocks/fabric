@@ -1,5 +1,5 @@
-// Command vault is the standalone build of the vault data CLI. The same
-// commands live in the fabric binary (`fabric vault …`, or a "vault"
+// Command vault is the standalone build of the bucket CLI. The same
+// commands live in the fabric binary (`fabric bucket …`, or a "vault"
 // symlink to it) — this target exists for a data-CLI-only install.
 package main
 

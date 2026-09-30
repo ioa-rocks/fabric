@@ -1,13 +1,15 @@
-// Package circle is the ownership layer (bucket-model memo §1): a circle is
-// a user key plus policy defaults. This package owns the state directory,
-// the user key custody (age container, reusing fabric's keystore — the
-// first library-mode reuse), and the bucket handles that compose genesis +
-// policy + index + blobs into the object API.
-package circle
+// Package store is a device's vault store: the blob store, the bucket
+// records (genesis + policy + index) and the per-device placement state
+// (subscriptions, mounts, folder replicas) that sync owns. Ownership —
+// the user key and the circle's identity — lives one layer down in the
+// fabric-level circle package (ADR 0017: the circle instance is hoisted
+// out of vault so astral can consume the same one); a store is opened
+// against an opened circle and signs nothing itself. Handles compose
+// genesis + policy + index + blobs into the object API.
+package store
 
 import (
 	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,23 +21,16 @@ import (
 	"sync"
 	"time"
 
-	"ioa.rocks/fabric/cert"
-	"ioa.rocks/fabric/keystore"
+	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/vault/blobstore"
 	"ioa.rocks/fabric/vault/bucket"
 	"ioa.rocks/fabric/vault/index"
 )
 
-// Config is the circle's on-disk identity card.
-type Config struct {
-	Name string `json:"name"` // human label for the circle owner
-	DID  string `json:"did"`  // owner user key, did:key
-}
-
-// Circle is an opened state directory.
-type Circle struct {
+// Store is an opened vault state directory.
+type Store struct {
 	Path   string
-	Config Config
+	Circle *circle.Circle
 	Blobs  *blobstore.Store
 
 	// NodeID identifies this device in location records. The daemon sets
@@ -62,62 +57,25 @@ func DefaultPath() string {
 	return filepath.Join(base, "vault")
 }
 
-// Init mints a circle: generates the owner user key into an age container
-// under the state dir. The key custody model mirrors fabric's root key
-// (spec §1 discipline): unlocked per signing operation, never resident.
-func Init(path, name, passphrase string) (*Circle, error) {
-	if name == "" {
-		return nil, errors.New("circle name must not be empty")
+// Open opens (creating on first use) the store at path for circle c.
+func Open(path string, c *circle.Circle) (*Store, error) {
+	if c == nil {
+		return nil, errors.New("opening store: no circle")
 	}
 	if err := os.MkdirAll(path, 0o700); err != nil {
-		return nil, err
-	}
-	cfgPath := filepath.Join(path, "config.json")
-	if _, err := os.Stat(cfgPath); err == nil {
-		return nil, fmt.Errorf("state dir %s is already initialized", path)
-	}
-
-	seed := make([]byte, ed25519.SeedSize)
-	if _, err := rand.Read(seed); err != nil {
-		return nil, err
-	}
-	priv := ed25519.NewKeyFromSeed(seed)
-	if err := keystore.SaveSeed(keyPath(path), seed, passphrase); err != nil {
-		return nil, fmt.Errorf("saving user key: %w", err)
-	}
-
-	cfg := Config{Name: name, DID: cert.DIDForKey(priv.Public().(ed25519.PublicKey))}
-	raw, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(cfgPath, raw, 0o600); err != nil {
-		return nil, err
-	}
-	return Open(path)
-}
-
-// Open loads an initialized circle.
-func Open(path string) (*Circle, error) {
-	raw, err := os.ReadFile(filepath.Join(path, "config.json"))
-	if err != nil {
-		return nil, fmt.Errorf("opening circle (did you run 'vault init'?): %w", err)
-	}
-	var cfg Config
-	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil, err
 	}
 	blobs, err := blobstore.Open(filepath.Join(path, "blobs"))
 	if err != nil {
 		return nil, err
 	}
-	return &Circle{Path: path, Config: cfg, Blobs: blobs, NodeID: cfg.DID}, nil
+	return &Store{Path: path, Circle: c, Blobs: blobs, NodeID: c.Config.DID}, nil
 }
 
-func (c *Circle) subsPath() string { return filepath.Join(c.Path, "subs.json") }
+func (c *Store) subsPath() string { return filepath.Join(c.Path, "subs.json") }
 
 // Subscriptions returns this device's bucket-ID → mode map.
-func (c *Circle) Subscriptions() (map[string]string, error) {
+func (c *Store) Subscriptions() (map[string]string, error) {
 	raw, err := os.ReadFile(c.subsPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return map[string]string{}, nil
@@ -133,7 +91,7 @@ func (c *Circle) Subscriptions() (map[string]string, error) {
 }
 
 // Subscription returns the mode for one bucket (SubNone if absent).
-func (c *Circle) Subscription(bucketID string) string {
+func (c *Store) Subscription(bucketID string) string {
 	subs, err := c.Subscriptions()
 	if err != nil {
 		return SubNone
@@ -143,7 +101,7 @@ func (c *Circle) Subscription(bucketID string) string {
 
 // SetSubscription records this device's placement commitment for a bucket.
 // SubNone removes the entry.
-func (c *Circle) SetSubscription(bucketID, mode string) error {
+func (c *Store) SetSubscription(bucketID, mode string) error {
 	if mode != SubFull && mode != SubCache && mode != SubNone {
 		return fmt.Errorf("unknown subscription mode %q (full, cache, or none)", mode)
 	}
@@ -173,12 +131,12 @@ type MountDecl struct {
 	Write  bool   `json:"write,omitempty"`
 }
 
-func (c *Circle) mountsPath() string { return filepath.Join(c.Path, "mounts.json") }
+func (c *Store) mountsPath() string { return filepath.Join(c.Path, "mounts.json") }
 
 // Mounts returns this device's mountpoint → declaration map. Keys are
 // absolute directories: a directory holds one bucket, while a bucket may
 // be mounted at several directories.
-func (c *Circle) Mounts() (map[string]MountDecl, error) {
+func (c *Store) Mounts() (map[string]MountDecl, error) {
 	raw, err := os.ReadFile(c.mountsPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return map[string]MountDecl{}, nil
@@ -194,7 +152,7 @@ func (c *Circle) Mounts() (map[string]MountDecl, error) {
 }
 
 // SetMount declares a mount at dir (an absolute path).
-func (c *Circle) SetMount(dir string, m MountDecl) error {
+func (c *Store) SetMount(dir string, m MountDecl) error {
 	if !filepath.IsAbs(dir) {
 		return fmt.Errorf("mountpoint must be an absolute path")
 	}
@@ -207,7 +165,7 @@ func (c *Circle) SetMount(dir string, m MountDecl) error {
 }
 
 // RemoveMount drops the declaration for dir.
-func (c *Circle) RemoveMount(dir string) error {
+func (c *Store) RemoveMount(dir string) error {
 	mounts, err := c.Mounts()
 	if err != nil {
 		return err
@@ -219,7 +177,7 @@ func (c *Circle) RemoveMount(dir string) error {
 	return c.writeMounts(mounts)
 }
 
-func (c *Circle) writeMounts(mounts map[string]MountDecl) error {
+func (c *Store) writeMounts(mounts map[string]MountDecl) error {
 	raw, err := json.MarshalIndent(mounts, "", "  ")
 	if err != nil {
 		return err
@@ -227,24 +185,15 @@ func (c *Circle) writeMounts(mounts map[string]MountDecl) error {
 	return os.WriteFile(c.mountsPath(), raw, 0o600)
 }
 
-func keyPath(path string) string { return filepath.Join(path, "user.key.age") }
-
-// Unlock loads the owner's user key for one signing operation.
-func (c *Circle) Unlock(passphrase string) (ed25519.PrivateKey, error) {
-	seed, err := keystore.LoadSeed(keyPath(c.Path), passphrase)
-	if err != nil {
-		return nil, fmt.Errorf("unlocking user key: %w", err)
-	}
-	return ed25519.NewKeyFromSeed(seed), nil
-}
-
-func (c *Circle) bucketDir(id string) string {
+func (c *Store) bucketDir(id string) string {
 	return filepath.Join(c.Path, "buckets", id)
 }
 
-// CreateBucket mints a bucket owned by this circle, with default policy.
-func (c *Circle) CreateBucket(name, passphrase string) (*Handle, error) {
-	priv, err := c.Unlock(passphrase)
+// CreateBucket mints a bucket owned by the store's circle, with default
+// policy, unlocking the user key in-process. The daemon never uses it —
+// it receives signed documents (SignBucket + AdoptBucket).
+func (c *Store) CreateBucket(name, passphrase string) (*Handle, error) {
+	priv, err := c.Circle.Unlock(passphrase)
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +233,7 @@ func SignBucket(priv ed25519.PrivateKey, name string) (genesis, policy []byte, e
 // AdoptBucket stores an externally signed genesis + policy (from CreateBucket
 // locally, or received over the control API / future sync) after verifying
 // both, then opens the bucket.
-func (c *Circle) AdoptBucket(genesisRaw, policyRaw []byte) (*Handle, error) {
+func (c *Store) AdoptBucket(genesisRaw, policyRaw []byte) (*Handle, error) {
 	b, err := bucket.Unmarshal(genesisRaw)
 	if err != nil {
 		return nil, err
@@ -332,7 +281,7 @@ func (h *Handle) UpdatePolicy(policyRaw []byte) (bool, error) {
 	if h.Policy != nil && sp.Policy.Version <= h.Policy.Policy.Version {
 		return false, nil
 	}
-	if err := os.WriteFile(filepath.Join(h.circle.bucketDir(h.id), "policy.cbor"), policyRaw, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(h.store.bucketDir(h.id), "policy.cbor"), policyRaw, 0o600); err != nil {
 		return false, err
 	}
 	h.Policy = sp
@@ -369,7 +318,7 @@ func SignPolicyRevision(priv ed25519.PrivateKey, current bucket.Policy, fn func(
 // BucketRaw returns a bucket's stored genesis and policy bytes verbatim —
 // what the sync exchange ships (signatures stay valid only over the exact
 // bytes).
-func (c *Circle) BucketRaw(id string) (genesis, policy []byte, err error) {
+func (c *Store) BucketRaw(id string) (genesis, policy []byte, err error) {
 	dir := c.bucketDir(id)
 	if genesis, err = os.ReadFile(filepath.Join(dir, "genesis.cbor")); err != nil {
 		return nil, nil, err
@@ -382,7 +331,7 @@ func (c *Circle) BucketRaw(id string) (genesis, policy []byte, err error) {
 
 // KnowsBucket reports whether the bucket a genesis describes is already in
 // the catalog, returning its ID either way.
-func (c *Circle) KnowsBucket(genesisRaw []byte) (id string, known bool, err error) {
+func (c *Store) KnowsBucket(genesisRaw []byte) (id string, known bool, err error) {
 	b, err := bucket.Unmarshal(genesisRaw)
 	if err != nil {
 		return "", false, err
@@ -395,7 +344,7 @@ func (c *Circle) KnowsBucket(genesisRaw []byte) (id string, known bool, err erro
 }
 
 // Buckets lists the buckets held in this state dir.
-func (c *Circle) Buckets() ([]*bucket.Bucket, error) {
+func (c *Store) Buckets() ([]*bucket.Bucket, error) {
 	entries, err := os.ReadDir(filepath.Join(c.Path, "buckets"))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -419,7 +368,7 @@ func (c *Circle) Buckets() ([]*bucket.Bucket, error) {
 }
 
 // ResolveBucket opens a bucket by ID, ID prefix, or birth name.
-func (c *Circle) ResolveBucket(ref string) (*Handle, error) {
+func (c *Store) ResolveBucket(ref string) (*Handle, error) {
 	id, err := c.ResolveBucketID(ref)
 	if err != nil {
 		return nil, err
@@ -430,7 +379,7 @@ func (c *Circle) ResolveBucket(ref string) (*Handle, error) {
 // ResolveBucketID resolves a bucket reference (ID, ID prefix, or birth name)
 // to the exact ID without opening the bucket — callers that cache open
 // handles (the daemon) resolve first, then open at most once.
-func (c *Circle) ResolveBucketID(ref string) (string, error) {
+func (c *Store) ResolveBucketID(ref string) (string, error) {
 	all, err := c.Buckets()
 	if err != nil {
 		return "", err
@@ -447,7 +396,7 @@ func (c *Circle) ResolveBucketID(ref string) (string, error) {
 	}
 	switch len(ids) {
 	case 0:
-		return "", fmt.Errorf("no bucket matches %q (see 'fabric vault buckets')", ref)
+		return "", fmt.Errorf("no bucket matches %q (see 'fabric bucket list')", ref)
 	case 1:
 		return ids[0], nil
 	default:
@@ -473,7 +422,7 @@ type Handle struct {
 	Policy *bucket.SignedPolicy
 	Index  *index.Store
 
-	circle        *Circle
+	store         *Store
 	id            string
 	holder        Holder
 	form          string
@@ -483,7 +432,7 @@ type Handle struct {
 }
 
 // OpenBucket opens a bucket handle by exact ID.
-func (c *Circle) OpenBucket(id string) (*Handle, error) {
+func (c *Store) OpenBucket(id string) (*Handle, error) {
 	dir := c.bucketDir(id)
 	raw, err := os.ReadFile(filepath.Join(dir, "genesis.cbor"))
 	if err != nil {
@@ -509,7 +458,7 @@ func (c *Circle) OpenBucket(id string) (*Handle, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Handle{Bucket: b, Policy: sp, Index: idx, circle: c, id: id}, nil
+	return &Handle{Bucket: b, Policy: sp, Index: idx, store: c, id: id}, nil
 }
 
 func (h *Handle) Close() error { return h.Index.Close() }
@@ -517,12 +466,12 @@ func (h *Handle) Close() error { return h.Index.Close() }
 func (h *Handle) ID() string { return h.id }
 
 // NodeID is the device identity revisions are authored under.
-func (h *Handle) NodeID() string { return h.circle.NodeID }
+func (h *Handle) NodeID() string { return h.store.NodeID }
 
 // Holder returns where this device keeps the bucket's content.
 func (h *Handle) Holder() Holder {
 	if h.holder == nil {
-		return h.circle.Blobs
+		return h.store.Blobs
 	}
 	return h.holder
 }
@@ -542,7 +491,7 @@ func (h *Handle) locationForm() string {
 
 // RecordHeld notes that this device now holds a blob (a location record).
 func (h *Handle) RecordHeld(hash string) error {
-	return h.Index.PutLocation(index.Location{Blob: hash, Node: h.circle.NodeID, Form: h.locationForm(), TS: time.Now().UnixNano()})
+	return h.Index.PutLocation(index.Location{Blob: hash, Node: h.store.NodeID, Form: h.locationForm(), TS: time.Now().UnixNano()})
 }
 
 // Put streams content in as a new file object: blob into the content
@@ -577,7 +526,7 @@ func (h *Handle) PutEntry(name string, rev index.Revision, r io.Reader, tags ...
 	if rev.Kind == index.KindSymlink && rev.Target == "" {
 		return nil, errors.New("symlink record needs a target")
 	}
-	o := index.NewObject(name, rev, now, h.circle.NodeID)
+	o := index.NewObject(name, rev, now, h.store.NodeID)
 	for _, t := range tags {
 		o.Tags.Add(t, now)
 	}
@@ -613,7 +562,7 @@ func checkName(name string) error {
 // Revise mints a local revision of an object (a copy of the rendered head
 // with fn applied) that supersedes every head this device knows.
 func (h *Handle) Revise(o *index.Object, fn func(r *index.Revision)) (*index.Object, error) {
-	o.Revise(h.circle.NodeID, time.Now().UnixNano(), fn)
+	o.Revise(h.store.NodeID, time.Now().UnixNano(), fn)
 	return h.Index.PutObject(o)
 }
 
@@ -658,7 +607,7 @@ func (h *Handle) Rename(o *index.Object, name string) (*index.Object, error) {
 	if err := checkName(name); err != nil {
 		return nil, err
 	}
-	o.Name.Set(name, time.Now().UnixNano(), h.circle.NodeID)
+	o.Name.Set(name, time.Now().UnixNano(), h.store.NodeID)
 	return h.Index.PutObject(o)
 }
 

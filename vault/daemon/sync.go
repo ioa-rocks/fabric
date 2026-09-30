@@ -22,8 +22,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
-	"ioa.rocks/fabric/vault/circle"
 	"ioa.rocks/fabric/vault/index"
+	"ioa.rocks/fabric/vault/store"
 )
 
 const (
@@ -158,7 +158,7 @@ func (d *Daemon) handleSync(s network.Stream) {
 }
 
 func (d *Daemon) dumpState() (*syncMsg, error) {
-	buckets, err := d.Circle.Buckets()
+	buckets, err := d.Store.Buckets()
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +168,7 @@ func (d *Daemon) dumpState() (*syncMsg, error) {
 		if err != nil {
 			continue
 		}
-		genesis, policy, err := d.Circle.BucketRaw(id)
+		genesis, policy, err := d.Store.BucketRaw(id)
 		if err != nil {
 			continue
 		}
@@ -226,14 +226,14 @@ func (d *Daemon) applyState(msg *syncMsg, from peer.ID) {
 		if held, err := h.ApplyRecords(records, from.String()); err != nil {
 			log.Printf("sync: merging objects for %q: %v", h.Bucket.Genesis.Name, err)
 		} else if held > 0 {
-			log.Printf("sync: bucket %q: %d deletion(s) from %s held for confirmation (fabric vault held)", h.Bucket.Genesis.Name, held, from)
+			log.Printf("sync: bucket %q: %d deletion(s) from %s held for confirmation (fabric bucket held)", h.Bucket.Genesis.Name, held, from)
 		}
 		for _, l := range sb.Locations {
 			if err := h.Index.PutLocation(l); err != nil {
 				log.Printf("sync: merging location: %v", err)
 			}
 		}
-		if d.Circle.Subscription(h.ID()) == circle.SubFull {
+		if d.Store.Subscription(h.ID()) == store.SubFull {
 			go d.fetchMissing(h)
 		}
 		d.kickFolders(h.ID())
@@ -241,8 +241,8 @@ func (d *Daemon) applyState(msg *syncMsg, from peer.ID) {
 }
 
 // adoptIfUnknown returns the (possibly fresh) handle for a synced bucket.
-func (d *Daemon) adoptIfUnknown(genesis, policy []byte) (*circle.Handle, bool, error) {
-	id, known, err := d.Circle.KnowsBucket(genesis)
+func (d *Daemon) adoptIfUnknown(genesis, policy []byte) (*store.Handle, bool, error) {
+	id, known, err := d.Store.KnowsBucket(genesis)
 	if err != nil {
 		return nil, false, err
 	}
@@ -257,7 +257,7 @@ func (d *Daemon) adoptIfUnknown(genesis, policy []byte) (*circle.Handle, bool, e
 // fetchMissing pulls every blob a full subscription entitles us to hold
 // but we don't. Serialized per daemon (one fetcher at a time) to keep the
 // prototype simple; a transfer scheduler is a later concern.
-func (d *Daemon) fetchMissing(h *circle.Handle) {
+func (d *Daemon) fetchMissing(h *store.Handle) {
 	if !d.begin() {
 		return
 	}
@@ -285,7 +285,7 @@ func (d *Daemon) fetchMissing(h *circle.Handle) {
 // fetchAnywhere tries every connected vault peer until one serves the
 // blob. Location records will drive smarter source selection when fleets
 // outgrow "just ask everyone".
-func (d *Daemon) fetchAnywhere(h *circle.Handle, hash string) error {
+func (d *Daemon) fetchAnywhere(h *store.Handle, hash string) error {
 	if d.Fabric == nil {
 		return fmt.Errorf("not on a mesh")
 	}
@@ -306,7 +306,7 @@ func (d *Daemon) fetchAnywhere(h *circle.Handle, hash string) error {
 	return lastErr
 }
 
-func (d *Daemon) fetchBlob(h *circle.Handle, p peer.ID, hash string) error {
+func (d *Daemon) fetchBlob(h *store.Handle, p peer.ID, hash string) error {
 	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Minute)
 	defer cancel()
 	s, err := d.Fabric.Host.NewStream(ctx, p, BlobProtocol)
@@ -380,10 +380,10 @@ func (d *Daemon) handleBlob(s network.Stream) {
 // blobPath finds a held blob in the circle store or any bucket's holder
 // (a folder replica serves its working files).
 func (d *Daemon) blobPath(hash string) (string, error) {
-	if p, err := d.Circle.Blobs.Path(hash); err == nil {
+	if p, err := d.Store.Blobs.Path(hash); err == nil {
 		return p, nil
 	}
-	buckets, err := d.Circle.Buckets()
+	buckets, err := d.Store.Buckets()
 	if err != nil {
 		return "", err
 	}

@@ -30,7 +30,8 @@ The three consumers the API is sketched against: the CLI importer,
 the projection writer, and the shared-album read path.
 
 ```
-Circle:    Init(name) / Open(statedir)
+Circle:    fabric-level `circle` package — Init(name) / Open(dir) / Unlock
+Store:     Open(dir, circle) — blobs, bucket records, placement (this package tree)
 Buckets:   Create(name) -> Bucket, List(), Open(id|name)
 Objects:   Put(bucket, name, reader, tags...) -> Object
            Get(bucket, objectID) -> reader
@@ -44,51 +45,58 @@ Later:     Subscribe(bucket, mode), Grant(bucket, userKey, caps),
 
 ## Build
 
-The fabric binary carries the data CLI (ADR 0013 — one binary): run it
-as `fabric vault …`, or symlink `vault → fabric` for the plain `vault …`
-spelling — argv[0] dispatch, busybox-style. `cmd/vault` still builds the
-same commands standalone for a data-CLI-only install:
+The fabric binary carries the CLI (ADR 0013 — one binary). Ownership is
+`fabric circle …` (the user key; a fabric-level package, ADR 0017), data is
+`fabric bucket …` — one noun per group, consumed once (fabric ADR 0006). A
+`vault → fabric` symlink means `fabric bucket` (argv[0] dispatch,
+busybox-style); `cmd/vault` builds the same group standalone.
 
 ```sh
 go build -o fabric ./cmd/fabric && ln -s fabric vault
 go test ./...
 ```
 
-Quickstart (throwaway state dir):
+Quickstart (throwaway directories; `-state` is the fabric state dir for
+circle commands and the store dir for bucket commands):
 
 ```sh
-export VAULT_PASSPHRASE=test          # or omit for an interactive prompt
-./vault init -state /tmp/v -name alex
-./vault bucket create -state /tmp/v family-photos
-./vault put -state /tmp/v -tag pets,2026 family-photos cat.jpg
-./vault ls  -state /tmp/v -tag pets family-photos
-./vault project -state /tmp/v family-photos /tmp/album   # read-only view
+export CIRCLE_PASSPHRASE=test         # or omit for an interactive prompt
+./fabric circle init -state /tmp/f -name alex
+./fabric bucket create -state /tmp/v -circle-state /tmp/f/circle family-photos
+./fabric bucket put -state /tmp/v -circle-state /tmp/f/circle -tag pets,2026 family-photos cat.jpg
+./fabric bucket ls  -state /tmp/v -circle-state /tmp/f/circle -tag pets family-photos
+./fabric bucket project -state /tmp/v -circle-state /tmp/f/circle family-photos /tmp/album
 ```
 
-Default state dir is `~/.config/vault`; every command accepts
-`-state`. Flags may come before or after positional arguments
-(after `tag`'s `<bucket> <object-ref>`, `-x` means "remove tag x").
+Defaults: circle `~/.config/fabric/circle`, store `~/.config/vault`. With a
+daemon running, bucket commands never need `-circle-state` (the daemon
+holds the circle); without one, the direct path opens it. Flags may come
+before or after positional arguments (after `tag`'s `<bucket>
+<object-ref>`, `-x` means "remove tag x").
 
 ## Daemon & mesh
 
 Vault is a **subsystem of the node daemon** (ADR 0013 — one process,
-one device identity per machine). `fabric up` activates it when
-circle state exists (default `~/.config/vault`, override with
-`-vault-state`; `-no-vault` to skip) and is pure connectivity
-otherwise. The subsystem serves the object API over a local control
-socket (`<vault-state>/control.sock`, HTTP+JSON — the seed of the
+one device identity per machine). `fabric up` activates it when the
+node has a circle (`<state>/circle`; the store defaults to
+`~/.config/vault`, override with `-vault-state`; `-no-vault` to skip)
+and is pure connectivity otherwise. A circle still living in the store
+directory from before the hoist is adopted automatically at startup
+(the two files are copied; the originals stay, unused). The subsystem
+serves the object API over a local control socket
+(`<vault-state>/control.sock`, HTTP+JSON — the seed of the
 network-facing API). While the daemon runs it owns the store (Pebble
-locks); the `vault` CLI detects the socket and routes through it —
+locks); the bucket CLI detects the socket and routes through it —
 same commands, same output. With no daemon running, the CLI opens
-the state directly.
+the store directly.
 
 Mesh membership is the machine's, managed by the fabric CLI:
 
 ```sh
 fabric join -name desk /ip4/…/tcp/4517/p2p/12D3Koo…   # approve on the master
-vault init -name alex     # create the circle (once, any device)
-fabric up &               # node daemon; vault subsystem activates
-vault status              # circle, mesh membership, connected vault peers
+fabric circle init -name alex   # create the circle (once, on one device)
+fabric up &                     # node daemon; vault subsystem activates
+fabric circle status            # circle, buckets served, mesh, vault peers
 ```
 
 "Which devices run vault" is simply which members have vault state —
@@ -98,21 +106,21 @@ other among mesh members by the `/vault/hello/1` protocol
 `fabric status`.
 
 **A second device of the same owner** (interim procedure until
-capability grants land — `vault init` would mint a *different* user
-key): copy the circle identity, then restart the daemon so the
-subsystem activates.
+capability grants let a device hold a sub-key — `circle init` there
+would mint a *different* user key): export the circle, join with it,
+then restart the daemon so the subsystem activates.
 
 ```sh
-ssh other 'mkdir -p -m 700 ~/.config/vault'
-scp ~/.config/vault/config.json ~/.config/vault/user.key.age other:.config/vault/
-# on other: restart 'fabric up' (systemctl restart fabric), then
-vault buckets            # catalog arrives via sync (≤30 s after connect)
-vault sub <bucket> full  # and blobs follow
+fabric circle export alex.circle          # carries the key container (passphrase-protected)
+scp alex.circle other:                    # move it privately
+ssh other 'fabric circle join alex.circle && rm alex.circle && systemctl --user restart fabric'
+# on other:
+fabric bucket list                        # catalog arrives via sync (≤30 s after connect)
+fabric bucket place <bucket> full         # and blobs follow
 ```
 
-Only those two files — `blobs/`, `buckets/`, and `subs.json` are
-per-device state that sync owns. The key container keeps its
-passphrase.
+Only the circle travels — `blobs/`, `buckets/`, `subs.json`,
+`mounts.json` and `folders.json` are per-device state that sync owns.
 
 ## Sync & placement
 
@@ -124,13 +132,19 @@ signature verification. Blobs move separately on `/vault/blob/1`,
 driven by subscriptions (memo §5 — pull, not push):
 
 ```sh
-vault sub photos full    # hold a complete copy; fetch what's missing
-vault sub photos cache   # hold what gets accessed (no eviction yet)
-vault sub photos none    # catalog + index only
-vault buckets            # id, sub mode, held/objects, name
+fabric bucket place photos full          # hold a complete copy; fetch what's missing
+fabric bucket place photos cache         # hold what gets accessed (no eviction yet)
+fabric bucket place photos none          # catalog + index only
+fabric bucket place photos folder ~/Sync # keep it as a real directory (a full placement)
+fabric bucket place photos               # this device's placement, in detail
+fabric bucket list                       # id, placement word, held/objects, name, where
 ```
 
-The creating device subscribes `full` by default. `vault get` works
+Placement is one word per bucket per device; moving off `folder`
+withdraws the folder declaration and leaves the directory alone.
+Mounts (`fabric bucket mount <bucket> <dir> [-write]`) are a surface over
+the store, not a placement. The creating device places `full` by
+default. `fabric bucket get` works
 on *any* vault node that can reach a holder — a missing blob is a
 mesh lookup, not an error. Transfers are verified by re-hashing
 (content addressing is the integrity check). Trust boundary today:
@@ -142,12 +156,16 @@ visibility and capability checks arrive with grants.
 - `bucket/` — genesis record, bucket ID, policy document
 - `blobstore/` — content-addressed whole-file blob store
 - `index/` — object records + merge semantics (LWW / OR-Set), Pebble-backed
-- `circle/` — user key (age-encrypted via fabric's keystore), state dir
+- `store/` — the device's store: bucket records, blobs, subscriptions,
+  mounts, folder declarations, bucket handles; opened against a circle
+  (`../circle` — user key, age-encrypted via fabric's keystore; the
+  ownership layer, fabric-level since 2026-09-30)
+- `folder/` — folder replicas (M1): scanner, materializer, shadow store
 - `daemon/` — the vault subsystem: control API (HTTP over unix
   socket), sync/blob/hello protocols; attached to the fabric daemon
   by `cmd/fabric up` (the composition root)
-- `../cmd/vault` — data CLI (daemon client when one is running,
-  direct otherwise)
+- `cli/` — the `fabric bucket` group (daemon client when one is
+  running, direct otherwise); `../cmd/vault` builds it standalone
 
 ## Status
 
@@ -161,7 +179,10 @@ tombstone propagation — race-detector clean). 2026-07-07: one-process
 topology per ADR 0013, then the repo merge — vault moved into the
 fabric repo as `vault/` packages; `fabric up` hosts the subsystem,
 `vault join/up` deleted (mesh membership is `fabric join`), the
-`vault` binary is the data CLI only.
+`vault` binary is the data CLI only. 2026-09-30: the circle hoisted to
+the fabric level (`circle` package; `vault/circle` → `vault/store`) and
+the CLI regrammared to `fabric circle …` + `fabric bucket …` (fabric
+ADR 0006).
 Next: live two-machine rollout (desk + NAS), then capability grants
 (second user key) and
 the projection consumer. Deferred: cache eviction (LRU), drop-safety

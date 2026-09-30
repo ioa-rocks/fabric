@@ -1,4 +1,4 @@
-package circle
+package store
 
 import (
 	"fmt"
@@ -25,7 +25,7 @@ type HeldRecord struct {
 // updates an entry; it never multiplies.
 type HeldSet map[string]HeldRecord
 
-func (h *Handle) heldPath() string { return filepath.Join(h.circle.bucketDir(h.id), "held.cbor") }
+func (h *Handle) heldPath() string { return filepath.Join(h.store.bucketDir(h.id), "held.cbor") }
 
 // Held loads the parked deletions.
 func (h *Handle) Held() (HeldSet, error) {

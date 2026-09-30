@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"ioa.rocks/fabric/vault/circle"
 	"ioa.rocks/fabric/vault/daemon"
 	"ioa.rocks/fabric/vault/fusefs"
 )
@@ -72,7 +71,7 @@ func (m *fakeMounter) isLive(dir string) bool {
 // manual, because the mount tests restart the daemon mid-test.
 func runSolo(t *testing.T, statePath string, m daemon.Mounter) (stop func()) {
 	t.Helper()
-	d, err := daemon.New(statePath, nil)
+	d, err := daemon.New(openTestStore(t, statePath), nil)
 	if err != nil {
 		t.Fatalf("daemon.New: %v", err)
 	}
@@ -98,9 +97,7 @@ func runSolo(t *testing.T, statePath string, m daemon.Mounter) (stop func()) {
 // mounter: declare, list, survive a daemon restart, remove.
 func TestDaemonOwnedMounts(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := circle.Init(dir, "alex", "pw"); err != nil {
-		t.Fatalf("circle.Init: %v", err)
-	}
+	initCircle(t, dir, "alex")
 	fm := newFakeMounter()
 	stop := runSolo(t, dir, fm)
 	cl := daemon.NewClient(dir)
@@ -196,9 +193,7 @@ func TestDaemonOwnedMountKernel(t *testing.T) {
 		t.Skip("FUSE unavailable")
 	}
 	dir := t.TempDir()
-	if _, err := circle.Init(dir, "alex", "pw"); err != nil {
-		t.Fatalf("circle.Init: %v", err)
-	}
+	initCircle(t, dir, "alex")
 	stop := runSolo(t, dir, fusefs.DaemonMounter{StatePath: dir})
 	defer stop()
 	cl := daemon.NewClient(dir)

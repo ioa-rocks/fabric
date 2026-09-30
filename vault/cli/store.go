@@ -9,11 +9,12 @@ import (
 	"io"
 	"sync"
 
-	"ioa.rocks/fabric/vault/circle"
 	"ioa.rocks/fabric/vault/daemon"
+	"ioa.rocks/fabric/vault/store"
 )
 
-type store interface {
+// store_ is the CLI's view of a store; the package name is taken.
+type store_ interface {
 	Buckets() ([]daemon.BucketInfo, error)
 	CreateBucket(genesis, policy []byte) (daemon.BucketInfo, error)
 	List(bucket string, tags []string) ([]daemon.ObjectInfo, error)
@@ -29,16 +30,21 @@ type store interface {
 	Close() error
 }
 
-// openStore picks the backend for a state dir.
-func openStore(statePath string) (store, error) {
-	if cl := daemon.TryClient(statePath); cl != nil {
+// openStore picks the backend: the daemon's socket when one serves the
+// store directory, a direct open (which needs the circle) otherwise.
+func openStore(p paths) (store_, error) {
+	if cl := daemon.TryClient(*p.store); cl != nil {
 		return clientStore{cl}, nil
 	}
-	c, err := circle.Open(statePath)
+	c, err := p.openCircle()
+	if err != nil {
+		return nil, fmt.Errorf("no daemon on %s and %w", daemon.SocketPath(*p.store), err)
+	}
+	st, err := store.Open(*p.store, c)
 	if err != nil {
 		return nil, err
 	}
-	return &directStore{c: c, handles: map[string]*circle.Handle{}}, nil
+	return &directStore{c: st, handles: map[string]*store.Handle{}}, nil
 }
 
 // clientStore adapts daemon.Client (adds the no-op Close).
@@ -48,9 +54,9 @@ func (clientStore) Close() error { return nil }
 
 // directStore runs the same operations in-process.
 type directStore struct {
-	c       *circle.Circle
+	c       *store.Store
 	mu      sync.Mutex
-	handles map[string]*circle.Handle
+	handles map[string]*store.Handle
 }
 
 func (s *directStore) Close() error {
@@ -62,7 +68,7 @@ func (s *directStore) Close() error {
 	return nil
 }
 
-func (s *directStore) handle(ref string) (*circle.Handle, error) {
+func (s *directStore) handle(ref string) (*store.Handle, error) {
 	id, err := s.c.ResolveBucketID(ref)
 	if err != nil {
 		return nil, err
@@ -110,13 +116,13 @@ func (s *directStore) CreateBucket(genesis, policy []byte) (daemon.BucketInfo, e
 	s.mu.Unlock()
 	// Same default as the daemon path: the creating device holds what it
 	// puts.
-	_ = s.c.SetSubscription(h.ID(), circle.SubFull)
-	return daemon.BucketInfo{ID: h.ID(), Name: h.Bucket.Genesis.Name, Sub: circle.SubFull}, nil
+	_ = s.c.SetSubscription(h.ID(), store.SubFull)
+	return daemon.BucketInfo{ID: h.ID(), Name: h.Bucket.Genesis.Name, Sub: store.SubFull}, nil
 }
 
 func (s *directStore) Sub(bucket, mode string) error {
 	if mode == "none" {
-		mode = circle.SubNone
+		mode = store.SubNone
 	}
 	id, err := s.c.ResolveBucketID(bucket)
 	if err != nil {

@@ -11,12 +11,13 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"sync"
 	"time"
 
 	fabricdaemon "ioa.rocks/fabric/daemon"
-	"ioa.rocks/fabric/vault/circle"
+	"ioa.rocks/fabric/vault/store"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -39,12 +40,12 @@ type Hello struct {
 	Version string `json:"version"`
 }
 
-// Daemon holds the circle open (and its Pebble locks — the CLI routes
+// Daemon holds the store open (and its Pebble locks — the CLI routes
 // through the control socket while a daemon runs) and syncs over the
 // fabric daemon it is attached to. It does not own the fabric lifecycle —
 // the composition root (cmd/fabric up, or a test) runs both.
 type Daemon struct {
-	Circle *circle.Circle
+	Store  *store.Store
 	Fabric *fabricdaemon.Daemon // nil when this machine is not on a mesh
 
 	// Mounter serves declared FUSE mounts (ADR 0016). Set by the
@@ -52,9 +53,9 @@ type Daemon struct {
 	Mounter Mounter
 
 	mu      sync.Mutex
-	handles map[string]*circle.Handle // bucket ID -> open handle
-	closed  bool                      // no new operations; handles about to close
-	wg      sync.WaitGroup            // in-flight operations
+	handles map[string]*store.Handle // bucket ID -> open handle
+	closed  bool                     // no new operations; handles about to close
+	wg      sync.WaitGroup           // in-flight operations
 
 	folderMu    sync.Mutex
 	liveFolders map[string]*liveFolder // directory -> open folder replica
@@ -89,7 +90,7 @@ func (d *Daemon) begin() bool {
 
 func (d *Daemon) end() { d.wg.Done() }
 
-// New assembles the vault subsystem from a vault state directory and
+// New assembles the vault subsystem over an opened store and
 // attaches it to fd's host: stream handlers for hello/sync/blob, and the
 // on-authenticated hook chained so every fresh member connection triggers
 // both fabric's membership anti-entropy and a vault exchange. fd == nil
@@ -97,15 +98,14 @@ func (d *Daemon) end() { d.wg.Done() }
 //
 // Attach before fd.Run(): handlers and the auth hook must be in place
 // when the first peer authenticates.
-func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
-	c, err := circle.Open(statePath)
-	if err != nil {
-		return nil, err
+func New(c *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
+	if c == nil {
+		return nil, errors.New("vault subsystem: no store")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Daemon{
-		Circle:       c,
-		handles:      make(map[string]*circle.Handle),
+		Store:        c,
+		handles:      make(map[string]*store.Handle),
 		liveMounts:   make(map[string]*liveMount),
 		mountErrs:    make(map[string]string),
 		liveFolders:  make(map[string]*liveFolder),
@@ -143,7 +143,7 @@ func (d *Daemon) Run() error {
 	}
 	defer stopControl()
 
-	log.Printf("vault subsystem up: circle %q (%s)", d.Circle.Config.Name, d.Circle.Config.DID)
+	log.Printf("vault subsystem up: circle %q (%s)", d.Store.Circle.Config.Name, d.Store.Circle.Config.DID)
 
 	if d.Fabric != nil {
 		go func() { defer close(d.syncDone); d.syncLoop() }()
@@ -195,8 +195,8 @@ func (d *Daemon) closeHandles() {
 
 // handle resolves a bucket reference and returns the daemon's open handle
 // for it, opening once and caching (the handle owns a Pebble lock).
-func (d *Daemon) handle(ref string) (*circle.Handle, error) {
-	id, err := d.Circle.ResolveBucketID(ref)
+func (d *Daemon) handle(ref string) (*store.Handle, error) {
+	id, err := d.Store.ResolveBucketID(ref)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +205,7 @@ func (d *Daemon) handle(ref string) (*circle.Handle, error) {
 	if h, ok := d.handles[id]; ok {
 		return h, nil
 	}
-	h, err := d.Circle.OpenBucket(id)
+	h, err := d.Store.OpenBucket(id)
 	if err != nil {
 		return nil, err
 	}
@@ -217,17 +217,17 @@ func (d *Daemon) handle(ref string) (*circle.Handle, error) {
 // verify-write-open runs under the daemon mutex: concurrent adopters (two
 // sync exchanges, or a sync racing the control API) must not both open the
 // same Pebble index.
-func (d *Daemon) adopt(genesis, policy []byte) (*circle.Handle, error) {
+func (d *Daemon) adopt(genesis, policy []byte) (*store.Handle, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	id, _, err := d.Circle.KnowsBucket(genesis)
+	id, _, err := d.Store.KnowsBucket(genesis)
 	if err != nil {
 		return nil, err
 	}
 	if prev, ok := d.handles[id]; ok {
 		return prev, nil // already adopted and open
 	}
-	h, err := d.Circle.AdoptBucket(genesis, policy)
+	h, err := d.Store.AdoptBucket(genesis, policy)
 	if err != nil {
 		return nil, err
 	}
@@ -239,8 +239,8 @@ func (d *Daemon) handleHello(s network.Stream) {
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(5 * time.Second))
 	_ = json.NewEncoder(s).Encode(Hello{
-		Circle:  d.Circle.Config.DID,
-		Name:    d.Circle.Config.Name,
+		Circle:  d.Store.Circle.Config.DID,
+		Name:    d.Store.Circle.Config.Name,
 		Version: Version,
 	})
 }

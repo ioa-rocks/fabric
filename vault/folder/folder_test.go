@@ -9,26 +9,32 @@ import (
 	"testing"
 	"time"
 
-	"ioa.rocks/fabric/vault/circle"
+	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/vault/index"
+	"ioa.rocks/fabric/vault/store"
 )
 
 // device is one simulated node: a circle, a bucket handle, a folder replica.
 type device struct {
-	c   *circle.Circle
-	h   *circle.Handle
+	c   *store.Store
+	h   *store.Handle
 	rep *Replica
 	dir string
 }
 
 func newDevice(t *testing.T, name string, genesis, policy []byte) *device {
 	t.Helper()
-	c, err := circle.Init(t.TempDir(), name, "pw")
+	root := t.TempDir()
+	cc, err := circle.Init(filepath.Join(root, "circle"), name, "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := store.Open(root, cc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	c.NodeID = "dev:" + name
-	var h *circle.Handle
+	var h *store.Handle
 	if genesis == nil {
 		if h, err = c.CreateBucket("lab", "pw"); err != nil {
 			t.Fatal(err)
@@ -130,10 +136,10 @@ func scan(t *testing.T, d *device) Report {
 	t.Helper()
 	rep, err := d.rep.Scan()
 	if err != nil {
-		t.Fatalf("scan %s: %v", d.c.Config.Name, err)
+		t.Fatalf("scan %s: %v", d.c.Circle.Config.Name, err)
 	}
 	if len(rep.Errors) > 0 {
-		t.Fatalf("scan %s errors: %v", d.c.Config.Name, rep.Errors)
+		t.Fatalf("scan %s errors: %v", d.c.Circle.Config.Name, rep.Errors)
 	}
 	return rep
 }
@@ -142,10 +148,10 @@ func materialize(t *testing.T, d *device) Report {
 	t.Helper()
 	rep, err := d.rep.Materialize()
 	if err != nil {
-		t.Fatalf("materialize %s: %v", d.c.Config.Name, err)
+		t.Fatalf("materialize %s: %v", d.c.Circle.Config.Name, err)
 	}
 	if len(rep.Errors) > 0 {
-		t.Fatalf("materialize %s errors: %v", d.c.Config.Name, rep.Errors)
+		t.Fatalf("materialize %s errors: %v", d.c.Circle.Config.Name, rep.Errors)
 	}
 	return rep
 }

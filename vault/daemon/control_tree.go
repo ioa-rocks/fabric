@@ -9,8 +9,8 @@ import (
 	"net/url"
 
 	"ioa.rocks/fabric/vault/bucket"
-	"ioa.rocks/fabric/vault/circle"
 	"ioa.rocks/fabric/vault/index"
+	"ioa.rocks/fabric/vault/store"
 )
 
 // Control surface for vault ADR 0001: policy revisions, trash/restore,
@@ -216,7 +216,7 @@ func (d *Daemon) handleConflicts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, ConflictEntries(cs))
 }
 
-func ConflictEntries(cs []circle.Conflict) []ConflictEntry {
+func ConflictEntries(cs []store.Conflict) []ConflictEntry {
 	out := []ConflictEntry{}
 	for _, c := range cs {
 		r := c.Revision
@@ -268,14 +268,14 @@ func (d *Daemon) handleHeld(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Daemon) handleHeldAccept(w http.ResponseWriter, r *http.Request) {
-	d.heldDecision(w, r, (*circle.Handle).AcceptHeld)
+	d.heldDecision(w, r, (*store.Handle).AcceptHeld)
 }
 
 func (d *Daemon) handleHeldReject(w http.ResponseWriter, r *http.Request) {
-	d.heldDecision(w, r, (*circle.Handle).RejectHeld)
+	d.heldDecision(w, r, (*store.Handle).RejectHeld)
 }
 
-func (d *Daemon) heldDecision(w http.ResponseWriter, r *http.Request, decide func(*circle.Handle) (int, error)) {
+func (d *Daemon) heldDecision(w http.ResponseWriter, r *http.Request, decide func(*store.Handle) (int, error)) {
 	h, err := d.handle(r.PathValue("bucket"))
 	if err != nil {
 		httpErr(w, err)

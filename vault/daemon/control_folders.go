@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"ioa.rocks/fabric/vault/circle"
+	"ioa.rocks/fabric/vault/store"
 )
 
 type folderBody struct {
@@ -34,24 +34,24 @@ func (d *Daemon) handleAddFolder(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
-	id, err := d.Circle.ResolveBucketID(body.Bucket)
+	id, err := d.Store.ResolveBucketID(body.Bucket)
 	if err != nil {
 		httpErr(w, err)
 		return
 	}
-	decl := circle.FolderDecl{Bucket: id}
-	if err := d.Circle.SetFolder(body.Dir, decl); err != nil {
+	decl := store.FolderDecl{Bucket: id}
+	if err := d.Store.SetFolder(body.Dir, decl); err != nil {
 		httpErr(w, err)
 		return
 	}
 	// A folder replica holds everything: it is a full placement.
-	if d.Circle.Subscription(id) != circle.SubFull {
-		_ = d.Circle.SetSubscription(id, circle.SubFull)
+	if d.Store.Subscription(id) != store.SubFull {
+		_ = d.Store.SetSubscription(id, store.SubFull)
 	}
 	if err := d.openFolder(body.Dir, decl); err != nil {
 		// The declaration stands; the loop retries. A first open that fails
 		// is reported loudly here and withdrawn, like a failed first mount.
-		_ = d.Circle.RemoveFolder(body.Dir)
+		_ = d.Store.RemoveFolder(body.Dir)
 		httpErr(w, err)
 		return
 	}
@@ -71,7 +71,7 @@ func (d *Daemon) handleRemoveFolder(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
-	if err := d.Circle.RemoveFolder(body.Dir); err != nil {
+	if err := d.Store.RemoveFolder(body.Dir); err != nil {
 		httpErr(w, err)
 		return
 	}

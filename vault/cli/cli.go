@@ -1,12 +1,16 @@
-// Package cli is the Vault command group ("fabric vault <command> [flags]") — the
-// CLI over the object-store API. Data commands work against a running
-// daemon's control socket when there is one (the daemon owns the store
-// while it runs) and fall back to opening the state directly — same
-// operations either way (bucket-model memo §2: the API is the product;
-// this is surface #1).
+// Package cli is the bucket command group ("fabric bucket <verb> …") — the
+// CLI over the object-store API, one noun consumed once: every verb takes
+// the bucket it acts on. Data commands work against a running daemon's
+// control socket when there is one (the daemon owns the store while it
+// runs) and fall back to opening the store directly — same operations
+// either way (bucket-model memo §2: the API is the product; this is
+// surface #1). Circle commands (init/join/status — the ownership layer)
+// are fabric's own, not this package's: ADR 0017 hoists the circle out
+// of vault.
 //
 // It is a package, not a main, so the one fabric binary can carry it
-// (ADR 0013): cmd/fabric dispatches here on `fabric vault …`.
+// (ADR 0013): cmd/fabric dispatches here on `fabric bucket …` and on a
+// "vault" argv[0].
 package cli
 
 import (
@@ -19,9 +23,10 @@ import (
 	"strings"
 	"syscall"
 
-	"ioa.rocks/fabric/vault/circle"
+	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/vault/daemon"
 	"ioa.rocks/fabric/vault/fusefs"
+	"ioa.rocks/fabric/vault/store"
 
 	"golang.org/x/term"
 )
@@ -35,14 +40,16 @@ func Main(args []string) int {
 	cmd, rest := args[0], args[1:]
 	var err error
 	switch cmd {
-	case "init":
-		err = cmdInit(rest)
-	case "status":
-		err = cmdStatus(rest)
-	case "buckets":
-		err = cmdBuckets(rest)
-	case "bucket":
-		err = cmdBucket(rest)
+	case "create":
+		err = cmdCreate(rest)
+	case "list":
+		err = cmdList(rest)
+	case "place":
+		err = cmdPlace(rest)
+	case "mount":
+		err = cmdMount(rest)
+	case "unmount":
+		err = cmdUnmount(rest)
 	case "put":
 		err = cmdPut(rest)
 	case "ls":
@@ -53,22 +60,8 @@ func Main(args []string) int {
 		err = cmdGet(rest)
 	case "rm":
 		err = cmdRm(rest)
-	case "sub":
-		err = cmdSub(rest)
 	case "project":
 		err = cmdProject(rest)
-	case "mount":
-		err = cmdMount(rest)
-	case "unmount":
-		err = cmdUnmount(rest)
-	case "mounts":
-		err = cmdMounts(rest)
-	case "folder":
-		err = cmdFolder(rest)
-	case "unfolder":
-		err = cmdUnfolder(rest)
-	case "folders":
-		err = cmdFolders(rest)
 	case "policy":
 		err = cmdPolicy(rest)
 	case "trash":
@@ -81,45 +74,46 @@ func Main(args []string) int {
 		err = cmdResolve(rest)
 	case "held":
 		err = cmdHeld(rest)
+	case "-h", "-help", "--help", "help":
+		usage()
+		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "vault: unknown command %q\n\n", cmd)
+		fmt.Fprintf(os.Stderr, "fabric bucket: unknown command %q\n\n", cmd)
 		usage()
 		return 2
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "vault:", err)
+		fmt.Fprintln(os.Stderr, "fabric bucket:", err)
 		return 1
 	}
 	return 0
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `usage: fabric vault <command> [flags]
+	fmt.Fprint(os.Stderr, `usage: fabric bucket <command> [flags]
 
-The data surface of the node. The node daemon itself is 'fabric up' —
-it activates the vault subsystem when circle state exists (ADR 0013);
-mesh membership is 'fabric join'. Data commands go through the running
-daemon's control socket, or open the state directly when none runs.
+Buckets are the data surface of the node; the circle that owns them is
+'fabric circle'. The node daemon is 'fabric up' — it serves buckets when
+a circle exists. Commands go through the running daemon's control socket,
+or open the store directly when none runs.
 
-  init     create a circle on this device (-name required)
-  status   show daemon state: circle, mesh, vault peers, mounts
-  bucket   bucket create <name> — mint a bucket (signs; needs passphrase)
-  buckets  list buckets
+  create   create <name> [-circle <name>] — mint a bucket (signs; needs the
+           circle passphrase)
+  list     list buckets and how this device holds each
+  place    place <bucket> — show this device's placement, in detail
+           place <bucket> full|cache|none — hold a complete copy / what
+           gets accessed / catalog and index only
+           place <bucket> folder <dir> — keep the bucket as a real
+           directory the daemon syncs (a full placement); -rescan now
+  mount    mount <bucket> <dir> [-write] — declare a FUSE mount the daemon
+           serves from now on, across restarts, until 'unmount'
+  unmount  unmount <dir> — remove a mount declaration and release the mount
   put      put <bucket> <file...> [-tag t1,t2] — add objects
   ls       ls <bucket> [-tag t1,t2] — list objects (tag intersection)
   tag      tag <bucket> <object-ref> [+tag ...] [-tag ...]
   get      get <bucket> <object-ref> [-o file] — read content
   rm       rm <bucket> <object-ref> — tombstone an object
-  sub      sub <bucket> [full|cache|none] — this device's placement commitment
   project  project <bucket> <dir> — materialize a read-only directory view
-  mount    mount <bucket> <dir> [-write] — declare a mount; the daemon serves
-           it from now on, across restarts, until 'unmount'
-  unmount  unmount <dir> — remove a mount declaration and release the mount
-  mounts   list declared mounts and whether each is live
-  folder   folder <bucket> <dir> — keep a bucket as a real directory (the
-           daemon scans it, materializes it and serves it from now on)
-  unfolder unfolder <dir> — stop; the directory is left as it is
-  folders  folders [-rescan <dir>] — state per folder: pending, conflicts, held
   policy   policy <bucket> [set key=value ...] — show or sign a policy revision
            (copies trash_days ignore symlinks nested_repos hold_min_count hold_min_percent)
   trash    trash <bucket> — list tombstoned objects
@@ -128,9 +122,10 @@ daemon's control socket, or open the state directly when none runs.
   resolve  resolve <bucket> <object-ref> — settle a conflict for the kept version
   held     held <bucket> [accept|reject] — deletions parked for confirmation
 
-Every command accepts -state <dir> (default `+circle.DefaultPath()+`),
+Every command accepts -state <dir> (the store, default `+store.DefaultPath()+`)
+and -circle-state <dir> (the circle, default `+circle.DefaultPath()+`),
 before or after positional arguments. Signing commands read
-$VAULT_PASSPHRASE or prompt.
+$CIRCLE_PASSPHRASE or prompt.
 `)
 }
 
@@ -163,16 +158,41 @@ func parse(fs *flag.FlagSet, args []string, limit int) []string {
 	return pos
 }
 
-func stateFlag(fs *flag.FlagSet) *string {
-	return fs.String("state", circle.DefaultPath(), "state directory")
+// paths is the pair of directories every command may need: the store
+// (per-device data) and the circle (ownership; only opened when a
+// command signs or runs without a daemon).
+type paths struct {
+	store  *string
+	circle *string
 }
 
-func passphrase() (string, error) {
+func pathFlags(fs *flag.FlagSet) paths {
+	return paths{
+		store:  fs.String("state", store.DefaultPath(), "store directory"),
+		circle: fs.String("circle-state", circle.DefaultPath(), "circle directory"),
+	}
+}
+
+// openCircle opens the circle, adopting a pre-hoist one from the store
+// directory first if that is where it still lives.
+func (p paths) openCircle() (*circle.Circle, error) {
+	if _, err := circle.Migrate(*p.circle, *p.store); err != nil {
+		return nil, fmt.Errorf("adopting the circle from %s: %w", *p.store, err)
+	}
+	return circle.Open(*p.circle)
+}
+
+// Passphrase reads the circle passphrase from $CIRCLE_PASSPHRASE (or the
+// pre-hoist $VAULT_PASSPHRASE) or an interactive no-echo prompt.
+func Passphrase() (string, error) {
+	if p := os.Getenv("CIRCLE_PASSPHRASE"); p != "" {
+		return p, nil
+	}
 	if p := os.Getenv("VAULT_PASSPHRASE"); p != "" {
 		return p, nil
 	}
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
-		return "", fmt.Errorf("no terminal for passphrase prompt; set VAULT_PASSPHRASE")
+		return "", fmt.Errorf("no terminal for passphrase prompt; set CIRCLE_PASSPHRASE")
 	}
 	fmt.Fprint(os.Stderr, "circle user-key passphrase: ")
 	b, err := term.ReadPassword(int(os.Stdin.Fd()))
@@ -197,101 +217,24 @@ func splitTags(s string) []string {
 	return out
 }
 
-func cmdInit(args []string) error {
-	fs := flag.NewFlagSet("init", flag.ExitOnError)
-	statePath := stateFlag(fs)
-	name := fs.String("name", "", "circle owner label (required)")
-	parse(fs, args, -1)
-	if *name == "" {
-		return fmt.Errorf("init: -name is required")
-	}
-	pass, err := passphrase()
-	if err != nil {
-		return err
-	}
-	c, err := circle.Init(*statePath, *name, pass)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("circle created: %s\n", c.Config.DID)
-	fmt.Printf("user-key container: %s — back it up\n", c.Path+"/user.key.age")
-	return nil
-}
-
-func cmdStatus(args []string) error {
-	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	statePath := stateFlag(fs)
-	parse(fs, args, -1)
-	cl := daemon.TryClient(*statePath)
-	if cl == nil {
-		return fmt.Errorf("no daemon on %s (the node daemon is 'fabric up')", daemon.SocketPath(*statePath))
-	}
-	s, err := cl.Status()
-	if err != nil {
-		return err
-	}
-	fmt.Printf("circle %q  %s\n", s.Name, s.Circle)
-	fmt.Printf("daemon %s, %d bucket(s)\n", s.Version, s.Buckets)
-	printStatusMounts(s.Mounts)
-	if len(s.Folders) > 0 {
-		fmt.Printf("folders:\n")
-		for _, f := range s.Folders {
-			state := "closed"
-			switch {
-			case f.Open && f.Available:
-				state = fmt.Sprintf("open  files %d  down %d  up %d  conflicts %d  held %d", f.Files, f.PendingDown, f.PendingUp, f.Conflicts, f.Held)
-			case f.Open:
-				state = "unavailable"
-			}
-			fmt.Printf("  %s  %q  %s\n", f.Dir, f.Name, state)
-		}
-	}
-	if !s.Mesh {
-		fmt.Println("mesh: not joined — 'fabric join' puts this machine on a mesh")
-		return nil
-	}
-	fmt.Printf("mesh: member %q, peer %s\n", s.MeshName, s.PeerID)
-	if len(s.Peers) == 0 {
-		fmt.Println("no members connected")
-	}
-	for _, p := range s.Peers {
-		if p.Vault {
-			fmt.Printf("  %-16s vault %s  circle %q %s\n", p.Name, p.Version, p.CircleName, p.Circle)
-		} else {
-			fmt.Printf("  %-16s (mesh member, no vault)\n", p.Name)
-		}
-	}
-	return nil
-}
-
-func printStatusMounts(mounts []daemon.MountInfo) {
-	if len(mounts) == 0 {
-		return
-	}
-	fmt.Printf("mounts:\n")
-	printMounts(mounts)
-}
-
-func cmdBucket(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("usage: fabric vault bucket create <name>")
-	}
-	if args[0] != "create" {
-		return fmt.Errorf("unknown bucket subcommand %q (usage: fabric vault bucket create <name>)", args[0])
-	}
-	fs := flag.NewFlagSet("bucket create", flag.ExitOnError)
-	statePath := stateFlag(fs)
-	pos := parse(fs, args[1:], -1)
+func cmdCreate(args []string) error {
+	fs := flag.NewFlagSet("create", flag.ExitOnError)
+	p := pathFlags(fs)
+	circleName := fs.String("circle", "", "owning circle (this device's one circle; named for the day a device holds several)")
+	pos := parse(fs, args, -1)
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: fabric vault bucket create <name>")
+		return fmt.Errorf("usage: fabric bucket create <name> [-circle <name>]")
 	}
 	// Signing happens here, where the passphrase prompt is — the daemon
 	// only ever receives the signed genesis + policy.
-	c, err := circle.Open(*statePath)
+	c, err := p.openCircle()
 	if err != nil {
 		return err
 	}
-	pass, err := passphrase()
+	if *circleName != "" && *circleName != c.Config.Name {
+		return fmt.Errorf("this device holds circle %q, not %q", c.Config.Name, *circleName)
+	}
+	pass, err := Passphrase()
 	if err != nil {
 		return err
 	}
@@ -299,11 +242,11 @@ func cmdBucket(args []string) error {
 	if err != nil {
 		return err
 	}
-	genesis, policy, err := circle.SignBucket(priv, pos[0])
+	genesis, policy, err := store.SignBucket(priv, pos[0])
 	if err != nil {
 		return err
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(p)
 	if err != nil {
 		return err
 	}
@@ -312,15 +255,15 @@ func cmdBucket(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("bucket created: %q  %s\n", b.Name, b.ID)
+	fmt.Printf("bucket created: %q  %s  in circle %q\n", b.Name, b.ID, c.Config.Name)
 	return nil
 }
 
-func cmdBuckets(args []string) error {
-	fs := flag.NewFlagSet("buckets", flag.ExitOnError)
-	statePath := stateFlag(fs)
+func cmdList(args []string) error {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	p := pathFlags(fs)
 	parse(fs, args, -1)
-	st, err := openStore(*statePath)
+	st, err := openStore(p)
 	if err != nil {
 		return err
 	}
@@ -330,63 +273,36 @@ func cmdBuckets(args []string) error {
 		return err
 	}
 	if len(buckets) == 0 {
-		fmt.Println("no buckets — create one with: vault bucket create <name>")
+		fmt.Println("no buckets — create one with: fabric bucket create <name>")
 		return nil
 	}
 	for _, b := range buckets {
-		sub := b.Sub
-		if sub == "" {
-			sub = "-"
-		}
-		where := ""
-		if b.Folder != "" {
-			where = "  folder " + b.Folder
-		}
-		for _, m := range b.Mounts {
-			where += "  mount " + m
-		}
-		fmt.Printf("%s  %-6s %3d/%-3d  %s%s\n", b.ID[:16], sub, b.Held, b.Objects, b.Name, where)
+		fmt.Printf("%s  %-6s %3d/%-3d  %s%s\n", b.ID[:16], placementWord(b), b.Held, b.Objects, b.Name, placementWhere(b))
 	}
 	return nil
 }
 
-func cmdSub(args []string) error {
-	fs := flag.NewFlagSet("sub", flag.ExitOnError)
-	statePath := stateFlag(fs)
-	pos := parse(fs, args, -1)
-	if len(pos) < 1 || len(pos) > 2 {
-		return fmt.Errorf("usage: fabric vault sub <bucket> [full|cache|none]")
+// placementWord is the one-word placement column: none, cache, full, or
+// folder (a folder replica is a full placement with a directory).
+func placementWord(b daemon.BucketInfo) string {
+	switch {
+	case b.Folder != "":
+		return "folder"
+	case b.Sub == "":
+		return "none"
 	}
-	st, err := openStore(*statePath)
-	if err != nil {
-		return err
+	return b.Sub
+}
+
+func placementWhere(b daemon.BucketInfo) string {
+	where := ""
+	if b.Folder != "" {
+		where = "  " + b.Folder
 	}
-	defer st.Close()
-	if len(pos) == 1 {
-		buckets, err := st.Buckets()
-		if err != nil {
-			return err
-		}
-		for _, b := range buckets {
-			if b.Name == pos[0] || strings.HasPrefix(b.ID, pos[0]) {
-				mode := b.Sub
-				if mode == "" {
-					mode = "none (catalog + index only)"
-				}
-				fmt.Printf("%s  %s: %s — holding %d/%d blobs\n", b.ID[:16], b.Name, mode, b.Held, b.Objects)
-				return nil
-			}
-		}
-		return fmt.Errorf("no bucket matches %q", pos[0])
+	for _, m := range b.Mounts {
+		where += "  mount " + m
 	}
-	if err := st.Sub(pos[0], pos[1]); err != nil {
-		return err
-	}
-	fmt.Printf("subscription set: %s -> %s\n", pos[0], pos[1])
-	if pos[1] == "full" {
-		fmt.Println("missing blobs will be fetched as peers are reachable")
-	}
-	return nil
+	return where
 }
 
 func printObject(o daemon.ObjectInfo) {
@@ -399,13 +315,13 @@ func printObject(o daemon.ObjectInfo) {
 
 func cmdPut(args []string) error {
 	fs := flag.NewFlagSet("put", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	p := pathFlags(fs)
 	tags := fs.String("tag", "", "comma-separated tags for the new objects")
 	pos := parse(fs, args, -1)
 	if len(pos) < 2 {
-		return fmt.Errorf("usage: fabric vault put <bucket> <file...> [-tag t1,t2]")
+		return fmt.Errorf("usage: fabric bucket put <bucket> <file...> [-tag t1,t2]")
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(p)
 	if err != nil {
 		return err
 	}
@@ -428,13 +344,13 @@ func cmdPut(args []string) error {
 
 func cmdLs(args []string) error {
 	fs := flag.NewFlagSet("ls", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	p := pathFlags(fs)
 	tags := fs.String("tag", "", "comma-separated tags; objects must carry all (facet intersection)")
 	pos := parse(fs, args, -1)
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: fabric vault ls <bucket> [-tag t1,t2]")
+		return fmt.Errorf("usage: fabric bucket ls <bucket> [-tag t1,t2]")
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(p)
 	if err != nil {
 		return err
 	}
@@ -451,12 +367,12 @@ func cmdLs(args []string) error {
 
 func cmdTag(args []string) error {
 	fs := flag.NewFlagSet("tag", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	p := pathFlags(fs)
 	// Flags stop being recognized after <bucket> <object-ref> — from there
 	// on "-x" means "remove tag x", not a flag.
 	pos := parse(fs, args, 2)
 	if len(pos) < 3 {
-		return fmt.Errorf("usage: fabric vault tag <bucket> <object-ref> [+tag ...] [-tag ...]")
+		return fmt.Errorf("usage: fabric bucket tag <bucket> <object-ref> [+tag ...] [-tag ...]")
 	}
 	var add, remove []string
 	for _, m := range pos[2:] {
@@ -469,7 +385,7 @@ func cmdTag(args []string) error {
 			add = append(add, m)
 		}
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(p)
 	if err != nil {
 		return err
 	}
@@ -484,13 +400,13 @@ func cmdTag(args []string) error {
 
 func cmdGet(args []string) error {
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	p := pathFlags(fs)
 	out := fs.String("o", "", "output file (default: stdout)")
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: fabric vault get <bucket> <object-ref> [-o file]")
+		return fmt.Errorf("usage: fabric bucket get <bucket> <object-ref> [-o file]")
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(p)
 	if err != nil {
 		return err
 	}
@@ -515,12 +431,12 @@ func cmdGet(args []string) error {
 
 func cmdRm(args []string) error {
 	fs := flag.NewFlagSet("rm", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	p := pathFlags(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: fabric vault rm <bucket> <object-ref>")
+		return fmt.Errorf("usage: fabric bucket rm <bucket> <object-ref>")
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(p)
 	if err != nil {
 		return err
 	}
@@ -535,16 +451,16 @@ func cmdRm(args []string) error {
 
 func cmdProject(args []string) error {
 	fs := flag.NewFlagSet("project", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	p := pathFlags(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: fabric vault project <bucket> <dir>")
+		return fmt.Errorf("usage: fabric bucket project <bucket> <dir>")
 	}
 	dir, err := filepath.Abs(pos[1])
 	if err != nil {
 		return err
 	}
-	st, err := openStore(*statePath)
+	st, err := openStore(p)
 	if err != nil {
 		return err
 	}
@@ -559,24 +475,24 @@ func cmdProject(args []string) error {
 
 func cmdMount(args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	p := pathFlags(fs)
 	debug := fs.Bool("debug", false, "show FUSE protocol logging (foreground only)")
 	write := fs.Bool("write", false, "enable staged filesystem writes")
 	foreground := fs.Bool("foreground", false, "serve the mount from this process instead of declaring it (debugging; dies with the terminal)")
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: fabric vault mount <bucket> <dir> [-write] [-foreground [-debug]]")
+		return fmt.Errorf("usage: fabric bucket mount <bucket> <dir> [-write] [-foreground [-debug]]")
 	}
 	mountpoint, err := filepath.Abs(pos[1])
 	if err != nil {
 		return err
 	}
-	cl := daemon.TryClient(*statePath)
+	cl := daemon.TryClient(*p.store)
 	if cl == nil {
-		return fmt.Errorf("mount requires the running node daemon on %s", daemon.SocketPath(*statePath))
+		return fmt.Errorf("mount requires the running node daemon on %s", daemon.SocketPath(*p.store))
 	}
 	if *foreground {
-		return foregroundMount(cl, *statePath, pos[0], mountpoint, *write, *debug)
+		return foregroundMount(cl, *p.store, pos[0], mountpoint, *write, *debug)
 	}
 	m, err := cl.AddMount(mountpoint, pos[0], *write)
 	if err != nil {
@@ -587,24 +503,24 @@ func cmdMount(args []string) error {
 		mode = "writable"
 	}
 	fmt.Printf("mount declared: the daemon serves bucket %.16s %s at %s\n", m.Bucket, mode, m.Dir)
-	fmt.Printf("it persists across daemon restarts; remove with: fabric vault unmount %s\n", m.Dir)
+	fmt.Printf("it persists across daemon restarts; remove with: fabric bucket unmount %s\n", m.Dir)
 	return nil
 }
 
 func cmdUnmount(args []string) error {
 	fs := flag.NewFlagSet("unmount", flag.ExitOnError)
-	statePath := stateFlag(fs)
+	p := pathFlags(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: fabric vault unmount <dir>")
+		return fmt.Errorf("usage: fabric bucket unmount <dir>")
 	}
 	dir, err := filepath.Abs(pos[0])
 	if err != nil {
 		return err
 	}
-	cl := daemon.TryClient(*statePath)
+	cl := daemon.TryClient(*p.store)
 	if cl == nil {
-		return fmt.Errorf("unmount requires the running node daemon on %s", daemon.SocketPath(*statePath))
+		return fmt.Errorf("unmount requires the running node daemon on %s", daemon.SocketPath(*p.store))
 	}
 	if err := cl.RemoveMount(dir); err != nil {
 		return err
@@ -613,27 +529,8 @@ func cmdUnmount(args []string) error {
 	return nil
 }
 
-func cmdMounts(args []string) error {
-	fs := flag.NewFlagSet("mounts", flag.ExitOnError)
-	statePath := stateFlag(fs)
-	parse(fs, args, -1)
-	cl := daemon.TryClient(*statePath)
-	if cl == nil {
-		return fmt.Errorf("mounts requires the running node daemon on %s", daemon.SocketPath(*statePath))
-	}
-	mounts, err := cl.Mounts()
-	if err != nil {
-		return err
-	}
-	if len(mounts) == 0 {
-		fmt.Println("no mounts declared — declare one with: fabric vault mount <bucket> <dir>")
-		return nil
-	}
-	printMounts(mounts)
-	return nil
-}
-
-func printMounts(mounts []daemon.MountInfo) {
+// PrintMounts renders mount lines (shared with 'fabric circle status').
+func PrintMounts(mounts []daemon.MountInfo) {
 	for _, m := range mounts {
 		mode := "ro"
 		if m.Write {

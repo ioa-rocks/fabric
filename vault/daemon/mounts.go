@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"ioa.rocks/fabric/vault/circle"
+	"ioa.rocks/fabric/vault/store"
 )
 
 // MountReconcileInterval is how often declared-but-dead mounts are retried.
@@ -46,7 +46,7 @@ type MountInfo struct {
 
 type liveMount struct {
 	handle MountHandle
-	decl   circle.MountDecl
+	decl   store.MountDecl
 	gen    uint64 // guards the Wait watcher against a remount at the same dir
 }
 
@@ -69,9 +69,9 @@ func (d *Daemon) mountLoop() {
 // reconcileMounts establishes every declared mount that is not live. A
 // mount that dropped without RemoveMount — an external fusermount -u, a
 // crashed previous daemon — comes back: the declaration is the intent, and
-// `fabric vault unmount` is how intent changes.
+// `fabric bucket unmount` is how intent changes.
 func (d *Daemon) reconcileMounts() {
-	decls, err := d.Circle.Mounts()
+	decls, err := d.Store.Mounts()
 	if err != nil {
 		log.Printf("vault mounts: reading declarations: %v", err)
 		return
@@ -92,7 +92,7 @@ func (d *Daemon) reconcileMounts() {
 
 // establishMount performs one mount attempt and registers the watcher that
 // clears the live entry when the kernel releases the mount.
-func (d *Daemon) establishMount(dir string, decl circle.MountDecl) error {
+func (d *Daemon) establishMount(dir string, decl store.MountDecl) error {
 	if d.Mounter == nil {
 		return fmt.Errorf("this daemon has no mounter wired")
 	}
@@ -173,12 +173,12 @@ func (d *Daemon) setMountErr(dir string, err error) {
 
 // mountInfos merges declarations with live state for status and listings.
 func (d *Daemon) mountInfos() ([]MountInfo, error) {
-	decls, err := d.Circle.Mounts()
+	decls, err := d.Store.Mounts()
 	if err != nil {
 		return nil, err
 	}
 	names := map[string]string{}
-	if buckets, err := d.Circle.Buckets(); err == nil {
+	if buckets, err := d.Store.Buckets(); err == nil {
 		for _, b := range buckets {
 			if id, err := b.ID(); err == nil {
 				names[id] = b.Genesis.Name

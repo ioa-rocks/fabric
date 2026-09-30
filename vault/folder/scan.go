@@ -154,7 +154,7 @@ func (r *Replica) Scan() (Report, error) {
 		}
 		rep.Held = held
 		if held > 0 {
-			r.logf("folder %s: %d local deletion(s) held for confirmation (fabric vault held)", r.Dir, held)
+			r.logf("folder %s: %d local deletion(s) held for confirmation (fabric bucket held)", r.Dir, held)
 		}
 		for _, rel := range gone {
 			_ = r.deleteEntry(rel)

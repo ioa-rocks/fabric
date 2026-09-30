@@ -3,6 +3,7 @@ package daemon_test
 import (
 	"bytes"
 	"io"
+	"ioa.rocks/fabric/circle"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,8 +11,8 @@ import (
 
 	fabricdaemon "ioa.rocks/fabric/daemon"
 	fabricstate "ioa.rocks/fabric/state"
-	"ioa.rocks/fabric/vault/circle"
 	"ioa.rocks/fabric/vault/daemon"
+	"ioa.rocks/fabric/vault/store"
 )
 
 type closeSpy struct {
@@ -43,7 +44,7 @@ func startDaemon(t *testing.T, statePath string) *daemon.Daemon {
 		}
 		fd.DisableTUN = true
 	}
-	d, err := daemon.New(statePath, fd)
+	d, err := daemon.New(openTestStore(t, statePath), fd)
 	if err != nil {
 		t.Fatalf("daemon.New: %v", err)
 	}
@@ -77,10 +78,34 @@ func startDaemon(t *testing.T, statePath string) *daemon.Daemon {
 	return d
 }
 
+// openTestStore opens the store at statePath against the circle the test
+// minted under it (initCircle).
+func openTestStore(t *testing.T, statePath string) *store.Store {
+	t.Helper()
+	c, err := circle.Open(circle.Dir(statePath))
+	if err != nil {
+		t.Fatalf("circle.Open: %v", err)
+	}
+	st, err := store.Open(statePath, c)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	return st
+}
+
+// initCircle mints the test circle beside the store (production keeps it
+// under the fabric state dir; the daemon does not care where).
+func initCircle(t *testing.T, statePath, name string) {
+	t.Helper()
+	if _, err := circle.Init(circle.Dir(statePath), name, "pw"); err != nil {
+		t.Fatalf("circle.Init: %v", err)
+	}
+}
+
 // signBucket mints a signed genesis+policy with the circle's key.
 func signBucket(t *testing.T, statePath, pass, name string) (genesis, policy []byte) {
 	t.Helper()
-	c, err := circle.Open(statePath)
+	c, err := circle.Open(circle.Dir(statePath))
 	if err != nil {
 		t.Fatalf("circle.Open: %v", err)
 	}
@@ -88,7 +113,7 @@ func signBucket(t *testing.T, statePath, pass, name string) (genesis, policy []b
 	if err != nil {
 		t.Fatalf("Unlock: %v", err)
 	}
-	genesis, policy, err = circle.SignBucket(priv, name)
+	genesis, policy, err = store.SignBucket(priv, name)
 	if err != nil {
 		t.Fatalf("SignBucket: %v", err)
 	}
@@ -99,9 +124,7 @@ func signBucket(t *testing.T, statePath, pass, name string) (genesis, policy []b
 // with no mesh attached: create bucket, put, list, tag, get, rm, project.
 func TestSoloDaemonAPI(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := circle.Init(dir, "alex", "pw"); err != nil {
-		t.Fatalf("circle.Init: %v", err)
-	}
+	initCircle(t, dir, "alex")
 	startDaemon(t, dir)
 	cl := daemon.NewClient(dir)
 
@@ -201,9 +224,7 @@ func TestSoloDaemonAPI(t *testing.T) {
 // the CLI must go through the socket.
 func TestDaemonHoldsLock(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := circle.Init(dir, "alex", "pw"); err != nil {
-		t.Fatalf("circle.Init: %v", err)
-	}
+	initCircle(t, dir, "alex")
 	startDaemon(t, dir)
 	cl := daemon.NewClient(dir)
 	genesis, policy := signBucket(t, dir, "pw", "photos")
@@ -215,10 +236,7 @@ func TestDaemonHoldsLock(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	c, err := circle.Open(dir)
-	if err != nil {
-		t.Fatalf("circle.Open: %v", err)
-	}
+	c := openTestStore(t, dir)
 	if _, err := c.ResolveBucket("photos"); err == nil {
 		t.Error("direct open succeeded while the daemon holds the lock")
 	}

@@ -13,7 +13,6 @@ import (
 
 	fabricdaemon "ioa.rocks/fabric/daemon"
 	fabricstate "ioa.rocks/fabric/state"
-	"ioa.rocks/fabric/vault/circle"
 	"ioa.rocks/fabric/vault/daemon"
 )
 
@@ -33,7 +32,7 @@ func runDaemon(t *testing.T, statePath string) (*daemon.Daemon, func()) {
 		}
 		fd.DisableTUN = true
 	}
-	d, err := daemon.New(statePath, fd)
+	d, err := daemon.New(openTestStore(t, statePath), fd)
 	if err != nil {
 		t.Fatalf("daemon.New: %v", err)
 	}
@@ -128,10 +127,7 @@ func TestReplaySeafileIncident(t *testing.T) {
 	stopA()
 	stopB()
 	edit := func(statePath, content string, deleteN int) {
-		c, err := circle.Open(statePath)
-		if err != nil {
-			t.Fatal(err)
-		}
+		c := openTestStore(t, statePath)
 		c.NodeID = "dev:" + filepath.Base(statePath)
 		h, err := c.ResolveBucket("work")
 		if err != nil {

@@ -2,8 +2,8 @@ package cli
 
 import (
 	"ioa.rocks/fabric/vault/bucket"
-	"ioa.rocks/fabric/vault/circle"
 	"ioa.rocks/fabric/vault/daemon"
+	"ioa.rocks/fabric/vault/store"
 )
 
 // treeStore is the ADR 0001 half of the store interface: policy revisions,
@@ -115,14 +115,14 @@ func (s *directStore) Held(name string) ([]daemon.HeldEntry, error) {
 }
 
 func (s *directStore) AcceptHeld(name string) (int, error) {
-	return s.decide(name, (*circle.Handle).AcceptHeld)
+	return s.decide(name, (*store.Handle).AcceptHeld)
 }
 
 func (s *directStore) RejectHeld(name string) (int, error) {
-	return s.decide(name, (*circle.Handle).RejectHeld)
+	return s.decide(name, (*store.Handle).RejectHeld)
 }
 
-func (s *directStore) decide(name string, fn func(*circle.Handle) (int, error)) (int, error) {
+func (s *directStore) decide(name string, fn func(*store.Handle) (int, error)) (int, error) {
 	h, err := s.handle(name)
 	if err != nil {
 		return 0, err
