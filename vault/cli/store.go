@@ -25,6 +25,7 @@ type store interface {
 	Rm(bucket, ref string) (daemon.ObjectInfo, error)
 	Project(bucket, dir string) (int, error)
 	Sub(bucket, mode string) error
+	treeStore
 	Close() error
 }
 

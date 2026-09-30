@@ -132,10 +132,10 @@ func (d *Daemon) handleConflicts(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
-	writeJSON(w, conflictEntries(cs))
+	writeJSON(w, ConflictEntries(cs))
 }
 
-func conflictEntries(cs []circle.Conflict) []ConflictEntry {
+func ConflictEntries(cs []circle.Conflict) []ConflictEntry {
 	out := []ConflictEntry{}
 	for _, c := range cs {
 		r := c.Revision

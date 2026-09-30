@@ -63,6 +63,18 @@ func Main(args []string) int {
 		err = cmdUnmount(rest)
 	case "mounts":
 		err = cmdMounts(rest)
+	case "policy":
+		err = cmdPolicy(rest)
+	case "trash":
+		err = cmdTrash(rest)
+	case "restore":
+		err = cmdRestore(rest)
+	case "conflicts":
+		err = cmdConflicts(rest)
+	case "resolve":
+		err = cmdResolve(rest)
+	case "held":
+		err = cmdHeld(rest)
 	default:
 		fmt.Fprintf(os.Stderr, "vault: unknown command %q\n\n", cmd)
 		usage()
@@ -98,6 +110,13 @@ daemon's control socket, or open the state directly when none runs.
            it from now on, across restarts, until 'unmount'
   unmount  unmount <dir> — remove a mount declaration and release the mount
   mounts   list declared mounts and whether each is live
+  policy   policy <bucket> [set key=value ...] — show or sign a policy revision
+           (copies trash_days ignore symlinks nested_repos hold_min_count hold_min_percent)
+  trash    trash <bucket> — list tombstoned objects
+  restore  restore <bucket> <object-ref> — revive a tombstoned object
+  conflicts  conflicts <bucket> — list concurrent edits kept as conflict copies
+  resolve  resolve <bucket> <object-ref> — settle a conflict for the kept version
+  held     held <bucket> [accept|reject] — deletions parked for confirmation
 
 Every command accepts -state <dir> (default `+circle.DefaultPath()+`),
 before or after positional arguments. Signing commands read
