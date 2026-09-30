@@ -606,6 +606,14 @@ func (h *Handle) Rename(o *index.Object, name string) (*index.Object, error) {
 	return h.Index.PutObject(o)
 }
 
+// GetBlob opens one blob by hash (a specific head's content).
+func (h *Handle) GetBlob(blob string) (io.ReadCloser, error) {
+	if blob == "" {
+		return nil, errors.New("no content")
+	}
+	return h.circle.Blobs.Open(blob)
+}
+
 // Get opens the current content of an object.
 func (h *Handle) Get(o *index.Object) (io.ReadCloser, error) {
 	if o.Blob() == "" {

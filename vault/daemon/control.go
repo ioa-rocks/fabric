@@ -489,16 +489,32 @@ func (d *Daemon) handleGet(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
+	// blob= selects one of the object's heads — a conflict copy — instead
+	// of the rendered winner (ADR 0001 §3).
+	blob := o.Blob()
+	if want := r.URL.Query().Get("blob"); want != "" {
+		found := false
+		for _, rev := range o.Heads {
+			if rev.Blob == want {
+				found = true
+			}
+		}
+		if !found {
+			httpErr(w, fmt.Errorf("blob %.12s is not a head of %s", want, o.ID[:8]))
+			return
+		}
+		blob = want
+	}
 	// On-demand fetch: a missing blob is a mesh lookup, not an error —
 	// vault get works on any node that can reach a holder (API-first; the
 	// cache axis without the bookkeeping).
-	if b := o.Blob(); b != "" && !d.Circle.Blobs.Has(b) && d.Fabric != nil {
-		if err := d.fetchAnywhere(b); err != nil {
+	if blob != "" && !d.Circle.Blobs.Has(blob) && d.Fabric != nil {
+		if err := d.fetchAnywhere(blob); err != nil {
 			httpErr(w, fmt.Errorf("blob not held here and no peer served it: %w", err))
 			return
 		}
 	}
-	rc, err := h.Get(o)
+	rc, err := h.GetBlob(blob)
 	if err != nil {
 		httpErr(w, err)
 		return

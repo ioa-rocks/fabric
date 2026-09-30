@@ -29,6 +29,11 @@ type source interface {
 	Replace(bucket, ref string, r io.Reader) (daemon.ObjectInfo, error)
 	Rename(bucket, ref, name string) (daemon.ObjectInfo, error)
 	Rm(bucket, ref string) (daemon.ObjectInfo, error)
+	// Tree records and conflict copies (vault ADR 0001 §3, §6).
+	PutEntry(bucket, name, kind, target string, mode uint32) (daemon.ObjectInfo, error)
+	SetAttr(bucket, ref string, mode *uint32, mtime *int64) (daemon.ObjectInfo, error)
+	GetBlob(bucket, ref, blob string) (io.ReadCloser, error)
+	Resolve(bucket, ref string) (daemon.ObjectInfo, error)
 	// Ping must reach the daemon every time it is called. close(2) relies on
 	// it to decide whether staged content can still be published, so a
 	// cached answer would let a close succeed against a daemon that has
@@ -129,7 +134,11 @@ func newMountState(bucket string, src source, seed []daemon.ObjectInfo, opts Opt
 func namespaceKey(objects []daemon.ObjectInfo) string {
 	parts := make([]string, 0, len(objects))
 	for _, o := range objects {
-		parts = append(parts, o.ID+"\x00"+o.Name)
+		key := o.ID + "\x00" + o.Name + "\x00" + o.Kind + "\x00" + o.Target
+		for _, c := range o.Conflicts {
+			key += "\x00" + c.Name
+		}
+		parts = append(parts, key)
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, "\x00")
@@ -167,19 +176,23 @@ func (m *mountState) refreshNamespace(ctx context.Context) error {
 	for _, prefix := range m.root.emptyDirPrefixes() {
 		next.ensureEmptyDir(prefix)
 	}
-	for name, child := range m.root.Children() {
-		_ = m.root.NotifyDelete(name, child)
+	// No kernel notifications here: this runs inside Readdir, and
+	// NotifyEntry/NotifyDelete on the directory the kernel is reading
+	// deadlock against its lock. The mount sets no entry or attribute
+	// cache timeouts, so the kernel looks names up afresh anyway.
+	for name := range m.root.Children() {
 		m.root.RmChild(name)
 	}
 	for name, child := range next.dirs {
 		m.root.AddChild(name, m.root.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR}), false)
-		_ = m.root.NotifyEntry(name)
 	}
 	for name, child := range next.files {
 		m.root.AddChild(name, m.root.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG}), false)
-		_ = m.root.NotifyEntry(name)
 	}
-	m.root.dirs, m.root.files = next.dirs, next.files
+	for name, child := range next.links {
+		m.root.AddChild(name, m.root.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFLNK}), false)
+	}
+	m.root.dirs, m.root.files, m.root.links = next.dirs, next.files, next.links
 	m.namespaceKey = key
 	m.cat.replace(objects)
 	return nil
@@ -317,15 +330,30 @@ type dirNode struct {
 	prefix string
 	dirs   map[string]*dirNode
 	files  map[string]*fileNode
+	links  map[string]*symlinkNode
+	// object is the directory record that keeps this directory alive while
+	// empty (ADR 0001 §6); zero for a directory implied by its children.
+	object daemon.ObjectInfo
+}
+
+// symlinkNode renders a symlink record: the target verbatim, never followed
+// by the mount itself.
+type symlinkNode struct {
+	fs.Inode
+	m      *mountState
+	object daemon.ObjectInfo
 }
 
 type fileNode struct {
 	fs.Inode
-	mu      sync.Mutex
-	m       *mountState
-	object  daemon.ObjectInfo
-	writing bool
-	removed bool
+	mu     sync.Mutex
+	m      *mountState
+	object daemon.ObjectInfo
+	// conflict renders one losing head of object as a read-only sibling
+	// (ADR 0001 §3). Deleting it resolves the object for the kept version.
+	conflict *daemon.ConflictInfo
+	writing  bool
+	removed  bool
 	// failed marks content this mount accepted but could not publish. The
 	// staged bytes are kept on disk; the path stops working so the loss is
 	// visible rather than silent.
@@ -343,7 +371,7 @@ func newTree(m *mountState, objects []daemon.ObjectInfo) (*dirNode, error) {
 		}
 		d := root
 		for i, part := range parts[:len(parts)-1] {
-			if _, isFile := d.files[part]; isFile {
+			if d.files[part] != nil || d.links[part] != nil {
 				return nil, fmt.Errorf("object path conflict: %q is both a file and directory", strings.Join(parts, "/"))
 			}
 			if d.dirs[part] == nil {
@@ -352,19 +380,49 @@ func newTree(m *mountState, objects []daemon.ObjectInfo) (*dirNode, error) {
 			d = d.dirs[part]
 		}
 		name := parts[len(parts)-1]
+		switch object.Kind {
+		case "dir":
+			if d.files[name] != nil || d.links[name] != nil {
+				return nil, fmt.Errorf("object path conflict: %q is both a file and directory", strings.Join(parts, "/"))
+			}
+			if d.dirs[name] == nil {
+				d.dirs[name] = newDir(m, path.Join(parts...))
+			}
+			if d.dirs[name].object.ID == "" || object.ID < d.dirs[name].object.ID {
+				d.dirs[name].object = object
+			}
+			continue
+		case "symlink":
+			if d.dirs[name] != nil || d.files[name] != nil {
+				return nil, fmt.Errorf("object path conflict: %q is both a symlink and a file or directory", strings.Join(parts, "/"))
+			}
+			if _, exists := d.links[name]; exists {
+				name = disambiguate(name, object.ID)
+			}
+			d.links[name] = &symlinkNode{m: m, object: object}
+			continue
+		}
 		if _, isDir := d.dirs[name]; isDir {
 			return nil, fmt.Errorf("object path conflict: %q is both a file and directory", strings.Join(parts, "/"))
 		}
-		if _, exists := d.files[name]; exists {
+		if d.files[name] != nil || d.links[name] != nil {
 			name = disambiguate(name, object.ID)
 		}
 		d.files[name] = &fileNode{m: m, object: object}
+		for i := range object.Conflicts {
+			c := object.Conflicts[i]
+			cname := path.Base(c.Name)
+			if d.files[cname] != nil || d.dirs[cname] != nil || d.links[cname] != nil {
+				cname = disambiguate(cname, object.ID)
+			}
+			d.files[cname] = &fileNode{m: m, object: object, conflict: &c}
+		}
 	}
 	return root, nil
 }
 
 func newDir(m *mountState, prefix string) *dirNode {
-	return &dirNode{m: m, prefix: prefix, dirs: map[string]*dirNode{}, files: map[string]*fileNode{}}
+	return &dirNode{m: m, prefix: prefix, dirs: map[string]*dirNode{}, files: map[string]*fileNode{}, links: map[string]*symlinkNode{}}
 }
 
 func objectPath(name string) ([]string, error) {
@@ -397,6 +455,37 @@ func (d *dirNode) OnAdd(ctx context.Context) {
 	for name, child := range d.files {
 		d.AddChild(name, d.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG}), false)
 	}
+	for name, child := range d.links {
+		d.AddChild(name, d.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFLNK}), false)
+	}
+}
+
+func (l *symlinkNode) Readlink(context.Context) ([]byte, syscall.Errno) {
+	return []byte(l.object.Target), 0
+}
+
+func (l *symlinkNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	out.Mode = syscall.S_IFLNK | 0o777
+	out.Size = uint64(len(l.object.Target))
+	out.Uid, out.Gid = uint32(os.Getuid()), uint32(os.Getgid())
+	setTimes(out, l.object)
+	return 0
+}
+
+// setTimes reports the source modification time when the record carries
+// one, else the time the rendered revision was written.
+func setTimes(out *fuse.AttrOut, object daemon.ObjectInfo) {
+	mtime := object.MTime
+	if mtime == 0 {
+		mtime = object.Modified
+	}
+	if mtime == 0 {
+		mtime = object.Created
+	}
+	if mtime > 0 {
+		out.Mtime = uint64(mtime / 1e9)
+		out.Mtimensec = uint32(mtime % 1e9)
+	}
 }
 
 func (d *dirNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -427,10 +516,16 @@ func (d *dirNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 func (f *fileNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	f.mu.Lock()
-	failed, active, object := f.failed, f.handle, f.object
+	failed, active, object, conflict := f.failed, f.handle, f.object, f.conflict
 	f.mu.Unlock()
 	if failed {
 		return syscall.EIO
+	}
+	if conflict != nil {
+		out.Mode, out.Size = syscall.S_IFREG|0o444, uint64(conflict.Size)
+		out.Uid, out.Gid = uint32(os.Getuid()), uint32(os.Getgid())
+		setTimes(out, daemon.ObjectInfo{MTime: conflict.MTime, Modified: conflict.TS})
+		return 0
 	}
 	switch {
 	case active != nil:
@@ -457,18 +552,15 @@ func (f *fileNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut
 	if f.m.writable {
 		out.Mode = syscall.S_IFREG | 0o644
 	}
+	// Only the exec bit is synchronized (ADR 0001 §6).
+	if object.Mode&0o111 != 0 {
+		out.Mode |= 0o111
+	}
 	out.Uid, out.Gid = uint32(os.Getuid()), uint32(os.Getgid())
-	// Modification time is when the content register last changed, not when
-	// the object was created — a replaced file must look changed, or rsync
-	// -style change detection never re-reads it.
-	mtime := object.Modified
-	if mtime == 0 {
-		mtime = object.Created
-	}
-	if mtime > 0 {
-		out.Mtime = uint64(mtime / 1e9)
-		out.Mtimensec = uint32(mtime % 1e9)
-	}
+	// Modification time is the source mtime when known, else when the
+	// content last changed — never the creation time: a replaced file must
+	// look changed, or rsync-style change detection never re-reads it.
+	setTimes(out, object)
 	return 0
 }
 
@@ -478,6 +570,28 @@ func (f *fileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32,
 		return nil, 0, syscall.EROFS
 	}
 	f.mu.Lock()
+	if c := f.conflict; c != nil {
+		object := f.object
+		f.mu.Unlock()
+		if write {
+			return nil, 0, syscall.EPERM
+		}
+		tmp, err := f.m.stage()
+		if err != nil {
+			return nil, 0, syscall.EIO
+		}
+		r, err := f.m.src.GetBlob(f.m.bucket, object.ID, c.Blob)
+		if err == nil {
+			_, err = io.Copy(tmp, r)
+			r.Close()
+		}
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			return nil, 0, syscall.EIO
+		}
+		return &fileHandle{file: tmp, path: tmp.Name(), node: f}, fuse.FOPEN_DIRECT_IO, 0
+	}
 	if f.failed {
 		f.mu.Unlock()
 		return nil, 0, syscall.EIO

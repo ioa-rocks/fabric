@@ -3,10 +3,14 @@ package daemon
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 
 	"ioa.rocks/fabric/vault/bucket"
 	"ioa.rocks/fabric/vault/circle"
+	"ioa.rocks/fabric/vault/index"
 )
 
 // Control surface for vault ADR 0001: policy revisions, trash/restore,
@@ -34,7 +38,22 @@ type countBody struct {
 	Count int `json:"count"`
 }
 
+type entryBody struct {
+	Name   string `json:"name"`
+	Kind   string `json:"kind"` // dir | symlink
+	Target string `json:"target,omitempty"`
+	Mode   uint32 `json:"mode,omitempty"`
+}
+
+type attrBody struct {
+	Ref   string  `json:"ref"`
+	Mode  *uint32 `json:"mode,omitempty"`
+	MTime *int64  `json:"mtime,omitempty"`
+}
+
 func (d *Daemon) treeRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v0/buckets/{bucket}/entries", d.handlePutEntry)
+	mux.HandleFunc("POST /v0/buckets/{bucket}/attr", d.handleSetAttr)
 	mux.HandleFunc("GET /v0/buckets/{bucket}/policy", d.handlePolicy)
 	mux.HandleFunc("PUT /v0/buckets/{bucket}/policy", d.handleSetPolicy)
 	mux.HandleFunc("GET /v0/buckets/{bucket}/trash", d.handleTrash)
@@ -44,6 +63,68 @@ func (d *Daemon) treeRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/buckets/{bucket}/held", d.handleHeld)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/held/accept", d.handleHeldAccept)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/held/reject", d.handleHeldReject)
+}
+
+// handlePutEntry creates a directory or symlink record (ADR 0001 §6).
+func (d *Daemon) handlePutEntry(w http.ResponseWriter, r *http.Request) {
+	h, err := d.handle(r.PathValue("bucket"))
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	var body entryBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpErr(w, err)
+		return
+	}
+	if body.Kind != index.KindDir && body.Kind != index.KindSymlink {
+		httpErr(w, fmt.Errorf("entry kind must be dir or symlink, got %q", body.Kind))
+		return
+	}
+	o, err := h.PutEntry(body.Name, index.Revision{Kind: body.Kind, Target: body.Target, Mode: body.Mode}, nil)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	d.kickSync()
+	writeJSON(w, Info(o))
+}
+
+// handleSetAttr records a mode or source-mtime change as a revision.
+func (d *Daemon) handleSetAttr(w http.ResponseWriter, r *http.Request) {
+	h, err := d.handle(r.PathValue("bucket"))
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	var body attrBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpErr(w, err)
+		return
+	}
+	o, err := h.ResolveObject(body.Ref)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	if body.Mode == nil && body.MTime == nil {
+		writeJSON(w, Info(o))
+		return
+	}
+	o, err = h.Revise(o, func(rev *index.Revision) {
+		if body.Mode != nil {
+			rev.Mode = *body.Mode & 0o777
+		}
+		if body.MTime != nil {
+			rev.MTime = *body.MTime
+		}
+	})
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	d.kickSync()
+	writeJSON(w, Info(o))
 }
 
 func (d *Daemon) handlePolicy(w http.ResponseWriter, r *http.Request) {
@@ -210,6 +291,33 @@ func (d *Daemon) heldDecision(w http.ResponseWriter, r *http.Request, decide fun
 }
 
 // Client side.
+
+func (c *Client) PutEntry(bucket, name, kind, target string, mode uint32) (ObjectInfo, error) {
+	var out ObjectInfo
+	err := c.post(bucketPath(bucket, "/entries"), entryBody{Name: name, Kind: kind, Target: target, Mode: mode}, &out)
+	return out, err
+}
+
+// SetAttr records a mode and/or mtime change; a nil pointer leaves that
+// attribute alone.
+func (c *Client) SetAttr(bucket, ref string, mode *uint32, mtime *int64) (ObjectInfo, error) {
+	var out ObjectInfo
+	err := c.post(bucketPath(bucket, "/attr"), attrBody{Ref: ref, Mode: mode, MTime: mtime}, &out)
+	return out, err
+}
+
+// GetBlob reads one head's content — a conflict copy — by blob hash.
+func (c *Client) GetBlob(bucket, ref, blob string) (io.ReadCloser, error) {
+	resp, err := c.http.Get("http://vault" + bucketPath(bucket, "/content") + "?ref=" + url.QueryEscape(ref) + "&blob=" + url.QueryEscape(blob))
+	if err != nil {
+		return nil, fmt.Errorf("is the daemon running? %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		return nil, decodeErr(resp)
+	}
+	return resp.Body, nil
+}
 
 func (c *Client) Policy(name string) (bucket.Policy, error) {
 	var out bucket.Policy

@@ -86,6 +86,41 @@ func (s *memorySource) Rename(_, ref, name string) (daemon.ObjectInfo, error) {
 	return o, nil
 }
 func (s *memorySource) Ping() error { return nil }
+func (s *memorySource) PutEntry(_, name, kind, target string, mode uint32) (daemon.ObjectInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.next++
+	id := fmt.Sprintf("%032d", s.next)
+	o := daemon.ObjectInfo{ID: id, Name: name, Kind: kind, Target: target, Mode: mode}
+	s.objects[id] = o
+	return o, nil
+}
+func (s *memorySource) SetAttr(_, ref string, mode *uint32, mtime *int64) (daemon.ObjectInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o := s.objects[ref]
+	if mode != nil {
+		o.Mode = *mode
+	}
+	if mtime != nil {
+		o.MTime = *mtime
+	}
+	s.objects[ref] = o
+	return o, nil
+}
+func (s *memorySource) GetBlob(_, ref, blob string) (io.ReadCloser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return io.NopCloser(bytes.NewReader(append([]byte(nil), s.data[blob]...))), nil
+}
+func (s *memorySource) Resolve(_, ref string) (daemon.ObjectInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o := s.objects[ref]
+	o.Conflicts = nil
+	s.objects[ref] = o
+	return o, nil
+}
 func (s *memorySource) Rm(_, ref string) (daemon.ObjectInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,6 +140,16 @@ func (fakeSource) Rename(string, string, string) (daemon.ObjectInfo, error) {
 }
 func (fakeSource) Rm(string, string) (daemon.ObjectInfo, error) { return daemon.ObjectInfo{}, nil }
 func (fakeSource) Ping() error                                  { return nil }
+func (fakeSource) PutEntry(string, string, string, string, uint32) (daemon.ObjectInfo, error) {
+	return daemon.ObjectInfo{}, nil
+}
+func (fakeSource) SetAttr(string, string, *uint32, *int64) (daemon.ObjectInfo, error) {
+	return daemon.ObjectInfo{}, nil
+}
+func (fakeSource) GetBlob(string, string, string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("conflict data")), nil
+}
+func (fakeSource) Resolve(string, string) (daemon.ObjectInfo, error) { return daemon.ObjectInfo{}, nil }
 
 // testTree builds a node tree without mounting it, for the pure naming tests.
 func testTree(t *testing.T, src source, objects []daemon.ObjectInfo) (*dirNode, error) {
@@ -237,13 +282,25 @@ func TestWritableMountLifecycle(t *testing.T) {
 	}
 	src.mu.Lock()
 	var id string
+	dirs := 0
 	for k, o := range src.objects {
+		if o.Kind == "dir" {
+			// mkdir became a directory record (ADR 0001 §6).
+			dirs++
+			if o.Name != "2026" {
+				t.Fatalf("dir record name=%q", o.Name)
+			}
+			continue
+		}
 		id = k
 		if o.Name != "2026/cat.jpg" {
 			t.Fatalf("name=%q", o.Name)
 		}
 	}
 	src.mu.Unlock()
+	if dirs != 1 {
+		t.Fatalf("%d directory records, want 1", dirs)
+	}
 	if err := os.WriteFile(mountpoint+"/2026/cat.jpg", []byte("better cat"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +315,7 @@ func TestWritableMountLifecycle(t *testing.T) {
 		src.mu.Lock()
 		o = src.objects[id]
 		got = string(src.data[id])
-		count = len(src.objects)
+		count = src.fileCount()
 		src.mu.Unlock()
 		if count == 1 && o.Name == "favorite.jpg" && got == "better cat" {
 			break
@@ -271,6 +328,13 @@ func TestWritableMountLifecycle(t *testing.T) {
 	if err := os.Remove(mountpoint + "/favorite.jpg"); err != nil {
 		t.Fatal(err)
 	}
+	// Emptied by the moves, 2026 stays as a directory record until rmdir.
+	src.mu.Lock()
+	count = len(src.objects)
+	src.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("objects after file delete=%d, want the directory record", count)
+	}
 	if err := os.Remove(mountpoint + "/2026"); err != nil {
 		t.Fatal(err)
 	}
@@ -280,6 +344,17 @@ func TestWritableMountLifecycle(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("objects after delete=%d", count)
 	}
+}
+
+// fileCount counts non-directory objects; the caller holds s.mu.
+func (s *memorySource) fileCount() int {
+	n := 0
+	for _, o := range s.objects {
+		if o.Kind != "dir" {
+			n++
+		}
+	}
+	return n
 }
 
 func TestMountedFileRefreshesRemoteSize(t *testing.T) {
