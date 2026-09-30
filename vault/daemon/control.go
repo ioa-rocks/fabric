@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -48,6 +49,11 @@ type BucketInfo struct {
 
 	Conflicts     int `json:"conflicts,omitempty"`      // rendered conflict copies (ADR 0001 §3)
 	HeldDeletions int `json:"held_deletions,omitempty"` // parked deletions awaiting a decision (§4)
+
+	// How this device holds it: a folder replica's directory, and any
+	// mounts over it.
+	Folder string   `json:"folder,omitempty"`
+	Mounts []string `json:"mounts,omitempty"`
 }
 
 // ObjectInfo is the wire form of an object — the API view over the CRDT
@@ -345,6 +351,8 @@ func (d *Daemon) handleBuckets(w http.ResponseWriter, _ *http.Request) {
 		httpErr(w, err)
 		return
 	}
+	folders, _ := d.Circle.Folders()
+	mounts, _ := d.Circle.Mounts()
 	out := []BucketInfo{}
 	for _, b := range buckets {
 		id, err := b.ID()
@@ -352,6 +360,17 @@ func (d *Daemon) handleBuckets(w http.ResponseWriter, _ *http.Request) {
 			continue
 		}
 		info := BucketInfo{ID: id, Name: b.Genesis.Name, Sub: d.Circle.Subscription(id)}
+		for dir, f := range folders {
+			if f.Bucket == id {
+				info.Folder = dir
+			}
+		}
+		for dir, m := range mounts {
+			if m.Bucket == id {
+				info.Mounts = append(info.Mounts, dir)
+			}
+		}
+		sort.Strings(info.Mounts)
 		if h, err := d.handle(id); err == nil {
 			info.Objects, info.Held, _ = h.Stats()
 			if cs, err := h.Conflicts(); err == nil {

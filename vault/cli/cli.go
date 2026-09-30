@@ -338,7 +338,14 @@ func cmdBuckets(args []string) error {
 		if sub == "" {
 			sub = "-"
 		}
-		fmt.Printf("%s  %-6s %3d/%-3d  %s\n", b.ID[:16], sub, b.Held, b.Objects, b.Name)
+		where := ""
+		if b.Folder != "" {
+			where = "  folder " + b.Folder
+		}
+		for _, m := range b.Mounts {
+			where += "  mount " + m
+		}
+		fmt.Printf("%s  %-6s %3d/%-3d  %s%s\n", b.ID[:16], sub, b.Held, b.Objects, b.Name, where)
 	}
 	return nil
 }
