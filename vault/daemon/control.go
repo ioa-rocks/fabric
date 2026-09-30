@@ -508,8 +508,8 @@ func (d *Daemon) handleGet(w http.ResponseWriter, r *http.Request) {
 	// On-demand fetch: a missing blob is a mesh lookup, not an error —
 	// vault get works on any node that can reach a holder (API-first; the
 	// cache axis without the bookkeeping).
-	if blob != "" && !d.Circle.Blobs.Has(blob) && d.Fabric != nil {
-		if err := d.fetchAnywhere(blob); err != nil {
+	if blob != "" && !h.Holder().Has(blob) && d.Fabric != nil {
+		if err := d.fetchAnywhere(h, blob); err != nil {
 			httpErr(w, fmt.Errorf("blob not held here and no peer served it: %w", err))
 			return
 		}

@@ -457,6 +457,17 @@ func (c *Circle) ResolveBucketID(ref string) (string, error) {
 
 // Handle is an opened bucket: genesis + policy + index over the shared blob
 // store. Close it when done (the index holds a Pebble lock).
+// Holder is where a bucket's content lives on this device: the circle
+// blobstore by default, or a folder replica (Location.Form "path"). Every
+// content read and write of a Handle goes through it.
+type Holder interface {
+	Put(r io.Reader) (hash string, size int64, err error)
+	Open(hash string) (io.ReadCloser, error)
+	Path(hash string) (string, error)
+	Has(hash string) bool
+	Size(hash string) (int64, error)
+}
+
 type Handle struct {
 	Bucket *bucket.Bucket
 	Policy *bucket.SignedPolicy
@@ -464,6 +475,8 @@ type Handle struct {
 
 	circle        *Circle
 	id            string
+	holder        Holder
+	form          string
 	policyMu      sync.Mutex
 	heldMu        sync.Mutex
 	recentDeletes []int64 // merge times of recent tombstones, for the bulk-hold window
@@ -503,6 +516,35 @@ func (h *Handle) Close() error { return h.Index.Close() }
 
 func (h *Handle) ID() string { return h.id }
 
+// NodeID is the device identity revisions are authored under.
+func (h *Handle) NodeID() string { return h.circle.NodeID }
+
+// Holder returns where this device keeps the bucket's content.
+func (h *Handle) Holder() Holder {
+	if h.holder == nil {
+		return h.circle.Blobs
+	}
+	return h.holder
+}
+
+// SetHolder switches the bucket's content home (a folder replica) and the
+// location form recorded for blobs held there.
+func (h *Handle) SetHolder(holder Holder, form string) {
+	h.holder, h.form = holder, form
+}
+
+func (h *Handle) locationForm() string {
+	if h.form == "" {
+		return index.FormWhole
+	}
+	return h.form
+}
+
+// RecordHeld notes that this device now holds a blob (a location record).
+func (h *Handle) RecordHeld(hash string) error {
+	return h.Index.PutLocation(index.Location{Blob: hash, Node: h.circle.NodeID, Form: h.locationForm(), TS: time.Now().UnixNano()})
+}
+
 // Put streams content in as a new file object: blob into the content
 // store, a fresh record into the index, a location record for this node.
 func (h *Handle) Put(name string, r io.Reader, tags ...string) (*index.Object, error) {
@@ -518,11 +560,17 @@ func (h *Handle) PutEntry(name string, rev index.Revision, r io.Reader, tags ...
 	}
 	now := time.Now().UnixNano()
 	if rev.KindOrFile() == index.KindFile {
-		hash, size, err := h.circle.Blobs.Put(r)
-		if err != nil {
-			return nil, err
+		// A nil reader with a preset blob means the holder already has the
+		// content (a folder scan found it in place).
+		if r != nil {
+			hash, size, err := h.Holder().Put(r)
+			if err != nil {
+				return nil, err
+			}
+			rev.Blob, rev.Size = hash, size
+		} else if rev.Blob == "" {
+			return nil, errors.New("file entry needs content")
 		}
-		rev.Blob, rev.Size = hash, size
 	} else {
 		rev.Blob, rev.Size = "", 0
 	}
@@ -538,7 +586,7 @@ func (h *Handle) PutEntry(name string, rev index.Revision, r io.Reader, tags ...
 		return nil, err
 	}
 	if rev.Blob != "" {
-		if err := h.Index.PutLocation(index.Location{Blob: rev.Blob, Node: h.circle.NodeID, Form: index.FormWhole, TS: now}); err != nil {
+		if err := h.RecordHeld(rev.Blob); err != nil {
 			return nil, err
 		}
 	}
@@ -577,21 +625,29 @@ func (h *Handle) Replace(o *index.Object, r io.Reader) (*index.Object, error) {
 }
 
 func (h *Handle) ReplaceAt(o *index.Object, r io.Reader, mtime int64) (*index.Object, error) {
-	hash, size, err := h.circle.Blobs.Put(r)
+	hash, size, err := h.Holder().Put(r)
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now().UnixNano()
-	o, err = h.Revise(o, func(rev *index.Revision) {
+	return h.ReplaceHeld(o, hash, size, mtime, 0)
+}
+
+// ReplaceHeld publishes content the holder already has (a folder scan) as
+// the object's new revision; mode 0 keeps the previous mode.
+func (h *Handle) ReplaceHeld(o *index.Object, hash string, size, mtime int64, mode uint32) (*index.Object, error) {
+	o, err := h.Revise(o, func(rev *index.Revision) {
 		rev.Blob, rev.Size, rev.Kind, rev.Target, rev.Deleted = hash, size, index.KindFile, "", false
 		if mtime != 0 {
 			rev.MTime = mtime
+		}
+		if mode != 0 {
+			rev.Mode = mode
 		}
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err := h.Index.PutLocation(index.Location{Blob: hash, Node: h.circle.NodeID, Form: index.FormWhole, TS: now}); err != nil {
+	if err := h.RecordHeld(hash); err != nil {
 		return nil, err
 	}
 	return o, nil
@@ -611,7 +667,7 @@ func (h *Handle) GetBlob(blob string) (io.ReadCloser, error) {
 	if blob == "" {
 		return nil, errors.New("no content")
 	}
-	return h.circle.Blobs.Open(blob)
+	return h.Holder().Open(blob)
 }
 
 // Get opens the current content of an object.
@@ -619,7 +675,7 @@ func (h *Handle) Get(o *index.Object) (io.ReadCloser, error) {
 	if o.Blob() == "" {
 		return nil, fmt.Errorf("object %s has no content (%s)", o.ID[:8], o.Head().KindOrFile())
 	}
-	return h.circle.Blobs.Open(o.Blob())
+	return h.Holder().Open(o.Blob())
 }
 
 // BackfillSize repairs a head written before size metadata existed. Size
@@ -633,7 +689,7 @@ func (h *Handle) BackfillSize(o *index.Object) (bool, error) {
 	if head == nil || head.Size != 0 || head.Blob == "" {
 		return false, nil
 	}
-	size, err := h.circle.Blobs.Size(head.Blob)
+	size, err := h.Holder().Size(head.Blob)
 	if err != nil {
 		return false, nil // not held here; a holder will repair it
 	}
@@ -654,7 +710,7 @@ func (h *Handle) Stats() (objects, held int, err error) {
 	}
 	for _, o := range objs {
 		objects++
-		if b := o.Blob(); b == "" || h.circle.Blobs.Has(b) {
+		if b := o.Blob(); b == "" || h.Holder().Has(b) {
 			held++
 		}
 	}
@@ -822,7 +878,7 @@ func (h *Handle) Project(dir string) (int, error) {
 			n++
 			continue
 		}
-		src, err := h.circle.Blobs.Path(head.Blob)
+		src, err := h.Holder().Path(head.Blob)
 		if err != nil {
 			continue // blob not held here; sync will fill it later
 		}

@@ -100,7 +100,7 @@ func (h *Handle) ApplyRecords(records []*index.Object, from string) (held int, e
 			continue // unknown here: nothing live to lose
 		}
 		locals[in.ID] = cur
-		if !cur.IsDeleted() && index.Merge(cur, in).IsDeleted() {
+		if merged := index.Merge(cur, in); !cur.IsDeleted() && merged.IsDeleted() && !merged.Head().Confirmed {
 			deleting = append(deleting, in)
 		}
 	}
@@ -186,8 +186,9 @@ func (h *Handle) ListHeld() ([]HeldInfo, error) {
 	return out, nil
 }
 
-// AcceptHeld merges the parked deletions: the objects are tombstoned as
-// the peer intended. Returns how many were applied.
+// AcceptHeld merges the parked deletions and re-issues each as a confirmed
+// tombstone, so the other replicas apply it without holding it again.
+// Returns how many were applied.
 func (h *Handle) AcceptHeld() (int, error) {
 	h.heldMu.Lock()
 	defer h.heldMu.Unlock()
@@ -201,8 +202,14 @@ func (h *Handle) AcceptHeld() (int, error) {
 		if err != nil {
 			return n, err
 		}
-		if _, err := h.Index.PutObject(in); err != nil {
+		merged, err := h.Index.PutObject(in)
+		if err != nil {
 			return n, err
+		}
+		if merged.IsDeleted() {
+			if _, err := h.Revise(merged, func(r *index.Revision) { r.Deleted, r.Confirmed = true, true }); err != nil {
+				return n, err
+			}
 		}
 		delete(set, id)
 		n++

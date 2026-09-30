@@ -210,9 +210,13 @@ type Revision struct {
 	MTime   int64  `cbor:"mtime,omitempty"`  // source modification time, unix nanos; 0 unknown
 	Target  string `cbor:"target,omitempty"` // symlink target
 	Deleted bool   `cbor:"deleted,omitempty"`
-	TS      int64  `cbor:"ts"` // unix nanos; orders concurrent heads for rendering
-	By      string `cbor:"by"` // device that wrote it
-	VV      VV     `cbor:"vv"`
+	// Confirmed marks a tombstone an operator accepted from a held bulk
+	// deletion (ADR 0001 §4): other replicas apply it without holding it
+	// again. Only an explicit accept sets it.
+	Confirmed bool   `cbor:"confirmed,omitempty"`
+	TS        int64  `cbor:"ts"` // unix nanos; orders concurrent heads for rendering
+	By        string `cbor:"by"` // device that wrote it
+	VV        VV     `cbor:"vv"`
 }
 
 // KindOrFile normalizes the empty kind.
@@ -229,7 +233,7 @@ func (r Revision) KindOrFile() string {
 func (r Revision) same(o Revision) bool {
 	return r.Blob == o.Blob && (r.Size == o.Size || r.Size == 0 || o.Size == 0) && r.KindOrFile() == o.KindOrFile() &&
 		r.Mode == o.Mode && r.MTime == o.MTime && r.Target == o.Target &&
-		r.Deleted == o.Deleted && r.TS == o.TS && r.By == o.By && r.VV.Equal(o.VV)
+		r.Deleted == o.Deleted && r.Confirmed == o.Confirmed && r.TS == o.TS && r.By == o.By && r.VV.Equal(o.VV)
 }
 
 // less is the total order that picks one head to render when several are

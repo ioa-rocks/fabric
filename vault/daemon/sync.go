@@ -271,10 +271,10 @@ func (d *Daemon) fetchMissing(h *circle.Handle) {
 		// Every live head, so a conflict copy can be rendered too.
 		for _, r := range o.Heads {
 			blob := r.Blob
-			if r.Deleted || blob == "" || d.Circle.Blobs.Has(blob) {
+			if r.Deleted || blob == "" || h.Holder().Has(blob) {
 				continue
 			}
-			if err := d.fetchAnywhere(blob); err != nil {
+			if err := d.fetchAnywhere(h, blob); err != nil {
 				log.Printf("fetch: blob %.12s (%s): %v", blob, o.Name.V, err)
 			}
 		}
@@ -284,7 +284,7 @@ func (d *Daemon) fetchMissing(h *circle.Handle) {
 // fetchAnywhere tries every connected vault peer until one serves the
 // blob. Location records will drive smarter source selection when fleets
 // outgrow "just ask everyone".
-func (d *Daemon) fetchAnywhere(hash string) error {
+func (d *Daemon) fetchAnywhere(h *circle.Handle, hash string) error {
 	if d.Fabric == nil {
 		return fmt.Errorf("not on a mesh")
 	}
@@ -294,18 +294,18 @@ func (d *Daemon) fetchAnywhere(hash string) error {
 		if !d.Fabric.Store.IsMember(p, now) {
 			continue
 		}
-		if err := d.fetchBlob(p, hash); err != nil {
+		if err := d.fetchBlob(h, p, hash); err != nil {
 			lastErr = err
 			continue
 		}
-		_ = d.recordHeld(hash)
+		_ = h.RecordHeld(hash)
 		d.kickSync() // let peers learn we hold it now
 		return nil
 	}
 	return lastErr
 }
 
-func (d *Daemon) fetchBlob(p peer.ID, hash string) error {
+func (d *Daemon) fetchBlob(h *circle.Handle, p peer.ID, hash string) error {
 	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Minute)
 	defer cancel()
 	s, err := d.Fabric.Host.NewStream(ctx, p, BlobProtocol)
@@ -330,7 +330,7 @@ func (d *Daemon) fetchBlob(p peer.ID, hash string) error {
 	// buffered its head). Content addressing is the integrity check:
 	// whatever arrives is re-hashed by Put.
 	body := io.LimitReader(io.MultiReader(dec.Buffered(), s), resp.Size)
-	got, n, err := d.Circle.Blobs.Put(body)
+	got, n, err := h.Holder().Put(body)
 	if err != nil {
 		return err
 	}
@@ -354,7 +354,7 @@ func (d *Daemon) handleBlob(s network.Stream) {
 		return
 	}
 	enc := cbor.NewEncoder(s)
-	path, err := d.Circle.Blobs.Path(req.Hash)
+	path, err := d.blobPath(req.Hash)
 	if err != nil {
 		_ = enc.Encode(blobResp{Found: false})
 		return
@@ -376,14 +376,16 @@ func (d *Daemon) handleBlob(s network.Stream) {
 	_, _ = io.Copy(s, f)
 }
 
-// recordHeld writes this node's location record for a freshly fetched
-// blob into every bucket index that references it.
-func (d *Daemon) recordHeld(hash string) error {
+// blobPath finds a held blob in the circle store or any bucket's holder
+// (a folder replica serves its working files).
+func (d *Daemon) blobPath(hash string) (string, error) {
+	if p, err := d.Circle.Blobs.Path(hash); err == nil {
+		return p, nil
+	}
 	buckets, err := d.Circle.Buckets()
 	if err != nil {
-		return err
+		return "", err
 	}
-	now := time.Now().UnixNano()
 	for _, b := range buckets {
 		id, err := b.ID()
 		if err != nil {
@@ -393,18 +395,9 @@ func (d *Daemon) recordHeld(hash string) error {
 		if err != nil {
 			continue
 		}
-		objs, err := h.Index.ListObjects()
-		if err != nil {
-			continue
-		}
-		for _, o := range objs {
-			for _, r := range o.Heads {
-				if r.Blob == hash {
-					_ = h.Index.PutLocation(index.Location{Blob: hash, Node: d.Circle.NodeID, Form: index.FormWhole, TS: now})
-					break
-				}
-			}
+		if p, err := h.Holder().Path(hash); err == nil {
+			return p, nil
 		}
 	}
-	return nil
+	return "", fmt.Errorf("blob %.12s: not held here", hash)
 }
