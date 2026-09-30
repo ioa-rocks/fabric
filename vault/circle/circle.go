@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -448,38 +449,91 @@ func (h *Handle) Close() error { return h.Index.Close() }
 
 func (h *Handle) ID() string { return h.id }
 
-// Put streams content in as a new object: blob into the content store, a
-// fresh record into the index, a location record for this node.
+// Put streams content in as a new file object: blob into the content
+// store, a fresh record into the index, a location record for this node.
 func (h *Handle) Put(name string, r io.Reader, tags ...string) (*index.Object, error) {
-	hash, size, err := h.circle.Blobs.Put(r)
-	if err != nil {
+	return h.PutEntry(name, index.Revision{Kind: index.KindFile}, r, tags...)
+}
+
+// PutEntry creates an object of any kind. For a file, r supplies the
+// content; for a directory or symlink record r is ignored and the
+// revision's Kind/Target/Mode/MTime describe the entry (ADR 0001 §6).
+func (h *Handle) PutEntry(name string, rev index.Revision, r io.Reader, tags ...string) (*index.Object, error) {
+	if err := checkName(name); err != nil {
 		return nil, err
 	}
 	now := time.Now().UnixNano()
-	o := index.NewObject(name, hash, size, now, h.circle.Config.DID)
+	if rev.KindOrFile() == index.KindFile {
+		hash, size, err := h.circle.Blobs.Put(r)
+		if err != nil {
+			return nil, err
+		}
+		rev.Blob, rev.Size = hash, size
+	} else {
+		rev.Blob, rev.Size = "", 0
+	}
+	if rev.Kind == index.KindSymlink && rev.Target == "" {
+		return nil, errors.New("symlink record needs a target")
+	}
+	o := index.NewObject(name, rev, now, h.circle.NodeID)
 	for _, t := range tags {
 		o.Tags.Add(t, now)
 	}
-	if o, err = h.Index.PutObject(o); err != nil {
+	o, err := h.Index.PutObject(o)
+	if err != nil {
 		return nil, err
 	}
-	if err := h.Index.PutLocation(index.Location{Blob: hash, Node: h.circle.NodeID, Form: index.FormWhole, TS: now}); err != nil {
-		return nil, err
+	if rev.Blob != "" {
+		if err := h.Index.PutLocation(index.Location{Blob: rev.Blob, Node: h.circle.NodeID, Form: index.FormWhole, TS: now}); err != nil {
+			return nil, err
+		}
 	}
 	return o, nil
 }
 
-// Replace publishes complete new content for an existing object while
-// preserving its object identity and tags.
+// checkName refuses names that could escape or confuse a tree surface
+// (ADR 0001 §6): absolute, "..", or NUL.
+func checkName(name string) error {
+	if name == "" {
+		return errors.New("name must not be empty")
+	}
+	if strings.HasPrefix(name, "/") || strings.ContainsRune(name, 0) {
+		return fmt.Errorf("invalid name %q", name)
+	}
+	for _, part := range strings.Split(name, "/") {
+		if part == ".." {
+			return fmt.Errorf("invalid name %q", name)
+		}
+	}
+	return nil
+}
+
+// Revise mints a local revision of an object (a copy of the rendered head
+// with fn applied) that supersedes every head this device knows.
+func (h *Handle) Revise(o *index.Object, fn func(r *index.Revision)) (*index.Object, error) {
+	o.Revise(h.circle.NodeID, time.Now().UnixNano(), fn)
+	return h.Index.PutObject(o)
+}
+
+// Replace publishes complete new content for an existing file object while
+// preserving its object identity and tags. mtime, if non-zero, records the
+// source modification time.
 func (h *Handle) Replace(o *index.Object, r io.Reader) (*index.Object, error) {
+	return h.ReplaceAt(o, r, 0)
+}
+
+func (h *Handle) ReplaceAt(o *index.Object, r io.Reader, mtime int64) (*index.Object, error) {
 	hash, size, err := h.circle.Blobs.Put(r)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now().UnixNano()
-	o.Blob.Set(hash, now, h.circle.Config.DID)
-	o.Size, o.SizeKnown = size, true
-	o, err = h.Index.PutObject(o)
+	o, err = h.Revise(o, func(rev *index.Revision) {
+		rev.Blob, rev.Size, rev.Kind, rev.Target, rev.Deleted = hash, size, index.KindFile, "", false
+		if mtime != 0 {
+			rev.MTime = mtime
+		}
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -491,28 +545,37 @@ func (h *Handle) Replace(o *index.Object, r io.Reader) (*index.Object, error) {
 
 // Rename changes only the display path; object identity and content survive.
 func (h *Handle) Rename(o *index.Object, name string) (*index.Object, error) {
-	o.Name.Set(name, time.Now().UnixNano(), h.circle.Config.DID)
+	if err := checkName(name); err != nil {
+		return nil, err
+	}
+	o.Name.Set(name, time.Now().UnixNano(), h.circle.NodeID)
 	return h.Index.PutObject(o)
 }
 
 // Get opens the current content of an object.
 func (h *Handle) Get(o *index.Object) (io.ReadCloser, error) {
-	return h.circle.Blobs.Open(o.Blob.V)
+	if o.Blob() == "" {
+		return nil, fmt.Errorf("object %s has no content (%s)", o.ID[:8], o.Head().KindOrFile())
+	}
+	return h.circle.Blobs.Open(o.Blob())
 }
 
-// BackfillSize upgrades an object written before size metadata existed. It is
-// intentionally local-only: discovering a legacy remote size must not fetch a
-// whole blob merely to satisfy stat(2). The repaired record syncs normally.
+// BackfillSize repairs a head written before size metadata existed. Size
+// is derived from the blob, so this is an in-place repair, not a revision
+// (a revision here would race the same repair on every other device). It
+// is intentionally local-only: discovering a legacy remote size must not
+// fetch a whole blob merely to satisfy stat(2). The repaired record syncs
+// normally and collapses with unrepaired copies (index.Revision.same).
 func (h *Handle) BackfillSize(o *index.Object) (bool, error) {
-	if o.SizeKnown {
+	head := o.Head()
+	if head == nil || head.Size != 0 || head.Blob == "" {
 		return false, nil
 	}
-	size, err := h.circle.Blobs.Size(o.Blob.V)
+	size, err := h.circle.Blobs.Size(head.Blob)
 	if err != nil {
 		return false, nil // not held here; a holder will repair it
 	}
-	o.Size = size
-	o.SizeKnown = true
+	head.Size = size
 	if _, err := h.Index.PutObject(o); err != nil {
 		return false, err
 	}
@@ -529,7 +592,7 @@ func (h *Handle) Stats() (objects, held int, err error) {
 	}
 	for _, o := range objs {
 		objects++
-		if h.circle.Blobs.Has(o.Blob.V) {
+		if b := o.Blob(); b == "" || h.circle.Blobs.Has(b) {
 			held++
 		}
 	}
@@ -588,9 +651,64 @@ func (h *Handle) Tag(o *index.Object, add, remove []string) (*index.Object, erro
 // Delete tombstones an object. The blob stays until retention/drop-safety
 // machinery lands (memo §5 — deletion is intent, dropping is local).
 func (h *Handle) Delete(o *index.Object) error {
-	o.Deleted.Set(fmt.Sprintf("deleted@%d", time.Now().Unix()), time.Now().UnixNano(), h.circle.Config.DID)
-	_, err := h.Index.PutObject(o)
+	_, err := h.Revise(o, func(r *index.Revision) { r.Deleted = true })
 	return err
+}
+
+// Restore revives a tombstoned object with its last content (ADR 0001 §4).
+func (h *Handle) Restore(o *index.Object) (*index.Object, error) {
+	if !o.IsDeleted() {
+		return o, nil
+	}
+	return h.Revise(o, func(r *index.Revision) { r.Deleted = false })
+}
+
+// Trash lists tombstoned objects, newest deletion first.
+func (h *Handle) Trash() ([]*index.Object, error) {
+	all, err := h.Index.DumpObjects()
+	if err != nil {
+		return nil, err
+	}
+	var out []*index.Object
+	for _, o := range all {
+		if o.IsDeleted() {
+			out = append(out, o)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Modified() > out[j].Modified() })
+	return out, nil
+}
+
+// Conflict is one losing head of an object, rendered under ConflictName.
+type Conflict struct {
+	Object   *index.Object
+	Revision index.Revision
+	Name     string
+}
+
+// Conflicts lists every rendered conflict copy in the bucket (ADR 0001 §3).
+func (h *Handle) Conflicts() ([]Conflict, error) {
+	objs, err := h.Index.ListObjects()
+	if err != nil {
+		return nil, err
+	}
+	var out []Conflict
+	for _, o := range objs {
+		for _, r := range o.Conflicts() {
+			out = append(out, Conflict{Object: o, Revision: r, Name: index.ConflictName(o.Name.V, r)})
+		}
+	}
+	return out, nil
+}
+
+// Resolve settles an object's conflict in favor of its rendered head: a new
+// revision dominating every head. The losing content stays in the blob
+// store like any superseded version.
+func (h *Handle) Resolve(o *index.Object) (*index.Object, error) {
+	if len(o.Conflicts()) == 0 {
+		return o, nil
+	}
+	return h.Revise(o, nil)
 }
 
 // Project materializes the bucket as a read-only directory — a projection
@@ -607,11 +725,30 @@ func (h *Handle) Project(dir string) (int, error) {
 	}
 	n := 0
 	for _, o := range objs {
-		src, err := h.circle.Blobs.Path(o.Blob.V)
+		dst := filepath.Join(dir, filepath.Clean("/"+o.Name.V))
+		head := o.Head()
+		switch head.KindOrFile() {
+		case index.KindDir:
+			if err := os.MkdirAll(dst, 0o755); err != nil {
+				return n, err
+			}
+			n++
+			continue
+		case index.KindSymlink:
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				return n, err
+			}
+			_ = os.Remove(dst)
+			if err := os.Symlink(head.Target, dst); err != nil {
+				return n, err
+			}
+			n++
+			continue
+		}
+		src, err := h.circle.Blobs.Path(head.Blob)
 		if err != nil {
 			continue // blob not held here; sync will fill it later
 		}
-		dst := filepath.Join(dir, filepath.Clean("/"+o.Name.V))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return n, err
 		}

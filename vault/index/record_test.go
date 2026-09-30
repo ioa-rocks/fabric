@@ -10,17 +10,16 @@ import (
 // the same state regardless of merge order (commutativity) and re-merging
 // must change nothing (idempotence).
 func TestMergeConvergence(t *testing.T) {
-	base := NewObject("cat.jpg", "hash-v1", 10, 1000, "did:alex")
+	base := NewObject("cat.jpg", Revision{Blob: "hash-v1", Size: 10}, 1000, "dev:a")
 
 	// Replica A renames and adds a tag.
 	a := clone(t, base)
-	a.Name.Set("cat-renamed.jpg", 2000, "did:alex")
+	a.Name.Set("cat-renamed.jpg", 2000, "dev:a")
 	a.Tags.Add("pets", 2000)
 
 	// Replica B swaps the blob (edit) and adds a different tag.
 	b := clone(t, base)
-	b.Blob.Set("hash-v2", 2500, "did:wife")
-	b.Size = 20
+	b.Revise("dev:b", 2500, func(r *Revision) { r.Blob, r.Size = "hash-v2", 20 })
 	b.Tags.Add("2026", 2500)
 
 	ab := Merge(a, b)
@@ -33,11 +32,11 @@ func TestMergeConvergence(t *testing.T) {
 		t.Fatal("merge is not idempotent")
 	}
 
-	if ab.Name.V != "cat-renamed.jpg" || ab.Blob.V != "hash-v2" {
-		t.Fatalf("LWW fields wrong after merge: name=%q blob=%q", ab.Name.V, ab.Blob.V)
+	if ab.Name.V != "cat-renamed.jpg" || ab.Blob() != "hash-v2" {
+		t.Fatalf("fields wrong after merge: name=%q blob=%q", ab.Name.V, ab.Blob())
 	}
-	if ab.Size != 20 {
-		t.Fatalf("size did not follow winning blob: %d", ab.Size)
+	if ab.Size() != 20 || len(ab.Heads) != 1 {
+		t.Fatalf("B's revision dominates the base: size=%d heads=%d", ab.Size(), len(ab.Heads))
 	}
 	tags := ab.Tags.List()
 	slices.Sort(tags)
@@ -81,11 +80,11 @@ func TestORSetAddWinsOverConcurrentRemove(t *testing.T) {
 }
 
 func TestTombstoneMerges(t *testing.T) {
-	base := NewObject("dog.jpg", "h1", 1, 1000, "did:alex")
+	base := NewObject("dog.jpg", Revision{Blob: "h1", Size: 1}, 1000, "dev:a")
 	a := clone(t, base)
-	a.Deleted.Set("gone", 2000, "did:alex")
+	a.Revise("dev:a", 2000, func(r *Revision) { r.Deleted = true })
 	b := clone(t, base)
-	b.Name.Set("dog-best.jpg", 1500, "did:wife")
+	b.Name.Set("dog-best.jpg", 1500, "dev:b")
 
 	m := Merge(a, b)
 	if !m.IsDeleted() {

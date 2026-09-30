@@ -55,14 +55,39 @@ type ObjectInfo struct {
 	Blob     string   `json:"blob"`
 	Size     int64    `json:"size"`
 	Created  int64    `json:"created_at"`            // Unix nanoseconds
-	Modified int64    `json:"modified_at,omitempty"` // when the content register last won a write
+	Modified int64    `json:"modified_at,omitempty"` // when the rendered revision was written
 	Tags     []string `json:"tags,omitempty"`
 	Deleted  bool     `json:"deleted,omitempty"`
+
+	// Tree metadata (vault ADR 0001 §6) and the conflict copies rendered
+	// beside this object (§3).
+	Kind      string         `json:"kind,omitempty"` // file | dir | symlink
+	Mode      uint32         `json:"mode,omitempty"`
+	MTime     int64          `json:"mtime,omitempty"` // source modification time, Unix nanoseconds
+	Target    string         `json:"target,omitempty"`
+	Conflicts []ConflictInfo `json:"conflicts,omitempty"`
+}
+
+// ConflictInfo is one losing head of an object, shown as a sibling file.
+type ConflictInfo struct {
+	Name  string `json:"name"`
+	Blob  string `json:"blob,omitempty"`
+	Size  int64  `json:"size"`
+	Kind  string `json:"kind,omitempty"`
+	MTime int64  `json:"mtime,omitempty"`
+	TS    int64  `json:"ts"`
+	By    string `json:"by"`
 }
 
 func Info(o *index.Object) ObjectInfo {
-	tags := o.Tags.List()
-	return ObjectInfo{ID: o.ID, Name: o.Name.V, Blob: o.Blob.V, Size: o.Size, Created: o.CreatedAt, Modified: o.Blob.TS, Tags: tags, Deleted: o.IsDeleted()}
+	info := ObjectInfo{ID: o.ID, Name: o.Name.V, Created: o.CreatedAt, Modified: o.Modified(), Tags: o.Tags.List(), Deleted: o.IsDeleted()}
+	if h := o.Head(); h != nil {
+		info.Blob, info.Size, info.Kind, info.Mode, info.MTime, info.Target = h.Blob, h.Size, h.KindOrFile(), h.Mode, h.MTime, h.Target
+	}
+	for _, r := range o.Conflicts() {
+		info.Conflicts = append(info.Conflicts, ConflictInfo{Name: index.ConflictName(o.Name.V, r), Blob: r.Blob, Size: r.Size, Kind: r.KindOrFile(), MTime: r.MTime, TS: r.TS, By: r.By})
+	}
+	return info
 }
 
 // PeerInfo describes one connected mesh member as seen from this vault
@@ -457,8 +482,8 @@ func (d *Daemon) handleGet(w http.ResponseWriter, r *http.Request) {
 	// On-demand fetch: a missing blob is a mesh lookup, not an error —
 	// vault get works on any node that can reach a holder (API-first; the
 	// cache axis without the bookkeeping).
-	if !d.Circle.Blobs.Has(o.Blob.V) && d.Fabric != nil {
-		if err := d.fetchAnywhere(o.Blob.V); err != nil {
+	if b := o.Blob(); b != "" && !d.Circle.Blobs.Has(b) && d.Fabric != nil {
+		if err := d.fetchAnywhere(b); err != nil {
 			httpErr(w, fmt.Errorf("blob not held here and no peer served it: %w", err))
 			return
 		}

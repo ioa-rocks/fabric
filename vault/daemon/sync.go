@@ -259,12 +259,15 @@ func (d *Daemon) fetchMissing(h *circle.Handle) {
 		return
 	}
 	for _, o := range objs {
-		blob := o.Blob.V
-		if blob == "" || d.Circle.Blobs.Has(blob) {
-			continue
-		}
-		if err := d.fetchAnywhere(blob); err != nil {
-			log.Printf("fetch: blob %.12s (%s): %v", blob, o.Name.V, err)
+		// Every live head, so a conflict copy can be rendered too.
+		for _, r := range o.Heads {
+			blob := r.Blob
+			if r.Deleted || blob == "" || d.Circle.Blobs.Has(blob) {
+				continue
+			}
+			if err := d.fetchAnywhere(blob); err != nil {
+				log.Printf("fetch: blob %.12s (%s): %v", blob, o.Name.V, err)
+			}
 		}
 	}
 }
@@ -386,9 +389,11 @@ func (d *Daemon) recordHeld(hash string) error {
 			continue
 		}
 		for _, o := range objs {
-			if o.Blob.V == hash {
-				_ = h.Index.PutLocation(index.Location{Blob: hash, Node: d.Circle.NodeID, Form: index.FormWhole, TS: now})
-				break
+			for _, r := range o.Heads {
+				if r.Blob == hash {
+					_ = h.Index.PutLocation(index.Location{Blob: hash, Node: d.Circle.NodeID, Form: index.FormWhole, TS: now})
+					break
+				}
 			}
 		}
 	}

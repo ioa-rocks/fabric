@@ -11,12 +11,12 @@ func TestStoreRoundtripAndFacets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cat := NewObject("cat.jpg", "h-cat", 1, 1000, "did:alex")
+	cat := NewObject("cat.jpg", Revision{Blob: "h-cat", Size: 1}, 1000, "dev:a")
 	cat.Tags.Add("pets", 1000)
 	cat.Tags.Add("2026", 1000)
-	dog := NewObject("dog.jpg", "h-dog", 1, 1001, "did:alex")
+	dog := NewObject("dog.jpg", Revision{Blob: "h-dog", Size: 1}, 1001, "dev:a")
 	dog.Tags.Add("pets", 1001)
-	tax := NewObject("tax.pdf", "h-tax", 1, 1002, "did:alex")
+	tax := NewObject("tax.pdf", Revision{Blob: "h-tax", Size: 1}, 1002, "dev:a")
 	tax.Tags.Add("2026", 1002)
 	for _, o := range []*Object{cat, dog, tax} {
 		if _, err := s.PutObject(o); err != nil {
@@ -44,7 +44,7 @@ func TestStoreRoundtripAndFacets(t *testing.T) {
 	}
 
 	// Tombstoned objects drop out of listings.
-	dog.Deleted.Set("gone", 2000, "did:alex")
+	dog.Revise("dev:a", 2000, func(r *Revision) { r.Deleted = true })
 	if _, err := s.PutObject(dog); err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestPutObjectMerges(t *testing.T) {
 	}
 	defer s.Close()
 
-	o := NewObject("a.jpg", "h1", 1, 1000, "did:alex")
+	o := NewObject("a.jpg", Revision{Blob: "h1", Size: 1}, 1000, "dev:a")
 	if _, err := s.PutObject(o); err != nil {
 		t.Fatal(err)
 	}
