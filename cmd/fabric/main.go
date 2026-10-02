@@ -169,7 +169,9 @@ func usage() {
   circle   circle init -name <label> — mint this node's circle (the owner's
            user key: what buckets and, next, subjects belong to)
            circle export <file> / circle join <file> — a second device of
-           the same owner; circle status — circle, buckets served, peers
+           the same owner; circle attest — sign this device into the circle
+           (peers sync only with attested devices); circle status — circle,
+           device attestation, buckets served, peers
   bucket   buckets of the circle ('fabric bucket -h'): create, list, place
            (full|cache|none|folder <dir>), mount, put/ls/get/rm, policy…;
            a "vault" symlink to this binary is the same group
@@ -338,6 +340,9 @@ func cmdUp(args []string) error {
 			if err != nil {
 				return fmt.Errorf("vault subsystem: %w", err)
 			}
+			// The circle instance of the namespace engine: who of the mesh
+			// is one of *our* devices. Vault gates on it; astral will.
+			d.Circle = daemon.NewCircleService(d.Host, d.Auth, c)
 			vd, err = vaultdaemon.New(st, d)
 			if err != nil {
 				return fmt.Errorf("vault subsystem: %w", err)

@@ -32,7 +32,11 @@ func runDaemon(t *testing.T, statePath string) (*daemon.Daemon, func()) {
 		}
 		fd.DisableTUN = true
 	}
-	d, err := daemon.New(openTestStore(t, statePath), fd)
+	st := openTestStore(t, statePath)
+	if fd != nil {
+		fd.Circle = fabricdaemon.NewCircleService(fd.Host, fd.Auth, st.Circle)
+	}
+	d, err := daemon.New(st, fd)
 	if err != nil {
 		t.Fatalf("daemon.New: %v", err)
 	}
@@ -87,8 +91,8 @@ func TestReplaySeafileIncident(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := newMeshNode(t, root, "alex", "a-vault")
-	b := newMeshNode(t, root, "alex-laptop", "b-vault")
+	a := newMeshNode(t, root, nil, "alex", "a-vault")
+	b := newMeshNode(t, root, a.bundle, "alex", "b-vault")
 	a.writeConfig(t, root, "a-vault", nil, a.event, b.event)
 	da, stopA := runDaemon(t, a.statePath)
 	addrs := da.Fabric.Host.Addrs()

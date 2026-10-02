@@ -94,8 +94,8 @@ func TestPlacementRootOverMesh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := newMeshNode(t, root, "alex", "a-vault")
-	b := newMeshNode(t, root, "alex-nas", "b-vault")
+	a := newMeshNode(t, root, nil, "alex", "a-vault")
+	b := newMeshNode(t, root, a.bundle, "alex", "b-vault")
 	a.writeConfig(t, root, "a-vault", nil, a.event, b.event)
 	da := startDaemon(t, a.statePath)
 	addrs := da.Fabric.Host.Addrs()

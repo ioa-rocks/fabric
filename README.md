@@ -536,6 +536,7 @@ the UI and daemon use a non-default Astral state directory.
 | `fabric announce add <hostname\|ip\|multiaddr>` | cloud/1:1-NAT nodes | also advertise an address no local interface carries; ports, transports, and resolved IPs derived automatically |
 | `fabric announce txt` | lighthouse | print the DNS TXT record enabling hostname joins |
 | `fabric circle init -name <label>` | one device per owner | mint the circle — the owner's user key, what buckets (and next, subjects) belong to; lives in `<state>/circle` |
+| `fabric circle attest` | each device of a circle | sign this device into the circle (done automatically by `circle init`/`join` when the node already has a fabric identity). Peers sync buckets and serve blobs only to attested devices of their own circle — mesh membership alone no longer grants vault access |
 | `fabric circle export <file>` / `fabric circle join <file>` | second device | carry the same circle to another device (interim until sub-key grants) |
 | `fabric circle status` | any member | circle, buckets served, mounts, folders, mesh, vault peers |
 | `fabric bucket ...` | any member | the circle's buckets: `create`, `list`, `place <b> full\|cache\|none\|folder <dir>`, `mount`, `put/ls/get/rm/…` (`fabric bucket -h`; a `vault` symlink means the same) |

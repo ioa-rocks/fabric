@@ -55,6 +55,10 @@ type Daemon struct {
 	Log    *event.Log // membership events: admissions + revocations (spec §5)
 	Sync   *fabricnet.EventSync
 	Queue  *admission.Queue // nil unless this node runs the admission queue
+	// Circle answers "is this member one of my circle's devices?" — set by
+	// the composition root when the node has a circle (NewCircleService);
+	// nil on pure-connectivity nodes. Vault gates on it (memo §9 step 3).
+	Circle *CircleService
 
 	// TUN bridge (mode C) — optional; nil when disabled or unavailable.
 	Bridge     *tunbridge.Bridge

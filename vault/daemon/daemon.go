@@ -19,6 +19,7 @@ import (
 	fabricdaemon "ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/vault/store"
 
+	"fmt"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -117,9 +118,20 @@ func New(c *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
 	}
 
 	if fd != nil {
+		// Trust boundary (l0-connectivity memo §9 step 3): sync and blobs
+		// are served only to verified devices of *this circle* — the
+		// fabric daemon's CircleService decides, from attestations, never
+		// from mesh membership alone. Hello stays member-wide: it is the
+		// presence card that lets status show who claims what.
+		if fd.Circle == nil {
+			return nil, errors.New("vault subsystem: the fabric daemon has no circle service (the composition root must attach NewCircleService for the store's circle)")
+		}
+		if fd.Circle.DID() != c.Circle.Config.DID {
+			return nil, fmt.Errorf("vault subsystem: fabric serves circle %s but the store belongs to %s", fd.Circle.DID(), c.Circle.Config.DID)
+		}
 		fd.Host.SetStreamHandler(HelloProtocol, fd.Auth.RequireMember(d.handleHello))
-		fd.Host.SetStreamHandler(SyncProtocol, fd.Auth.RequireMember(d.handleSync))
-		fd.Host.SetStreamHandler(BlobProtocol, fd.Auth.RequireMember(d.handleBlob))
+		fd.Host.SetStreamHandler(SyncProtocol, fd.Circle.Require(d.handleSync))
+		fd.Host.SetStreamHandler(BlobProtocol, fd.Circle.Require(d.handleBlob))
 		// Chain onto fabric's own on-auth hook (it drives membership-event
 		// anti-entropy) rather than replacing it.
 		fd.Auth.SetOnAuthenticated(func(p peer.ID) {
@@ -144,6 +156,9 @@ func (d *Daemon) Run() error {
 	defer stopControl()
 
 	log.Printf("vault subsystem up: circle %q (%s)", d.Store.Circle.Config.Name, d.Store.Circle.Config.DID)
+	if d.Fabric != nil && !d.Fabric.Circle.Attested() {
+		log.Printf("vault: this device holds no circle attestation — peers will not sync with it until 'fabric circle attest' runs here (no restart needed)")
+	}
 
 	if d.Fabric != nil {
 		go func() { defer close(d.syncDone); d.syncLoop() }()

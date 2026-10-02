@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"os"
 
+	"crypto/ed25519"
 	"ioa.rocks/fabric/circle"
+	"ioa.rocks/fabric/state"
 	vaultcli "ioa.rocks/fabric/vault/cli"
 	vaultdaemon "ioa.rocks/fabric/vault/daemon"
 	vaultstore "ioa.rocks/fabric/vault/store"
+	"time"
 )
 
 // The circle is the node's ownership layer (ADR 0017): a user key that
@@ -19,7 +22,7 @@ import (
 
 func cmdCircle(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: fabric circle init|join|export|status")
+		return fmt.Errorf("usage: fabric circle init|join|export|attest|status")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -29,6 +32,8 @@ func cmdCircle(args []string) error {
 		return cmdCircleJoin(rest)
 	case "export":
 		return cmdCircleExport(rest)
+	case "attest":
+		return cmdCircleAttest(rest)
 	case "status":
 		return cmdCircleStatus(rest)
 	}
@@ -75,6 +80,9 @@ func cmdCircleInit(args []string) error {
 		return err
 	}
 	fmt.Printf("circle created: %q  %s\n", c.Config.Name, c.Config.DID)
+	if err := attestDevice(*statePath, c, pass); err != nil {
+		return err
+	}
 	fmt.Printf("user-key container: %s — back it up\n", c.KeyPath())
 	fmt.Println("another device of yours joins with: fabric circle export <file>, then fabric circle join <file> there")
 	return nil
@@ -91,11 +99,18 @@ func cmdCircleJoin(args []string) error {
 	if err != nil {
 		return err
 	}
+	pass, err := vaultcli.Passphrase()
+	if err != nil {
+		return err
+	}
 	c, err := circle.Join(circle.Dir(*statePath), b)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("joined circle %q  %s\n", c.Config.Name, c.Config.DID)
+	if err := attestDevice(*statePath, c, pass); err != nil {
+		return err
+	}
 	fmt.Println("restart the node daemon ('fabric up') so it serves buckets; the catalog arrives via sync")
 	return nil
 }
@@ -122,6 +137,56 @@ func cmdCircleExport(args []string) error {
 	return nil
 }
 
+// attestDevice signs this node's fabric device key into the circle
+// (circle.Attest) — the statement peers verify before they sync with it.
+// Needs the fabric identity; before 'fabric join' it only says what to run.
+func attestDevice(statePath string, c *circle.Circle, pass string) error {
+	dir, err := state.Open(statePath)
+	if err != nil {
+		return err
+	}
+	devPriv, err := dir.LoadDeviceKey()
+	if err != nil {
+		fmt.Println("no fabric identity on this node yet — after 'fabric join', run 'fabric circle attest' so the circle's other devices serve this one")
+		return nil
+	}
+	raw, err := devPriv.GetPublic().Raw()
+	if err != nil {
+		return err
+	}
+	priv, err := c.Unlock(pass)
+	if err != nil {
+		return err
+	}
+	a, err := circle.Attest(priv, ed25519.PublicKey(raw), time.Now())
+	if err != nil {
+		return err
+	}
+	if err := c.SaveAttestation(a); err != nil {
+		return err
+	}
+	fmt.Printf("device attested into circle %q (%s) — a running daemon picks it up without restart\n", c.Config.Name, c.AttestationPath())
+	return nil
+}
+
+// cmdCircleAttest (re)signs this device into its circle: for nodes that
+// joined the circle before attestations existed, or that joined the mesh
+// after the circle.
+func cmdCircleAttest(args []string) error {
+	fs := flag.NewFlagSet("circle attest", flag.ExitOnError)
+	statePath, vaultState := circleFlags(fs)
+	fs.Parse(args)
+	c, err := openCircle(*statePath, *vaultState)
+	if err != nil {
+		return err
+	}
+	pass, err := vaultcli.Passphrase()
+	if err != nil {
+		return err
+	}
+	return attestDevice(*statePath, c, pass)
+}
+
 func cmdCircleStatus(args []string) error {
 	fs := flag.NewFlagSet("circle status", flag.ExitOnError)
 	statePath, vaultState := circleFlags(fs)
@@ -132,6 +197,11 @@ func cmdCircleStatus(args []string) error {
 	}
 	fmt.Printf("circle %q  %s\n", c.Config.Name, c.Config.DID)
 	fmt.Printf("  %s\n", c.Path)
+	if _, err := c.LoadAttestation(); err == nil {
+		fmt.Println("  device: attested (peers of the circle serve this device)")
+	} else {
+		fmt.Println("  device: NOT attested — run 'fabric circle attest'; until then no peer syncs with this device")
+	}
 	cl := vaultdaemon.TryClient(*vaultState)
 	if cl == nil {
 		fmt.Printf("buckets: no daemon on %s (the node daemon is 'fabric up')\n", vaultdaemon.SocketPath(*vaultState))

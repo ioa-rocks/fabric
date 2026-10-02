@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"crypto/ed25519"
 	fabricdaemon "ioa.rocks/fabric/daemon"
 	fabricstate "ioa.rocks/fabric/state"
 	"ioa.rocks/fabric/vault/daemon"
@@ -44,7 +45,13 @@ func startDaemon(t *testing.T, statePath string) *daemon.Daemon {
 		}
 		fd.DisableTUN = true
 	}
-	d, err := daemon.New(openTestStore(t, statePath), fd)
+	st := openTestStore(t, statePath)
+	if fd != nil {
+		// The composition root attaches the circle service (as `fabric up`
+		// does) — vault gates sync and blobs on it.
+		fd.Circle = fabricdaemon.NewCircleService(fd.Host, fd.Auth, st.Circle)
+	}
+	d, err := daemon.New(st, fd)
 	if err != nil {
 		t.Fatalf("daemon.New: %v", err)
 	}
@@ -99,6 +106,49 @@ func initCircle(t *testing.T, statePath, name string) {
 	t.Helper()
 	if _, err := circle.Init(circle.Dir(statePath), name, "pw"); err != nil {
 		t.Fatalf("circle.Init: %v", err)
+	}
+}
+
+// joinCircle installs an exported circle as this node's (a second device
+// of the same owner).
+func joinCircle(t *testing.T, statePath string, b *circle.Bundle) {
+	t.Helper()
+	if _, err := circle.Join(circle.Dir(statePath), b); err != nil {
+		t.Fatalf("circle.Join: %v", err)
+	}
+}
+
+// exportCircle returns the node's circle as a bundle for another node.
+func exportCircle(t *testing.T, statePath string) *circle.Bundle {
+	t.Helper()
+	c, err := circle.Open(circle.Dir(statePath))
+	if err != nil {
+		t.Fatalf("circle.Open: %v", err)
+	}
+	b, err := c.Export()
+	if err != nil {
+		t.Fatalf("circle.Export: %v", err)
+	}
+	return b
+}
+
+// attestDevice signs the node's device key into its circle, as the CLI does.
+func attestDevice(t *testing.T, statePath string, devicePub ed25519.PublicKey) {
+	t.Helper()
+	c, err := circle.Open(circle.Dir(statePath))
+	if err != nil {
+		t.Fatalf("circle.Open: %v", err)
+	}
+	priv, err := c.Unlock("pw")
+	if err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	a, err := circle.Attest(priv, devicePub, time.Now())
+	if err != nil {
+		t.Fatalf("Attest: %v", err)
+	}
+	if err := c.SaveAttestation(a); err != nil {
+		t.Fatalf("SaveAttestation: %v", err)
 	}
 }
 

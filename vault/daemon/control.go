@@ -105,7 +105,8 @@ func Info(o *index.Object) ObjectInfo {
 type PeerInfo struct {
 	Name       string `json:"name"` // member cert label
 	PeerID     string `json:"peer_id"`
-	Vault      bool   `json:"vault"` // advertises /vault/hello/1
+	Vault      bool   `json:"vault"`       // advertises /vault/hello/1
+	SameCircle bool   `json:"same_circle"` // verified device of this node's circle (attestation)
 	Circle     string `json:"circle,omitempty"`
 	CircleName string `json:"circle_name,omitempty"`
 	Version    string `json:"version,omitempty"`
@@ -265,6 +266,9 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
 			if c, ok := d.Fabric.Store.Cert(p); ok {
 				pi.Name = c.Payload.Meta.Name
 			}
+			cctx, ccancel := context.WithTimeout(r.Context(), 3*time.Second)
+			pi.SameCircle = d.Fabric.Circle.SameCircle(cctx, p)
+			ccancel()
 			if protos, err := d.Fabric.Host.Peerstore().SupportsProtocols(p, HelloProtocol); err == nil && len(protos) > 0 && d.Fabric.Auth.Allows(p, HelloProtocol) {
 				pi.Vault = true
 				ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)

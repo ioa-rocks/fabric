@@ -22,6 +22,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"ioa.rocks/fabric/vault/bucket"
 	"ioa.rocks/fabric/vault/index"
 	"ioa.rocks/fabric/vault/store"
 )
@@ -112,6 +113,9 @@ func (d *Daemon) syncPeer(p peer.ID) {
 	defer d.end()
 	ctx, cancel := context.WithTimeout(d.ctx, 60*time.Second)
 	defer cancel()
+	if !d.Fabric.Circle.SameCircle(ctx, p) {
+		return // a member, but not one of our circle's devices — nothing to exchange
+	}
 	s, err := d.Fabric.Host.NewStream(ctx, p, SyncProtocol)
 	if err != nil {
 		return // not a vault node (or gone) — nothing to do
@@ -251,6 +255,16 @@ func (d *Daemon) adoptIfUnknown(genesis, policy []byte) (*store.Handle, bool, er
 		h, err := d.handle(id)
 		return h, false, err
 	}
+	// Only this circle's buckets are adopted from peers: a same-circle
+	// device that has been compromised must not be able to plant a bucket
+	// signed by some other key (defense in depth behind the circle gate).
+	b, err := bucket.Unmarshal(genesis)
+	if err != nil {
+		return nil, false, err
+	}
+	if b.Genesis.Owner != d.Store.Circle.Config.DID {
+		return nil, false, fmt.Errorf("bucket %q is owned by %s, not this circle — refusing to adopt", b.Genesis.Name, b.Genesis.Owner)
+	}
 	h, err := d.adopt(genesis, policy)
 	return h, true, err
 }
@@ -293,6 +307,12 @@ func (d *Daemon) fetchAnywhere(h *store.Handle, hash string) error {
 	var lastErr error = fmt.Errorf("no connected vault peer holds it")
 	for _, p := range d.Fabric.Host.Network().Peers() {
 		if !d.Fabric.Auth.Allows(p, BlobProtocol) {
+			continue
+		}
+		cctx, ccancel := context.WithTimeout(d.ctx, 10*time.Second)
+		same := d.Fabric.Circle.SameCircle(cctx, p)
+		ccancel()
+		if !same {
 			continue
 		}
 		if err := d.fetchBlob(h, p, hash); err != nil {
