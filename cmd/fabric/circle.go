@@ -230,8 +230,10 @@ func cmdCircleStatus(args []string) error {
 	}
 	for _, p := range s.Peers {
 		switch {
+		case p.SameCircle:
+			fmt.Printf("  %-16s vault %s  same circle (verified device)\n", p.Name, p.Version)
 		case p.Vault && p.Circle == c.Config.DID:
-			fmt.Printf("  %-16s vault %s  same circle\n", p.Name, p.Version)
+			fmt.Printf("  %-16s vault %s  claims this circle but is NOT attested — no sync until 'fabric circle attest' runs there\n", p.Name, p.Version)
 		case p.Vault:
 			fmt.Printf("  %-16s vault %s  circle %q %s\n", p.Name, p.Version, p.CircleName, p.Circle)
 		default:
