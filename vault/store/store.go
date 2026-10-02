@@ -29,9 +29,12 @@ import (
 
 // Store is an opened vault state directory.
 type Store struct {
-	Path   string
-	Circle *circle.Circle
-	Blobs  *blobstore.Store
+	Path string
+	// CircleRoot is the node's circle root (circle.Root); the store serves
+	// every circle under it, listed on demand so a circle added while the
+	// daemon runs is picked up without a restart.
+	CircleRoot string
+	Blobs      *blobstore.Store
 
 	// NodeID identifies this device in location records. The daemon sets
 	// it to the fabric peer ID once the node is meshed; it defaults to the
@@ -61,15 +64,19 @@ func DefaultPath() string {
 	return filepath.Join(base, "vault")
 }
 
-// Open opens (creating on first use) the store at path for circle c.
-func Open(path string, c *circle.Circle) (*Store, error) {
-	if c == nil {
-		return nil, errors.New("opening store: no circle")
+// Open opens (creating on first use) the store at path for the circles
+// under circleRoot.
+func Open(path string, circleRoot string) (*Store, error) {
+	if circleRoot == "" {
+		return nil, errors.New("opening store: no circle root")
 	}
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return nil, err
 	}
-	st := &Store{Path: path, Circle: c, NodeID: c.Config.DID, roots: map[string]*blobstore.Store{}}
+	st := &Store{Path: path, CircleRoot: circleRoot, NodeID: "solo", roots: map[string]*blobstore.Store{}}
+	if cs, _ := circle.List(circleRoot); len(cs) > 0 {
+		st.NodeID = cs[0].Config.DID
+	}
 	blobs, err := blobstore.Open(st.defaultBlobsDir())
 	if err != nil {
 		return nil, err
@@ -149,11 +156,27 @@ func (c *Store) bucketDir(id string) string {
 	return filepath.Join(c.Path, "buckets", id)
 }
 
-// CreateBucket mints a bucket owned by the store's circle, with default
-// policy, unlocking the user key in-process. The daemon never uses it —
-// it receives signed documents (SignBucket + AdoptBucket).
-func (c *Store) CreateBucket(name, passphrase string) (*Handle, error) {
-	priv, err := c.Circle.Unlock(passphrase)
+// Circles lists the circles this store serves (the node's circle root).
+func (c *Store) Circles() []*circle.Circle {
+	cs, _ := circle.List(c.CircleRoot)
+	return cs
+}
+
+// Owns returns the node's circle that owns a bucket (by owner DID).
+func (c *Store) Owns(ownerDID string) (*circle.Circle, bool) {
+	for _, cc := range c.Circles() {
+		if cc.Config.DID == ownerDID {
+			return cc, true
+		}
+	}
+	return nil, false
+}
+
+// CreateBucket mints a bucket owned by one of the store's circles, with
+// default policy, unlocking the user key in-process. The daemon never uses
+// it — it receives signed documents (SignBucket + AdoptBucket).
+func (c *Store) CreateBucket(owner *circle.Circle, name, passphrase string) (*Handle, error) {
+	priv, err := owner.Unlock(passphrase)
 	if err != nil {
 		return nil, err
 	}

@@ -1,6 +1,7 @@
 package daemon_test
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"path/filepath"
@@ -22,7 +23,8 @@ type meshNode struct {
 	dir       fabricstate.Dir
 	cert      *cert.Cert
 	event     *event.Event
-	bundle    *circle.Bundle // this node's circle, for a second device to join
+	bundle    *circle.Bundle    // this node's circle, for a second device to join
+	devPub    ed25519.PublicKey // the fabric device key (for attesting later circles)
 }
 
 // newMeshNode: shared == nil mints a fresh circle named circleName (the
@@ -50,7 +52,7 @@ func newMeshNode(t *testing.T, root ed25519.PrivateKey, shared *circle.Bundle, c
 		t.Fatalf("device pub: %v", err)
 	}
 	attestDevice(t, statePath, ed25519.PublicKey(pubRaw))
-	bundle := exportCircle(t, statePath)
+	bundle := exportCircle(t, statePath, circleName)
 	c, err := cert.Issue(root, ed25519.PublicKey(pubRaw), cert.CmdMember,
 		cert.Meta{Name: memberName}, time.Now().Add(-time.Minute), 365*24*time.Hour)
 	if err != nil {
@@ -63,7 +65,17 @@ func newMeshNode(t *testing.T, root ed25519.PrivateKey, shared *circle.Bundle, c
 	if err != nil {
 		t.Fatalf("event.NewAdded: %v", err)
 	}
-	return &meshNode{statePath: statePath, dir: dir, cert: c, event: ev, bundle: bundle}
+	return &meshNode{statePath: statePath, dir: dir, cert: c, event: ev, bundle: bundle, devPub: ed25519.PublicKey(pubRaw)}
+}
+
+// initAlso mints a second circle on this node (the shared "family" circle
+// beside the personal one), attests the device into it, and returns its
+// bundle for another device.
+func (n *meshNode) initAlso(t *testing.T, name string) *circle.Bundle {
+	t.Helper()
+	initCircle(t, n.statePath, name)
+	attestDevice(t, n.statePath, n.devPub)
+	return exportCircle(t, n.statePath, name)
 }
 
 func (n *meshNode) writeConfig(t *testing.T, root ed25519.PrivateKey, name string, bootstrap []string, roster ...*event.Event) {
@@ -115,11 +127,11 @@ func TestTwoNodeMesh(t *testing.T) {
 		if err == nil && st.Mesh {
 			for _, p := range st.Peers {
 				if p.Vault && p.Name == "a-vault" {
-					if p.Circle == "" || p.CircleName != "alex" {
+					if len(p.Circles) != 1 || p.Circles[0].Name != "alex" || p.Circles[0].DID == "" {
 						t.Fatalf("hello card wrong: %+v", p)
 					}
-					if p.SameCircle {
-						t.Fatalf("A serves alex's circle, B serves wife's — must not verify as same circle: %+v", p)
+					if len(p.Shared) != 0 {
+						t.Fatalf("A serves alex's circle, B serves wife's — must share nothing verified: %+v", p)
 					}
 					return // B sees A as a vault node serving alex's circle, not its own
 				}
@@ -181,4 +193,89 @@ func TestForeignCircleIsNotSynced(t *testing.T) {
 	if len(bs) != 0 {
 		t.Fatalf("B adopted a bucket from a foreign circle: %+v", bs)
 	}
+}
+
+// TestSharedCircleBesidePersonal is memo §9 step 4: the desk holds its
+// personal circle *and* a shared one; her device holds only the shared one.
+// Buckets of the shared circle flow both ways; the personal circle's never
+// reach her — not even their catalog entries — and status says who shares
+// what.
+func TestSharedCircleBesidePersonal(t *testing.T) {
+	old := daemon.SyncInterval
+	daemon.SyncInterval = 300 * time.Millisecond
+	t.Cleanup(func() { daemon.SyncInterval = old })
+	_, root, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desk := newMeshNode(t, root, nil, "alex", "desk")
+	family := desk.initAlso(t, "family")
+	hers := newMeshNode(t, root, family, "family", "her-pc")
+	roster := []*event.Event{desk.event, hers.event}
+	desk.writeConfig(t, root, "desk", nil, roster...)
+	dd := startDaemon(t, desk.statePath)
+	addrs := dd.Fabric.Host.Addrs()
+	bootstrap := addrs[0].String() + "/p2p/" + dd.Fabric.Host.ID().String()
+	hers.writeConfig(t, root, "her-pc", []string{bootstrap}, roster...)
+	startDaemon(t, hers.statePath)
+	clD := daemon.NewClient(desk.statePath)
+	clH := daemon.NewClient(hers.statePath)
+
+	g, p := signBucketIn(t, desk.statePath, "alex", "pw", "private")
+	if _, err := clD.CreateBucket(g, p); err != nil {
+		t.Fatal(err)
+	}
+	g, p = signBucketIn(t, desk.statePath, "family", "pw", "album")
+	if _, err := clD.CreateBucket(g, p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clD.Put("private", "secret.txt", bytes.NewReader([]byte("mine")), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clD.Put("album", "beach.jpg", bytes.NewReader([]byte("jpeg")), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "album on her pc", func() bool {
+		bs, err := clH.Buckets()
+		return err == nil && len(bs) == 1 && bs[0].Name == "album" && bs[0].Objects == 1
+	})
+	time.Sleep(4 * daemon.SyncInterval)
+	bs, err := clH.Buckets()
+	if err != nil || len(bs) != 1 {
+		t.Fatalf("her pc must hold exactly the album, got %+v %v", bs, err)
+	}
+	// Her writes reach the desk's copy of the album.
+	if _, err := clH.Put("album", "reply.jpg", bytes.NewReader([]byte("jpeg2")), nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "her object on the desk", func() bool {
+		bs, err := clD.Buckets()
+		if err != nil {
+			return false
+		}
+		for _, b := range bs {
+			if b.Name == "album" && b.Objects == 2 {
+				return true
+			}
+		}
+		return false
+	})
+	// Status: the desk sees her pc sharing exactly "family".
+	st, err := clD.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Circles) != 2 {
+		t.Fatalf("desk should report two circles, got %+v", st.Circles)
+	}
+	for _, pi := range st.Peers {
+		if pi.Name == "her-pc" {
+			if len(pi.Shared) != 1 || pi.Shared[0] != "family" {
+				t.Fatalf("desk∩her-pc = %v, want [family]", pi.Shared)
+			}
+			return
+		}
+	}
+	t.Fatalf("her pc not in desk's peers: %+v", st.Peers)
 }

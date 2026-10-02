@@ -34,7 +34,7 @@ func runDaemon(t *testing.T, statePath string) (*daemon.Daemon, func()) {
 	}
 	st := openTestStore(t, statePath)
 	if fd != nil {
-		fd.Circle = fabricdaemon.NewCircleService(fd.Host, fd.Auth, st.Circle)
+		fd.Circle = fabricdaemon.NewCircleService(fd.Host, fd.Auth, st.CircleRoot)
 	}
 	d, err := daemon.New(st, fd)
 	if err != nil {

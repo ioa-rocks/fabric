@@ -34,11 +34,18 @@ const Version = "0.2-dev"
 // device).
 const HelloProtocol = "/vault/hello/1"
 
-// Hello is the card exchanged on HelloProtocol.
+// Hello is the card exchanged on HelloProtocol: which circles this node
+// *claims* to serve (the circle exchange on /fabric/circle/2 is what
+// verifies them) and its vault version.
 type Hello struct {
-	Circle  string `json:"circle"` // circle owner DID this node serves
-	Name    string `json:"name"`   // circle's human label
-	Version string `json:"version"`
+	Circles []HelloCircle `json:"circles"`
+	Version string        `json:"version"`
+}
+
+// HelloCircle is one circle on the hello card.
+type HelloCircle struct {
+	DID  string `json:"did"`
+	Name string `json:"name"`
 }
 
 // Daemon holds the store open (and its Pebble locks — the CLI routes
@@ -124,14 +131,14 @@ func New(c *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		// from mesh membership alone. Hello stays member-wide: it is the
 		// presence card that lets status show who claims what.
 		if fd.Circle == nil {
-			return nil, errors.New("vault subsystem: the fabric daemon has no circle service (the composition root must attach NewCircleService for the store's circle)")
+			return nil, errors.New("vault subsystem: the fabric daemon has no circle service (the composition root must attach NewCircleService for the store's circle root)")
 		}
-		if fd.Circle.DID() != c.Circle.Config.DID {
-			return nil, fmt.Errorf("vault subsystem: fabric serves circle %s but the store belongs to %s", fd.Circle.DID(), c.Circle.Config.DID)
+		if fd.Circle.Root() != c.CircleRoot {
+			return nil, fmt.Errorf("vault subsystem: fabric serves circles under %s but the store uses %s", fd.Circle.Root(), c.CircleRoot)
 		}
 		fd.Host.SetStreamHandler(HelloProtocol, fd.Auth.RequireMember(d.handleHello))
-		fd.Host.SetStreamHandler(SyncProtocol, fd.Circle.Require(d.handleSync))
-		fd.Host.SetStreamHandler(BlobProtocol, fd.Circle.Require(d.handleBlob))
+		fd.Host.SetStreamHandler(SyncProtocol, fd.Circle.RequireAny(d.handleSync))
+		fd.Host.SetStreamHandler(BlobProtocol, fd.Circle.RequireAny(d.handleBlob))
 		// Chain onto fabric's own on-auth hook (it drives membership-event
 		// anti-entropy) rather than replacing it.
 		fd.Auth.SetOnAuthenticated(func(p peer.ID) {
@@ -155,9 +162,11 @@ func (d *Daemon) Run() error {
 	}
 	defer stopControl()
 
-	log.Printf("vault subsystem up: circle %q (%s)", d.Store.Circle.Config.Name, d.Store.Circle.Config.DID)
-	if d.Fabric != nil && !d.Fabric.Circle.Attested() {
-		log.Printf("vault: this device holds no circle attestation — peers will not sync with it until 'fabric circle attest' runs here (no restart needed)")
+	for _, c := range d.Store.Circles() {
+		log.Printf("vault subsystem up: circle %q (%s)", c.Config.Name, c.Config.DID)
+		if d.Fabric != nil && !d.Fabric.Circle.Attested(c) {
+			log.Printf("vault: this device holds no attestation for circle %q — its peers will not sync with it until 'fabric circle attest' runs here (no restart needed)", c.Config.Name)
+		}
 	}
 
 	if d.Fabric != nil {
@@ -253,11 +262,7 @@ func (d *Daemon) adopt(genesis, policy []byte) (*store.Handle, error) {
 func (d *Daemon) handleHello(s network.Stream) {
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(5 * time.Second))
-	_ = json.NewEncoder(s).Encode(Hello{
-		Circle:  d.Store.Circle.Config.DID,
-		Name:    d.Store.Circle.Config.Name,
-		Version: Version,
-	})
+	_ = json.NewEncoder(s).Encode(d.helloCard())
 }
 
 // hello asks a peer for its vault card.
@@ -273,4 +278,13 @@ func (d *Daemon) hello(ctx context.Context, p peer.ID) (*Hello, error) {
 		return nil, err
 	}
 	return &h, nil
+}
+
+// helloCard is what this node claims on HelloProtocol.
+func (d *Daemon) helloCard() Hello {
+	h := Hello{Version: Version}
+	for _, c := range d.Store.Circles() {
+		h.Circles = append(h.Circles, HelloCircle{DID: c.Config.DID, Name: c.Config.Name})
+	}
+	return h
 }

@@ -41,6 +41,7 @@ func SocketPath(statePath string) string {
 // the local health seed: a full subscription is satisfied when Held ==
 // Objects.
 type BucketInfo struct {
+	Owner   string `json:"owner,omitempty"` // owning circle DID
 	ID      string `json:"id"`
 	Name    string `json:"name"`
 	Sub     string `json:"sub,omitempty"`  // this device's subscription mode
@@ -103,21 +104,30 @@ func Info(o *index.Object) ObjectInfo {
 // PeerInfo describes one connected mesh member as seen from this vault
 // node, including whether it runs vault and for which circle.
 type PeerInfo struct {
-	Name       string `json:"name"` // member cert label
-	PeerID     string `json:"peer_id"`
-	Vault      bool   `json:"vault"`       // advertises /vault/hello/1
-	SameCircle bool   `json:"same_circle"` // verified device of this node's circle (attestation)
-	Circle     string `json:"circle,omitempty"`
-	CircleName string `json:"circle_name,omitempty"`
-	Version    string `json:"version,omitempty"`
+	Name   string `json:"name"` // member cert label
+	PeerID string `json:"peer_id"`
+	Vault  bool   `json:"vault"` // advertises /vault/hello/1
+	// Shared lists the circles (names) this node and the peer verifiably
+	// share — the ones buckets flow for. Circles is what the peer's hello
+	// card claims, verified or not.
+	Shared  []string      `json:"shared,omitempty"`
+	Circles []HelloCircle `json:"circles,omitempty"`
+	Version string        `json:"version,omitempty"`
+}
+
+// CircleInfo describes one circle this node holds.
+type CircleInfo struct {
+	DID      string `json:"did"`
+	Name     string `json:"name"`
+	Attested bool   `json:"attested"` // this device holds its attestation
+	Buckets  int    `json:"buckets"`
 }
 
 // StatusReply is GET /v0/status.
 type StatusReply struct {
-	Circle  string `json:"circle"` // owner DID
-	Name    string `json:"name"`
-	Version string `json:"version"`
-	Buckets int    `json:"buckets"`
+	Circles []CircleInfo `json:"circles"`
+	Version string       `json:"version"`
+	Buckets int          `json:"buckets"`
 
 	Mesh     bool         `json:"mesh"`                // fabric node attached
 	MeshName string       `json:"mesh_name,omitempty"` // this vault node's member label
@@ -248,11 +258,21 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s := StatusReply{
-		Circle:  d.Store.Circle.Config.DID,
-		Name:    d.Store.Circle.Config.Name,
 		Version: Version,
 		Buckets: len(buckets),
 		Mesh:    d.Fabric != nil,
+	}
+	for _, c := range d.Store.Circles() {
+		ci := CircleInfo{DID: c.Config.DID, Name: c.Config.Name}
+		if _, err := c.LoadAttestation(); err == nil {
+			ci.Attested = true
+		}
+		for _, b := range buckets {
+			if b.Genesis.Owner == c.Config.DID {
+				ci.Buckets++
+			}
+		}
+		s.Circles = append(s.Circles, ci)
 	}
 	if d.Fabric != nil {
 		s.MeshName = d.Fabric.Config.Name
@@ -267,13 +287,17 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
 				pi.Name = c.Payload.Meta.Name
 			}
 			cctx, ccancel := context.WithTimeout(r.Context(), 3*time.Second)
-			pi.SameCircle = d.Fabric.Circle.SameCircle(cctx, p)
+			for _, did := range d.Fabric.Circle.Shared(cctx, p) {
+				if c, ok := d.Store.Owns(did); ok {
+					pi.Shared = append(pi.Shared, c.Config.Name)
+				}
+			}
 			ccancel()
 			if protos, err := d.Fabric.Host.Peerstore().SupportsProtocols(p, HelloProtocol); err == nil && len(protos) > 0 && d.Fabric.Auth.Allows(p, HelloProtocol) {
 				pi.Vault = true
 				ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 				if h, err := d.hello(ctx, p); err == nil {
-					pi.Circle, pi.CircleName, pi.Version = h.Circle, h.Name, h.Version
+					pi.Circles, pi.Version = h.Circles, h.Version
 				}
 				cancel()
 			}
@@ -369,7 +393,7 @@ func (d *Daemon) handleBuckets(w http.ResponseWriter, _ *http.Request) {
 			continue
 		}
 		pl := d.Store.Placement(id)
-		info := BucketInfo{ID: id, Name: b.Genesis.Name, Sub: pl.Mode, Root: pl.Root}
+		info := BucketInfo{ID: id, Owner: b.Genesis.Owner, Name: b.Genesis.Name, Sub: pl.Mode, Root: pl.Root}
 		for dir, f := range folders {
 			if f.Bucket == id {
 				info.Folder = dir
@@ -457,7 +481,7 @@ func (d *Daemon) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
 	// to the one sane default we have).
 	_ = d.Store.SetSubscription(h.ID(), store.SubFull)
 	d.kickSync()
-	writeJSON(w, BucketInfo{ID: h.ID(), Name: h.Bucket.Genesis.Name, Sub: store.SubFull})
+	writeJSON(w, BucketInfo{ID: h.ID(), Owner: h.Bucket.Genesis.Owner, Name: h.Bucket.Genesis.Name, Sub: store.SubFull})
 }
 
 func splitTags(s string) []string {

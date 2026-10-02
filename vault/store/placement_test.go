@@ -52,7 +52,7 @@ func TestPlacementRecordCompat(t *testing.T) {
 		t.Fatalf("subs.json not rewritten as records: %s", raw)
 	}
 	// Reopen: still readable.
-	c2, err := Open(dir, c.Circle)
+	c2, err := Open(dir, c.CircleRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestPlacementRootHolder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := c.CreateBucket("photos", pass)
+	h, err := c.createBucket("photos", pass)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestPlacementRootHolder(t *testing.T) {
 
 	// Another bucket at a second root: its holder reads the first root too
 	// (blobs are shared across buckets).
-	h2, err := c.CreateBucket("docs", pass)
+	h2, err := c.createBucket("docs", pass)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestPlacementRootUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := c.CreateBucket("photos", pass)
+	h, err := c.createBucket("photos", pass)
 	if err != nil {
 		t.Fatal(err)
 	}

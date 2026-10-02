@@ -172,17 +172,27 @@ type paths struct {
 func pathFlags(fs *flag.FlagSet) paths {
 	return paths{
 		store:  fs.String("state", store.DefaultPath(), "store directory"),
-		circle: fs.String("circle-state", circle.DefaultPath(), "circle directory"),
+		circle: fs.String("circle-state", circle.DefaultPath(), "circle root (the node's circles live under it)"),
 	}
 }
 
-// openCircle opens the circle, adopting a pre-hoist one from the store
+// openCircle opens one of the node's circles — the named one, or the only
+// one when name is "" — adopting a pre-hoist circle from the store
 // directory first if that is where it still lives.
-func (p paths) openCircle() (*circle.Circle, error) {
+func (p paths) openCircle(name string) (*circle.Circle, error) {
 	if _, err := circle.Migrate(*p.circle, *p.store); err != nil {
 		return nil, fmt.Errorf("adopting the circle from %s: %w", *p.store, err)
 	}
-	return circle.Open(*p.circle)
+	if name == "" {
+		return circle.Only(*p.circle)
+	}
+	return circle.ByName(*p.circle, name)
+}
+
+// openOwner opens the circle that owns a bucket, by the owner DID the
+// store reports — the key that may sign that bucket's policy.
+func (p paths) openOwner(ownerDID string) (*circle.Circle, error) {
+	return circle.ByDID(*p.circle, ownerDID)
 }
 
 // Passphrase reads the circle passphrase from $CIRCLE_PASSPHRASE (or the
@@ -223,19 +233,16 @@ func splitTags(s string) []string {
 func cmdCreate(args []string) error {
 	fs := flag.NewFlagSet("create", flag.ExitOnError)
 	p := pathFlags(fs)
-	circleName := fs.String("circle", "", "owning circle (this device's one circle; named for the day a device holds several)")
+	circleName := fs.String("circle", "", "owning circle (required when this device holds several)")
 	pos := parse(fs, args, -1)
 	if len(pos) != 1 {
 		return fmt.Errorf("usage: fabric bucket create <name> [-circle <name>]")
 	}
 	// Signing happens here, where the passphrase prompt is — the daemon
 	// only ever receives the signed genesis + policy.
-	c, err := p.openCircle()
+	c, err := p.openCircle(*circleName)
 	if err != nil {
 		return err
-	}
-	if *circleName != "" && *circleName != c.Config.Name {
-		return fmt.Errorf("this device holds circle %q, not %q", c.Config.Name, *circleName)
 	}
 	pass, err := Passphrase()
 	if err != nil {

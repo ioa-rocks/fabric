@@ -25,18 +25,18 @@ type device struct {
 func newDevice(t *testing.T, name string, genesis, policy []byte) *device {
 	t.Helper()
 	root := t.TempDir()
-	cc, err := circle.Init(filepath.Join(root, "circle"), name, "pw")
+	cc, err := circle.Init(filepath.Join(root, "circles"), name, "pw")
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := store.Open(root, cc)
+	c, err := store.Open(root, filepath.Join(root, "circles"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	c.NodeID = "dev:" + name
 	var h *store.Handle
 	if genesis == nil {
-		if h, err = c.CreateBucket("lab", "pw"); err != nil {
+		if h, err = c.CreateBucket(cc, "lab", "pw"); err != nil {
 			t.Fatal(err)
 		}
 	} else if h, err = c.AdoptBucket(genesis, policy); err != nil {
@@ -136,10 +136,10 @@ func scan(t *testing.T, d *device) Report {
 	t.Helper()
 	rep, err := d.rep.Scan()
 	if err != nil {
-		t.Fatalf("scan %s: %v", d.c.Circle.Config.Name, err)
+		t.Fatalf("scan %s: %v", d.c.Circles()[0].Config.Name, err)
 	}
 	if len(rep.Errors) > 0 {
-		t.Fatalf("scan %s errors: %v", d.c.Circle.Config.Name, rep.Errors)
+		t.Fatalf("scan %s errors: %v", d.c.Circles()[0].Config.Name, rep.Errors)
 	}
 	return rep
 }
@@ -148,10 +148,10 @@ func materialize(t *testing.T, d *device) Report {
 	t.Helper()
 	rep, err := d.rep.Materialize()
 	if err != nil {
-		t.Fatalf("materialize %s: %v", d.c.Circle.Config.Name, err)
+		t.Fatalf("materialize %s: %v", d.c.Circles()[0].Config.Name, err)
 	}
 	if len(rep.Errors) > 0 {
-		t.Fatalf("materialize %s errors: %v", d.c.Circle.Config.Name, rep.Errors)
+		t.Fatalf("materialize %s errors: %v", d.c.Circles()[0].Config.Name, rep.Errors)
 	}
 	return rep
 }

@@ -7,18 +7,21 @@ import (
 )
 
 func TestInitOpenUnlock(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "circle")
-	c, err := Init(dir, "alex", "pw")
+	root := filepath.Join(t.TempDir(), "circles")
+	c, err := Init(root, "alex", "pw")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Config.Name != "alex" || c.Config.DID == "" {
-		t.Fatalf("config %+v", c.Config)
+	if c.Config.Name != "alex" || c.Config.DID == "" || c.Path != filepath.Join(root, "alex") {
+		t.Fatalf("config %+v path %s", c.Config, c.Path)
 	}
-	if _, err := Init(dir, "alex", "pw"); err == nil {
-		t.Fatal("second init succeeded")
+	if _, err := Init(root, "alex", "pw"); err == nil {
+		t.Fatal("second init of the same name succeeded")
 	}
-	re, err := Open(dir)
+	if _, err := Init(root, "bad/name", "pw"); err == nil {
+		t.Fatal("a name with a slash was accepted")
+	}
+	re, err := ByName(root, "alex")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,11 +34,29 @@ func TestInitOpenUnlock(t *testing.T) {
 	if _, err := re.Unlock("pw"); err != nil {
 		t.Fatal(err)
 	}
+	// A second circle beside it: a node holds several.
+	fam, err := Init(root, "family", "pw2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := List(root)
+	if err != nil || len(all) != 2 || all[0].Config.Name != "alex" || all[1].Config.Name != "family" {
+		t.Fatalf("List = %v %v", all, err)
+	}
+	if _, err := Only(root); err == nil {
+		t.Fatal("Only must refuse to pick among two circles")
+	}
+	if got, err := ByDID(root, fam.Config.DID); err != nil || got.Config.Name != "family" {
+		t.Fatalf("ByDID: %v %v", got, err)
+	}
+	if !Any(root) || Any(filepath.Join(t.TempDir(), "none")) {
+		t.Fatal("Any wrong")
+	}
 }
 
 func TestExportJoinAndMigrate(t *testing.T) {
-	a := filepath.Join(t.TempDir(), "circle")
-	c, err := Init(a, "alex", "pw")
+	root := filepath.Join(t.TempDir(), "circles")
+	c, err := Init(root, "alex", "pw")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +77,7 @@ func TestExportJoinAndMigrate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	other := filepath.Join(t.TempDir(), "circle")
+	other := filepath.Join(t.TempDir(), "circles")
 	j, err := Join(other, rb)
 	if err != nil {
 		t.Fatal(err)
@@ -68,23 +89,37 @@ func TestExportJoinAndMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := Join(other, rb); err == nil {
-		t.Fatal("join replaced an existing circle")
+		t.Fatal("joined the same circle twice")
+	}
+	// A different circle with the same name is refused too (names key
+	// directories and -circle flags).
+	clash := filepath.Join(t.TempDir(), "circles")
+	cc, _ := Init(clash, "alex", "pw")
+	cb, _ := cc.Export()
+	if _, err := Join(other, cb); err == nil {
+		t.Fatal("joined a different circle under an already-used name")
 	}
 
-	// Legacy layout: the two files inside a vault state dir.
+	// Legacy layouts: the single <state>/circle dir (with an attestation),
+	// or the two files inside a vault state dir. Both are copied into the
+	// root; the originals stay.
 	legacy := t.TempDir()
 	for _, f := range []string{configFile, keyFile} {
-		data, _ := os.ReadFile(filepath.Join(a, f))
+		data, _ := os.ReadFile(filepath.Join(c.Path, f))
 		os.WriteFile(filepath.Join(legacy, f), data, 0o600)
 	}
-	dst := filepath.Join(t.TempDir(), "circle")
+	os.WriteFile(filepath.Join(legacy, attestationFile), []byte("x"), 0o600)
+	dst := filepath.Join(t.TempDir(), "circles")
 	did, err := Migrate(dst, legacy)
 	if err != nil || !did {
 		t.Fatalf("migrate: %v %v", did, err)
 	}
-	m, err := Open(dst)
+	m, err := ByDID(dst, c.Config.DID)
 	if err != nil || m.Config != c.Config {
 		t.Fatalf("migrated: %+v %v", m, err)
+	}
+	if _, err := os.Stat(m.AttestationPath()); err != nil {
+		t.Fatal("attestation did not move with the circle")
 	}
 	if !Exists(legacy) {
 		t.Fatal("legacy files were removed")

@@ -14,11 +14,16 @@ const pass = "test-passphrase"
 
 // initStore mints a circle under dir and opens a store beside it.
 func initStore(dir, name, pass string) (*Store, error) {
-	c, err := circle.Init(filepath.Join(dir, "circle"), name, pass)
-	if err != nil {
+	root := filepath.Join(dir, "circles")
+	if _, err := circle.Init(root, name, pass); err != nil {
 		return nil, err
 	}
-	return Open(dir, c)
+	return Open(dir, root)
+}
+
+// createBucket mints a bucket in the store's first (test) circle.
+func (c *Store) createBucket(name, pass string) (*Handle, error) {
+	return c.CreateBucket(c.Circles()[0], name, pass)
 }
 
 func TestCircleLifecycle(t *testing.T) {
@@ -27,17 +32,17 @@ func TestCircleLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Circle.Config.DID == "" || !strings.HasPrefix(c.Circle.Config.DID, "did:key:") {
-		t.Fatalf("bad DID: %q", c.Circle.Config.DID)
+	if c.Circles()[0].Config.DID == "" || !strings.HasPrefix(c.Circles()[0].Config.DID, "did:key:") {
+		t.Fatalf("bad DID: %q", c.Circles()[0].Config.DID)
 	}
 	if _, err := initStore(dir, "alex", pass); err == nil {
 		t.Fatal("double init unexpectedly succeeded")
 	}
-	if _, err := c.Circle.Unlock("wrong"); err == nil {
+	if _, err := c.Circles()[0].Unlock("wrong"); err == nil {
 		t.Fatal("wrong passphrase unexpectedly unlocked the user key")
 	}
 
-	h, err := c.CreateBucket("family-photos", pass)
+	h, err := c.createBucket("family-photos", pass)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +115,7 @@ func TestCircleLifecycle(t *testing.T) {
 	h.Close()
 
 	// Reopen by name and by ID prefix; state persists.
-	c2, err := Open(dir, c.Circle)
+	c2, err := Open(dir, c.CircleRoot)
 	if err != nil {
 		t.Fatal(err)
 	}

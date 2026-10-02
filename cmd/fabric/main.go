@@ -325,24 +325,26 @@ func cmdUp(args []string) error {
 	// into the node's state first (ADR 0017: the circle is fabric's).
 	var vd *vaultdaemon.Daemon
 	if !*noVault {
-		circleDir := circle.Dir(*statePath)
-		if did, err := circle.Migrate(circleDir, *vaultState); err != nil {
-			return fmt.Errorf("adopting the circle from %s: %w", *vaultState, err)
-		} else if did {
-			log.Printf("circle adopted from %s into %s (the old copy is left in place, unused)", *vaultState, circleDir)
+		root := circle.Root(*statePath)
+		// Older layouts: the single <state>/circle directory, and before
+		// that the circle files inside the vault store directory. Both are
+		// adopted into the root (copies; the originals stay, inert).
+		for _, legacy := range []string{circle.LegacyDir(*statePath), *vaultState} {
+			if did, err := circle.Migrate(root, legacy); err != nil {
+				return fmt.Errorf("adopting the circle from %s: %w", legacy, err)
+			} else if did {
+				log.Printf("circle adopted from %s into %s (the old copy is left in place, unused)", legacy, root)
+			}
 		}
-		if circle.Exists(circleDir) {
-			c, err := circle.Open(circleDir)
+		if circle.Any(root) {
+			st, err := vaultstore.Open(*vaultState, root)
 			if err != nil {
 				return fmt.Errorf("vault subsystem: %w", err)
 			}
-			st, err := vaultstore.Open(*vaultState, c)
-			if err != nil {
-				return fmt.Errorf("vault subsystem: %w", err)
-			}
-			// The circle instance of the namespace engine: who of the mesh
-			// is one of *our* devices. Vault gates on it; astral will.
-			d.Circle = daemon.NewCircleService(d.Host, d.Auth, c)
+			// The circle instance of the namespace engine: which of our
+			// circles a mesh member is a device of. Vault gates on it;
+			// astral will.
+			d.Circle = daemon.NewCircleService(d.Host, d.Auth, root)
 			vd, err = vaultdaemon.New(st, d)
 			if err != nil {
 				return fmt.Errorf("vault subsystem: %w", err)

@@ -1,31 +1,33 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"flag"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
-	"crypto/ed25519"
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/state"
 	vaultcli "ioa.rocks/fabric/vault/cli"
 	vaultdaemon "ioa.rocks/fabric/vault/daemon"
 	vaultstore "ioa.rocks/fabric/vault/store"
-	"time"
 )
 
 // The circle is the node's ownership layer (ADR 0017): a user key that
-// buckets — and, next, astral subjects and grants — belong to. It lives
-// under the fabric state directory, beside the device key, and is
-// managed here rather than by any one data plane. One circle per node
-// today.
-
+// buckets — and, next, astral subjects and grants — belong to. A node holds
+// any number of circles under <state>/circles/<name> (ADR 0011: a device
+// participates in several namespaces): its owner's personal circle, a
+// shared "family" circle, … Each is managed here, not by any one data
+// plane. Vault serves a bucket only to verified devices of the circle that
+// owns it — mesh membership alone grants nothing.
 func cmdCircle(args []string) error {
-	if len(args) < 1 {
+	if len(args) == 0 {
 		return fmt.Errorf("usage: fabric circle init|join|export|attest|status")
 	}
-	sub, rest := args[0], args[1:]
-	switch sub {
+	rest := args[1:]
+	switch args[0] {
 	case "init":
 		return cmdCircleInit(rest)
 	case "join":
@@ -36,74 +38,102 @@ func cmdCircle(args []string) error {
 		return cmdCircleAttest(rest)
 	case "status":
 		return cmdCircleStatus(rest)
+	default:
+		return fmt.Errorf("usage: fabric circle init|join|export|attest|status")
 	}
-	return fmt.Errorf("unknown circle command %q (init|join|export|status)", sub)
 }
 
-// circleFlags: the circle lives in <state>/circle; -vault-state is where a
-// pre-hoist circle would still be found (and where the store is).
 func circleFlags(fs *flag.FlagSet) (statePath, vaultState *string) {
 	statePath = stateFlag(fs)
 	vaultState = fs.String("vault-state", vaultstore.DefaultPath(), "vault store directory")
 	return
 }
 
-// openCircle adopts a pre-hoist circle from the vault store directory if
-// that is where it still lives, then opens the node's circle.
-func openCircle(statePath, vaultState string) (*circle.Circle, error) {
-	dir := circle.Dir(statePath)
-	if did, err := circle.Migrate(dir, vaultState); err != nil {
-		return nil, fmt.Errorf("adopting the circle from %s: %w", vaultState, err)
-	} else if did {
-		fmt.Fprintf(os.Stderr, "circle adopted from %s into %s (the old copy is left in place, unused)\n", vaultState, dir)
+// circleRoot adopts older single-circle layouts into the node's circle
+// root, then returns the root.
+func circleRoot(statePath, vaultState string) (string, error) {
+	root := circle.Root(statePath)
+	for _, legacy := range []string{circle.LegacyDir(statePath), vaultState} {
+		if did, err := circle.Migrate(root, legacy); err != nil {
+			return "", fmt.Errorf("adopting the circle from %s: %w", legacy, err)
+		} else if did {
+			fmt.Fprintf(os.Stderr, "circle adopted from %s into %s (the old copy is left in place, unused)\n", legacy, root)
+		}
 	}
-	return circle.Open(dir)
+	return root, nil
+}
+
+// pickCircle resolves -circle: the named circle, or the only one.
+func pickCircle(root, name string) (*circle.Circle, error) {
+	if name == "" {
+		return circle.Only(root)
+	}
+	return circle.ByName(root, name)
+}
+
+// passFor reads the passphrase for one circle — $CIRCLE_PASSPHRASE when
+// set (one passphrase for every circle), else a prompt naming the circle.
+func passFor(c *circle.Circle) (string, error) {
+	if os.Getenv("CIRCLE_PASSPHRASE") != "" || os.Getenv("VAULT_PASSPHRASE") != "" {
+		return vaultcli.Passphrase()
+	}
+	fmt.Fprintf(os.Stderr, "circle %q: ", c.Config.Name)
+	return vaultcli.Passphrase()
 }
 
 func cmdCircleInit(args []string) error {
 	fs := flag.NewFlagSet("circle init", flag.ExitOnError)
 	statePath, vaultState := circleFlags(fs)
-	name := fs.String("name", "", "circle owner label (required)")
+	name := fs.String("name", "", "circle name (required; a single word — it names the directory and the -circle flag)")
 	fs.Parse(args)
 	if *name == "" {
 		return fmt.Errorf("circle init: -name is required")
 	}
-	if circle.Exists(*vaultState) {
-		return fmt.Errorf("a circle already lives in %s — 'fabric circle status' adopts it", *vaultState)
+	root, err := circleRoot(*statePath, *vaultState)
+	if err != nil {
+		return err
 	}
 	pass, err := vaultcli.Passphrase()
 	if err != nil {
 		return err
 	}
-	c, err := circle.Init(circle.Dir(*statePath), *name, pass)
+	c, err := circle.Init(root, *name, pass)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("circle created: %q  %s\n", c.Config.Name, c.Config.DID)
+	fmt.Printf("user-key container: %s — back it up\n", c.KeyPath())
 	if err := attestDevice(*statePath, c, pass); err != nil {
 		return err
 	}
-	fmt.Printf("user-key container: %s — back it up\n", c.KeyPath())
-	fmt.Println("another device of yours joins with: fabric circle export <file>, then fabric circle join <file> there")
+	fmt.Println("another device joins with: fabric circle export -circle " + c.Config.Name + " <file>, then fabric circle join <file> there")
+	if cl := vaultdaemon.TryClient(*vaultState); cl == nil {
+		fmt.Println("restart the node daemon ('fabric up') if it was running without any circle, so it starts serving buckets")
+	}
 	return nil
 }
 
 func cmdCircleJoin(args []string) error {
 	fs := flag.NewFlagSet("circle join", flag.ExitOnError)
-	statePath, _ := circleFlags(fs)
+	statePath, vaultState := circleFlags(fs)
 	fs.Parse(args)
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: fabric circle join <bundle-file | circle-dir>")
+	}
+	root, err := circleRoot(*statePath, *vaultState)
+	if err != nil {
+		return err
 	}
 	b, err := circle.ReadBundle(fs.Arg(0))
 	if err != nil {
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "joining circle %q — its passphrase is needed to attest this device: ", b.Config.Name)
 	pass, err := vaultcli.Passphrase()
 	if err != nil {
 		return err
 	}
-	c, err := circle.Join(circle.Dir(*statePath), b)
+	c, err := circle.Join(root, b)
 	if err != nil {
 		return err
 	}
@@ -111,18 +141,27 @@ func cmdCircleJoin(args []string) error {
 	if err := attestDevice(*statePath, c, pass); err != nil {
 		return err
 	}
-	fmt.Println("restart the node daemon ('fabric up') so it serves buckets; the catalog arrives via sync")
+	if cl := vaultdaemon.TryClient(*vaultState); cl == nil {
+		fmt.Println("restart the node daemon ('fabric up') if it was running without any circle; the catalog arrives via sync")
+	} else {
+		fmt.Println("the running daemon picks the circle up; its buckets arrive via sync")
+	}
 	return nil
 }
 
 func cmdCircleExport(args []string) error {
 	fs := flag.NewFlagSet("circle export", flag.ExitOnError)
 	statePath, vaultState := circleFlags(fs)
+	name := fs.String("circle", "", "which circle to export (required when the node holds several)")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: fabric circle export <file>")
+		return fmt.Errorf("usage: fabric circle export [-circle <name>] <file>")
 	}
-	c, err := openCircle(*statePath, *vaultState)
+	root, err := circleRoot(*statePath, *vaultState)
+	if err != nil {
+		return err
+	}
+	c, err := pickCircle(root, *name)
 	if err != nil {
 		return err
 	}
@@ -169,38 +208,76 @@ func attestDevice(statePath string, c *circle.Circle, pass string) error {
 	return nil
 }
 
-// cmdCircleAttest (re)signs this device into its circle: for nodes that
-// joined the circle before attestations existed, or that joined the mesh
-// after the circle.
+// cmdCircleAttest (re)signs this device into its circles: for nodes that
+// joined a circle before attestations existed, or that joined the mesh
+// after the circle. Without -circle, every circle lacking an attestation.
 func cmdCircleAttest(args []string) error {
 	fs := flag.NewFlagSet("circle attest", flag.ExitOnError)
 	statePath, vaultState := circleFlags(fs)
+	name := fs.String("circle", "", "attest into this circle only (default: every circle not yet attested)")
 	fs.Parse(args)
-	c, err := openCircle(*statePath, *vaultState)
+	root, err := circleRoot(*statePath, *vaultState)
 	if err != nil {
 		return err
 	}
-	pass, err := vaultcli.Passphrase()
-	if err != nil {
-		return err
+	var targets []*circle.Circle
+	if *name != "" {
+		c, err := circle.ByName(root, *name)
+		if err != nil {
+			return err
+		}
+		targets = []*circle.Circle{c}
+	} else {
+		all, err := circle.List(root)
+		if err != nil {
+			return err
+		}
+		for _, c := range all {
+			if _, err := c.LoadAttestation(); err != nil {
+				targets = append(targets, c)
+			}
+		}
+		if len(targets) == 0 {
+			fmt.Println("this device is attested into every circle it holds")
+			return nil
+		}
 	}
-	return attestDevice(*statePath, c, pass)
+	for _, c := range targets {
+		pass, err := passFor(c)
+		if err != nil {
+			return err
+		}
+		if err := attestDevice(*statePath, c, pass); err != nil {
+			return fmt.Errorf("circle %q: %w", c.Config.Name, err)
+		}
+	}
+	return nil
 }
 
 func cmdCircleStatus(args []string) error {
 	fs := flag.NewFlagSet("circle status", flag.ExitOnError)
 	statePath, vaultState := circleFlags(fs)
 	fs.Parse(args)
-	c, err := openCircle(*statePath, *vaultState)
+	root, err := circleRoot(*statePath, *vaultState)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("circle %q  %s\n", c.Config.Name, c.Config.DID)
-	fmt.Printf("  %s\n", c.Path)
-	if _, err := c.LoadAttestation(); err == nil {
-		fmt.Println("  device: attested (peers of the circle serve this device)")
-	} else {
-		fmt.Println("  device: NOT attested — run 'fabric circle attest'; until then no peer syncs with this device")
+	circles, err := circle.List(root)
+	if err != nil {
+		return err
+	}
+	if len(circles) == 0 {
+		fmt.Printf("no circle on this node (%s) — 'fabric circle init -name <name>' mints one, 'fabric circle join <file>' joins an existing one\n", root)
+		return nil
+	}
+	for _, c := range circles {
+		fmt.Printf("circle %q  %s\n", c.Config.Name, c.Config.DID)
+		fmt.Printf("  %s\n", c.Path)
+		if _, err := c.LoadAttestation(); err == nil {
+			fmt.Println("  device: attested (peers of the circle serve this device)")
+		} else {
+			fmt.Printf("  device: NOT attested — run 'fabric circle attest -circle %s'; until then no peer syncs this circle with this device\n", c.Config.Name)
+		}
 	}
 	cl := vaultdaemon.TryClient(*vaultState)
 	if cl == nil {
@@ -212,6 +289,9 @@ func cmdCircleStatus(args []string) error {
 		return err
 	}
 	fmt.Printf("buckets: daemon %s serves %d bucket(s) from %s ('fabric bucket list')\n", s.Version, s.Buckets, *vaultState)
+	for _, ci := range s.Circles {
+		fmt.Printf("  %-16s %d bucket(s)\n", ci.Name, ci.Buckets)
+	}
 	if len(s.Mounts) > 0 {
 		fmt.Println("mounts:")
 		vaultcli.PrintMounts(s.Mounts)
@@ -230,12 +310,16 @@ func cmdCircleStatus(args []string) error {
 	}
 	for _, p := range s.Peers {
 		switch {
-		case p.SameCircle:
-			fmt.Printf("  %-16s vault %s  same circle (verified device)\n", p.Name, p.Version)
-		case p.Vault && p.Circle == c.Config.DID:
-			fmt.Printf("  %-16s vault %s  claims this circle but is NOT attested — no sync until 'fabric circle attest' runs there\n", p.Name, p.Version)
+		case len(p.Shared) > 0:
+			fmt.Printf("  %-16s vault %s  shares: %s (verified device)\n", p.Name, p.Version, strings.Join(p.Shared, ", "))
+		case p.Vault && len(p.Circles) > 0:
+			var claims []string
+			for _, hc := range p.Circles {
+				claims = append(claims, hc.Name)
+			}
+			fmt.Printf("  %-16s vault %s  claims %s — shares nothing verified with this device (attest, or no circle in common)\n", p.Name, p.Version, strings.Join(claims, ", "))
 		case p.Vault:
-			fmt.Printf("  %-16s vault %s  circle %q %s\n", p.Name, p.Version, p.CircleName, p.Circle)
+			fmt.Printf("  %-16s vault %s  no circle\n", p.Name, p.Version)
 		default:
 			fmt.Printf("  %-16s (mesh member, no vault)\n", p.Name)
 		}

@@ -37,8 +37,13 @@ func cmdPolicy(args []string) error {
 	if pos[1] != "set" || len(pos) < 3 {
 		return fmt.Errorf("usage: fabric bucket policy <bucket> set key=value ... (keys: copies trash_days ignore symlinks nested_repos hold_min_count hold_min_percent)")
 	}
-	// Signing happens here, where the passphrase prompt is.
-	c, err := pth.openCircle()
+	// Signing happens here, where the passphrase prompt is — with the key
+	// of the circle that owns this bucket.
+	owner, err := bucketOwner(st, pos[0])
+	if err != nil {
+		return err
+	}
+	c, err := pth.openOwner(owner)
 	if err != nil {
 		return err
 	}
@@ -263,4 +268,18 @@ func cmdHeld(args []string) error {
 	}
 	fmt.Printf("%d deletion(s) held — fabric bucket held <bucket> accept|reject\n", len(list))
 	return nil
+}
+
+// bucketOwner resolves a bucket (by ID prefix or name) to its owner DID.
+func bucketOwner(st store_, ref string) (string, error) {
+	infos, err := st.Buckets()
+	if err != nil {
+		return "", err
+	}
+	for _, b := range infos {
+		if b.Name == ref || (len(ref) >= 6 && strings.HasPrefix(b.ID, ref)) {
+			return b.Owner, nil
+		}
+	}
+	return "", fmt.Errorf("no bucket %q", ref)
 }

@@ -18,7 +18,7 @@ func TestBulkDeletionIsHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.NodeID = "dev:local"
-	h, err := c.CreateBucket("work", pass)
+	h, err := c.createBucket("work", pass)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestBulkDeletionIsHeld(t *testing.T) {
 	h.recentDeletes = nil
 	c2, _ := initStore(t.TempDir(), "alex", pass)
 	c2.NodeID = "dev:local"
-	h2, _ := c2.CreateBucket("trickle", pass)
+	h2, _ := c2.createBucket("trickle", pass)
 	var tobjs []*index.Object
 	for i := 0; i < 100; i++ {
 		o, _ := h2.Put(fmt.Sprintf("t%03d", i), strings.NewReader("x"))
@@ -148,7 +148,7 @@ func TestBulkDeletionIsHeld(t *testing.T) {
 	}
 
 	// Policy can disable the hold.
-	priv, _ := c.Circle.Unlock(pass)
+	priv, _ := c.Circles()[0].Unlock(pass)
 	raw, err := SignPolicyRevision(priv, h.CurrentPolicy(), func(p *bucket.Policy) { p.HoldMinCount = -1 })
 	if err != nil {
 		t.Fatal(err)

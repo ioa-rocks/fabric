@@ -535,10 +535,10 @@ the UI and daemon use a non-default Astral state directory.
 | `fabric peer add <multiaddr>` | any member | add a bootstrap peer |
 | `fabric announce add <hostname\|ip\|multiaddr>` | cloud/1:1-NAT nodes | also advertise an address no local interface carries; ports, transports, and resolved IPs derived automatically |
 | `fabric announce txt` | lighthouse | print the DNS TXT record enabling hostname joins |
-| `fabric circle init -name <label>` | one device per owner | mint the circle — the owner's user key, what buckets (and next, subjects) belong to; lives in `<state>/circle` |
+| `fabric circle init -name <name>` | any device | mint a circle — a user key that buckets (and next, subjects) belong to. A node holds any number of circles under `<state>/circles/<name>`: the owner's personal one, a shared `family` one, … |
 | `fabric circle attest` | each device of a circle | sign this device into the circle (done automatically by `circle init`/`join` when the node already has a fabric identity). Peers sync buckets and serve blobs only to attested devices of their own circle — mesh membership alone no longer grants vault access |
-| `fabric circle export <file>` / `fabric circle join <file>` | second device | carry the same circle to another device (interim until sub-key grants) |
-| `fabric circle status` | any member | circle, buckets served, mounts, folders, mesh, vault peers |
+| `fabric circle export [-circle <name>] <file>` / `fabric circle join <file>` | another device | carry a circle to another device, which then holds its key and is attested into it (interim until sub-key grants). A shared circle is how two people share buckets: both devices hold it, neither holds the other's personal circle |
+| `fabric circle status` | any member | circles held and attested, buckets per circle, mounts, folders, mesh, and which circles each vault peer verifiably shares |
 | `fabric bucket ...` | any member | the circle's buckets: `create`, `list`, `place <b> full\|cache\|none\|folder <dir>`, `mount`, `put/ls/get/rm/…` (`fabric bucket -h`; a `vault` symlink means the same) |
 | `fabric astral ...` | any member | inspect and use the coordination plane (`fabric astral -h`) |
 
@@ -593,7 +593,7 @@ user key) to skip the interactive prompts (CI, scripts).
 - `circle` — the ownership layer (ADR 0017): the owner's user key
   (age container, same keystore discipline as the root key), its DID,
   and the export/join bundle. Below vault and astral; `fabric circle`
-  manages it. One circle per node today.
+  manages it. A node holds any number of circles (`<state>/circles/<name>`).
 - `vault/…` — the data layer: `bucket`, `blobstore`, `index`, `store`
   (the device's store, opened against a circle), `folder`, and the
   vault subsystem daemon; `fabric bucket` is its CLI. See

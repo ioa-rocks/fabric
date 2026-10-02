@@ -94,7 +94,7 @@ Mesh membership is the machine's, managed by the fabric CLI:
 
 ```sh
 fabric join -name desk /ip4/…/tcp/4517/p2p/12D3Koo…   # approve on the master
-fabric circle init -name alex   # create the circle (once, on one device)
+fabric circle init -name alex   # create the circle (once, on one device); a node may hold several
 fabric up &                     # node daemon; vault subsystem activates
 fabric circle status            # circle, buckets served, mesh, vault peers
 ```
@@ -117,13 +117,27 @@ would mint a *different* user key): export the circle, join with it,
 then restart the daemon so the subsystem activates.
 
 ```sh
-fabric circle export alex.circle          # carries the key container (passphrase-protected)
+fabric circle export -circle alex alex.circle   # carries the key container (passphrase-protected)
 scp alex.circle other:                    # move it privately
 ssh other 'fabric circle join alex.circle && rm alex.circle && systemctl --user restart fabric'
 #   join asks for the circle passphrase and attests the device (needs the fabric
 #   identity — if the node has not joined the mesh yet, run 'fabric circle attest' after it has)
 # on other:
 fabric bucket list                        # catalog arrives via sync (≤30 s after connect)
+```
+
+**Sharing with another person** is a second circle, not a grant: mint it,
+join their device to it, and mint the shared buckets in it. Each device
+syncs exactly the buckets of the circles it is attested into — the
+personal circle's buckets never reach the other person, not even their
+catalog entries.
+
+```sh
+fabric circle init -name family                 # on the desk: now holds "main" and "family"
+fabric circle export -circle family family.circle
+# their device: fabric circle join family.circle   (joins family only; attests itself)
+fabric bucket create album -circle family       # owned by the shared circle
+fabric bucket list                              # shows the owner circle per bucket
 fabric bucket place <bucket> full         # and blobs follow
 ```
 

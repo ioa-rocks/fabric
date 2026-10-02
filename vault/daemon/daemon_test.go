@@ -49,7 +49,7 @@ func startDaemon(t *testing.T, statePath string) *daemon.Daemon {
 	if fd != nil {
 		// The composition root attaches the circle service (as `fabric up`
 		// does) — vault gates sync and blobs on it.
-		fd.Circle = fabricdaemon.NewCircleService(fd.Host, fd.Auth, st.Circle)
+		fd.Circle = fabricdaemon.NewCircleService(fd.Host, fd.Auth, st.CircleRoot)
 	}
 	d, err := daemon.New(st, fd)
 	if err != nil {
@@ -89,11 +89,7 @@ func startDaemon(t *testing.T, statePath string) *daemon.Daemon {
 // minted under it (initCircle).
 func openTestStore(t *testing.T, statePath string) *store.Store {
 	t.Helper()
-	c, err := circle.Open(circle.Dir(statePath))
-	if err != nil {
-		t.Fatalf("circle.Open: %v", err)
-	}
-	st, err := store.Open(statePath, c)
+	st, err := store.Open(statePath, circle.Root(statePath))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -104,7 +100,7 @@ func openTestStore(t *testing.T, statePath string) *store.Store {
 // under the fabric state dir; the daemon does not care where).
 func initCircle(t *testing.T, statePath, name string) {
 	t.Helper()
-	if _, err := circle.Init(circle.Dir(statePath), name, "pw"); err != nil {
+	if _, err := circle.Init(circle.Root(statePath), name, "pw"); err != nil {
 		t.Fatalf("circle.Init: %v", err)
 	}
 }
@@ -113,17 +109,17 @@ func initCircle(t *testing.T, statePath, name string) {
 // of the same owner).
 func joinCircle(t *testing.T, statePath string, b *circle.Bundle) {
 	t.Helper()
-	if _, err := circle.Join(circle.Dir(statePath), b); err != nil {
+	if _, err := circle.Join(circle.Root(statePath), b); err != nil {
 		t.Fatalf("circle.Join: %v", err)
 	}
 }
 
-// exportCircle returns the node's circle as a bundle for another node.
-func exportCircle(t *testing.T, statePath string) *circle.Bundle {
+// exportCircle returns one of the node's circles as a bundle for another node.
+func exportCircle(t *testing.T, statePath, name string) *circle.Bundle {
 	t.Helper()
-	c, err := circle.Open(circle.Dir(statePath))
+	c, err := circle.ByName(circle.Root(statePath), name)
 	if err != nil {
-		t.Fatalf("circle.Open: %v", err)
+		t.Fatalf("circle.ByName: %v", err)
 	}
 	b, err := c.Export()
 	if err != nil {
@@ -132,33 +128,54 @@ func exportCircle(t *testing.T, statePath string) *circle.Bundle {
 	return b
 }
 
-// attestDevice signs the node's device key into its circle, as the CLI does.
+// attestDevice signs the node's device key into every circle it holds, as
+// the CLI does at init/join/attest.
 func attestDevice(t *testing.T, statePath string, devicePub ed25519.PublicKey) {
 	t.Helper()
-	c, err := circle.Open(circle.Dir(statePath))
+	cs, err := circle.List(circle.Root(statePath))
 	if err != nil {
-		t.Fatalf("circle.Open: %v", err)
+		t.Fatalf("circle.List: %v", err)
 	}
-	priv, err := c.Unlock("pw")
-	if err != nil {
-		t.Fatalf("Unlock: %v", err)
-	}
-	a, err := circle.Attest(priv, devicePub, time.Now())
-	if err != nil {
-		t.Fatalf("Attest: %v", err)
-	}
-	if err := c.SaveAttestation(a); err != nil {
-		t.Fatalf("SaveAttestation: %v", err)
+	for _, c := range cs {
+		if _, err := c.LoadAttestation(); err == nil {
+			continue
+		}
+		priv, err := c.Unlock("pw")
+		if err != nil {
+			t.Fatalf("Unlock: %v", err)
+		}
+		a, err := circle.Attest(priv, devicePub, time.Now())
+		if err != nil {
+			t.Fatalf("Attest: %v", err)
+		}
+		if err := c.SaveAttestation(a); err != nil {
+			t.Fatalf("SaveAttestation: %v", err)
+		}
 	}
 }
 
 // signBucket mints a signed genesis+policy with the circle's key.
 func signBucket(t *testing.T, statePath, pass, name string) (genesis, policy []byte) {
 	t.Helper()
-	c, err := circle.Open(circle.Dir(statePath))
+	c, err := circle.Only(circle.Root(statePath))
 	if err != nil {
-		t.Fatalf("circle.Open: %v", err)
+		t.Fatalf("circle.Only: %v", err)
 	}
+	return signBucketWith(t, c, pass, name)
+}
+
+// signBucketIn mints a bucket owned by the named circle of the node.
+func signBucketIn(t *testing.T, statePath, circleName, pass, name string) (genesis, policy []byte) {
+	t.Helper()
+	c, err := circle.ByName(circle.Root(statePath), circleName)
+	if err != nil {
+		t.Fatalf("circle.ByName: %v", err)
+	}
+	return signBucketWith(t, c, pass, name)
+}
+
+func signBucketWith(t *testing.T, c *circle.Circle, pass, name string) (genesis, policy []byte) {
+	t.Helper()
 	priv, err := c.Unlock(pass)
 	if err != nil {
 		t.Fatalf("Unlock: %v", err)
@@ -185,8 +202,8 @@ func TestSoloDaemonAPI(t *testing.T) {
 	if st.Mesh {
 		t.Error("solo daemon claims a mesh")
 	}
-	if st.Name != "alex" {
-		t.Errorf("circle name = %q", st.Name)
+	if len(st.Circles) != 1 || st.Circles[0].Name != "alex" {
+		t.Errorf("circles = %+v, want just alex", st.Circles)
 	}
 
 	genesis, policy := signBucket(t, dir, "pw", "photos")

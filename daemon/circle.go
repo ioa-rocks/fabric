@@ -5,10 +5,10 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -20,46 +20,46 @@ import (
 )
 
 // CircleProtocolID is the circle-presence exchange: after membership auth,
-// two members show each other their device attestations (circle.Attestation)
-// and learn which circle, if any, the other serves. It is control plane
-// (always within scope); what it unlocks is the circle-gated data planes.
-const CircleProtocolID = "/fabric/circle/1"
+// two members show each other the device attestations they hold — one per
+// circle this device belongs to — and learn which circles the other
+// verifiably serves. It is control plane (always within scope); what it
+// unlocks is the circle-gated data planes.
+const CircleProtocolID = "/fabric/circle/2"
 
-const maxAttestationWireSize = 4 * 1024
+const maxAttestationsWireSize = 64 * 1024
 
 // CircleService is the circle instance of the namespace engine (ADR 0014,
-// l0-connectivity memo §9 step 3): it answers "is this member one of *my
-// circle's* devices?" so vault — and later astral — gate on ownership, not
-// on mesh membership. Verification uses the circle DID inside the
-// attestation and the peer key libp2p authenticated; nothing the remote
-// daemon configures can widen it. Cached per connection.
+// l0-connectivity memo §9 steps 3–4): it answers "which of *my* circles is
+// this member a device of?" so vault — and later astral — gate on
+// ownership, not on mesh membership. A node holds any number of circles
+// (its circle root); verification uses the circle DID inside each
+// attestation and the peer key libp2p authenticated, so nothing the remote
+// daemon configures can widen it. Results are cached per connection.
 type CircleService struct {
 	h    host.Host
 	auth *fabricnet.AuthService
-	c    *circle.Circle
+	root string
 
 	mu    sync.RWMutex
-	peers map[peer.ID]circleEntry // verified circle per connected member
-
-	ownMu sync.Mutex
-	own   *circle.Attestation // lazily loaded: `fabric circle attest` needs no restart
+	peers map[peer.ID]circleEntry
 	stop  func()
 }
 
-// circleEntry is one exchange result. A positive result holds for the
-// connection; a negative one ("" — the peer presented no attestation) only
-// for noCircleTTL, so a device attested after connecting (`fabric circle
+// circleEntry is one exchange result. A result with circles holds for the
+// connection; an empty one (the peer presented no attestation) only for
+// noCircleTTL, so a device attested after connecting (`fabric circle
 // attest` needs no restart) is picked up without a reconnect.
 type circleEntry struct {
-	did string
-	at  time.Time
+	dids []string
+	at   time.Time
 }
 
 const noCircleTTL = 30 * time.Second
 
-// NewCircleService attaches the exchange to the host for the node's circle.
-func NewCircleService(h host.Host, auth *fabricnet.AuthService, c *circle.Circle) *CircleService {
-	s := &CircleService{h: h, auth: auth, c: c, peers: map[peer.ID]circleEntry{}}
+// NewCircleService attaches the exchange to the host for the circles under
+// root (listed on demand — circles added later need no restart).
+func NewCircleService(h host.Host, auth *fabricnet.AuthService, root string) *CircleService {
+	s := &CircleService{h: h, auth: auth, root: root, peers: map[peer.ID]circleEntry{}}
 	h.SetStreamHandler(CircleProtocolID, auth.RequireMember(s.handle))
 	nb := &network.NotifyBundle{DisconnectedF: func(n network.Network, conn network.Conn) {
 		p := conn.RemotePeer()
@@ -74,8 +74,31 @@ func NewCircleService(h host.Host, auth *fabricnet.AuthService, c *circle.Circle
 	return s
 }
 
-// DID is the circle this node serves.
-func (s *CircleService) DID() string { return s.c.Config.DID }
+// Root is the circle root this node serves.
+func (s *CircleService) Root() string { return s.root }
+
+// Circles lists the circles this node holds right now.
+func (s *CircleService) Circles() []*circle.Circle {
+	cs, _ := circle.List(s.root)
+	return cs
+}
+
+// Has reports whether this node holds the circle.
+func (s *CircleService) Has(did string) bool {
+	for _, c := range s.Circles() {
+		if c.Config.DID == did {
+			return true
+		}
+	}
+	return false
+}
+
+// Attested reports whether this device holds its attestation for a circle —
+// without one, no peer treats it as part of that circle.
+func (s *CircleService) Attested(c *circle.Circle) bool {
+	_, err := c.LoadAttestation()
+	return err == nil
+}
 
 // Close detaches the service.
 func (s *CircleService) Close() {
@@ -83,56 +106,50 @@ func (s *CircleService) Close() {
 	s.stop()
 }
 
-// Attested reports whether this device holds its circle's attestation —
-// without one, no peer will treat it as part of the circle.
-func (s *CircleService) Attested() bool { return s.ownAttestation() != nil }
-
-func (s *CircleService) ownAttestation() *circle.Attestation {
-	s.ownMu.Lock()
-	defer s.ownMu.Unlock()
-	if s.own != nil {
-		return s.own
-	}
-	a, err := s.c.LoadAttestation()
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			// Logged once per attempt is too chatty; the status surface says it.
-			_ = err
+func (s *CircleService) ownAttestations() ([][]byte, error) {
+	var out [][]byte
+	for _, c := range s.Circles() {
+		a, err := c.LoadAttestation()
+		if err != nil {
+			continue // not attested into this circle (yet)
 		}
-		return nil
+		raw, err := a.Marshal()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, raw)
 	}
-	s.own = a
-	return a
+	return out, nil
 }
 
-func (s *CircleService) remember(p peer.ID, did string) {
+func (s *CircleService) remember(p peer.ID, dids []string) {
 	s.mu.Lock()
-	s.peers[p] = circleEntry{did: did, at: time.Now()}
+	s.peers[p] = circleEntry{dids: dids, at: time.Now()}
 	s.mu.Unlock()
 }
 
-// CircleOf returns the verified circle of a member, if a current exchange
-// result exists ("" means it presented no attestation, within noCircleTTL).
-func (s *CircleService) CircleOf(p peer.ID) (did string, known bool) {
+// CirclesOf returns the member's verified circles, if a current exchange
+// result exists (an empty list means it presented no attestation, within
+// noCircleTTL).
+func (s *CircleService) CirclesOf(p peer.ID) (dids []string, known bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	e, ok := s.peers[p]
-	if !ok || (e.did == "" && time.Since(e.at) > noCircleTTL) {
-		return "", false
+	if !ok || (len(e.dids) == 0 && time.Since(e.at) > noCircleTTL) {
+		return nil, false
 	}
-	return e.did, true
+	return e.dids, true
 }
 
-// Ensure returns the member's verified circle DID, running the exchange if
-// this connection has not had one yet. "" with nil error means the member
-// presented no (valid) attestation.
-func (s *CircleService) Ensure(ctx context.Context, p peer.ID) (string, error) {
-	if did, ok := s.CircleOf(p); ok {
-		return did, nil
+// Ensure returns the member's verified circle DIDs, running the exchange
+// if this connection has not had one yet.
+func (s *CircleService) Ensure(ctx context.Context, p peer.ID) ([]string, error) {
+	if dids, ok := s.CirclesOf(p); ok {
+		return dids, nil
 	}
 	st, err := s.h.NewStream(ctx, p, CircleProtocolID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer st.Close()
 	if dl, ok := ctx.Deadline(); ok {
@@ -140,38 +157,61 @@ func (s *CircleService) Ensure(ctx context.Context, p peer.ID) (string, error) {
 	}
 	if err := s.writeOwn(st); err != nil {
 		st.Reset()
-		return "", err
+		return nil, err
 	}
 	pub, err := ed25519Of(s.h.Peerstore().PubKey(p))
 	if err != nil {
 		st.Reset()
-		return "", err
+		return nil, err
 	}
-	did, err := readAttestation(st, pub)
+	dids, err := readAttestations(st, pub)
 	if err != nil {
 		st.Reset()
-		return "", err
+		return nil, err
 	}
-	s.remember(p, did)
-	return did, nil
+	s.remember(p, dids)
+	return dids, nil
 }
 
-// SameCircle reports whether the member is a verified device of this
-// node's circle.
-func (s *CircleService) SameCircle(ctx context.Context, p peer.ID) bool {
-	did, err := s.Ensure(ctx, p)
-	return err == nil && did != "" && did == s.c.Config.DID
+// Shared returns the circles this node and the member verifiably share.
+func (s *CircleService) Shared(ctx context.Context, p peer.ID) []string {
+	theirs, err := s.Ensure(ctx, p)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, c := range s.Circles() {
+		for _, d := range theirs {
+			if d == c.Config.DID {
+				out = append(out, d)
+				break
+			}
+		}
+	}
+	return out
 }
 
-// Require wraps a stream handler so that only verified devices of this
-// node's circle reach it (on top of membership and scope, which
-// RequireMember enforces).
-func (s *CircleService) Require(next network.StreamHandler) network.StreamHandler {
+// InCircle reports whether the member is a verified device of one of this
+// node's circles, the one named by did.
+func (s *CircleService) InCircle(ctx context.Context, p peer.ID, did string) bool {
+	for _, d := range s.Shared(ctx, p) {
+		if d == did {
+			return true
+		}
+	}
+	return false
+}
+
+// RequireAny wraps a stream handler so that only members sharing at least
+// one circle with this node reach it (on top of membership and scope,
+// which RequireMember enforces). Handlers then narrow per resource with
+// InCircle.
+func (s *CircleService) RequireAny(next network.StreamHandler) network.StreamHandler {
 	return s.auth.RequireMember(func(st network.Stream) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		ok := s.SameCircle(ctx, st.Conn().RemotePeer())
+		shared := s.Shared(ctx, st.Conn().RemotePeer())
 		cancel()
-		if !ok {
+		if len(shared) == 0 {
 			st.Reset()
 			return
 		}
@@ -188,49 +228,58 @@ func (s *CircleService) handle(st network.Stream) {
 		st.Reset()
 		return
 	}
-	did, err := readAttestation(st, pub)
+	dids, err := readAttestations(st, pub)
 	if err != nil {
 		st.Reset()
 		return
 	}
-	s.remember(st.Conn().RemotePeer(), did)
+	s.remember(st.Conn().RemotePeer(), dids)
 	if err := s.writeOwn(st); err != nil {
 		st.Reset()
 	}
 }
 
-// writeOwn sends this node's attestation, or an empty frame when it has
-// none (a member of the mesh that is not in any circle, or not yet attested).
+// writeOwn sends this node's attestations as one frame holding a CBOR list
+// (empty when the node is in no circle, or not yet attested into any).
 func (s *CircleService) writeOwn(st network.Stream) error {
-	own := s.ownAttestation()
-	if own == nil {
-		return wire.WriteFrame(st, nil)
+	own, err := s.ownAttestations()
+	if err != nil {
+		return err
 	}
-	raw, err := own.Marshal()
+	raw, err := cbor.Marshal(own)
 	if err != nil {
 		return err
 	}
 	return wire.WriteFrame(st, raw)
 }
 
-// readAttestation reads one frame and verifies it against the peer key the
-// transport authenticated. An empty frame is "no circle" — valid, "".
-func readAttestation(st network.Stream, devicePub ed25519.PublicKey) (string, error) {
-	raw, err := wire.ReadFrame(st, maxAttestationWireSize)
+// readAttestations reads one frame and verifies every attestation in it
+// against the peer key the transport authenticated. One bad attestation
+// fails the whole exchange — a peer presenting a forgery is not trusted
+// for the rest of its list either.
+func readAttestations(st network.Stream, devicePub ed25519.PublicKey) ([]string, error) {
+	raw, err := wire.ReadFrame(st, maxAttestationsWireSize)
 	if err != nil {
-		return "", fmt.Errorf("reading attestation: %w", err)
+		return nil, fmt.Errorf("reading attestations: %w", err)
 	}
-	if len(raw) == 0 {
-		return "", nil
+	var list [][]byte
+	if len(raw) > 0 {
+		if err := cbor.Unmarshal(raw, &list); err != nil {
+			return nil, fmt.Errorf("decoding attestations: %w", err)
+		}
 	}
-	a, err := circle.UnmarshalAttestation(raw)
-	if err != nil {
-		return "", err
+	dids := make([]string, 0, len(list))
+	for _, item := range list {
+		a, err := circle.UnmarshalAttestation(item)
+		if err != nil {
+			return nil, err
+		}
+		if err := a.Verify(devicePub); err != nil {
+			return nil, fmt.Errorf("peer attestation: %w", err)
+		}
+		dids = append(dids, a.Circle)
 	}
-	if err := a.Verify(devicePub); err != nil {
-		return "", fmt.Errorf("peer attestation: %w", err)
-	}
-	return a.Circle, nil
+	return dids, nil
 }
 
 func ed25519Of(pk crypto.PubKey) (ed25519.PublicKey, error) {

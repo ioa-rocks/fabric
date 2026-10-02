@@ -29,7 +29,7 @@ import (
 
 const (
 	SyncProtocol = "/vault/sync/2" // 2: revision heads (ADR 0001); 1 nodes do not interoperate
-	BlobProtocol = "/vault/blob/1"
+	BlobProtocol = "/vault/blob/2" // 2: request names the bucket, so the holder can authorize per circle
 )
 
 // SyncInterval is the anti-entropy timer. Connect events and local writes
@@ -49,7 +49,8 @@ type syncMsg struct {
 }
 
 type blobReq struct {
-	Hash string `cbor:"hash"`
+	Hash   string `cbor:"hash"`
+	Bucket string `cbor:"bucket"` // the bucket the requester wants it for; authorizes the request
 }
 
 type blobResp struct {
@@ -113,8 +114,9 @@ func (d *Daemon) syncPeer(p peer.ID) {
 	defer d.end()
 	ctx, cancel := context.WithTimeout(d.ctx, 60*time.Second)
 	defer cancel()
-	if !d.Fabric.Circle.SameCircle(ctx, p) {
-		return // a member, but not one of our circle's devices — nothing to exchange
+	shared := d.Fabric.Circle.Shared(ctx, p)
+	if len(shared) == 0 {
+		return // a member, but a device of none of our circles — nothing to exchange
 	}
 	s, err := d.Fabric.Host.NewStream(ctx, p, SyncProtocol)
 	if err != nil {
@@ -123,7 +125,7 @@ func (d *Daemon) syncPeer(p peer.ID) {
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(60 * time.Second))
 
-	out, err := d.dumpState()
+	out, err := d.dumpState(shared)
 	if err != nil {
 		log.Printf("sync: dumping local state: %v", err)
 		return
@@ -135,7 +137,7 @@ func (d *Daemon) syncPeer(p peer.ID) {
 	if err := cbor.NewDecoder(s).Decode(&in); err != nil {
 		return
 	}
-	d.applyState(&in, p)
+	d.applyState(&in, p, shared)
 }
 
 // handleSync is the responder side: merge theirs, send ours.
@@ -151,7 +153,14 @@ func (d *Daemon) handleSync(s network.Stream) {
 	if err := cbor.NewDecoder(s).Decode(&in); err != nil {
 		return
 	}
-	out, err := d.dumpState()
+	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
+	shared := d.Fabric.Circle.Shared(ctx, s.Conn().RemotePeer())
+	cancel()
+	if len(shared) == 0 {
+		s.Reset()
+		return
+	}
+	out, err := d.dumpState(shared)
 	if err != nil {
 		log.Printf("sync: dumping local state: %v", err)
 		return
@@ -159,16 +168,22 @@ func (d *Daemon) handleSync(s network.Stream) {
 	if err := cbor.NewEncoder(s).Encode(out); err != nil {
 		return
 	}
-	d.applyState(&in, s.Conn().RemotePeer())
+	d.applyState(&in, s.Conn().RemotePeer(), shared)
 }
 
-func (d *Daemon) dumpState() (*syncMsg, error) {
+// dumpState renders the buckets owned by the given circles — the ones the
+// peer verifiably shares with us. A bucket of a circle the peer is not in
+// never leaves this node, not even its catalog entry.
+func (d *Daemon) dumpState(owners []string) (*syncMsg, error) {
 	buckets, err := d.Store.Buckets()
 	if err != nil {
 		return nil, err
 	}
 	msg := &syncMsg{}
 	for _, b := range buckets {
+		if !inSet(owners, b.Genesis.Owner) {
+			continue
+		}
 		id, err := b.ID()
 		if err != nil {
 			continue
@@ -204,9 +219,9 @@ func (d *Daemon) dumpState() (*syncMsg, error) {
 // applyState merges a peer's dump: adopt unknown buckets (signatures
 // verify at adoption), merge every object and location record, then fetch
 // whatever our subscriptions now say we're missing.
-func (d *Daemon) applyState(msg *syncMsg, from peer.ID) {
+func (d *Daemon) applyState(msg *syncMsg, from peer.ID, shared []string) {
 	for _, sb := range msg.Buckets {
-		h, isNew, err := d.adoptIfUnknown(sb.Genesis, sb.Policy)
+		h, isNew, err := d.adoptIfUnknown(sb.Genesis, sb.Policy, shared)
 		if err != nil {
 			log.Printf("sync: rejecting bucket from %s: %v", from, err)
 			continue
@@ -246,7 +261,17 @@ func (d *Daemon) applyState(msg *syncMsg, from peer.ID) {
 }
 
 // adoptIfUnknown returns the (possibly fresh) handle for a synced bucket.
-func (d *Daemon) adoptIfUnknown(genesis, policy []byte) (*store.Handle, bool, error) {
+func (d *Daemon) adoptIfUnknown(genesis, policy []byte, shared []string) (*store.Handle, bool, error) {
+	// A peer may only speak for buckets of circles it verifiably shares
+	// with us — known or not. A compromised device of one circle must not
+	// touch another circle's buckets, nor plant one signed by a stray key.
+	b, err := bucket.Unmarshal(genesis)
+	if err != nil {
+		return nil, false, err
+	}
+	if !inSet(shared, b.Genesis.Owner) {
+		return nil, false, fmt.Errorf("bucket %q is owned by %s, a circle this peer is not a device of — refusing", b.Genesis.Name, b.Genesis.Owner)
+	}
 	id, known, err := d.Store.KnowsBucket(genesis)
 	if err != nil {
 		return nil, false, err
@@ -254,16 +279,6 @@ func (d *Daemon) adoptIfUnknown(genesis, policy []byte) (*store.Handle, bool, er
 	if known {
 		h, err := d.handle(id)
 		return h, false, err
-	}
-	// Only this circle's buckets are adopted from peers: a same-circle
-	// device that has been compromised must not be able to plant a bucket
-	// signed by some other key (defense in depth behind the circle gate).
-	b, err := bucket.Unmarshal(genesis)
-	if err != nil {
-		return nil, false, err
-	}
-	if b.Genesis.Owner != d.Store.Circle.Config.DID {
-		return nil, false, fmt.Errorf("bucket %q is owned by %s, not this circle — refusing to adopt", b.Genesis.Name, b.Genesis.Owner)
 	}
 	h, err := d.adopt(genesis, policy)
 	return h, true, err
@@ -310,9 +325,9 @@ func (d *Daemon) fetchAnywhere(h *store.Handle, hash string) error {
 			continue
 		}
 		cctx, ccancel := context.WithTimeout(d.ctx, 10*time.Second)
-		same := d.Fabric.Circle.SameCircle(cctx, p)
+		in := d.Fabric.Circle.InCircle(cctx, p, h.Bucket.Genesis.Owner)
 		ccancel()
-		if !same {
+		if !in {
 			continue
 		}
 		if err := d.fetchBlob(h, p, hash); err != nil {
@@ -336,7 +351,7 @@ func (d *Daemon) fetchBlob(h *store.Handle, p peer.ID, hash string) error {
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(10 * time.Minute))
 
-	if err := cbor.NewEncoder(s).Encode(blobReq{Hash: hash}); err != nil {
+	if err := cbor.NewEncoder(s).Encode(blobReq{Hash: hash, Bucket: h.ID()}); err != nil {
 		return err
 	}
 	dec := cbor.NewDecoder(s)
@@ -375,6 +390,22 @@ func (d *Daemon) handleBlob(s network.Stream) {
 		return
 	}
 	enc := cbor.NewEncoder(s)
+	// Authorize: the requester must be a device of the circle owning the
+	// bucket it names, and that bucket must actually reference the blob —
+	// otherwise any shared-circle device could name its own bucket and
+	// fetch another circle's bytes by hash.
+	h, err := d.handle(req.Bucket)
+	if err != nil {
+		_ = enc.Encode(blobResp{Found: false})
+		return
+	}
+	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
+	in := d.Fabric.Circle.InCircle(ctx, s.Conn().RemotePeer(), h.Bucket.Genesis.Owner)
+	cancel()
+	if !in || !d.bucketReferences(h, req.Hash) {
+		_ = enc.Encode(blobResp{Found: false})
+		return
+	}
 	path, err := d.blobPath(req.Hash)
 	if err != nil {
 		_ = enc.Encode(blobResp{Found: false})
@@ -422,4 +453,31 @@ func (d *Daemon) blobPath(hash string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("blob %.12s: not held here", hash)
+}
+
+// bucketReferences reports whether a bucket's index knows the blob: a
+// location record, or an object pointing at it.
+func (d *Daemon) bucketReferences(h *store.Handle, hash string) bool {
+	if locs, err := h.Index.Locations(hash); err == nil && len(locs) > 0 {
+		return true
+	}
+	objs, err := h.Index.DumpObjects()
+	if err != nil {
+		return false
+	}
+	for _, o := range objs {
+		if o.Blob() == hash {
+			return true
+		}
+	}
+	return false
+}
+
+func inSet(set []string, s string) bool {
+	for _, x := range set {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }

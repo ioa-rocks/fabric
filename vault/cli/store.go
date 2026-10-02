@@ -7,6 +7,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"ioa.rocks/fabric/circle"
 	"sync"
 
 	"ioa.rocks/fabric/vault/daemon"
@@ -38,11 +39,13 @@ func openStore(p paths) (store_, error) {
 	if cl := daemon.TryClient(*p.store); cl != nil {
 		return clientStore{cl}, nil
 	}
-	c, err := p.openCircle()
-	if err != nil {
-		return nil, fmt.Errorf("no daemon on %s and %w", daemon.SocketPath(*p.store), err)
+	if _, err := circle.Migrate(*p.circle, *p.store); err != nil {
+		return nil, fmt.Errorf("adopting the circle from %s: %w", *p.store, err)
 	}
-	st, err := store.Open(*p.store, c)
+	if !circle.Any(*p.circle) {
+		return nil, fmt.Errorf("no daemon on %s and this node holds no circle (did you run 'fabric circle init'?)", daemon.SocketPath(*p.store))
+	}
+	st, err := store.Open(*p.store, *p.circle)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +110,7 @@ func (s *directStore) Buckets() ([]daemon.BucketInfo, error) {
 			continue
 		}
 		pl := s.c.Placement(id)
-		info := daemon.BucketInfo{ID: id, Name: b.Genesis.Name, Sub: pl.Mode, Root: pl.Root}
+		info := daemon.BucketInfo{ID: id, Owner: b.Genesis.Owner, Name: b.Genesis.Name, Sub: pl.Mode, Root: pl.Root}
 		if h, err := s.handle(id); err == nil {
 			info.Objects, info.Held, _ = h.Stats()
 		}
@@ -127,7 +130,7 @@ func (s *directStore) CreateBucket(genesis, policy []byte) (daemon.BucketInfo, e
 	// Same default as the daemon path: the creating device holds what it
 	// puts.
 	_ = s.c.SetSubscription(h.ID(), store.SubFull)
-	return daemon.BucketInfo{ID: h.ID(), Name: h.Bucket.Genesis.Name, Sub: store.SubFull}, nil
+	return daemon.BucketInfo{ID: h.ID(), Owner: h.Bucket.Genesis.Owner, Name: h.Bucket.Genesis.Name, Sub: store.SubFull}, nil
 }
 
 func (s *directStore) Place(bucket, mode string, root *string) error {
