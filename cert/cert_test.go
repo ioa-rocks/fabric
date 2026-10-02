@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"slices"
 	"testing"
 	"time"
 
@@ -186,7 +187,7 @@ func TestRenewPreservesPayload(t *testing.T) {
 		renewed.Payload.Sub != old.Payload.Sub || renewed.Payload.Cmd != old.Payload.Cmd {
 		t.Fatal("renewal changed identity/role fields")
 	}
-	if renewed.Payload.Meta != old.Payload.Meta {
+	if !metaEqual(renewed.Payload.Meta, old.Payload.Meta) {
 		t.Fatalf("renewal changed meta: %+v != %+v", renewed.Payload.Meta, old.Payload.Meta)
 	}
 	if !renewed.Expiry().After(old.Expiry()) {
@@ -221,9 +222,9 @@ func TestVerifyAndForwardUnknownPayloadFields(t *testing.T) {
 
 	// The same payload as a hypothetical newer binary would encode it.
 	type futureMeta struct {
-		Name  string `cbor:"name"`
-		IP    string `cbor:"ip,omitempty"`
-		Scope string `cbor:"scope,omitempty"` // unknown here
+		Name string `cbor:"name"`
+		IP   string `cbor:"ip,omitempty"`
+		Ring string `cbor:"ring,omitempty"` // unknown here
 	}
 	type futurePayload struct {
 		Iss   string     `cbor:"iss"`
@@ -240,7 +241,7 @@ func TestVerifyAndForwardUnknownPayloadFields(t *testing.T) {
 	rootDID := DIDForKey(nsPub)
 	fp := futurePayload{
 		Iss: rootDID, Aud: DIDForKey(devPub), Sub: rootDID, Cmd: CmdMember,
-		Meta:  futureMeta{Name: "guest-pc", Scope: "tun=none"},
+		Meta:  futureMeta{Name: "guest-pc", Ring: "guest"},
 		Nbf:   now.Unix(),
 		Exp:   now.Add(time.Hour).Unix(),
 		Nonce: make([]byte, nonceSize),
@@ -303,7 +304,7 @@ func TestWireShapeUnchanged(t *testing.T) {
 	if err := cbor.Unmarshal(wire, &legacy); err != nil {
 		t.Fatal(err)
 	}
-	if legacy.Payload.Meta != c.Payload.Meta || legacy.Payload.Aud != c.Payload.Aud || legacy.Payload.Exp != c.Payload.Exp ||
+	if !metaEqual(legacy.Payload.Meta, c.Payload.Meta) || legacy.Payload.Aud != c.Payload.Aud || legacy.Payload.Exp != c.Payload.Exp ||
 		!bytes.Equal(legacy.Payload.Nonce, c.Payload.Nonce) || !bytes.Equal(legacy.Sig, c.Sig) {
 		t.Fatal("legacy layout decode differs")
 	}
@@ -313,5 +314,104 @@ func TestWireShapeUnchanged(t *testing.T) {
 	}
 	if !bytes.Equal(relegacy, wire) {
 		t.Fatal("legacy re-encoding is not byte-identical to the new Marshal")
+	}
+}
+
+func metaEqual(a, b Meta) bool {
+	return a.Name == b.Name && a.IP == b.IP && slices.Equal(a.Scope, b.Scope)
+}
+
+func TestScopeSemantics(t *testing.T) {
+	// Absent scope: everything. Present: control plane + listed families.
+	for _, f := range []string{"", ScopeTun, ScopeVault, ScopeAstral, "nexus"} {
+		if !ScopeAllows(nil, f) {
+			t.Fatalf("unscoped cert must allow %q", f)
+		}
+	}
+	vaultOnly := []string{ScopeVault}
+	if !ScopeAllows(vaultOnly, "") || !ScopeAllows(vaultOnly, ScopeVault) {
+		t.Fatal("scoped cert must allow the control plane and its own family")
+	}
+	if ScopeAllows(vaultOnly, ScopeTun) || ScopeAllows(vaultOnly, ScopeAstral) || ScopeAllows(vaultOnly, "nexus") {
+		t.Fatal("scoped cert allowed a family it does not list")
+	}
+	meshOnly := []string{ScopeMesh}
+	if !ScopeAllows(meshOnly, "") || ScopeAllows(meshOnly, ScopeVault) {
+		t.Fatal("mesh-only scope must allow only the control plane")
+	}
+
+	cases := map[string]string{
+		"/fabric/tun/1": ScopeTun, "/vault/sync/2": ScopeVault, "/vault/blob/1": ScopeVault,
+		"/astral/subject/1": ScopeAstral, "/fabric/auth/1": "", "/fabric/sync/1": "",
+		"/fabric/links/1": "", "/ipfs/ping/1.0.0": "",
+	}
+	for proto, want := range cases {
+		if got := ScopeFamily(proto); got != want {
+			t.Errorf("ScopeFamily(%q) = %q, want %q", proto, got, want)
+		}
+	}
+}
+
+func TestScopeNormalize(t *testing.T) {
+	if s, err := ParseScope(""); err != nil || s != nil {
+		t.Fatalf("empty scope must be unrestricted, got %v %v", s, err)
+	}
+	if s, err := ParseScope("full"); err != nil || s != nil {
+		t.Fatalf("'full' must be unrestricted, got %v %v", s, err)
+	}
+	if s, err := ParseScope("vault, astral,vault"); err != nil || !slices.Equal(s, []string{ScopeVault, ScopeAstral}) {
+		t.Fatalf("dedupe/trim failed: %v %v", s, err)
+	}
+	if s, err := ParseScope("mesh"); err != nil || !slices.Equal(s, []string{ScopeMesh}) {
+		t.Fatalf("mesh-only must stay explicit on the wire, got %v %v", s, err)
+	}
+	if s, err := ParseScope("mesh,tun"); err != nil || !slices.Equal(s, []string{ScopeTun}) {
+		t.Fatalf("mesh is implied when a family is present, got %v %v", s, err)
+	}
+	if _, err := ParseScope("tun,nexus"); err == nil {
+		t.Fatal("unknown family accepted")
+	}
+	if !slices.Equal(ScopeWithout(ScopeTun), []string{ScopeVault, ScopeAstral}) {
+		t.Fatalf("ScopeWithout(tun) = %v", ScopeWithout(ScopeTun))
+	}
+}
+
+// A mesh-only scope must survive the wire: omitempty would silently turn an
+// empty list into "unrestricted", which is why NormalizeScope keeps "mesh".
+func TestScopeRoundTripAndRenewMeta(t *testing.T) {
+	nsPub, nsPriv := genKey(t)
+	devPub, _ := genKey(t)
+	now := time.Now()
+	c, err := Issue(nsPriv, devPub, CmdMember, Meta{Name: "guest", Scope: []string{ScopeMesh}}, now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, _ := c.Marshal()
+	back, err := Unmarshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(back, nsPub, now); err != nil {
+		t.Fatal(err)
+	}
+	if back.Allows(ScopeVault) || !back.Allows("") {
+		t.Fatalf("mesh-only scope lost on the wire: %v", back.Payload.Meta.Scope)
+	}
+
+	// Promotion is a renewal: same identity, new scope and address.
+	meta := back.Payload.Meta
+	meta.Scope = []string{ScopeVault}
+	promoted, err := RenewMeta(nsPriv, back, meta, now.Add(time.Minute), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(promoted, nsPub, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if promoted.Payload.Aud != back.Payload.Aud || promoted.Payload.Cmd != back.Payload.Cmd {
+		t.Fatal("renewal changed identity or role")
+	}
+	if !promoted.Allows(ScopeVault) || promoted.Allows(ScopeTun) {
+		t.Fatalf("promoted scope wrong: %v", promoted.Payload.Meta.Scope)
 	}
 }

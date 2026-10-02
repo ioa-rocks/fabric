@@ -38,6 +38,9 @@ type StatusPeer struct {
 	Member    bool   `json:"member"`
 	Connected bool   `json:"connected"`
 	Revoked   bool   `json:"revoked,omitempty"`
+	// Scope is the cert-borne protocol scope (fabric ADR 0005); absent means
+	// unrestricted.
+	Scope []string `json:"scope,omitempty"`
 
 	// Link telemetry — how traffic actually reaches this peer (only set
 	// while connected).
@@ -68,32 +71,33 @@ type MemberInfo struct {
 	Name        string    `json:"name"`
 	Fingerprint string    `json:"fingerprint"`
 	DevicePub   []byte    `json:"device_pub"`
-	Cert        []byte    `json:"cert,omitempty"` // marshaled signed cert
-	IP          string    `json:"ip,omitempty"`   // overlay address from the cert
+	Cert        []byte    `json:"cert,omitempty"`  // marshaled signed cert
+	IP          string    `json:"ip,omitempty"`    // overlay address from the cert
+	Scope       []string  `json:"scope,omitempty"` // cert-borne protocol scope; absent = unrestricted
 	Expiry      time.Time `json:"expiry"`
 	Connected   bool      `json:"connected"`
 	Self        bool      `json:"self,omitempty"` // the answering daemon's own entry
 }
 
 type StatusReply struct {
-	Name         string       `json:"name"`
-	PeerID       string       `json:"peer_id"`
-	NamespaceDID string       `json:"namespace_did"`
-	Master       bool         `json:"master"`       // holds the namespace root key
-	QueueHost    bool         `json:"queue_host"`   // runs the admission queue (lighthouse role)
-	Reachability string       `json:"reachability"` // autonat v1 node verdict: public / private / unknown
+	Name         string `json:"name"`
+	PeerID       string `json:"peer_id"`
+	NamespaceDID string `json:"namespace_did"`
+	Master       bool   `json:"master"`       // holds the namespace root key
+	QueueHost    bool   `json:"queue_host"`   // runs the admission queue (lighthouse role)
+	Reachability string `json:"reachability"` // autonat v1 node verdict: public / private / unknown
 	// Per-address verdicts (autonat v2): which public addresses peers
 	// could actually dial back. On dual-stack NAT'd lines these carry the
 	// real story the single word above can't.
-	ReachableAddrs   []string `json:"reachable_addrs,omitempty"`
-	UnreachableAddrs []string `json:"unreachable_addrs,omitempty"`
-	UnverifiedAddrs  []string `json:"unverified_addrs,omitempty"`
-	OverlayIP        string   `json:"overlay_ip,omitempty"`
-	CertExpiry   *time.Time   `json:"cert_expiry,omitempty"` // this node's own cert
-	TUNActive    bool         `json:"tun_active"`
-	DNSActive    bool         `json:"dns_active"`
-	Addrs        []string     `json:"addrs"`
-	Peers        []StatusPeer `json:"peers"`
+	ReachableAddrs   []string     `json:"reachable_addrs,omitempty"`
+	UnreachableAddrs []string     `json:"unreachable_addrs,omitempty"`
+	UnverifiedAddrs  []string     `json:"unverified_addrs,omitempty"`
+	OverlayIP        string       `json:"overlay_ip,omitempty"`
+	CertExpiry       *time.Time   `json:"cert_expiry,omitempty"` // this node's own cert
+	TUNActive        bool         `json:"tun_active"`
+	DNSActive        bool         `json:"dns_active"`
+	Addrs            []string     `json:"addrs"`
+	Peers            []StatusPeer `json:"peers"`
 }
 
 // EventInfo is a membership event as shown in the activity feed.
@@ -181,6 +185,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		if c, ok := d.Store.Cert(p); ok {
 			sp.Name = c.Payload.Meta.Name
 			sp.IP = c.Payload.Meta.IP
+			sp.Scope = c.Payload.Meta.Scope
 			exp := c.Expiry()
 			sp.CertExpiry = &exp
 		}
@@ -200,7 +205,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	for p, c := range members {
 		if !seen[p.String()] {
 			exp := c.Expiry()
-			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true, IP: c.Payload.Meta.IP, CertExpiry: &exp, KnownAddrs: d.knownAddrs(p)})
+			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true, IP: c.Payload.Meta.IP, Scope: c.Payload.Meta.Scope, CertExpiry: &exp, KnownAddrs: d.knownAddrs(p)})
 			seen[p.String()] = true
 		}
 	}
@@ -249,6 +254,7 @@ func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
 			DevicePub:   devKey,
 			Cert:        raw,
 			IP:          c.Payload.Meta.IP,
+			Scope:       c.Payload.Meta.Scope,
 			Expiry:      c.Expiry(),
 			Connected:   self || d.Host.Network().Connectedness(p) == network.Connected,
 			Self:        self,

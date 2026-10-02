@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -133,5 +134,43 @@ func TestDurableBootstrapAddr(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Overlay routes come from certs: an address is routable only when the cert
+// carries one and its scope admits TUN (fabric ADR 0005) — never from what
+// the member itself configures.
+func TestOverlayRoutesHonourScope(t *testing.T) {
+	_, root, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issue := func(name, ip string, scope []string) (peer.ID, *cert.Cert) {
+		pub, _, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := cert.Issue(root, pub, cert.CmdMember, cert.Meta{Name: name, IP: ip, Scope: scope}, time.Now(), time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return peer.ID(name), c
+	}
+	members := map[peer.ID]*cert.Cert{}
+	add := func(p peer.ID, c *cert.Cert) { members[p] = c }
+	add(issue("full", "100.64.0.2/24", nil))
+	add(issue("tun-scoped", "100.64.0.3/24", []string{cert.ScopeTun, cert.ScopeVault}))
+	add(issue("no-ip", "", nil))
+	add(issue("vault-only-with-stale-ip", "100.64.0.4/24", []string{cert.ScopeVault}))
+
+	routes := overlayRoutes(members)
+	want := map[string]peer.ID{"100.64.0.2": "full", "100.64.0.3": "tun-scoped"}
+	if len(routes) != len(want) {
+		t.Fatalf("routes = %v, want %v", routes, want)
+	}
+	for ip, p := range want {
+		if routes[netip.MustParseAddr(ip)] != p {
+			t.Fatalf("route for %s = %v, want %v", ip, routes[netip.MustParseAddr(ip)], p)
+		}
 	}
 }

@@ -294,6 +294,8 @@ fresh validity window, so it needs the master:
 ```sh
 fabric renew nas          # one member (also: peer ID / fingerprint)
 fabric renew -expiring    # everything past half-life, this node included
+fabric renew -scope vault guest-pc   # change a member's protocol scope (promotion/demotion is a renewal;
+                                     # adding tun assigns an overlay address, dropping it releases one)
 ```
 
 or the "Renew cert" button on any peer (and on the master's own card)
@@ -525,7 +527,7 @@ the UI and daemon use a non-default Astral state directory.
 | `fabric graph [-json]` | any member | whole-mesh link map, human or machine readable |
 | `fabric join -name <label> <host \| -bootstrap <addr>>` | new device | request admission and wait; bare hostname resolves via its `_fabric` TXT record |
 | `fabric pending` | master | list join requests |
-| `fabric approve [-no-overlay] <fingerprint>` | master | sign a membership cert for a pending request; `-no-overlay` admits without an overlay address — connectivity and member-gated services, no TUN leg, enforced by every node from the cert (semi-trusted hardware; fabric ADR 0005 step 1) |
+| `fabric approve [-scope tun,vault,astral\|mesh] [-no-overlay] <fingerprint>` | master | sign a membership cert for a pending request. `-scope` signs a protocol scope into the cert: the control plane plus only the listed families (`mesh` = connectivity only); `-no-overlay` = everything but TUN. Every node enforces it in both directions, so the member cannot opt back in (semi-trusted hardware; fabric ADR 0005) |
 | `fabric deny <fingerprint>` | master | reject a pending request |
 | `fabric revoke <name \| peer-id \| fingerprint>` | master | revoke a member and gossip the cut-off |
 | `fabric ui [-listen 127.0.0.1:4518]` | any member | serve the topology/admin web UI |

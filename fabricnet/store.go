@@ -65,6 +65,20 @@ func (s *MemberStore) IsMember(p peer.ID, now time.Time) bool {
 	return ok && now.Before(c.Expiry())
 }
 
+// Allows reports whether the peer is a current, unrevoked member whose cert
+// scope admits the protocol (fabric ADR 0005): control-plane protocols for
+// every member, data-plane families only when the master signed them in.
+// Certs without a scope admit everything.
+func (s *MemberStore) Allows(p peer.ID, protocolID string, now time.Time) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, isRevoked := s.revoked[p]; isRevoked {
+		return false
+	}
+	c, ok := s.members[p]
+	return ok && now.Before(c.Expiry()) && c.Allows(cert.ScopeFamily(protocolID))
+}
+
 // Cert returns the stored certificate for a peer, if any.
 func (s *MemberStore) Cert(p peer.ID) (*cert.Cert, bool) {
 	s.mu.RLock()

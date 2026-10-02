@@ -461,16 +461,23 @@ func (d *Daemon) refreshRoutes() {
 		return
 	}
 	members, _ := d.Store.Snapshot()
+	d.Bridge.SetRoutes(overlayRoutes(members))
+}
+
+// overlayRoutes derives the TUN routing table from member certs: an address
+// is routable only if the cert carries one *and* its scope admits the TUN
+// family (fabric ADR 0005) — the outbound half of the no-TUN-leg bound.
+func overlayRoutes(members map[peer.ID]*cert.Cert) map[netip.Addr]peer.ID {
 	routes := make(map[netip.Addr]peer.ID, len(members))
 	for p, c := range members {
-		if c.Payload.Meta.IP == "" {
+		if c.Payload.Meta.IP == "" || !c.Allows(cert.ScopeTun) {
 			continue
 		}
 		if pfx, err := netip.ParsePrefix(c.Payload.Meta.IP); err == nil {
 			routes[pfx.Addr()] = p
 		}
 	}
-	d.Bridge.SetRoutes(routes)
+	return routes
 }
 
 // watchReachability tracks the autonat verdicts for the status API: the

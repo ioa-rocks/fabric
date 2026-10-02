@@ -152,7 +152,7 @@ func usage() {
   status   show node, membership, and connection state
   graph    show the whole mesh's links; -json for machines
   pending  list join requests awaiting approval (master)
-  approve  approve a pending join request by fingerprint (master; -no-overlay = no TUN leg)
+  approve  approve a pending join request by fingerprint (master; -scope / -no-overlay bound its protocols)
   deny     deny a pending join request by fingerprint (master)
   revoke   revoke a member by name, peer ID, or fingerprint (master)
   renew    re-sign a member's cert with a fresh validity window (master);
@@ -467,7 +467,11 @@ func cmdStatus(args []string) error {
 		if ip == "" {
 			ip = "-"
 		}
-		fmt.Printf("  %-16s %-9s %-8s %-18s %s\n", name, conn, member, ip, p.ID)
+		scope := ""
+		if p.Scope != nil {
+			scope = "  scope:" + cert.ScopeString(p.Scope)
+		}
+		fmt.Printf("  %-16s %-9s %-8s %-18s %s%s\n", name, conn, member, ip, p.ID, scope)
 	}
 	return nil
 }
@@ -787,10 +791,21 @@ func cmdPending(args []string) error {
 func cmdApprove(args []string) error {
 	fs := flag.NewFlagSet("approve", flag.ExitOnError)
 	statePath := stateFlag(fs)
-	noOverlay := fs.Bool("no-overlay", false, "admit without an overlay address: connectivity and member-gated services, but no TUN leg into the overlay (every node enforces it from the cert; the member cannot opt back in)")
+	scopeFlag := fs.String("scope", "", "protocol scope signed into the cert, comma-separated families (tun,vault,astral; 'mesh' = control plane only; empty = full). Every node enforces it from the cert — the member cannot opt back in (fabric ADR 0005)")
+	noOverlay := fs.Bool("no-overlay", false, "shorthand for -scope "+strings.Join(cert.ScopeWithout(cert.ScopeTun), ",")+": everything but an overlay address / TUN leg")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: fabric approve [-no-overlay] <fingerprint>")
+		return fmt.Errorf("usage: fabric approve [-scope tun,vault,astral|mesh] [-no-overlay] <fingerprint>")
+	}
+	if *noOverlay && *scopeFlag != "" {
+		return fmt.Errorf("-no-overlay and -scope are alternatives")
+	}
+	if *noOverlay {
+		*scopeFlag = strings.Join(cert.ScopeWithout(cert.ScopeTun), ",")
+	}
+	scope, err := cert.ParseScope(*scopeFlag)
+	if err != nil {
+		return err
 	}
 	fp := fs.Arg(0)
 
@@ -832,9 +847,7 @@ func cmdApprove(args []string) error {
 		return err
 	}
 	var ip string
-	if *noOverlay {
-		fmt.Printf("no overlay address: %q gets no TUN leg (member-gated services only)\n", match.Name)
-	} else {
+	if cert.ScopeAllows(scope, cert.ScopeTun) {
 		ip, err = daemon.AllocateOverlayIP(dir, members)
 		if err != nil {
 			return err
@@ -843,13 +856,16 @@ func cmdApprove(args []string) error {
 			fmt.Printf("assigning overlay address %s\n", ip)
 		}
 	}
+	if scope != nil {
+		fmt.Printf("scope %s: control plane plus the listed families only; no overlay address unless tun is listed\n", cert.ScopeString(scope))
+	}
 
 	rootPriv, err := unlockRootKey(dir)
 	if err != nil {
 		return err
 	}
 	now := time.Now()
-	c, err := cert.Issue(rootPriv, ed25519.PublicKey(match.DevicePub), cert.CmdMember, cert.Meta{Name: match.Name, IP: ip}, now, certValidity)
+	c, err := cert.Issue(rootPriv, ed25519.PublicKey(match.DevicePub), cert.CmdMember, cert.Meta{Name: match.Name, IP: ip, Scope: scope}, now, certValidity)
 	if err != nil {
 		return err
 	}
@@ -969,9 +985,20 @@ func cmdRenew(args []string) error {
 	fs := flag.NewFlagSet("renew", flag.ExitOnError)
 	statePath := stateFlag(fs)
 	expiring := fs.Bool("expiring", false, "renew every cert past half-life (this node's included)")
+	scopeFlag := fs.String("scope", "", "also change the member's protocol scope (tun,vault,astral | mesh | full) — a scope change is a renewal; adding tun assigns an overlay address, dropping it releases one (fabric ADR 0005)")
 	fs.Parse(args)
 	if *expiring == (fs.NArg() == 1) {
-		return fmt.Errorf("usage: fabric renew <name | peer-id | fingerprint>  |  fabric renew -expiring")
+		return fmt.Errorf("usage: fabric renew [-scope …] <name | peer-id | fingerprint>  |  fabric renew -expiring")
+	}
+	if *expiring && *scopeFlag != "" {
+		return fmt.Errorf("-scope applies to one member at a time, not -expiring")
+	}
+	var newScope []string
+	if *scopeFlag != "" {
+		var err error
+		if newScope, err = cert.ParseScope(*scopeFlag); err != nil {
+			return err
+		}
 	}
 
 	dir, err := state.Open(*statePath)
@@ -1036,7 +1063,25 @@ func cmdRenew(args []string) error {
 		if err != nil {
 			return fmt.Errorf("roster cert for %q: %w", m.Name, err)
 		}
-		renewed, err := cert.Renew(rootPriv, old, now, cert.DefaultValidity)
+		meta := old.Payload.Meta
+		if *scopeFlag != "" {
+			meta.Scope = newScope
+			wantTun := cert.ScopeAllows(newScope, cert.ScopeTun)
+			switch {
+			case wantTun && meta.IP == "":
+				if meta.IP, err = daemon.AllocateOverlayIP(dir, members); err != nil {
+					return err
+				}
+				if meta.IP != "" {
+					fmt.Printf("assigning overlay address %s\n", meta.IP)
+				}
+			case !wantTun && meta.IP != "":
+				fmt.Printf("releasing overlay address %s\n", meta.IP)
+				meta.IP = ""
+			}
+			fmt.Printf("scope %s -> %s\n", cert.ScopeString(old.Payload.Meta.Scope), cert.ScopeString(newScope))
+		}
+		renewed, err := cert.RenewMeta(rootPriv, old, meta, now, cert.DefaultValidity)
 		if err != nil {
 			return fmt.Errorf("renewing %q: %w", m.Name, err)
 		}

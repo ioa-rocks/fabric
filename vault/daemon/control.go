@@ -265,7 +265,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
 			if c, ok := d.Fabric.Store.Cert(p); ok {
 				pi.Name = c.Payload.Meta.Name
 			}
-			if protos, err := d.Fabric.Host.Peerstore().SupportsProtocols(p, HelloProtocol); err == nil && len(protos) > 0 {
+			if protos, err := d.Fabric.Host.Peerstore().SupportsProtocols(p, HelloProtocol); err == nil && len(protos) > 0 && d.Fabric.Auth.Allows(p, HelloProtocol) {
 				pi.Vault = true
 				ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 				if h, err := d.hello(ctx, p); err == nil {

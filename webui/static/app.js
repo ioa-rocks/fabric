@@ -495,6 +495,7 @@ function renderDetails(d, ns) {
   kv.className = "kv";
   add(kv, "name", n.name || "—");
   if (n.ip) add(kv, "overlay IP", mono(n.ip.split("/")[0]));
+  if (n.scope) add(kv, "scope", `mesh + ${n.scope.filter(f => f !== "mesh").join(" + ") || "nothing else"}`);
   add(kv, "peer ID", mono(n.id));
   if (n.connected) {
     add(kv, "link", `${n.relayed ? "RELAYED" : "direct"} · ${n.transport || "?"} · ${n.direction === "inbound" ? "they dialed us" : "we dialed them"}`);
@@ -673,7 +674,10 @@ function openForm(host, kind, fingerprint, what) {
   form.innerHTML = `
     <div class="form-note">Root-key passphrase to ${what}. Signing happens in this UI process, never in the daemon.</div>
     <input type="password" name="pass" placeholder="namespace root key passphrase" autocomplete="off" required>
-    ${kind === "approve" ? `<label class="form-note"><input type="checkbox" name="no_overlay"> No overlay address — connectivity and member-gated services only, no TUN leg (for hardware you don't fully trust)</label>` : ""}
+    ${kind === "approve" ? `<div class="form-note">Protocol scope signed into the cert — uncheck what this device must never do (hardware you don't fully trust). The mesh control plane is always on; every node enforces the rest.</div>
+    <label class="form-note"><input type="checkbox" name="scope_tun" checked> overlay address + TUN leg</label>
+    <label class="form-note"><input type="checkbox" name="scope_vault" checked> vault</label>
+    <label class="form-note"><input type="checkbox" name="scope_astral" checked> astral</label>` : ""}
     <div class="form-error" hidden></div>
     <div class="actions">
       <button class="action ${kind === "revoke" ? "danger" : "approve"}" type="submit">${{ revoke: "Sign revocation", renew: "Sign renewal" }[kind] || "Sign certificate"}</button>
@@ -686,7 +690,10 @@ function openForm(host, kind, fingerprint, what) {
     errBox.hidden = true;
     try {
       const body = { fingerprint, passphrase: form.pass.value };
-      if (kind === "approve" && form.no_overlay.checked) body.no_overlay = true;
+      if (kind === "approve") {
+        const picked = ["tun", "vault", "astral"].filter(f => form[`scope_${f}`].checked);
+        if (picked.length < 3) body.scope = picked.length ? picked : ["mesh"];
+      }
       await doPost(`/api/${kind}`, body);
       state.form = null;
       render();

@@ -154,6 +154,9 @@ type signedRequest struct {
 	// leg, member-gated services only. Enforced by every node from the
 	// cert; the member cannot opt back in.
 	NoOverlay bool `json:"no_overlay,omitempty"`
+	// Scope (approve only): the protocol families to sign in (fabric ADR
+	// 0005); absent = unrestricted. Takes precedence over NoOverlay.
+	Scope []string `json:"scope,omitempty"`
 }
 
 // unlock loads the namespace root key with the passphrase from the request.
@@ -200,8 +203,17 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadGateway, err)
 		return
 	}
+	scopeTokens := req.Scope
+	if scopeTokens == nil && req.NoOverlay {
+		scopeTokens = cert.ScopeWithout(cert.ScopeTun)
+	}
+	scope, err := cert.NormalizeScope(scopeTokens)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err)
+		return
+	}
 	var ip string
-	if !req.NoOverlay {
+	if cert.ScopeAllows(scope, cert.ScopeTun) {
 		ip, err = daemon.AllocateOverlayIP(s.dir, members)
 		if err != nil {
 			httpError(w, http.StatusInternalServerError, err)
@@ -214,7 +226,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	c, err := cert.Issue(rootPriv, ed25519.PublicKey(match.DevicePub), cert.CmdMember, cert.Meta{Name: match.Name, IP: ip}, now, cert.DefaultValidity)
+	c, err := cert.Issue(rootPriv, ed25519.PublicKey(match.DevicePub), cert.CmdMember, cert.Meta{Name: match.Name, IP: ip, Scope: scope}, now, cert.DefaultValidity)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return

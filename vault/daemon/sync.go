@@ -92,12 +92,13 @@ func (d *Daemon) syncLoop() {
 	}
 }
 
-// syncAll exchanges with every connected member. Members that don't run
-// vault fail the protocol negotiation instantly — that's the filter.
+// syncAll exchanges with every connected member whose cert scope admits
+// vault (fabric ADR 0005 — sending our state to a member outside its scope
+// would be a leak, so the initiator checks too). Members that don't run
+// vault fail the protocol negotiation instantly — that's the other filter.
 func (d *Daemon) syncAll() {
-	now := time.Now()
 	for _, p := range d.Fabric.Host.Network().Peers() {
-		if d.Fabric.Store.IsMember(p, now) {
+		if d.Fabric.Auth.Allows(p, SyncProtocol) {
 			d.syncPeer(p)
 		}
 	}
@@ -289,10 +290,9 @@ func (d *Daemon) fetchAnywhere(h *store.Handle, hash string) error {
 	if d.Fabric == nil {
 		return fmt.Errorf("not on a mesh")
 	}
-	now := time.Now()
 	var lastErr error = fmt.Errorf("no connected vault peer holds it")
 	for _, p := range d.Fabric.Host.Network().Peers() {
-		if !d.Fabric.Store.IsMember(p, now) {
+		if !d.Fabric.Auth.Allows(p, BlobProtocol) {
 			continue
 		}
 		if err := d.fetchBlob(h, p, hash); err != nil {

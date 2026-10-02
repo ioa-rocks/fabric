@@ -16,9 +16,14 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 )
 
 const echoProtocol = "/fabric/test-echo/1"
+
+// vaultEchoProtocol is the same echo under a data-plane prefix, so the
+// scope gate (fabric ADR 0005) has something to refuse.
+const vaultEchoProtocol = "/vault/test-echo/1"
 
 type node struct {
 	host  host.Host
@@ -31,6 +36,12 @@ type node struct {
 // newNode builds a libp2p host with the full enforcement stack. If member is
 // true the node holds a valid membership cert; otherwise it is a stranger.
 func newNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.PrivateKey, name string, member bool, grace time.Duration) *node {
+	t.Helper()
+	return newScopedNode(t, nsPub, nsPriv, name, member, nil, grace)
+}
+
+// newScopedNode is newNode with a cert-borne protocol scope (nil = full).
+func newScopedNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.PrivateKey, name string, member bool, scope []string, grace time.Duration) *node {
 	t.Helper()
 
 	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
@@ -57,7 +68,7 @@ func newNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.PrivateKey, n
 		if err != nil {
 			t.Fatal(err)
 		}
-		n.own, err = cert.Issue(nsPriv, ed25519.PublicKey(raw), cert.CmdMember, cert.Meta{Name: name}, time.Now(), 90*24*time.Hour)
+		n.own, err = cert.Issue(nsPriv, ed25519.PublicKey(raw), cert.CmdMember, cert.Meta{Name: name, Scope: scope}, time.Now(), 90*24*time.Hour)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -66,7 +77,7 @@ func newNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.PrivateKey, n
 		n.joins.Add(1)
 	})
 
-	h.SetStreamHandler(echoProtocol, n.auth.RequireMember(func(s network.Stream) {
+	echoHandler := n.auth.RequireMember(func(s network.Stream) {
 		defer s.Close()
 		r := bufio.NewReader(s)
 		line, err := r.ReadString('\n')
@@ -74,7 +85,9 @@ func newNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.PrivateKey, n
 			return
 		}
 		_, _ = s.Write([]byte(line))
-	}))
+	})
+	h.SetStreamHandler(echoProtocol, echoHandler)
+	h.SetStreamHandler(vaultEchoProtocol, echoHandler)
 	return n
 }
 
@@ -90,9 +103,13 @@ func connect(t *testing.T, from, to *node) {
 }
 
 func echo(n *node, to peer.ID, msg string) (string, error) {
+	return echoOn(n, to, echoProtocol, msg)
+}
+
+func echoOn(n *node, to peer.ID, proto string, msg string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	s, err := n.host.NewStream(ctx, to, echoProtocol)
+	s, err := n.host.NewStream(ctx, to, protocol.ID(proto))
 	if err != nil {
 		return "", err
 	}
@@ -244,4 +261,54 @@ func connect2(from, to *node) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return from.host.Connect(ctx, peer.AddrInfo{ID: to.host.ID(), Addrs: to.host.Addrs()})
+}
+
+// A member whose cert scope omits a data-plane family is refused on that
+// family's protocols by every honest node, while the control plane still
+// works — and the restriction is decided by the *remote's* cert, not by
+// anything the scoped node configures (fabric ADR 0005).
+func TestScopedMemberIsGatedPerProtocolFamily(t *testing.T) {
+	nsPub, nsPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := newNode(t, nsPub, nsPriv, "full", true, 5*time.Second)
+	meshOnly := newScopedNode(t, nsPub, nsPriv, "guest", true, []string{cert.ScopeMesh}, 5*time.Second)
+	vaultOnly := newScopedNode(t, nsPub, nsPriv, "nas-ish", true, []string{cert.ScopeVault}, 5*time.Second)
+
+	for _, n := range []*node{meshOnly, vaultOnly} {
+		connect(t, n, full)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := n.auth.Authenticate(ctx, full.host.ID())
+		cancel()
+		if err != nil {
+			t.Fatalf("Authenticate: %v", err)
+		}
+	}
+
+	// Control plane: everyone.
+	for _, n := range []*node{meshOnly, vaultOnly} {
+		if got, err := echo(n, full.host.ID(), "ctl"); err != nil || got != "ctl" {
+			t.Fatalf("control-plane echo from %s: %q %v", n.own.Payload.Meta.Name, got, err)
+		}
+	}
+	// Data plane: only the scoped-in family, in both directions.
+	if _, err := echoOn(meshOnly, full.host.ID(), vaultEchoProtocol, "x"); err == nil {
+		t.Fatal("mesh-only member reached a vault protocol on the full node")
+	}
+	if got, err := echoOn(vaultOnly, full.host.ID(), vaultEchoProtocol, "v"); err != nil || got != "v" {
+		t.Fatalf("vault-scoped member refused on vault protocol: %q %v", got, err)
+	}
+	// Defense in depth: a scoped node declines to serve outside its own
+	// scope too (the real bound is the initiator's Allows check below).
+	if _, err := echoOn(full, meshOnly.host.ID(), vaultEchoProtocol, "x"); err == nil {
+		t.Fatal("mesh-only node served a vault protocol")
+	}
+	// The outbound helper agrees with the gate.
+	if full.auth.Allows(meshOnly.host.ID(), vaultEchoProtocol) || !full.auth.Allows(meshOnly.host.ID(), echoProtocol) {
+		t.Fatal("Allows disagrees with the gate for the mesh-only member")
+	}
+	if !full.auth.Allows(vaultOnly.host.ID(), vaultEchoProtocol) || full.auth.Allows(vaultOnly.host.ID(), "/fabric/tun/1") {
+		t.Fatal("Allows disagrees with the gate for the vault-only member")
+	}
 }

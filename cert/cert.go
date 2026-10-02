@@ -12,6 +12,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
@@ -47,6 +49,117 @@ const nonceSize = 16
 type Meta struct {
 	Name string `cbor:"name"`         // human label, e.g. "nas", "work-laptop"
 	IP   string `cbor:"ip,omitempty"` // overlay address, CIDR notation
+	// Scope is the cert-borne protocol scope (fabric ADR 0005): the
+	// data-plane families this device may use, signed by the master. Absent
+	// (nil) means unrestricted — every family, as all certs were before the
+	// field existed. Present means the mesh control plane (membership,
+	// gossip, relay, links) plus exactly the listed families; ScopeMesh
+	// alone is the minimal "connectivity only" member. Every honest node
+	// enforces it in both directions, so the member cannot opt back in.
+	Scope []string `cbor:"scope,omitempty"`
+}
+
+// Scope families. ScopeMesh is the control plane every member has; it is
+// only ever written to make an otherwise-empty scope explicit.
+const (
+	ScopeMesh   = "mesh"
+	ScopeTun    = "tun"    // /fabric/tun/* — an overlay address and the L3 leg
+	ScopeVault  = "vault"  // /vault/*
+	ScopeAstral = "astral" // /astral/*
+)
+
+// AllScopes lists every data-plane family this binary knows.
+func AllScopes() []string { return []string{ScopeTun, ScopeVault, ScopeAstral} }
+
+// ScopeWithout is every known family except one — the "-no-overlay" shape.
+func ScopeWithout(family string) []string {
+	var out []string
+	for _, f := range AllScopes() {
+		if f != family {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// ScopeFamily maps a protocol ID to the scope family that governs it, or ""
+// for the control plane (always allowed to members).
+func ScopeFamily(protocolID string) string {
+	switch {
+	case strings.HasPrefix(protocolID, "/fabric/tun/"):
+		return ScopeTun
+	case strings.HasPrefix(protocolID, "/vault/"):
+		return ScopeVault
+	case strings.HasPrefix(protocolID, "/astral/"):
+		return ScopeAstral
+	}
+	return ""
+}
+
+// ScopeAllows reports whether a scope admits a family: an absent scope admits
+// everything, the control plane ("") is always admitted, otherwise the
+// family must be listed. Unknown families in a scope are simply never
+// matched here — a newer master's token restricts an older node to what it
+// understands, never widens it.
+func ScopeAllows(scope []string, family string) bool {
+	if scope == nil || family == "" {
+		return true
+	}
+	return slices.Contains(scope, family)
+}
+
+// Allows is ScopeAllows over this cert's scope.
+func (c *Cert) Allows(family string) bool { return ScopeAllows(c.Payload.Meta.Scope, family) }
+
+// NormalizeScope validates and canonicalizes a scope as entered on the
+// master: empty input means unrestricted (nil); tokens must be known
+// families or ScopeMesh; duplicates collapse; "mesh" is dropped unless it is
+// all that remains — then it stays, so the scope is explicitly present and
+// not mistaken for unrestricted on the wire.
+func NormalizeScope(tokens []string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, t := range tokens {
+		t = strings.TrimSpace(t)
+		switch t {
+		case "":
+			continue
+		case ScopeMesh:
+			seen[ScopeMesh] = true
+			continue
+		case ScopeTun, ScopeVault, ScopeAstral:
+			if !seen[t] {
+				seen[t] = true
+				out = append(out, t)
+			}
+		default:
+			return nil, fmt.Errorf("unknown scope family %q (known: %s, or mesh)", t, strings.Join(AllScopes(), ", "))
+		}
+	}
+	if out == nil {
+		if seen[ScopeMesh] {
+			return []string{ScopeMesh}, nil
+		}
+		return nil, nil
+	}
+	return out, nil
+}
+
+// ParseScope reads a comma-separated scope from a flag. "" and "full" both
+// mean unrestricted.
+func ParseScope(csv string) ([]string, error) {
+	if csv == "" || csv == "full" {
+		return nil, nil
+	}
+	return NormalizeScope(strings.Split(csv, ","))
+}
+
+// ScopeString renders a scope for humans.
+func ScopeString(scope []string) string {
+	if scope == nil {
+		return "full"
+	}
+	return strings.Join(scope, ",")
 }
 
 // Payload is the signed portion of a membership certificate.
@@ -134,6 +247,13 @@ func Issue(rootPriv ed25519.PrivateKey, devicePub ed25519.PublicKey, cmd string,
 // role, and overlay IP: a renewal must never renumber a node — only the
 // validity window and nonce change.
 func Renew(rootPriv ed25519.PrivateKey, old *Cert, nbf time.Time, validity time.Duration) (*Cert, error) {
+	return RenewMeta(rootPriv, old, old.Payload.Meta, nbf, validity)
+}
+
+// RenewMeta is Renew with new attributes: the renewal that changes a
+// member's scope or overlay address (fabric ADR 0005 — a scope change is a
+// renewal, never a new identity). Identity and role are still preserved.
+func RenewMeta(rootPriv ed25519.PrivateKey, old *Cert, meta Meta, nbf time.Time, validity time.Duration) (*Cert, error) {
 	if DIDForKey(rootPriv.Public().(ed25519.PublicKey)) != old.Payload.Iss {
 		return nil, errors.New("renewal key does not match the certificate's namespace")
 	}
@@ -142,6 +262,7 @@ func Renew(rootPriv ed25519.PrivateKey, old *Cert, nbf time.Time, validity time.
 		return nil, fmt.Errorf("generating nonce: %w", err)
 	}
 	p := old.Payload
+	p.Meta = meta
 	p.Nbf = nbf.Unix()
 	p.Exp = nbf.Add(validity).Unix()
 	p.Nonce = nonce

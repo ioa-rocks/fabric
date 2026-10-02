@@ -555,7 +555,7 @@ func (d *Daemon) announceRegistry() {
 		return
 	}
 	for _, p := range d.Fabric.Host.Network().Peers() {
-		if _, ok := d.Fabric.Store.Cert(p); ok {
+		if d.Fabric.Auth.Allows(p, Protocol) { // cert scope, fabric ADR 0005
 			go d.refreshRegistry(p)
 		}
 	}
@@ -606,6 +606,9 @@ func (d *Daemon) remoteWithin(host string, req request, within time.Duration) (r
 	p, ok := d.peerByName(host)
 	if !ok {
 		return response{}, fmt.Errorf("astral: host %q not connected", host)
+	}
+	if !d.Fabric.Auth.Allows(p, Protocol) {
+		return response{}, fmt.Errorf("astral: host %q is outside the astral scope of its membership cert", host)
 	}
 	ctx, cancel := context.WithTimeout(d.ctx, within)
 	defer cancel()

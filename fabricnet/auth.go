@@ -168,15 +168,34 @@ func (a *AuthService) Revoke(p peer.ID) {
 }
 
 // RequireMember wraps a stream handler so that only authenticated members
-// reach it — the per-protocol enforcement layer of spec §4.
+// reach it — the per-protocol enforcement layer of spec §4. Since fabric ADR
+// 0005 it also enforces the cert-borne scope: the negotiated protocol's
+// family must be admitted by the remote member's cert, whatever that
+// member's own daemon claims. As defense in depth a node also declines to
+// serve protocols outside its *own* scope — not a security boundary (the
+// scoped box is the party we don't trust), but it keeps an honest scoped
+// node from receiving data a buggy peer pushes at it.
 func (a *AuthService) RequireMember(next network.StreamHandler) network.StreamHandler {
 	return func(s network.Stream) {
-		if !a.store.IsMember(s.Conn().RemotePeer(), time.Now()) {
+		proto := string(s.Protocol())
+		if !a.store.Allows(s.Conn().RemotePeer(), proto, time.Now()) {
+			s.Reset()
+			return
+		}
+		if own := a.ownCert(); own != nil && !own.Allows(cert.ScopeFamily(proto)) {
 			s.Reset()
 			return
 		}
 		next(s)
 	}
+}
+
+// Allows is the outbound half of scope enforcement: before this node opens
+// a data-plane stream to a member — or routes packets to it — it asks
+// whether that member's cert admits the protocol. Pushing state to a member
+// outside its scope would be a leak, so initiators check too.
+func (a *AuthService) Allows(p peer.ID, protocolID string) bool {
+	return a.store.Allows(p, protocolID, time.Now())
 }
 
 // readAndValidateCert reads one cert frame and checks both signatures-level
