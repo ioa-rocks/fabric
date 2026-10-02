@@ -102,8 +102,14 @@ fabric circle status            # circle, buckets served, mesh, vault peers
 "Which devices run vault" is simply which members have vault state —
 participation is opt-in per device (memo §5). Vault peers find each
 other among mesh members by the `/vault/hello/1` protocol
-(member-gated; carries circle DID + version). Mesh-level debugging:
-`fabric status`.
+(member-gated; carries circle DID + version) — but they **sync and serve
+blobs only to verified devices of their own circle**: each device holds
+a *device attestation* signed by the circle key (`circle init`/`join`
+mint it; `fabric circle attest` for a device that joined earlier), and
+peers check it on `/fabric/circle/1` after membership auth. A mesh
+member outside the circle sees the hello card and nothing else.
+Mesh-level debugging: `fabric status`; `fabric circle status` shows
+whether this device is attested and which peers verify as same-circle.
 
 **A second device of the same owner** (interim procedure until
 capability grants let a device hold a sub-key — `circle init` there
@@ -114,6 +120,8 @@ then restart the daemon so the subsystem activates.
 fabric circle export alex.circle          # carries the key container (passphrase-protected)
 scp alex.circle other:                    # move it privately
 ssh other 'fabric circle join alex.circle && rm alex.circle && systemctl --user restart fabric'
+#   join asks for the circle passphrase and attests the device (needs the fabric
+#   identity — if the node has not joined the mesh yet, run 'fabric circle attest' after it has)
 # on other:
 fabric bucket list                        # catalog arrives via sync (≤30 s after connect)
 fabric bucket place <bucket> full         # and blobs follow
