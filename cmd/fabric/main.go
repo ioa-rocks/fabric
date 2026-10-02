@@ -152,7 +152,7 @@ func usage() {
   status   show node, membership, and connection state
   graph    show the whole mesh's links; -json for machines
   pending  list join requests awaiting approval (master)
-  approve  approve a pending join request by fingerprint (master)
+  approve  approve a pending join request by fingerprint (master; -no-overlay = no TUN leg)
   deny     deny a pending join request by fingerprint (master)
   revoke   revoke a member by name, peer ID, or fingerprint (master)
   renew    re-sign a member's cert with a fresh validity window (master);
@@ -787,9 +787,10 @@ func cmdPending(args []string) error {
 func cmdApprove(args []string) error {
 	fs := flag.NewFlagSet("approve", flag.ExitOnError)
 	statePath := stateFlag(fs)
+	noOverlay := fs.Bool("no-overlay", false, "admit without an overlay address: connectivity and member-gated services, but no TUN leg into the overlay (every node enforces it from the cert; the member cannot opt back in)")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: fabric approve <fingerprint>")
+		return fmt.Errorf("usage: fabric approve [-no-overlay] <fingerprint>")
 	}
 	fp := fs.Arg(0)
 
@@ -830,12 +831,17 @@ func cmdApprove(args []string) error {
 	if err != nil {
 		return err
 	}
-	ip, err := daemon.AllocateOverlayIP(dir, members)
-	if err != nil {
-		return err
-	}
-	if ip != "" {
-		fmt.Printf("assigning overlay address %s\n", ip)
+	var ip string
+	if *noOverlay {
+		fmt.Printf("no overlay address: %q gets no TUN leg (member-gated services only)\n", match.Name)
+	} else {
+		ip, err = daemon.AllocateOverlayIP(dir, members)
+		if err != nil {
+			return err
+		}
+		if ip != "" {
+			fmt.Printf("assigning overlay address %s\n", ip)
+		}
 	}
 
 	rootPriv, err := unlockRootKey(dir)

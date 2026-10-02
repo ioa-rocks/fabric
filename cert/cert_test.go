@@ -1,10 +1,13 @@
 package cert
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
 	"time"
+
+	"github.com/fxamacker/cbor/v2"
 )
 
 func genKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
@@ -104,8 +107,37 @@ func TestVerifyRejections(t *testing.T) {
 		}
 	})
 	t.Run("tampered payload", func(t *testing.T) {
-		c := valid(t)
-		c.Payload.Cmd = CmdAdmin // privilege escalation attempt
+		// Tamper on the wire — the bytes the signature covers. (The parsed
+		// struct is read-only by contract; edits to it are neither signed
+		// over nor emitted.)
+		wire, err := valid(t).Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var w wireCert
+		if err := cbor.Unmarshal(wire, &w); err != nil {
+			t.Fatal(err)
+		}
+		var p Payload
+		if err := cbor.Unmarshal(w.Payload, &p); err != nil {
+			t.Fatal(err)
+		}
+		p.Cmd = CmdAdmin // privilege escalation attempt
+		w.Payload, err = encMode.Marshal(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tampered, err := encMode.Marshal(w)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := Unmarshal(tampered)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Payload.Cmd != CmdAdmin {
+			t.Fatal("test setup: tamper did not land")
+		}
 		if err := Verify(c, nsPub, now); err == nil {
 			t.Fatal("verified a tampered cert")
 		}
@@ -175,5 +207,111 @@ func TestRenewRejectsForeignRootKey(t *testing.T) {
 	}
 	if _, err := Renew(otherPriv, old, time.Now(), DefaultValidity); err == nil {
 		t.Fatal("renewal with a foreign root key unexpectedly succeeded")
+	}
+}
+
+// A cert whose payload carries fields this binary does not know (a future
+// scope attribute, fabric ADR 0005) must still verify, and must leave this
+// node byte-for-byte as it arrived — otherwise the fleet could never be
+// upgraded ahead of the first scoped cert.
+func TestVerifyAndForwardUnknownPayloadFields(t *testing.T) {
+	nsPub, nsPriv := genKey(t)
+	devPub, _ := genKey(t)
+	now := time.Now()
+
+	// The same payload as a hypothetical newer binary would encode it.
+	type futureMeta struct {
+		Name  string `cbor:"name"`
+		IP    string `cbor:"ip,omitempty"`
+		Scope string `cbor:"scope,omitempty"` // unknown here
+	}
+	type futurePayload struct {
+		Iss   string     `cbor:"iss"`
+		Aud   string     `cbor:"aud"`
+		Sub   string     `cbor:"sub"`
+		Cmd   string     `cbor:"cmd"`
+		Meta  futureMeta `cbor:"meta"`
+		Nbf   int64      `cbor:"nbf"`
+		Exp   int64      `cbor:"exp"`
+		Nonce []byte     `cbor:"nonce"`
+		Prf   [][]byte   `cbor:"prf"`
+		Ext   string     `cbor:"ext,omitempty"` // unknown top-level field
+	}
+	rootDID := DIDForKey(nsPub)
+	fp := futurePayload{
+		Iss: rootDID, Aud: DIDForKey(devPub), Sub: rootDID, Cmd: CmdMember,
+		Meta:  futureMeta{Name: "guest-pc", Scope: "tun=none"},
+		Nbf:   now.Unix(),
+		Exp:   now.Add(time.Hour).Unix(),
+		Nonce: make([]byte, nonceSize),
+		Prf:   [][]byte{},
+		Ext:   "something newer",
+	}
+	payload, err := encMode.Marshal(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := encMode.Marshal(wireCert{Payload: payload, Sig: ed25519.Sign(nsPriv, payload)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := Unmarshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Payload.Meta.Name != "guest-pc" {
+		t.Fatalf("known fields must still parse: %+v", c.Payload.Meta)
+	}
+	if err := Verify(c, nsPub, now.Add(time.Minute)); err != nil {
+		t.Fatalf("Verify with unknown fields: %v", err)
+	}
+	again, err := c.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(again, wire) {
+		t.Fatal("re-marshalling dropped or reordered payload fields")
+	}
+	// And the forwarded bytes verify on the next hop too.
+	hop, err := Unmarshal(again)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(hop, nsPub, now.Add(time.Minute)); err != nil {
+		t.Fatalf("Verify after forwarding: %v", err)
+	}
+}
+
+// The wire shape must not have changed: a cert issued and marshalled here
+// decodes with the pre-raw-payload layout (payload map + sig).
+func TestWireShapeUnchanged(t *testing.T) {
+	_, nsPriv := genKey(t)
+	devPub, _ := genKey(t)
+	c, err := Issue(nsPriv, devPub, CmdMember, Meta{Name: "nas", IP: "100.64.0.9/24"}, time.Now(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := c.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy struct {
+		Payload Payload `cbor:"payload"`
+		Sig     []byte  `cbor:"sig"`
+	}
+	if err := cbor.Unmarshal(wire, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Payload.Meta != c.Payload.Meta || legacy.Payload.Aud != c.Payload.Aud || legacy.Payload.Exp != c.Payload.Exp ||
+		!bytes.Equal(legacy.Payload.Nonce, c.Payload.Nonce) || !bytes.Equal(legacy.Sig, c.Sig) {
+		t.Fatal("legacy layout decode differs")
+	}
+	relegacy, err := encMode.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(relegacy, wire) {
+		t.Fatal("legacy re-encoding is not byte-identical to the new Marshal")
 	}
 }

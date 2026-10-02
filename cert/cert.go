@@ -66,9 +66,26 @@ type Payload struct {
 
 // Cert is a payload plus the namespace root key's signature over the
 // payload's deterministic CBOR encoding.
+//
+// A decoded cert also keeps the payload bytes exactly as they arrived, and
+// Verify checks the signature over those — never over a re-encoding of the
+// parsed struct. This is what lets the master sign new payload fields (a
+// protocol scope, fabric ADR 0005) before every node understands them: an
+// older binary drops unknown fields when parsing, but still verifies and
+// re-gossips the original bytes untouched. Renew is the one place a payload
+// is re-encoded from the struct, so a renewal signed by a binary that does
+// not know a field drops it — upgrade the signer first.
 type Cert struct {
-	Payload Payload `cbor:"payload"`
-	Sig     []byte  `cbor:"sig"`
+	Payload Payload // read-only: edits are neither signed over nor emitted
+	Sig     []byte
+	raw     []byte // payload bytes as signed; nil until marshalled once
+}
+
+// wireCert is the on-the-wire shape: the payload travels as an opaque CBOR
+// item so unknown fields survive a round trip through any node.
+type wireCert struct {
+	Payload cbor.RawMessage `cbor:"payload"`
+	Sig     []byte          `cbor:"sig"`
 }
 
 // Deterministic encoding (RFC 8949 core deterministic requirements) so that
@@ -109,7 +126,7 @@ func Issue(rootPriv ed25519.PrivateKey, devicePub ed25519.PublicKey, cmd string,
 	if err != nil {
 		return nil, fmt.Errorf("encoding payload: %w", err)
 	}
-	return &Cert{Payload: p, Sig: ed25519.Sign(rootPriv, msg)}, nil
+	return &Cert{Payload: p, Sig: ed25519.Sign(rootPriv, msg), raw: msg}, nil
 }
 
 // Renew re-issues an existing certificate with a fresh validity window
@@ -132,7 +149,20 @@ func Renew(rootPriv ed25519.PrivateKey, old *Cert, nbf time.Time, validity time.
 	if err != nil {
 		return nil, fmt.Errorf("encoding payload: %w", err)
 	}
-	return &Cert{Payload: p, Sig: ed25519.Sign(rootPriv, msg)}, nil
+	return &Cert{Payload: p, Sig: ed25519.Sign(rootPriv, msg), raw: msg}, nil
+}
+
+// payloadBytes returns the bytes the signature covers: the original wire
+// payload when the cert was decoded, else the deterministic encoding.
+func (c *Cert) payloadBytes() ([]byte, error) {
+	if c.raw != nil {
+		return c.raw, nil
+	}
+	msg, err := encMode.Marshal(c.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("encoding payload: %w", err)
+	}
+	return msg, nil
 }
 
 // Verify checks a certificate against the expected namespace root public key
@@ -163,9 +193,9 @@ func Verify(c *Cert, namespacePub ed25519.PublicKey, now time.Time) error {
 	if now.Unix() > c.Payload.Exp {
 		return errors.New("certificate expired")
 	}
-	msg, err := encMode.Marshal(c.Payload)
+	msg, err := c.payloadBytes()
 	if err != nil {
-		return fmt.Errorf("encoding payload: %w", err)
+		return err
 	}
 	if !ed25519.Verify(namespacePub, msg, c.Sig) {
 		return errors.New("signature verification failed")
@@ -183,17 +213,27 @@ func (c *Cert) Expiry() time.Time {
 	return time.Unix(c.Payload.Exp, 0)
 }
 
-// Marshal encodes the certificate for the wire.
+// Marshal encodes the certificate for the wire. A decoded cert re-emits its
+// payload byte-for-byte, so fields this binary does not know are forwarded
+// rather than stripped.
 func (c *Cert) Marshal() ([]byte, error) {
-	return encMode.Marshal(c)
+	msg, err := c.payloadBytes()
+	if err != nil {
+		return nil, err
+	}
+	return encMode.Marshal(wireCert{Payload: msg, Sig: c.Sig})
 }
 
 // Unmarshal decodes a certificate from the wire. The result is untrusted
 // until Verify passes.
 func Unmarshal(data []byte) (*Cert, error) {
-	var c Cert
-	if err := cbor.Unmarshal(data, &c); err != nil {
+	var w wireCert
+	if err := cbor.Unmarshal(data, &w); err != nil {
 		return nil, fmt.Errorf("decoding certificate: %w", err)
+	}
+	c := Cert{Sig: w.Sig, raw: append([]byte(nil), w.Payload...)}
+	if err := cbor.Unmarshal(w.Payload, &c.Payload); err != nil {
+		return nil, fmt.Errorf("decoding certificate payload: %w", err)
 	}
 	return &c, nil
 }

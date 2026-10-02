@@ -673,6 +673,7 @@ function openForm(host, kind, fingerprint, what) {
   form.innerHTML = `
     <div class="form-note">Root-key passphrase to ${what}. Signing happens in this UI process, never in the daemon.</div>
     <input type="password" name="pass" placeholder="namespace root key passphrase" autocomplete="off" required>
+    ${kind === "approve" ? `<label class="form-note"><input type="checkbox" name="no_overlay"> No overlay address — connectivity and member-gated services only, no TUN leg (for hardware you don't fully trust)</label>` : ""}
     <div class="form-error" hidden></div>
     <div class="actions">
       <button class="action ${kind === "revoke" ? "danger" : "approve"}" type="submit">${{ revoke: "Sign revocation", renew: "Sign renewal" }[kind] || "Sign certificate"}</button>
@@ -684,7 +685,9 @@ function openForm(host, kind, fingerprint, what) {
     const errBox = form.querySelector(".form-error");
     errBox.hidden = true;
     try {
-      await doPost(`/api/${kind}`, { fingerprint, passphrase: form.pass.value });
+      const body = { fingerprint, passphrase: form.pass.value };
+      if (kind === "approve" && form.no_overlay.checked) body.no_overlay = true;
+      await doPost(`/api/${kind}`, body);
       state.form = null;
       render();
     } catch (err) {

@@ -150,6 +150,10 @@ func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
 type signedRequest struct {
 	Fingerprint string `json:"fingerprint"`
 	Passphrase  string `json:"passphrase"`
+	// NoOverlay (approve only): admit without an overlay address — no TUN
+	// leg, member-gated services only. Enforced by every node from the
+	// cert; the member cannot opt back in.
+	NoOverlay bool `json:"no_overlay,omitempty"`
 }
 
 // unlock loads the namespace root key with the passphrase from the request.
@@ -196,10 +200,13 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadGateway, err)
 		return
 	}
-	ip, err := daemon.AllocateOverlayIP(s.dir, members)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, err)
-		return
+	var ip string
+	if !req.NoOverlay {
+		ip, err = daemon.AllocateOverlayIP(s.dir, members)
+		if err != nil {
+			httpError(w, http.StatusInternalServerError, err)
+			return
+		}
 	}
 	rootPriv, err := s.unlock(req.Passphrase)
 	if err != nil {

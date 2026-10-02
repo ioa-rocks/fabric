@@ -133,6 +133,17 @@ func TestBridgeRelaysAndPinsSource(t *testing.T) {
 		t.Fatalf("packet to unknown destination delivered: %x", pkt[20])
 	case <-time.After(300 * time.Millisecond):
 	}
+
+	// A member admitted without an overlay address has no route anywhere.
+	// B drops its frames on arrival even though the stream is member-gated
+	// and the source matches what A claims — the cert decides, not A.
+	bb.SetRoutes(map[netip.Addr]peer.ID{})
+	devA.in <- ipv4Packet("100.64.0.1", "100.64.0.2", 0x77)
+	select {
+	case pkt := <-devB.out:
+		t.Fatalf("frame from a route-less member delivered: %x", pkt[20])
+	case <-time.After(300 * time.Millisecond):
+	}
 }
 
 // No destination listen address is given to the sender. Delivery must use
