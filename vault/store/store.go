@@ -37,6 +37,10 @@ type Store struct {
 	// it to the fabric peer ID once the node is meshed; it defaults to the
 	// circle DID, which is only ever seen by solo (never-synced) stores.
 	NodeID string
+
+	mu         sync.Mutex
+	placements map[string]Placement        // bucket ID → this device's commitment (subs.json)
+	roots      map[string]*blobstore.Store // placement root → opened blob store
 }
 
 // Subscription modes (bucket-model memo §5): a per-node, per-bucket
@@ -65,60 +69,16 @@ func Open(path string, c *circle.Circle) (*Store, error) {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return nil, err
 	}
-	blobs, err := blobstore.Open(filepath.Join(path, "blobs"))
+	st := &Store{Path: path, Circle: c, NodeID: c.Config.DID, roots: map[string]*blobstore.Store{}}
+	blobs, err := blobstore.Open(st.defaultBlobsDir())
 	if err != nil {
 		return nil, err
 	}
-	return &Store{Path: path, Circle: c, Blobs: blobs, NodeID: c.Config.DID}, nil
-}
-
-func (c *Store) subsPath() string { return filepath.Join(c.Path, "subs.json") }
-
-// Subscriptions returns this device's bucket-ID → mode map.
-func (c *Store) Subscriptions() (map[string]string, error) {
-	raw, err := os.ReadFile(c.subsPath())
-	if errors.Is(err, os.ErrNotExist) {
-		return map[string]string{}, nil
-	}
-	if err != nil {
+	st.Blobs = blobs
+	if err := st.loadPlacements(); err != nil {
 		return nil, err
 	}
-	var subs map[string]string
-	if err := json.Unmarshal(raw, &subs); err != nil {
-		return nil, fmt.Errorf("reading subscriptions: %w", err)
-	}
-	return subs, nil
-}
-
-// Subscription returns the mode for one bucket (SubNone if absent).
-func (c *Store) Subscription(bucketID string) string {
-	subs, err := c.Subscriptions()
-	if err != nil {
-		return SubNone
-	}
-	return subs[bucketID]
-}
-
-// SetSubscription records this device's placement commitment for a bucket.
-// SubNone removes the entry.
-func (c *Store) SetSubscription(bucketID, mode string) error {
-	if mode != SubFull && mode != SubCache && mode != SubNone {
-		return fmt.Errorf("unknown subscription mode %q (full, cache, or none)", mode)
-	}
-	subs, err := c.Subscriptions()
-	if err != nil {
-		return err
-	}
-	if mode == SubNone {
-		delete(subs, bucketID)
-	} else {
-		subs[bucketID] = mode
-	}
-	raw, err := json.MarshalIndent(subs, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(c.subsPath(), raw, 0o600)
+	return st, nil
 }
 
 // MountDecl is one declared FUSE mount: this device's commitment to keep a
@@ -404,11 +364,10 @@ func (c *Store) ResolveBucketID(ref string) (string, error) {
 	}
 }
 
-// Handle is an opened bucket: genesis + policy + index over the shared blob
-// store. Close it when done (the index holds a Pebble lock).
-// Holder is where a bucket's content lives on this device: the circle
-// blobstore by default, or a folder replica (Location.Form "path"). Every
-// content read and write of a Handle goes through it.
+// Holder is where a bucket's content lives on this device: a blob store
+// (the default one, or the placement's root) or a folder replica
+// (Location.Form "path"). Every content read and write of a Handle goes
+// through it.
 type Holder interface {
 	Put(r io.Reader) (hash string, size int64, err error)
 	Open(hash string) (io.ReadCloser, error)
@@ -417,6 +376,8 @@ type Holder interface {
 	Size(hash string) (int64, error)
 }
 
+// Handle is an opened bucket: genesis + policy + index over its holder.
+// Close it when done (the index holds a Pebble lock).
 type Handle struct {
 	Bucket *bucket.Bucket
 	Policy *bucket.SignedPolicy
@@ -424,6 +385,7 @@ type Handle struct {
 
 	store         *Store
 	id            string
+	holderMu      sync.Mutex // holder/form: set by the folder lifecycle, read by every content op
 	holder        Holder
 	form          string
 	policyMu      sync.Mutex
@@ -468,21 +430,31 @@ func (h *Handle) ID() string { return h.id }
 // NodeID is the device identity revisions are authored under.
 func (h *Handle) NodeID() string { return h.store.NodeID }
 
-// Holder returns where this device keeps the bucket's content.
+// Holder returns where this device keeps the bucket's content: the folder
+// replica if one is declared, else the blob store its placement names
+// (the default store when it names none; see Placement.Root).
 func (h *Handle) Holder() Holder {
-	if h.holder == nil {
-		return h.store.Blobs
+	h.holderMu.Lock()
+	holder := h.holder
+	h.holderMu.Unlock()
+	if holder == nil {
+		return h.store.holderFor(h.id)
 	}
-	return h.holder
+	return holder
 }
 
 // SetHolder switches the bucket's content home (a folder replica) and the
-// location form recorded for blobs held there.
+// location form recorded for blobs held there. Callers (the daemon's folder
+// open/close) race content operations on other goroutines, hence the lock.
 func (h *Handle) SetHolder(holder Holder, form string) {
+	h.holderMu.Lock()
+	defer h.holderMu.Unlock()
 	h.holder, h.form = holder, form
 }
 
 func (h *Handle) locationForm() string {
+	h.holderMu.Lock()
+	defer h.holderMu.Unlock()
 	if h.form == "" {
 		return index.FormWhole
 	}

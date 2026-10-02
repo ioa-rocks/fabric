@@ -268,6 +268,7 @@ function renderVault(d) {
       .catch(err => { alert("subscription: " + (err.message || err)); poll(); });
     const selTd = document.createElement("td");
     selTd.append(sel);
+    if (b.root) selTd.append(" at ", mono(b.root));
     tr.append(
       td(strong(b.name)),
       td(mono(b.id.slice(0, 16))),

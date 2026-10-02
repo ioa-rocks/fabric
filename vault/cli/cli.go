@@ -105,6 +105,9 @@ or open the store directly when none runs.
            gets accessed / catalog and index only
            place <bucket> folder <dir> — keep the bucket as a real
            directory the daemon syncs (a full placement); -rescan now
+           place <bucket> full|cache -at <dir> — keep this bucket's blobs
+           in a store rooted at <dir> (e.g. the NAS array); -at default
+           returns to the device's own store
   mount    mount <bucket> <dir> [-write] — declare a FUSE mount the daemon
            serves from now on, across restarts, until 'unmount'
   unmount  unmount <dir> — remove a mount declaration and release the mount
@@ -298,6 +301,8 @@ func placementWhere(b daemon.BucketInfo) string {
 	where := ""
 	if b.Folder != "" {
 		where = "  " + b.Folder
+	} else if b.Root != "" {
+		where = "  at " + b.Root
 	}
 	for _, m := range b.Mounts {
 		where += "  mount " + m

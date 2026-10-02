@@ -43,9 +43,10 @@ func SocketPath(statePath string) string {
 type BucketInfo struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
-	Sub     string `json:"sub,omitempty"` // this device's subscription mode
-	Objects int    `json:"objects"`       // live objects in the index
-	Held    int    `json:"held"`          // whose blobs this device holds
+	Sub     string `json:"sub,omitempty"`  // this device's subscription mode
+	Root    string `json:"root,omitempty"` // blob store root this placement names (default store when empty)
+	Objects int    `json:"objects"`        // live objects in the index
+	Held    int    `json:"held"`           // whose blobs this device holds
 
 	Conflicts     int `json:"conflicts,omitempty"`      // rendered conflict copies (ADR 0001 §3)
 	HeldDeletions int `json:"held_deletions,omitempty"` // parked deletions awaiting a decision (§4)
@@ -151,6 +152,10 @@ type projectBody struct {
 
 type subBody struct {
 	Mode string `json:"mode"` // "full" | "cache" | "" (none)
+	// Root, when present, sets the placement's blob store root: an
+	// absolute directory, or "" / "default" for the device's default
+	// store. Absent keeps whatever root the placement has.
+	Root *string `json:"root,omitempty"`
 }
 
 type mountBody struct {
@@ -359,7 +364,8 @@ func (d *Daemon) handleBuckets(w http.ResponseWriter, _ *http.Request) {
 		if err != nil {
 			continue
 		}
-		info := BucketInfo{ID: id, Name: b.Genesis.Name, Sub: d.Store.Subscription(id)}
+		pl := d.Store.Placement(id)
+		info := BucketInfo{ID: id, Name: b.Genesis.Name, Sub: pl.Mode, Root: pl.Root}
 		for dir, f := range folders {
 			if f.Bucket == id {
 				info.Folder = dir
@@ -400,16 +406,25 @@ func (d *Daemon) handleSub(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
-	if err := d.Store.SetSubscription(id, mode); err != nil {
+	pl := d.Store.Placement(id)
+	pl.Mode = mode
+	if body.Root != nil {
+		pl.Root = *body.Root
+		if pl.Root == "default" {
+			pl.Root = ""
+		}
+	}
+	if err := d.Store.SetPlacement(id, pl); err != nil {
 		httpErr(w, err)
 		return
 	}
+	pl = d.Store.Placement(id)
 	if mode == store.SubFull {
 		if h, err := d.handle(id); err == nil {
 			go d.fetchMissing(h) // start honoring the commitment now
 		}
 	}
-	writeJSON(w, map[string]string{"id": id, "sub": mode})
+	writeJSON(w, map[string]string{"id": id, "sub": mode, "root": pl.Root})
 }
 
 func (d *Daemon) handleCreateBucket(w http.ResponseWriter, r *http.Request) {

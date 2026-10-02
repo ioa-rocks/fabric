@@ -136,12 +136,22 @@ fabric bucket place photos full          # hold a complete copy; fetch what's mi
 fabric bucket place photos cache         # hold what gets accessed (no eviction yet)
 fabric bucket place photos none          # catalog + index only
 fabric bucket place photos folder ~/Sync # keep it as a real directory (a full placement)
+fabric bucket place photos full -at /mnt/array/vault  # keep its blobs on that disk
+fabric bucket place photos full -at default           # back to <state>/blobs
 fabric bucket place photos               # this device's placement, in detail
 fabric bucket list                       # id, placement word, held/objects, name, where
 ```
 
 Placement is one word per bucket per device; moving off `folder`
-withdraws the folder declaration and leaves the directory alone.
+withdraws the folder declaration and leaves the directory alone. `-at
+<dir>` gives a `full`/`cache` placement its own blob store root (a NAS
+keeps the photo bucket on the array and small buckets on NVMe); the
+root is this device's business and never travels. Blobs already in the
+default store stay there and stay readable — nothing is moved; a root
+that cannot be opened refuses writes rather than landing them on the
+wrong disk. Per-device placement records live in `subs.json`
+(`{"mode": "full", "root": "/mnt/array/vault"}`; the older bare-mode
+form still reads).
 Mounts (`fabric bucket mount <bucket> <dir> [-write]`) are a surface over
 the store, not a placement. The creating device places `full` by
 default. `fabric bucket get` works
@@ -156,8 +166,8 @@ visibility and capability checks arrive with grants.
 - `bucket/` — genesis record, bucket ID, policy document
 - `blobstore/` — content-addressed whole-file blob store
 - `index/` — object records + merge semantics (LWW / OR-Set), Pebble-backed
-- `store/` — the device's store: bucket records, blobs, subscriptions,
-  mounts, folder declarations, bucket handles; opened against a circle
+- `store/` — the device's store: bucket records, blobs, placements
+  (mode + optional store root), mounts, folder declarations, bucket handles; opened against a circle
   (`../circle` — user key, age-encrypted via fabric's keystore; the
   ownership layer, fabric-level since 2026-09-30)
 - `folder/` — folder replicas (M1): scanner, materializer, shadow store

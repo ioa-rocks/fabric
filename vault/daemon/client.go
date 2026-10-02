@@ -215,8 +215,15 @@ func (c *Client) Rm(bucket, ref string) (ObjectInfo, error) {
 	return out, err
 }
 
+// Sub sets the placement mode, keeping the placement's root.
 func (c *Client) Sub(bucket, mode string) error {
 	return c.post(bucketPath(bucket, "/sub"), subBody{Mode: mode}, nil)
+}
+
+// SubAt sets the placement mode and its blob store root ("" or "default"
+// = the device's default store).
+func (c *Client) SubAt(bucket, mode, root string) error {
+	return c.post(bucketPath(bucket, "/sub"), subBody{Mode: mode, Root: &root}, nil)
 }
 
 func (c *Client) Mounts() ([]MountInfo, error) {

@@ -25,7 +25,9 @@ type store_ interface {
 	Tag(bucket, ref string, add, remove []string) (daemon.ObjectInfo, error)
 	Rm(bucket, ref string) (daemon.ObjectInfo, error)
 	Project(bucket, dir string) (int, error)
-	Sub(bucket, mode string) error
+	// Place sets the placement mode; root, when non-nil, also sets the
+	// blob store root ("" or "default" = the default store).
+	Place(bucket, mode string, root *string) error
 	treeStore
 	Close() error
 }
@@ -51,6 +53,13 @@ func openStore(p paths) (store_, error) {
 type clientStore struct{ *daemon.Client }
 
 func (clientStore) Close() error { return nil }
+
+func (s clientStore) Place(bucket, mode string, root *string) error {
+	if root == nil {
+		return s.Client.Sub(bucket, mode)
+	}
+	return s.Client.SubAt(bucket, mode, *root)
+}
 
 // directStore runs the same operations in-process.
 type directStore struct {
@@ -97,7 +106,8 @@ func (s *directStore) Buckets() ([]daemon.BucketInfo, error) {
 		if err != nil {
 			continue
 		}
-		info := daemon.BucketInfo{ID: id, Name: b.Genesis.Name, Sub: s.c.Subscription(id)}
+		pl := s.c.Placement(id)
+		info := daemon.BucketInfo{ID: id, Name: b.Genesis.Name, Sub: pl.Mode, Root: pl.Root}
 		if h, err := s.handle(id); err == nil {
 			info.Objects, info.Held, _ = h.Stats()
 		}
@@ -120,7 +130,7 @@ func (s *directStore) CreateBucket(genesis, policy []byte) (daemon.BucketInfo, e
 	return daemon.BucketInfo{ID: h.ID(), Name: h.Bucket.Genesis.Name, Sub: store.SubFull}, nil
 }
 
-func (s *directStore) Sub(bucket, mode string) error {
+func (s *directStore) Place(bucket, mode string, root *string) error {
 	if mode == "none" {
 		mode = store.SubNone
 	}
@@ -128,7 +138,15 @@ func (s *directStore) Sub(bucket, mode string) error {
 	if err != nil {
 		return err
 	}
-	return s.c.SetSubscription(id, mode)
+	pl := s.c.Placement(id)
+	pl.Mode = mode
+	if root != nil {
+		pl.Root = *root
+		if pl.Root == "default" {
+			pl.Root = ""
+		}
+	}
+	return s.c.SetPlacement(id, pl)
 }
 
 func (s *directStore) List(bucket string, tags []string) ([]daemon.ObjectInfo, error) {

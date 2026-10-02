@@ -17,15 +17,19 @@ import (
 // folder replica — a full placement kept as a real directory. One word
 // per bucket per device; changing it from a folder to anything else
 // withdraws the folder declaration (the directory is left as it is).
-// Mounts are a surface over the store, not a placement, so they are
-// declared separately ('fabric bucket mount').
+// '-at <dir>' names the blob store root a full or cache placement writes
+// to (placement-record memo: the root is local to this device and never
+// gossiped); 'default' returns to the device's own store. Mounts are a
+// surface over the store, not a placement, so they are declared
+// separately ('fabric bucket mount').
 
 func cmdPlace(args []string) error {
 	fs := flag.NewFlagSet("place", flag.ExitOnError)
 	p := pathFlags(fs)
 	rescan := fs.Bool("rescan", false, "ask the daemon to scan the folder replica now")
+	at := fs.String("at", "", "blob store root for a full/cache placement (absolute dir, or 'default')")
 	pos := parse(fs, args, -1)
-	usage := "usage: fabric bucket place <bucket> [full|cache|none | folder <dir>] [-rescan]"
+	usage := "usage: fabric bucket place <bucket> [full|cache|none | folder <dir>] [-at <dir>|default] [-rescan]"
 	if len(pos) < 1 || len(pos) > 3 {
 		return errors.New(usage)
 	}
@@ -47,6 +51,9 @@ func cmdPlace(args []string) error {
 		case mode == "folder":
 			if len(pos) != 3 {
 				return errors.New(usage)
+			}
+			if *at != "" {
+				return errors.New("-at applies to full/cache placements; a folder replica keeps its blobs beside the folder")
 			}
 			dir, err := filepath.Abs(pos[2])
 			if err != nil {
@@ -82,10 +89,23 @@ func cmdPlace(args []string) error {
 				}
 				fmt.Printf("folder declaration withdrawn: %s (the directory is untouched)\n", b.Folder)
 			}
-			if err := st.Sub(b.ID, mode); err != nil {
+			var root *string
+			if *at != "" {
+				r := *at
+				if r != "default" {
+					if r, err = filepath.Abs(r); err != nil {
+						return err
+					}
+				}
+				root = &r
+			}
+			if err := st.Place(b.ID, mode, root); err != nil {
 				return err
 			}
 			fmt.Printf("placed: %s -> %s\n", b.Name, mode)
+			if root != nil && *root != "default" {
+				fmt.Printf("blobs for this bucket now land in %s; any already in the default store stay there, readable\n", *root)
+			}
 			if mode == store.SubFull {
 				fmt.Println("missing blobs will be fetched as peers are reachable")
 			}
@@ -114,6 +134,8 @@ func cmdPlace(args []string) error {
 	}
 	if b.Folder != "" {
 		mode = "folder " + b.Folder
+	} else if b.Root != "" {
+		mode += " at " + b.Root
 	}
 	fmt.Printf("%s  %s: %s — holding %d/%d blobs\n", b.ID[:16], b.Name, mode, b.Held, b.Objects)
 	if cl == nil {

@@ -377,10 +377,11 @@ func (d *Daemon) handleBlob(s network.Stream) {
 	_, _ = io.Copy(s, f)
 }
 
-// blobPath finds a held blob in the circle store or any bucket's holder
-// (a folder replica serves its working files).
+// blobPath finds a held blob in the device's blob stores (default and
+// every placement root) or any bucket's holder (a folder replica serves
+// its working files).
 func (d *Daemon) blobPath(hash string) (string, error) {
-	if p, err := d.Store.Blobs.Path(hash); err == nil {
+	if p, err := d.Store.BlobPath(hash); err == nil {
 		return p, nil
 	}
 	buckets, err := d.Store.Buckets()
