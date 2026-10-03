@@ -93,7 +93,7 @@ func cmdCircleInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	pass, err := vaultcli.Passphrase()
+	pass, err := vaultcli.NewPassphrase()
 	if err != nil {
 		return err
 	}

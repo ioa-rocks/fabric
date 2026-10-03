@@ -207,7 +207,38 @@ func Passphrase() (string, error) {
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return "", fmt.Errorf("no terminal for passphrase prompt; set CIRCLE_PASSPHRASE")
 	}
-	fmt.Fprint(os.Stderr, "circle user-key passphrase: ")
+	return prompt("circle user-key passphrase: ")
+}
+
+// NewPassphrase is Passphrase for a key that is being *created*: when it
+// comes from a prompt it is asked twice, because a typo here locks the new
+// key for good (there is no recovery for a circle key).
+func NewPassphrase() (string, error) {
+	if os.Getenv("CIRCLE_PASSPHRASE") != "" || os.Getenv("VAULT_PASSPHRASE") != "" || !term.IsTerminal(int(os.Stdin.Fd())) {
+		return Passphrase()
+	}
+	for {
+		first, err := prompt("new circle passphrase: ")
+		if err != nil {
+			return "", err
+		}
+		if first == "" {
+			fmt.Fprintln(os.Stderr, "empty passphrase — try again")
+			continue
+		}
+		again, err := prompt("repeat it: ")
+		if err != nil {
+			return "", err
+		}
+		if first == again {
+			return first, nil
+		}
+		fmt.Fprintln(os.Stderr, "they differ — try again")
+	}
+}
+
+func prompt(label string) (string, error) {
+	fmt.Fprint(os.Stderr, label)
 	b, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
