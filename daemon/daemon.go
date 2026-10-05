@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -53,8 +54,10 @@ type Daemon struct {
 	Store  *fabricnet.MemberStore
 	Auth   *fabricnet.AuthService
 	Log    *event.Log // membership events: admissions + revocations (spec §5)
-	Sync   *fabricnet.EventSync
-	Queue  *admission.Queue // nil unless this node runs the admission queue
+
+	bridgeIP string // overlay address fabric0 was brought up with (renumbering notice)
+	Sync     *fabricnet.EventSync
+	Queue    *admission.Queue // nil unless this node runs the admission queue
 	// Circle answers "is this member one of my circle's devices?" — set by
 	// the composition root when the node has a circle (NewCircleService);
 	// nil on pure-connectivity nodes. Vault gates on it (memo §9 step 3).
@@ -359,6 +362,7 @@ func (d *Daemon) startTUN() {
 		return
 	}
 	d.Bridge = tunbridge.New(d.Host, dev, d.Auth.RequireMember)
+	d.bridgeIP = d.OwnCert().Payload.Meta.IP
 	d.refreshRoutes()
 	log.Printf("tun: fabric0 up, this node is %s", d.OwnCert().Payload.Meta.IP)
 	d.startDNS()
@@ -603,6 +607,55 @@ func AllocateOverlayIP(dir state.Dir, members []MemberInfo) (string, error) {
 	return tunbridge.NextFreeIP(cfg.Subnet, taken)
 }
 
+// CheckOverlayIP validates an operator-chosen overlay address for a member
+// (renumbering via `fabric renew -ip`): inside the configured subnet, not
+// the network or broadcast address, and not held by any other roster entry
+// — lapsed members included, their addresses are reserved. The member being
+// renumbered is identified by fingerprint and may keep its own address.
+// Returns the address in prefix form, as certs carry it.
+func CheckOverlayIP(dir state.Dir, members []MemberInfo, want, fingerprint string) (string, error) {
+	cfg, err := dir.LoadConfig()
+	if err != nil {
+		return "", err
+	}
+	if cfg.Subnet == "" {
+		return "", errors.New("this namespace has no overlay subnet configured")
+	}
+	subnet, err := netip.ParsePrefix(cfg.Subnet)
+	if err != nil {
+		return "", fmt.Errorf("overlay subnet: %w", err)
+	}
+	subnet = subnet.Masked()
+	addr, err := netip.ParseAddr(want)
+	if err != nil {
+		pfx, perr := netip.ParsePrefix(want)
+		if perr != nil {
+			return "", fmt.Errorf("overlay address %q: not an IP address", want)
+		}
+		addr = pfx.Addr()
+	}
+	if !subnet.Contains(addr) {
+		return "", fmt.Errorf("overlay address %s is outside the subnet %s", addr, subnet)
+	}
+	if addr == subnet.Addr() || addr == tunbridge.LastAddr(subnet) {
+		return "", fmt.Errorf("overlay address %s is the subnet's network/broadcast address", addr)
+	}
+	got := netip.PrefixFrom(addr, subnet.Bits()).String()
+	for _, m := range members {
+		if m.IP == "" || m.Fingerprint == fingerprint {
+			continue
+		}
+		if p, err := netip.ParsePrefix(m.IP); err == nil && p.Addr() == addr {
+			who := m.Name
+			if m.Expired {
+				who += " (expired; its address is held until it re-joins or is revoked)"
+			}
+			return "", fmt.Errorf("overlay address %s is held by %s", addr, who)
+		}
+	}
+	return got, nil
+}
+
 // ReturningMemberIP returns the overlay address a lapsed member is still
 // holding, if the device requesting admission (by key fingerprint) is one:
 // a known device coming back after its cert expired keeps its address
@@ -640,6 +693,11 @@ func (d *Daemon) adoptOwnCert(c *cert.Cert) {
 	d.certMu.Unlock()
 	if err := d.Dir.SaveCert(c); err != nil {
 		log.Printf("persisting renewed cert: %v", err)
+	}
+	if d.Bridge != nil && d.bridgeIP != c.Payload.Meta.IP {
+		// Renumbering (fabric renew -ip). The bridge and resolver were
+		// brought up on the old address; a restart re-addresses fabric0.
+		log.Printf("overlay address changed %s -> %s — restart this daemon to re-address fabric0", d.bridgeIP, c.Payload.Meta.IP)
 	}
 	if d.Auth != nil {
 		d.Auth.SetOwn(c)

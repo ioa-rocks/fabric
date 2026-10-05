@@ -43,6 +43,9 @@ func NextFreeIP(subnet string, taken []string) (string, error) {
 }
 
 // lastAddr returns the highest address in a v4 prefix (the broadcast).
+// LastAddr is the subnet's last (broadcast) address — never allocated.
+func LastAddr(p netip.Prefix) netip.Addr { return lastAddr(p) }
+
 func lastAddr(p netip.Prefix) netip.Addr {
 	a4 := p.Addr().As4()
 	hostBits := 32 - p.Bits()

@@ -296,6 +296,9 @@ fabric renew nas          # one member (also: peer ID / fingerprint)
 fabric renew -expiring    # everything past half-life, this node included
 fabric renew -scope vault guest-pc   # change a member's protocol scope (promotion/demotion is a renewal;
                                      # adding tun assigns an overlay address, dropping it releases one)
+fabric renew -ip 100.64.0.2 nas      # renumber: move a member to a free overlay address (then restart
+                                     # its daemon so fabric0 re-addresses; routes and .fabric names follow
+                                     # the cert on every other node without a restart)
 ```
 
 or the "Renew cert" button on any peer (and on the master's own card)

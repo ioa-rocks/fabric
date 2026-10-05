@@ -1033,12 +1033,13 @@ func cmdRenew(args []string) error {
 	statePath := stateFlag(fs)
 	expiring := fs.Bool("expiring", false, "renew every cert past half-life (this node's included)")
 	scopeFlag := fs.String("scope", "", "also change the member's protocol scope (tun,vault,astral | mesh | full) — a scope change is a renewal; adding tun assigns an overlay address, dropping it releases one (fabric ADR 0005)")
+	ipFlag := fs.String("ip", "", "move the member to this overlay address — renumbering is a renewal (same name, role, scope); the address must be free in the subnet, and the member's daemon needs a restart to re-address fabric0")
 	fs.Parse(args)
 	if *expiring == (fs.NArg() == 1) {
-		return fmt.Errorf("usage: fabric renew [-scope …] <name | peer-id | fingerprint>  |  fabric renew -expiring")
+		return fmt.Errorf("usage: fabric renew [-scope …] [-ip …] <name | peer-id | fingerprint>  |  fabric renew -expiring")
 	}
-	if *expiring && *scopeFlag != "" {
-		return fmt.Errorf("-scope applies to one member at a time, not -expiring")
+	if *expiring && (*scopeFlag != "" || *ipFlag != "") {
+		return fmt.Errorf("-scope and -ip apply to one member at a time, not -expiring")
 	}
 	var newScope []string
 	if *scopeFlag != "" {
@@ -1107,6 +1108,17 @@ func cmdRenew(args []string) error {
 		}
 		fmt.Printf("renewing %q%s — currently expires %s\n", m.Name, self, m.Expiry.Format(time.RFC3339))
 	}
+	// Validate a renumbering before asking for the passphrase.
+	var newIP string
+	if *ipFlag != "" {
+		m := targets[0]
+		if !cert.ScopeAllows(m.Scope, cert.ScopeTun) && !cert.ScopeAllows(newScope, cert.ScopeTun) {
+			return fmt.Errorf("%q has no overlay leg (scope %s); give it one with -scope tun,… to assign an address", m.Name, cert.ScopeString(m.Scope))
+		}
+		if newIP, err = daemon.CheckOverlayIP(dir, members, *ipFlag, m.Fingerprint); err != nil {
+			return err
+		}
+	}
 	rootPriv, err := unlockRootKey(dir)
 	if err != nil {
 		return err
@@ -1118,6 +1130,12 @@ func cmdRenew(args []string) error {
 			return fmt.Errorf("roster cert for %q: %w", m.Name, err)
 		}
 		meta := old.Payload.Meta
+		if newIP != "" {
+			if newIP != meta.IP {
+				fmt.Printf("overlay address %s -> %s (restart %q's daemon afterwards to re-address fabric0)\n", meta.IP, newIP, m.Name)
+			}
+			meta.IP = newIP
+		}
 		if *scopeFlag != "" {
 			meta.Scope = newScope
 			wantTun := cert.ScopeAllows(newScope, cert.ScopeTun)
