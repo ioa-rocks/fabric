@@ -214,10 +214,13 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 	}
 	var ip string
 	if cert.ScopeAllows(scope, cert.ScopeTun) {
-		ip, err = daemon.AllocateOverlayIP(s.dir, members)
-		if err != nil {
-			httpError(w, http.StatusInternalServerError, err)
-			return
+		// A known device returning after cert expiry keeps its address.
+		if ip = daemon.ReturningMemberIP(members, match.Fingerprint); ip == "" {
+			ip, err = daemon.AllocateOverlayIP(s.dir, members)
+			if err != nil {
+				httpError(w, http.StatusInternalServerError, err)
+				return
+			}
 		}
 	}
 	rootPriv, err := s.unlock(req.Passphrase)
@@ -337,6 +340,10 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	}
 	if match == nil {
 		httpError(w, http.StatusNotFound, fmt.Errorf("no member with fingerprint %q", req.Fingerprint))
+		return
+	}
+	if match.Expired {
+		httpError(w, http.StatusConflict, fmt.Errorf("%q's cert expired %s — an expired device cannot receive a renewal; run 'fabric join' on it (it keeps its name and address)", match.Name, match.Expiry.Format(time.RFC3339)))
 		return
 	}
 	old, err := cert.Unmarshal(match.Cert)

@@ -23,12 +23,20 @@ func NewLog(nsPub ed25519.PublicKey) *Log {
 	return &Log{nsPub: nsPub, events: make(map[string]*Event)}
 }
 
-// Add verifies an event and inserts it, reporting whether it was new. Stale
-// events (an admission whose cert already expired) fail verification and are
-// rejected — that is the log's garbage collection working on ingest.
+// Add verifies an event and inserts it, reporting whether it was new. An
+// admission whose cert expired within cert.LapsedRetention is kept as roster
+// memory (see Lapsed): verified as of its last valid instant, it proves the
+// device *was* admitted, which is what names a returning device. Older stale
+// events are rejected — that is the log's garbage collection working on
+// ingest.
 func (l *Log) Add(e *Event, now time.Time) (bool, error) {
 	if err := Verify(e, l.nsPub, now); err != nil {
-		return false, err
+		if !Lapsed(e, now) {
+			return false, err
+		}
+		if err := Verify(e, l.nsPub, lastValid(e)); err != nil {
+			return false, err
+		}
 	}
 	id := e.ID()
 	l.mu.Lock()
@@ -59,17 +67,40 @@ func (l *Log) Len() int {
 	return len(l.events)
 }
 
-// GC drops events that no longer matter: admissions whose cert expired, and
-// revocations older than the maximum cert lifetime — a revocation is spent
-// once every cert it could have killed has expired on its own (spec §5:
-// expiry garbage-collects the revocation list).
+// Lapsed reports whether e is an admission whose cert has expired but is
+// still within cert.LapsedRetention of its expiry — roster memory for a
+// device that may come back.
+func Lapsed(e *Event, now time.Time) bool {
+	if e.Payload.Kind != KindAdded {
+		return false
+	}
+	c, err := e.AddedCert()
+	if err != nil {
+		return false
+	}
+	return !now.Before(c.Expiry()) && now.Before(c.Expiry().Add(cert.LapsedRetention))
+}
+
+// lastValid is the final instant at which an admission's cert verified.
+func lastValid(e *Event) time.Time {
+	c, err := e.AddedCert()
+	if err != nil {
+		return time.Time{}
+	}
+	return c.Expiry().Add(-time.Second)
+}
+
+// GC drops events that no longer matter: admissions whose cert expired past
+// the lapsed retention, and revocations older than the maximum cert
+// lifetime — a revocation is spent once every cert it could have killed has
+// expired on its own (spec §5: expiry garbage-collects the revocation list).
 func (l *Log) GC(now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for id, e := range l.events {
 		switch e.Payload.Kind {
 		case KindAdded:
-			if c, err := e.AddedCert(); err != nil || !now.Before(c.Expiry()) {
+			if c, err := e.AddedCert(); err != nil || !now.Before(c.Expiry().Add(cert.LapsedRetention)) {
 				delete(l.events, id)
 			}
 		case KindRevoked:

@@ -38,6 +38,10 @@ type StatusPeer struct {
 	Member    bool   `json:"member"`
 	Connected bool   `json:"connected"`
 	Revoked   bool   `json:"revoked,omitempty"`
+	// Expired marks a lapsed member: its cert ran out unrenewed, it is no
+	// member, but it is still known by name and holds its overlay address
+	// until it re-joins or is revoked (cert.LapsedRetention).
+	Expired bool `json:"expired,omitempty"`
 	// Scope is the cert-borne protocol scope (fabric ADR 0005); absent means
 	// unrestricted.
 	Scope []string `json:"scope,omitempty"`
@@ -76,7 +80,8 @@ type MemberInfo struct {
 	Scope       []string  `json:"scope,omitempty"` // cert-borne protocol scope; absent = unrestricted
 	Expiry      time.Time `json:"expiry"`
 	Connected   bool      `json:"connected"`
-	Self        bool      `json:"self,omitempty"` // the answering daemon's own entry
+	Self        bool      `json:"self,omitempty"`    // the answering daemon's own entry
+	Expired     bool      `json:"expired,omitempty"` // lapsed: not a member, cert expired; re-join needed
 }
 
 type StatusReply struct {
@@ -182,7 +187,14 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	seen := map[string]bool{}
 	for _, p := range d.Host.Network().Peers() {
 		sp := StatusPeer{ID: p.String(), Connected: true, Member: d.Store.IsMember(p, now), Revoked: d.Store.IsRevoked(p, now)}
-		if c, ok := d.Store.Cert(p); ok {
+		c, ok := d.Store.Cert(p)
+		if !ok {
+			// A lapsed member connecting is a stranger with a name: say
+			// who it is and that its cert ran out.
+			c, ok = d.Store.LapsedCert(p)
+			sp.Expired = ok
+		}
+		if ok {
 			sp.Name = c.Payload.Meta.Name
 			sp.IP = c.Payload.Meta.IP
 			sp.Scope = c.Payload.Meta.Scope
@@ -206,6 +218,15 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		if !seen[p.String()] {
 			exp := c.Expiry()
 			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true, IP: c.Payload.Meta.IP, Scope: c.Payload.Meta.Scope, CertExpiry: &exp, KnownAddrs: d.knownAddrs(p)})
+			seen[p.String()] = true
+		}
+	}
+	// Lapsed members stay visible until their retention runs out: an
+	// expired device that is off is still "carbon — expired", not nothing.
+	for p, c := range d.Store.Lapsed() {
+		if !seen[p.String()] {
+			exp := c.Expiry()
+			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Expired: true, IP: c.Payload.Meta.IP, Scope: c.Payload.Meta.Scope, CertExpiry: &exp, KnownAddrs: d.knownAddrs(p)})
 			seen[p.String()] = true
 		}
 	}
@@ -238,7 +259,7 @@ func (d *Daemon) handleGraph(w http.ResponseWriter, _ *http.Request) {
 func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
 	members, _ := d.Store.Snapshot()
 	out := make([]MemberInfo, 0, len(members)+1)
-	add := func(p peer.ID, c *cert.Cert, self bool) {
+	add := func(p peer.ID, c *cert.Cert, self, expired bool) {
 		devKey, err := c.DeviceKey()
 		if err != nil {
 			return
@@ -258,13 +279,20 @@ func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
 			Expiry:      c.Expiry(),
 			Connected:   self || d.Host.Network().Connectedness(p) == network.Connected,
 			Self:        self,
+			Expired:     expired,
 		})
 	}
 	// The store never holds this node's own cert — include it explicitly so
 	// the signing side can renew every member of the mesh, itself included.
-	add(d.Host.ID(), d.OwnCert(), true)
+	add(d.Host.ID(), d.OwnCert(), true, false)
 	for p, c := range members {
-		add(p, c, false)
+		add(p, c, false, false)
+	}
+	// Lapsed members ride along flagged: the signing side must not renew
+	// them (nothing could deliver it) but must keep their address reserved
+	// and hand it back when the same device re-joins.
+	for p, c := range d.Store.Lapsed() {
+		add(p, c, false, true)
 	}
 	writeJSON(w, out)
 }

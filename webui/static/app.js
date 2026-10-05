@@ -74,12 +74,16 @@ function classify(p, pendingByID) {
   if (p.member) return p.connected ? "member" : "offline";
   const pend = pendingByID.get(p.id);
   if (pend && pend.status === "pending") return "pending";
+  /* A lapsed member: cert ran out unrenewed. Not a member, but known by
+     name — and once it re-joins, its pending request shows up here first. */
+  if (p.expired) return "expired";
   return "stranger";
 }
 
 const KIND_LABEL = {
   self: "this node", member: "member", offline: "member (offline)",
   pending: "pending approval", stranger: "stranger", revoked: "revoked",
+  expired: "expired — re-join needed",
 };
 
 /* ---------- render ---------- */
@@ -97,6 +101,7 @@ function render() {
   const ns = nodes();
 
   renderHeader(d);
+  if (!state.form || state.form.host !== "expiry") renderExpiryBanner(d);
   // Revoked peers never connect again — they are tombstones, not topology.
   // The graph shows the live mesh; they get their own list until they GC.
   const live = ns.filter(n => n.kind !== "revoked");
@@ -110,6 +115,56 @@ function render() {
   renderVault(d);
   renderAstral(d);
   renderFeed(d);
+}
+
+/* ---------- certificate-expiry banner ----------
+   Spec §5 renewal tiers, made impossible to miss: anything expired or
+   expiring within 30 days raises a red banner across the top of every
+   node's UI (critical); 30–90 days a softer one. Expiry is silent
+   otherwise — a lapsed device drops off the mesh and can't take its
+   renewal any more — so this is the alarm, not the node card's badge. */
+
+const EXPIRY_LOUD_DAYS = 30, EXPIRY_SOFT_DAYS = 90;
+
+function renderExpiryBanner(d) {
+  const el = document.getElementById("expiry-banner");
+  el.innerHTML = "";
+  el.className = "banner expiry";
+  const items = [];
+  for (const m of d.members || []) {
+    if (!m.expiry) continue;
+    const days = Math.floor((new Date(m.expiry) - Date.now()) / 86400000);
+    if (m.expired || days < 0) items.push({ m, days, tier: "expired" });
+    else if (days < EXPIRY_LOUD_DAYS) items.push({ m, days, tier: "loud" });
+    else if (days < EXPIRY_SOFT_DAYS) items.push({ m, days, tier: "soft" });
+  }
+  const loud = items.some(i => i.tier !== "soft");
+  el.hidden = !items.length;
+  document.title = (loud ? "⚠ certs expiring — " : "") + "fabric — topology";
+  if (el.hidden) return;
+  el.classList.add(loud ? "critical" : "soft");
+  items.sort((a, b) => a.days - b.days);
+
+  const h = document.createElement("h3");
+  h.textContent = loud ? "⚠ Certificates need attention now" : "Certificates due for renewal";
+  el.append(h);
+  const ul = document.createElement("ul");
+  for (const { m, days, tier } of items) {
+    const li = document.createElement("li");
+    const who = m.self ? `${m.name} (this node)` : m.name;
+    if (tier === "expired") {
+      li.append(strong(who), ` — expired ${-days} day${-days === 1 ? "" : "s"} ago. It is off the mesh and a renewal can't reach it: run \`fabric join\` on that device (it keeps its name and address).`);
+    } else {
+      li.append(strong(who), ` — expires in ${days} day${days === 1 ? "" : "s"} (${new Date(m.expiry).toLocaleDateString()}).`);
+      if (d.master) li.append(actionButton("Renew now", "approve",
+        () => openForm(el, "renew", m.fingerprint, `re-sign “${m.name}”’s cert with a fresh validity window`, "expiry")));
+    }
+    ul.append(li);
+  }
+  el.append(ul);
+  el.append(note(d.master
+    ? "Renewal re-signs the same cert (name, address, scope unchanged) and reaches the device over the mesh — no restart. CLI: fabric renew -expiring"
+    : "Renewals are signed on the master node: run `fabric renew -expiring` there, or use its UI."));
 }
 
 /* ---------- astral coordination card ---------- */
@@ -453,7 +508,7 @@ function drawNode(svg, x, y, n, radius) {
 }
 
 function renderLegend(ns) {
-  const kinds = ["member", "pending", "offline", "revoked", "stranger"];
+  const kinds = ["member", "pending", "offline", "expired", "revoked", "stranger"];
   const present = new Set(ns.map(n => n.kind));
   const lg = document.getElementById("legend");
   lg.innerHTML = "";
@@ -478,7 +533,7 @@ function renderLegend(ns) {
 }
 
 function kindColor(k) {
-  return { member: "var(--good)", pending: "var(--warn)", stranger: "var(--serious)", revoked: "var(--critical)" }[k] || "var(--ink-3)";
+  return { member: "var(--good)", pending: "var(--warn)", expired: "var(--warn)", stranger: "var(--serious)", revoked: "var(--critical)" }[k] || "var(--ink-3)";
 }
 
 /* ---------- details panel ---------- */
@@ -512,6 +567,9 @@ function renderDetails(d, ns) {
     fp.className = "fingerprint";
     fp.textContent = groupFp(pend.fingerprint);
     box.append(note("Compare this fingerprint with the joining device's screen before approving."), fp);
+  } else if (n.kind === "expired") {
+    box.append(note("This device's certificate ran out before it was renewed, so the mesh refuses it — and a renewal can't reach it. " +
+      "On the device, run `fabric join` again: it keeps its name, device key and overlay address. Revoke it to forget it."));
   }
 
   if (!d.master) {
@@ -532,6 +590,11 @@ function renderDetails(d, ns) {
         () => openForm(box, "renew", m.fingerprint, `re-sign “${m.name}”’s cert with a fresh validity window (same name, IP, and role)`)),
       actionButton("Revoke membership", "danger",
         () => openForm(box, "revoke", m.fingerprint, `cut “${m.name}” off the mesh immediately`)));
+  } else if (n.kind === "expired") {
+    const m = (d.members || []).find(m => m.id === n.id);
+    if (m) actions.append(
+      actionButton("Forget device", "danger",
+        () => openForm(box, "revoke", m.fingerprint, `forget “${m.name}” — release its overlay address and stop listing it`)));
   }
   if (actions.childElementCount) box.append(actions);
 }
@@ -558,6 +621,12 @@ function addrList(kv, n) {
 /* Cert-expiry line with the renewal-tier badge (spec §5: warn <90d, alarm <30d). */
 function expiryRow(kv, iso) {
   const days = Math.floor((new Date(iso) - Date.now()) / 86400000);
+  if (days < 0) {
+    const ddEl = add(kv, "cert expired", `${new Date(iso).toLocaleDateString()} (${-days}d ago)`);
+    const b = badge("pending"); b.className = "badge warn"; b.textContent = "re-join needed";
+    ddEl.append(" ", b);
+    return;
+  }
   const ddEl = add(kv, "cert expires", `${new Date(iso).toLocaleDateString()} (${days}d)`);
   if (days < 30) {
     const b = badge("pending"); b.className = "badge warn"; b.textContent = "renew NOW";
@@ -666,13 +735,16 @@ function renderRevoked(revoked) {
 
 /* ---------- passphrase form ---------- */
 
-function openForm(host, kind, fingerprint, what) {
-  state.form = { kind, fingerprint };
+function openForm(host, kind, fingerprint, what, hostName) {
+  state.form = { kind, fingerprint, host: hostName };
   host.querySelectorAll("form.passform").forEach(f => f.remove());
+  /* The form's submit is the action itself — hide the buttons that opened
+     it so there is exactly one thing to press (Cancel brings them back). */
+  host.querySelectorAll(":scope > .actions").forEach(a => { a.hidden = true; });
   const form = document.createElement("form");
   form.className = "passform";
   form.innerHTML = `
-    <div class="form-note">Root-key passphrase to ${what}. Signing happens in this UI process, never in the daemon.</div>
+    <div class="form-note">Enter the root-key passphrase to ${what}. Signing happens in this UI process, never in the daemon.</div>
     <input type="password" name="pass" placeholder="namespace root key passphrase" autocomplete="off" required>
     ${kind === "approve" ? `<div class="form-note">Protocol scope signed into the cert — uncheck what this device must never do (hardware you don't fully trust). The mesh control plane is always on; every node enforces the rest.</div>
     <label class="form-note"><input type="checkbox" name="scope_tun" checked> overlay address + TUN leg</label>
@@ -680,7 +752,7 @@ function openForm(host, kind, fingerprint, what) {
     <label class="form-note"><input type="checkbox" name="scope_astral" checked> astral</label>` : ""}
     <div class="form-error" hidden></div>
     <div class="actions">
-      <button class="action ${kind === "revoke" ? "danger" : "approve"}" type="submit">${{ revoke: "Sign revocation", renew: "Sign renewal" }[kind] || "Sign certificate"}</button>
+      <button class="action ${kind === "revoke" ? "danger" : "approve"}" type="submit">${{ approve: "Approve — sign certificate", revoke: "Revoke — sign revocation", renew: "Renew — sign certificate" }[kind] || "Sign"}</button>
       <button class="action quiet" type="button" data-cancel>Cancel</button>
     </div>`;
   form.querySelector("[data-cancel]").onclick = () => { state.form = null; render(); };

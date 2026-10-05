@@ -304,14 +304,33 @@ event on the existing gossip: every store keeps the later-expiring
 cert regardless of arrival order, and the renewed node adopts its new
 cert live — persisted and presented in handshakes immediately, no
 restart. Renewals log as `cert renewed`, not as a new member joining,
-so the admission-transparency alarm stays meaningful. The UI flags
-certs under 90 days ("renew soon") and under 30 ("renew NOW").
+so the admission-transparency alarm stays meaningful. Expiry is loud
+before it bites: anything expired or expiring within 30 days raises a
+red banner across the top of every node's UI (with a "Renew now" button
+on the master) and a `!!! CERTIFICATES NEED ATTENTION` block at the top
+of `fabric status`; 30–90 days shows a softer banner and the node card's
+"renew soon" badge.
 
 Renew *before* expiry: an expired node can't connect to receive its
-renewal (the mesh refuses it), and its path back is a fresh `fabric
-join`. Renewal is also how members admitted before the TUN bridge
-(certs without an overlay IP) get re-issued — though they currently
-keep their empty IP; assigning one at renewal is a small follow-up.
+renewal (the mesh refuses it before gossip could reach it), and its
+path back is a fresh `fabric join` on that device — same device key, so
+it keeps its name and its overlay address. Until then it stays on the
+roster as **expired** (`fabric status`: `EXPIRED`; UI: "expired —
+re-join needed") rather than vanishing: an expired device that connects
+is shown by name instead of as an anonymous stranger, an offline one is
+still listed, its address stays reserved, and `renew` refuses it with a
+pointer to `join`. That memory lasts a year past expiry
+(`cert.LapsedRetention`); revoking the device ("Forget device" in the
+UI) ends it early. Renewal is also how members admitted before the TUN
+bridge (certs without an overlay IP) get re-issued — though they
+currently keep their empty IP; assigning one at renewal is a small
+follow-up.
+
+To re-join an expired device that still has its state directory: stop
+the daemon, move `config.json` and `cert.cbor` aside, run `fabric join
+-name <its name> -bootstrap <a queue host>`, approve on the master, put
+the old `config.json` back (same namespace; it carries `queue_host`,
+`announce_addrs`, bootstrap pins) and start the daemon.
 
 ## Kicking a device out
 

@@ -67,6 +67,22 @@ header {
   color: var(--ink); border-radius: 10px; padding: 10px 14px; margin-bottom: 14px;
 }
 
+.banner.expiry { font-size: 1.05rem; }
+.banner.expiry.critical {
+  background: color-mix(in srgb, var(--critical) 22%, var(--card));
+  border: 2px solid var(--critical);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--critical) 25%, transparent);
+}
+.banner.expiry.soft {
+  background: color-mix(in srgb, var(--warn) 16%, var(--card));
+  border-color: color-mix(in srgb, var(--warn) 50%, var(--line));
+}
+.banner.expiry h3 { margin: 0 0 6px; font-size: 1.1rem; }
+.banner.expiry ul { margin: 0 0 6px; padding-left: 20px; }
+.banner.expiry li { margin: 3px 0; }
+.banner.expiry li .action { margin-left: 8px; padding: 2px 10px; font-size: 0.9rem; }
+.banner.expiry .passform { margin-top: 8px; }
+
 main { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 14px; align-items: start; }
 @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
 aside { display: flex; flex-direction: column; gap: 14px; }
@@ -93,6 +109,7 @@ aside { display: flex; flex-direction: column; gap: 14px; }
 #graph .node.member circle.body { stroke: var(--good); }
 #graph .node.pending circle.body { stroke: var(--warn); }
 #graph .node.offline circle.body { stroke: var(--ink-3); }
+#graph .node.expired circle.body { stroke: var(--warn); stroke-dasharray: 4 3; }
 #graph .node.stranger circle.body { stroke: var(--serious); }
 #graph .node.revoked circle.body { stroke: var(--critical); }
 #graph .node.selected circle.halo { fill: none; stroke: var(--ink-3); stroke-width: 1.5; stroke-dasharray: 3 3; }
@@ -117,6 +134,7 @@ dl.kv dd { margin: 0; font-size: 12.5px; overflow-wrap: anywhere; }
 .badge.member   { background: color-mix(in srgb, var(--good) 14%, var(--card));     border-color: color-mix(in srgb, var(--good) 35%, var(--line)); }
 .badge.pending  { background: color-mix(in srgb, var(--warn) 16%, var(--card));     border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
 .badge.stranger { background: color-mix(in srgb, var(--serious) 15%, var(--card));  border-color: color-mix(in srgb, var(--serious) 38%, var(--line)); }
+.badge.expired  { background: color-mix(in srgb, var(--warn) 16%, var(--card));     border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
 .badge.revoked  { background: color-mix(in srgb, var(--critical) 13%, var(--card)); border-color: color-mix(in srgb, var(--critical) 38%, var(--line)); }
 .badge.offline  { background: var(--surface); border-color: var(--line); color: var(--ink-2); }
 .badge.warn-soft { background: color-mix(in srgb, var(--warn) 16%, var(--card)); border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }

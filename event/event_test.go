@@ -183,12 +183,49 @@ func TestLogGC(t *testing.T) {
 	if l.Len() != 2 {
 		t.Fatalf("premature GC: %d events left, want 2", l.Len())
 	}
-	l.GC(now.Add(2 * time.Hour)) // cert expired; revocation still retained
-	if l.Len() != 1 {
-		t.Fatalf("after cert expiry: %d events left, want 1", l.Len())
+	l.GC(now.Add(2 * time.Hour)) // cert expired: kept as a lapsed admission; revocation retained
+	if l.Len() != 2 {
+		t.Fatalf("after cert expiry: %d events left, want 2 (lapsed admission is roster memory)", l.Len())
 	}
-	l.GC(now.Add(cert.DefaultValidity + time.Hour))
+	l.GC(now.Add(cert.DefaultValidity + 30*time.Minute)) // revocation spent; lapsed admission still within retention
+	if l.Len() != 1 {
+		t.Fatalf("after max cert lifetime: %d events left, want 1 (the lapsed admission)", l.Len())
+	}
+	l.GC(now.Add(time.Hour + cert.LapsedRetention + time.Minute)) // lapsed retention over
 	if l.Len() != 0 {
-		t.Fatalf("after max cert lifetime: %d events left, want 0", l.Len())
+		t.Fatalf("after lapsed retention: %d events left, want 0", l.Len())
+	}
+}
+
+// A lapsed admission (cert expired, within retention) is accepted into the
+// log as roster memory — it still proves the device was admitted — while an
+// admission past retention is stale and rejected on ingest.
+func TestLogKeepsLapsedAdmission(t *testing.T) {
+	nsPub, nsPriv := testKeys(t)
+	now := time.Now()
+	l := NewLog(nsPub)
+
+	lapsed := testCert(t, nsPriv, "nas", now.Add(-2*time.Hour), time.Hour)
+	e, _ := NewAdded(nsPriv, lapsed, now.Add(-2*time.Hour))
+	if !Lapsed(e, now) {
+		t.Fatal("expired-within-retention admission not reported as lapsed")
+	}
+	if fresh, err := l.Add(e, now); err != nil || !fresh {
+		t.Fatalf("lapsed admission rejected: fresh=%v err=%v", fresh, err)
+	}
+
+	stale := testCert(t, nsPriv, "forgotten", now.Add(-2*cert.LapsedRetention), time.Hour)
+	e2, _ := NewAdded(nsPriv, stale, now.Add(-2*cert.LapsedRetention))
+	if Lapsed(e2, now) {
+		t.Fatal("admission past retention reported as lapsed")
+	}
+	if _, err := l.Add(e2, now); err == nil {
+		t.Fatal("stale admission past retention accepted")
+	}
+
+	// Tampering is still caught on the lapsed path.
+	e.Payload.At++
+	if _, err := l.Add(e, now); err == nil {
+		t.Fatal("tampered lapsed admission accepted")
 	}
 }

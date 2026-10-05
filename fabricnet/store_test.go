@@ -53,3 +53,85 @@ func TestAddMemberKeepsLaterExpiry(t *testing.T) {
 		t.Fatalf("renewal did not replace the old cert: expiry %v, want %v", c.Expiry(), renewed.Expiry())
 	}
 }
+
+// An expired cert is roster memory, not membership: the device is known by
+// name (LapsedCert) and listed (Lapsed) but admitted nowhere; a valid cert
+// for the same device lifts it out; revocation forgets it; GC moves a
+// member whose cert runs out into the lapsed set and drops it only after
+// cert.LapsedRetention.
+func TestExpiredMemberIsLapsedNotMember(t *testing.T) {
+	nsPub, nsPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := PeerIDForKey(devPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	expired, err := cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: "nas", IP: "100.64.0.2/24"}, now.Add(-2*time.Hour), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewMemberStore(nsPub)
+	s.AddMember(p, expired)
+	if s.IsMember(p, now) {
+		t.Fatal("expired cert made the peer a member")
+	}
+	if _, ok := s.Cert(p); ok {
+		t.Fatal("expired cert returned as a membership cert")
+	}
+	if c, ok := s.LapsedCert(p); !ok || c.Payload.Meta.Name != "nas" {
+		t.Fatalf("lapsed cert not remembered: ok=%v", ok)
+	}
+	if members, _ := s.Snapshot(); len(members) != 0 {
+		t.Fatal("lapsed peer leaked into the membership snapshot")
+	}
+	if len(s.Lapsed()) != 1 {
+		t.Fatalf("lapsed set has %d entries, want 1", len(s.Lapsed()))
+	}
+
+	// Re-admission with a valid cert lifts it out of the lapsed set.
+	fresh, err := cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: "nas", IP: "100.64.0.2/24"}, now, cert.DefaultValidity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.AddMember(p, fresh)
+	if !s.IsMember(p, now) {
+		t.Fatal("re-admitted peer is not a member")
+	}
+	if _, ok := s.LapsedCert(p); ok {
+		t.Fatal("re-admitted peer still in the lapsed set")
+	}
+	// …and a stale expired event arriving late must not demote it.
+	s.AddMember(p, expired)
+	if !s.IsMember(p, now) || len(s.Lapsed()) != 0 {
+		t.Fatal("stale expired cert demoted a current member")
+	}
+
+	// GC: a member whose cert runs out becomes lapsed, then is dropped only
+	// after the retention window.
+	s.GC(fresh.Expiry().Add(time.Minute))
+	if s.IsMember(p, fresh.Expiry().Add(time.Minute)) {
+		t.Fatal("member survived its expiry")
+	}
+	if _, ok := s.LapsedCert(p); !ok {
+		t.Fatal("expired member was dropped instead of lapsing")
+	}
+	s.GC(fresh.Expiry().Add(cert.LapsedRetention + time.Minute))
+	if _, ok := s.LapsedCert(p); ok {
+		t.Fatal("lapsed entry survived its retention")
+	}
+
+	// Revoking a lapsed device forgets it.
+	s.AddMember(p, expired)
+	s.Revoke(p, now)
+	if _, ok := s.LapsedCert(p); ok || !s.IsRevoked(p, now) {
+		t.Fatal("revoked lapsed device still remembered")
+	}
+}

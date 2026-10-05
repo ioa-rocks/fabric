@@ -17,18 +17,28 @@ import (
 // MemberStore is the local view of namespace membership: verified certs by
 // peer ID, plus revocations. Revocations are retained only until the revoked
 // cert's expiry — expiry garbage-collects the revocation list (spec §5).
+//
+// A member whose cert ran out without being renewed is not dropped on the
+// spot: it moves to the lapsed set, where it is no member (every membership
+// check says no) but is still remembered by name, address, and scope for
+// cert.LapsedRetention. That memory is what lets the roster say "nas —
+// expired, re-join needed" instead of showing an anonymous stranger, and
+// what keeps the device's overlay address reserved until it is back or
+// revoked.
 type MemberStore struct {
 	namespacePub ed25519.PublicKey
 
 	mu      sync.RWMutex
 	members map[peer.ID]*cert.Cert
-	revoked map[peer.ID]time.Time // peer -> revoked cert's expiry
+	lapsed  map[peer.ID]*cert.Cert // expired, unrevoked, within retention
+	revoked map[peer.ID]time.Time  // peer -> revoked cert's expiry
 }
 
 func NewMemberStore(namespacePub ed25519.PublicKey) *MemberStore {
 	return &MemberStore{
 		namespacePub: namespacePub,
 		members:      make(map[peer.ID]*cert.Cert),
+		lapsed:       make(map[peer.ID]*cert.Cert),
 		revoked:      make(map[peer.ID]time.Time),
 	}
 }
@@ -38,12 +48,24 @@ func NewMemberStore(namespacePub ed25519.PublicKey) *MemberStore {
 func (s *MemberStore) NamespaceKey() ed25519.PublicKey { return s.namespacePub }
 
 // AddMember records a verified certificate for a peer. The caller must have
-// validated the cert (including the aud == peer-ID binding) first.
+// validated the cert's signature and the aud == peer-ID binding first; a
+// cert that has already expired is accepted as roster memory (lapsed), not
+// as membership.
 func (s *MemberStore) AddMember(p peer.ID, c *cert.Cert) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, isRevoked := s.revoked[p]; isRevoked {
 		return // a revoked peer cannot re-add itself with an old cert
+	}
+	if !time.Now().Before(c.Expiry()) {
+		if _, live := s.members[p]; live {
+			return // a stale event must not demote a current member
+		}
+		if cur, ok := s.lapsed[p]; ok && c.Expiry().Before(cur.Expiry()) {
+			return
+		}
+		s.lapsed[p] = c
+		return
 	}
 	// Later-expiring cert wins: added-events arrive in no particular order
 	// (gossip, anti-entropy, handshakes), so a stale event must not clobber
@@ -52,6 +74,7 @@ func (s *MemberStore) AddMember(p peer.ID, c *cert.Cert) {
 		return
 	}
 	s.members[p] = c
+	delete(s.lapsed, p)
 }
 
 // IsMember reports whether the peer holds a currently valid, unrevoked cert.
@@ -79,7 +102,8 @@ func (s *MemberStore) Allows(p peer.ID, protocolID string, now time.Time) bool {
 	return ok && now.Before(c.Expiry()) && c.Allows(cert.ScopeFamily(protocolID))
 }
 
-// Cert returns the stored certificate for a peer, if any.
+// Cert returns the stored membership certificate for a peer, if any. Lapsed
+// certs are not membership; see LapsedCert.
 func (s *MemberStore) Cert(p peer.ID) (*cert.Cert, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -87,8 +111,18 @@ func (s *MemberStore) Cert(p peer.ID) (*cert.Cert, bool) {
 	return c, ok
 }
 
+// LapsedCert returns the expired cert a former member is remembered by, if
+// the peer is in the lapsed set.
+func (s *MemberStore) LapsedCert(p peer.ID) (*cert.Cert, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	c, ok := s.lapsed[p]
+	return c, ok
+}
+
 // Snapshot returns copies of the current membership and revocation views —
-// the roster for status displays and the topology UI.
+// the roster for status displays and the topology UI. Lapsed members are
+// not included; see Lapsed.
 func (s *MemberStore) Snapshot() (members map[peer.ID]*cert.Cert, revoked map[peer.ID]time.Time) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -103,7 +137,21 @@ func (s *MemberStore) Snapshot() (members map[peer.ID]*cert.Cert, revoked map[pe
 	return members, revoked
 }
 
+// Lapsed returns a copy of the lapsed set: former members whose cert expired
+// unrenewed, remembered for cert.LapsedRetention so the roster can name them
+// and hold their overlay address until they re-join or are revoked.
+func (s *MemberStore) Lapsed() map[peer.ID]*cert.Cert {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[peer.ID]*cert.Cert, len(s.lapsed))
+	for p, c := range s.lapsed {
+		out[p] = c
+	}
+	return out
+}
+
 // Revoke marks a peer as revoked until its cert would have expired anyway.
+// Revoking a lapsed device is how the operator forgets it.
 func (s *MemberStore) Revoke(p peer.ID, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -113,6 +161,7 @@ func (s *MemberStore) Revoke(p peer.ID, now time.Time) {
 	}
 	s.revoked[p] = exp
 	delete(s.members, p)
+	delete(s.lapsed, p)
 }
 
 // IsRevoked reports whether the peer is currently revoked.
@@ -123,13 +172,20 @@ func (s *MemberStore) IsRevoked(p peer.ID, now time.Time) bool {
 	return ok && now.Before(exp)
 }
 
-// GC drops expired members and spent revocation records.
+// GC moves expired members to the lapsed set, drops lapsed entries past
+// their retention, and drops spent revocation records.
 func (s *MemberStore) GC(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for p, c := range s.members {
 		if !now.Before(c.Expiry()) {
 			delete(s.members, p)
+			s.lapsed[p] = c
+		}
+	}
+	for p, c := range s.lapsed {
+		if !now.Before(c.Expiry().Add(cert.LapsedRetention)) {
+			delete(s.lapsed, p)
 		}
 	}
 	for p, exp := range s.revoked {

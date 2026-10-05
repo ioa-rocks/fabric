@@ -449,6 +449,7 @@ func cmdStatus(args []string) error {
 	for _, a := range s.Addrs {
 		fmt.Printf("  listen %s\n", a)
 	}
+	printExpiryWarnings(s)
 	if len(s.Peers) == 0 {
 		fmt.Println("no known peers")
 		return nil
@@ -465,6 +466,8 @@ func cmdStatus(args []string) error {
 			member = "REVOKED"
 		case p.Member:
 			member = "member"
+		case p.Expired:
+			member = "EXPIRED" // cert ran out; re-join needed ('fabric join' on that device)
 		}
 		name := p.Name
 		if name == "" {
@@ -481,6 +484,43 @@ func cmdStatus(args []string) error {
 		fmt.Printf("  %-16s %-9s %-8s %-18s %s%s\n", name, conn, member, ip, p.ID, scope)
 	}
 	return nil
+}
+
+// printExpiryWarnings is the CLI's loud tier of the spec-§5 renewal
+// warnings: every cert expired or expiring within 30 days, this node's
+// included, as a block nobody scrolls past. Expiry is otherwise silent — a
+// lapsed device just drops off the mesh and can no longer take a renewal.
+func printExpiryWarnings(s *daemon.StatusReply) {
+	const loud = 30 * 24 * time.Hour
+	now := time.Now()
+	var lines []string
+	days := func(t time.Time) int { return int(t.Sub(now).Hours() / 24) }
+	if s.CertExpiry != nil && s.CertExpiry.Sub(now) < loud {
+		lines = append(lines, fmt.Sprintf("this node's own cert expires in %dd (%s)", days(*s.CertExpiry), s.CertExpiry.Format("2006-01-02")))
+	}
+	for _, p := range s.Peers {
+		if p.CertExpiry == nil || p.Revoked {
+			continue
+		}
+		name := p.Name
+		if name == "" {
+			name = p.ID
+		}
+		switch {
+		case p.Expired:
+			lines = append(lines, fmt.Sprintf("%s EXPIRED %dd ago — off the mesh; run 'fabric join' on it", name, -days(*p.CertExpiry)))
+		case p.CertExpiry.Sub(now) < loud:
+			lines = append(lines, fmt.Sprintf("%s expires in %dd (%s)", name, days(*p.CertExpiry), p.CertExpiry.Format("2006-01-02")))
+		}
+	}
+	if len(lines) == 0 {
+		return
+	}
+	fmt.Println("!!! CERTIFICATES NEED ATTENTION — an expired device drops off the mesh and cannot be renewed any more:")
+	for _, l := range lines {
+		fmt.Printf("!!!   %s\n", l)
+	}
+	fmt.Println("!!!   renew on the master: fabric renew -expiring")
 }
 
 // cmdGraph prints the aggregated mesh map — every live link any reachable
@@ -855,11 +895,11 @@ func cmdApprove(args []string) error {
 	}
 	var ip string
 	if cert.ScopeAllows(scope, cert.ScopeTun) {
-		ip, err = daemon.AllocateOverlayIP(dir, members)
-		if err != nil {
+		if ip = daemon.ReturningMemberIP(members, match.Fingerprint); ip != "" {
+			fmt.Printf("known device returning after cert expiry — keeping its overlay address %s\n", ip)
+		} else if ip, err = daemon.AllocateOverlayIP(dir, members); err != nil {
 			return err
-		}
-		if ip != "" {
+		} else if ip != "" {
 			fmt.Printf("assigning overlay address %s\n", ip)
 		}
 	}
@@ -1024,6 +1064,10 @@ func cmdRenew(args []string) error {
 	var targets []daemon.MemberInfo
 	if *expiring {
 		for _, m := range members {
+			if m.Expired {
+				fmt.Fprintf(os.Stderr, "skipping %q: cert expired %s — an expired device cannot receive a renewal; run 'fabric join' on it\n", m.Name, m.Expiry.Format(time.RFC3339))
+				continue
+			}
 			if time.Until(m.Expiry) < cert.RenewBelow {
 				targets = append(targets, m)
 			}
@@ -1044,6 +1088,9 @@ func cmdRenew(args []string) error {
 		case 0:
 			return fmt.Errorf("no member matches %q (see 'fabric status' for the roster)", target)
 		case 1:
+			if m := matches[0]; m.Expired {
+				return fmt.Errorf("%q's cert expired %s — an expired device cannot receive a renewal (the mesh refuses it before gossip could reach it); run 'fabric join' on that device, it keeps its name and address", m.Name, m.Expiry.Format(time.RFC3339))
+			}
 			targets = matches
 		default:
 			for _, m := range matches {

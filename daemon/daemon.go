@@ -603,6 +603,19 @@ func AllocateOverlayIP(dir state.Dir, members []MemberInfo) (string, error) {
 	return tunbridge.NextFreeIP(cfg.Subnet, taken)
 }
 
+// ReturningMemberIP returns the overlay address a lapsed member is still
+// holding, if the device requesting admission (by key fingerprint) is one:
+// a known device coming back after its cert expired keeps its address
+// instead of drawing a new one.
+func ReturningMemberIP(members []MemberInfo, fingerprint string) string {
+	for _, m := range members {
+		if m.Expired && m.Fingerprint == fingerprint {
+			return m.IP
+		}
+	}
+	return ""
+}
+
 // Stop shuts the daemon down.
 func (d *Daemon) Stop() { d.cancel() }
 
@@ -685,10 +698,17 @@ func (d *Daemon) applyEvent(e *event.Event) {
 				break
 			}
 			old, known := d.Store.Cert(p)
+			_, wasLapsed := d.Store.LapsedCert(p)
 			d.Store.AddMember(p, c)
 			// Renewals reuse MemberAdded (spec §5) but must not fire the
 			// "new member" admission-transparency notification.
 			switch {
+			case !time.Now().Before(c.Expiry()):
+				if !known && !wasLapsed {
+					log.Printf("roster: %q (%s) lapsed — its cert expired %s; it needs a fresh 'fabric join'", c.Payload.Meta.Name, p, c.Expiry().Format(time.RFC3339))
+				}
+			case wasLapsed:
+				log.Printf("member re-admitted: %q (%s), approved by master", c.Payload.Meta.Name, p)
 			case !known:
 				log.Printf("member added: %q (%s), approved by master", c.Payload.Meta.Name, p)
 			case c.Expiry().After(old.Expiry()):

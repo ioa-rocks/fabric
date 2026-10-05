@@ -38,6 +38,14 @@ const DefaultValidity = 365 * 24 * time.Hour
 // warning on every node, < 30d loud (desktop notification on the master).
 const RenewBelow = 183 * 24 * time.Hour
 
+// LapsedRetention is how long an expired, unrevoked membership stays on the
+// roster as "expired": the device is no member (nothing admits it) but is
+// still known by name, address, and scope, so a node that was off for a
+// season comes back as "nas — expired" rather than as an anonymous stranger,
+// and its overlay address is held for it. Re-admission (`fabric join`, same
+// device key) or revocation ends the retention early.
+const LapsedRetention = DefaultValidity
+
 const nonceSize = 16
 
 // Meta carries the certificate's attributes beyond identity. IP is the
