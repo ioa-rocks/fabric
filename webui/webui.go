@@ -55,6 +55,11 @@ func (s *Server) Handler() http.Handler {
 		panic(err) // embedded tree is fixed at compile time
 	}
 	mux.Handle("GET /", http.FileServerFS(static))
+	// Bucket URLs serve the same shell; the browser selects the detail view.
+	// Keep assets absolute so direct links and reloads work at this depth.
+	mux.HandleFunc("GET /buckets/{bucket}", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFileFS(w, r, static, "index.html")
+	})
 	mux.HandleFunc("GET /api/overview", s.handleOverview)
 	mux.HandleFunc("POST /api/approve", s.handleApprove)
 	mux.HandleFunc("POST /api/deny", s.handleDeny)
@@ -382,7 +387,7 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleVaultObjects lists a bucket's objects (?bucket=<ref>&tags=t1,t2).
+// handleVaultObjects browses one bounded page (?bucket=<ref>&after=<cursor>&tags=t1,t2).
 // Read-only browse — content stays behind the CLI/API for now.
 func (s *Server) handleVaultObjects(w http.ResponseWriter, r *http.Request) {
 	cl := vaultdaemon.TryClient(s.vaultPath)
@@ -401,7 +406,7 @@ func (s *Server) handleVaultObjects(w http.ResponseWriter, r *http.Request) {
 			tags = append(tags, t)
 		}
 	}
-	objs, err := cl.List(bucket, tags)
+	objs, err := cl.ListPage(r.Context(), bucket, r.URL.Query().Get("after"), tags)
 	if err != nil {
 		httpError(w, http.StatusBadGateway, err)
 		return

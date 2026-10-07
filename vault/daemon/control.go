@@ -196,6 +196,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("GET /v0/buckets", d.handleBuckets)
 	mux.HandleFunc("POST /v0/buckets", d.handleCreateBucket)
 	mux.HandleFunc("GET /v0/buckets/{bucket}/objects", d.handleList)
+	mux.HandleFunc("GET /v0/buckets/{bucket}/objects/page", d.handleListPage)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/objects", d.handlePut)
 	mux.HandleFunc("GET /v0/buckets/{bucket}/content", d.handleGet)
 	mux.HandleFunc("PUT /v0/buckets/{bucket}/content", d.handleReplace)
@@ -521,6 +522,31 @@ func (d *Daemon) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	if repaired {
 		d.kickSync()
+	}
+	writeJSON(w, out)
+}
+
+// ObjectPage is a bounded browse response. Next may be set on an empty page
+// when a scan window contains only deleted objects or nonmatching tags.
+type ObjectPage struct {
+	Objects []ObjectInfo `json:"objects"`
+	Next    string       `json:"next,omitempty"`
+}
+
+func (d *Daemon) handleListPage(w http.ResponseWriter, r *http.Request) {
+	h, err := d.handle(r.PathValue("bucket"))
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	objects, next, err := h.Index.ListObjectsPage(r.Context(), r.URL.Query().Get("after"), splitTags(r.URL.Query().Get("tags"))...)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	out := ObjectPage{Objects: make([]ObjectInfo, 0, len(objects)), Next: next}
+	for _, o := range objects {
+		out.Objects = append(out.Objects, Info(o))
 	}
 	writeJSON(w, out)
 }

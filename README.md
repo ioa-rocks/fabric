@@ -495,7 +495,20 @@ feed. On the master it is also the admin surface: approve/deny pending
 joins (with the fingerprint displayed for comparison) and revoke
 members. Its Astral card shows hosted and remotely placed names, backlog,
 active claim leases, heartbeat monitors, the offline outbox, and the current
-authorization boundary.
+authorization boundary. Vault lists buckets with their owning circles. Each
+bucket links to `/buckets/<id>`, a bookmarkable detail page with overview,
+local placement and folder/mount status, conflicts and held-deletion counts,
+and paginated files. Placement controls live on that page. Folder replicas
+show their existing placement without offering a blob-store mode switch.
+The file view browses at most 100 objects per page in stable object-ID order,
+with Previous/Next and an explicit Refresh that returns to the first page.
+Dashboard polling preserves the open page and does not reload its objects.
+The dedicated `/objects/page` control endpoint
+seeks by cursor and scans at most 1,000 records per request; a page containing
+only deleted or filtered records can be empty with a Next cursor. Pages are
+independent reads, so refresh to see insertions before the current cursor.
+Deploy the daemon along with the UI for this endpoint; the CLI
+and SDK complete-list endpoint remains unchanged.
 
 `fabric ui` is deliberately a separate process from the daemon: the
 root-key passphrase is entered in the browser form, but signing happens

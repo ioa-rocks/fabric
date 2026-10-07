@@ -11,7 +11,10 @@ const state = {
   selected: null,   // selected node id ('self' or peer id)
   form: null,       // {kind:'approve'|'deny'|'revoke', fp, error, busy}
   failing: false,
-  openBucket: null, // bucket id whose object list is expanded in the vault card
+  bucketID: location.pathname.match(/^\/buckets\/([^/]+)\/?$/)?.[1] || null,
+  bucketTitle: "Bucket",
+  placementBusy: false,
+  objectView: null, // retained page and in-flight request, independent of dashboard polls
 };
 
 /* ---------- theme ---------- */
@@ -98,9 +101,13 @@ function render() {
     banner.hidden = true;
   }
   const d = state.data;
-  const ns = nodes();
-
   renderHeader(d);
+  if (state.bucketID) {
+    renderBucketPage(d);
+    if (!state.form || state.form.host !== "expiry") renderExpiryBanner(d);
+    return;
+  }
+  const ns = nodes();
   if (!state.form || state.form.host !== "expiry") renderExpiryBanner(d);
   // Revoked peers never connect again — they are tombstones, not topology.
   // The graph shows the live mesh; they get their own list until they GC.
@@ -140,7 +147,7 @@ function renderExpiryBanner(d) {
   }
   const loud = items.some(i => i.tier !== "soft");
   el.hidden = !items.length;
-  document.title = (loud ? "⚠ certs expiring — " : "") + "fabric — topology";
+  document.title = (loud ? "⚠ certs expiring — " : "") + "fabric — " + (state.bucketID ? state.bucketTitle : "topology");
   if (el.hidden) return;
   el.classList.add(loud ? "critical" : "soft");
   items.sort((a, b) => a.days - b.days);
@@ -260,16 +267,13 @@ function planeAlert(text) {
 
 /* ---------- vault card ---------- */
 
-/* Buckets + placement. Present only while the daemon runs the vault
-   subsystem (ADR 0013). The one write here is the subscription selector —
-   a per-device commitment, not a signing operation. Clicking a bucket row
-   toggles its object list. */
+/* Bucket summary. Links open dedicated detail pages; this overview never
+   loads file listings. Placement changes live on the detail page. */
 function renderVault(d) {
   const card = document.getElementById("vault-card");
   card.hidden = !d.vault;
-  if (card.hidden) { state.openBucket = null; return; }
+  if (card.hidden) { closeObjects(); return; }
   const vs = d.vault.status || {};
-  document.getElementById("vault-circle").textContent = vs.name || "?";
 
   const vaultPeers = (vs.peers || []).filter(p => p.vault).map(p => p.name || short(p.peer_id));
   const buckets = d.vault.buckets || [];
@@ -297,8 +301,7 @@ function renderVault(d) {
   }
   const table = document.createElement("table");
   table.className = "buckets";
-  table.innerHTML = `<tr><th>bucket</th><th>id</th><th>objects</th><th>held</th><th>placement</th></tr>`;
-  let open = null; // fill the expanded object list only after the table is in the DOM
+  table.innerHTML = `<tr><th>bucket</th><th>circle</th><th>objects</th><th>held</th><th>placement</th></tr>`;
   for (const b of buckets) {
     const tr = document.createElement("tr");
     tr.className = "bucket-row";
@@ -311,35 +314,20 @@ function renderVault(d) {
     } else {
       held.textContent = `${b.held}/${b.objects}`;
     }
-    const sel = document.createElement("select");
-    for (const mode of ["none", "cache", "full"]) {
-      const o = document.createElement("option");
-      o.value = mode; o.textContent = mode;
-      o.selected = (b.sub || "none") === mode;
-      sel.append(o);
-    }
-    sel.onclick = (e) => e.stopPropagation(); // row toggles objects; the selector shouldn't
-    sel.onchange = () => doPost("/api/vault/sub", { bucket: b.id, mode: sel.value })
-      .catch(err => { alert("subscription: " + (err.message || err)); poll(); });
-    const selTd = document.createElement("td");
-    selTd.append(sel);
-    if (b.root) selTd.append(" at ", mono(b.root));
+    const link = document.createElement("a");
+    link.href = "/buckets/" + encodeURIComponent(b.id);
+    link.className = "bucket-link";
+    link.textContent = b.name;
     tr.append(
-      td(strong(b.name)),
-      td(mono(b.id.slice(0, 16))),
+      td(link),
+      td((vs.circles || []).find(c => c.did === b.owner)?.name || b.owner || "Unknown"),
       td(String(b.objects)),
       held,
-      selTd,
+      td(b.folder ? "folder" : (b.sub || "none")),
     );
-    tr.onclick = () => toggleObjects(table, tr, b);
     table.append(tr);
-    if (state.openBucket === b.id) {
-      tr.after(objectsRow(b));
-      open = b;
-    }
   }
   box.append(table);
-  if (open) loadObjects(open); // now getElementById can see the list
 }
 
 function td(child) {
@@ -348,38 +336,134 @@ function td(child) {
   return c;
 }
 
-function toggleObjects(table, tr, b) {
-  if (state.openBucket === b.id) {
-    state.openBucket = null;
-    table.querySelector(".objects-row")?.remove();
+// A dedicated detail view uses the existing overview data for metadata and
+// only fetches files on entry or explicit navigation. Ordinary links provide
+// bookmarking, reload, browser history and opening a bucket in another tab.
+function renderBucketPage(d) {
+  const b = (d.vault?.buckets || []).find(b => b.id === state.bucketID);
+  const message = document.getElementById("bucket-message");
+  document.getElementById("bucket-content").hidden = !b;
+  message.hidden = !!b;
+  state.bucketTitle = b?.name || "Bucket unavailable";
+  document.getElementById("bucket-title").textContent = state.bucketTitle;
+  document.getElementById("bucket-crumb").textContent = b?.name || "Bucket";
+  if (!b) {
+    message.textContent = d.vault ? "This bucket is not available on this device." : "Vault is not available on this device.";
+    closeObjects();
     return;
   }
-  state.openBucket = b.id;
-  table.querySelector(".objects-row")?.remove();
-  tr.after(objectsRow(b));
-  loadObjects(b);
+  document.getElementById("bucket-subtitle").textContent = "Details from " + (d.status.name || "this device");
+  const vs = d.vault.status || {};
+  const owner = (vs.circles || []).find(c => c.did === b.owner);
+  const overview = document.createElement("dl");
+  overview.className = "kv";
+  const field = (dl, label, value) => {
+    const dt = document.createElement("dt"), dd = document.createElement("dd");
+    dt.textContent = label;
+    dd.append(value);
+    dl.append(dt, dd);
+  };
+  field(overview, "Circle", owner?.name || b.owner || "Unknown");
+  field(overview, "Objects", String(b.objects));
+  field(overview, "Content held locally", `${b.held} / ${b.objects}`);
+  field(overview, "Conflicts", String(b.conflicts || 0));
+  field(overview, "Held deletions", String(b.held_deletions || 0));
+  field(overview, "Bucket ID", mono(b.id));
+  document.getElementById("bucket-overview").replaceChildren(overview);
+
+  const local = document.createElement("dl");
+  local.className = "kv";
+  if (b.folder) {
+    field(local, "Placement", "Folder replica");
+    field(local, "Folder", mono(b.folder));
+  } else {
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", "Placement on this device");
+    for (const mode of ["none", "cache", "full"]) {
+      const option = document.createElement("option");
+      option.value = mode; option.textContent = mode;
+      option.selected = (b.sub || "none") === mode;
+      select.append(option);
+    }
+    select.onchange = async () => {
+      select.disabled = true;
+      state.placementBusy = true;
+      try { await doPost("/api/vault/sub", { bucket: b.id, mode: select.value }); }
+      catch (err) { alert("Placement: " + (err.message || err)); }
+      finally { state.placementBusy = false; select.disabled = false; select.blur(); renderBucketPage(state.data); }
+    };
+    field(local, "Placement", select);
+    field(local, "Storage", b.root ? mono(b.root) : "Default store");
+  }
+  const folder = (vs.folders || []).find(f => f.bucket === b.id);
+  if (folder) {
+    field(local, "Folder status", folder.error || (folder.available ? "Available" : "Unavailable"));
+    field(local, "Pending upload", String(folder.pending_up));
+    field(local, "Pending download", String(folder.pending_down));
+    field(local, "Last scan", folder.last_scan ? new Date(folder.last_scan / 1e6).toLocaleString() : "Not scanned yet");
+    field(local, "Excluded repositories", String(folder.excluded_repos || 0));
+    field(local, "Ignored entries", String(folder.ignored || 0));
+  }
+  for (const m of (vs.mounts || []).filter(m => m.bucket === b.id)) {
+    field(local, "Mount", mono(m.dir));
+    field(local, "Mount status", m.error || `${m.mounted ? "Mounted" : "Waiting to mount"} · ${m.write ? "read/write" : "read-only"}`);
+  }
+  const localBox = document.getElementById("bucket-local");
+  if (!state.placementBusy && !localBox.contains(document.activeElement)) localBox.replaceChildren(local);
+  if (state.objectView?.bucket !== b.id) openObjects(b);
 }
 
-function objectsRow(b) {
-  const row = document.createElement("tr");
-  row.className = "objects-row";
-  const cell = document.createElement("td");
-  cell.colSpan = 5;
-  cell.innerHTML = `<ul class="objects-list" id="objects-${b.id.slice(0, 16)}"><li class="muted">loading…</li></ul>`;
-  row.append(cell);
-  return row;
+function closeObjects() {
+  state.objectView?.controller?.abort();
+  state.objectView?.row.remove();
+  state.objectView = null;
 }
 
-async function loadObjects(b) {
-  const list = document.getElementById("objects-" + b.id.slice(0, 16));
-  if (!list) return;
+function openObjects(b) {
+  closeObjects();
+  const row = document.createElement("div");
+  row.className = "object-browser";
+  const list = document.createElement("ul");
+  list.className = "objects-list";
+  const controls = document.createElement("div");
+  controls.className = "objects-controls";
+  const label = document.createElement("span");
+  label.setAttribute("role", "status");
+  const button = (text, click) => {
+    const el = document.createElement("button");
+    el.type = "button";
+    el.textContent = text;
+    el.onclick = click;
+    return el;
+  };
+  const view = { bucket: b.id, row, list, label, after: "", history: [], next: "" };
+  view.previous = button("Previous", () => loadObjects(view, view.history.at(-1), view.history.slice(0, -1)));
+  view.forward = button("Next", () => loadObjects(view, view.next, [...view.history, view.after]));
+  view.refresh = button("Refresh", () => loadObjects(view, "", []));
+  controls.append(view.previous, view.forward, view.refresh, label);
+  row.append(controls, list);
+  document.getElementById("bucket-files").append(row);
+  state.objectView = view;
+  loadObjects(view, "", []);
+}
+
+async function loadObjects(view, after, history) {
+  view.controller?.abort();
+  const controller = new AbortController();
+  view.controller = controller;
+  view.previous.disabled = view.forward.disabled = view.refresh.disabled = true;
+  view.label.textContent = "Loading…";
   try {
-    const r = await fetch("/api/vault/objects?bucket=" + encodeURIComponent(b.id));
+    const query = new URLSearchParams({ bucket: view.bucket, after });
+    const r = await fetch("/api/vault/objects?" + query, { signal: controller.signal });
     if (!r.ok) throw new Error((await r.json()).error || r.statusText);
-    const objs = await r.json();
-    list.innerHTML = "";
-    if (!objs.length) { list.innerHTML = `<li class="muted">empty bucket</li>`; return; }
-    for (const o of objs.slice(0, 100)) {
+    const page = await r.json();
+    if (state.objectView !== view || view.controller !== controller) return;
+    view.after = after;
+    view.history = history;
+    view.next = page.next || "";
+    view.list.replaceChildren();
+    for (const o of page.objects) {
       const li = document.createElement("li");
       li.append(mono(o.id.slice(0, 12)), " ", o.name);
       if (o.tags && o.tags.length) {
@@ -388,16 +472,21 @@ async function loadObjects(b) {
         t.textContent = "  [" + o.tags.join(" ") + "]";
         li.append(t);
       }
-      list.append(li);
+      view.list.append(li);
     }
-    if (objs.length > 100) {
-      const more = document.createElement("li");
-      more.className = "muted";
-      more.textContent = `… and ${objs.length - 100} more (vault ls for the full list)`;
-      list.append(more);
-    }
+    view.label.textContent = page.objects.length
+      ? `Page ${history.length + 1} · ${page.objects.length} objects · refresh to see changes`
+      : (view.next ? "No live objects in this page — continue with Next" : "No more objects");
   } catch (err) {
-    if (list) list.innerHTML = `<li class="muted">objects: ${err.message || err}</li>`;
+    if (err.name !== "AbortError" && state.objectView === view && view.controller === controller) {
+      view.label.textContent = "Could not load files: " + (err.message || err);
+    }
+  } finally {
+    if (state.objectView === view && view.controller === controller) {
+      view.previous.disabled = !view.history.length;
+      view.forward.disabled = !view.next;
+      view.refresh.disabled = false;
+    }
   }
 }
 
@@ -876,6 +965,8 @@ async function copy(text, elem) {
 
 /* ---------- go ---------- */
 
+document.getElementById("dashboard").hidden = !!state.bucketID;
+document.getElementById("bucket-page").hidden = !state.bucketID;
 initTheme();
 poll().then(() => {
   // deep-link: ?select=<name or peer id> opens that node's details

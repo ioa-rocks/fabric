@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>fabric — topology</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='14' fill='%230ca30c'/><circle cx='18' cy='26' r='9' fill='%23888'/><circle cx='82' cy='26' r='9' fill='%23888'/><circle cx='18' cy='78' r='9' fill='%23888'/><circle cx='82' cy='78' r='9' fill='%23888'/></svg>">
 </head>
 <body>
@@ -24,6 +24,7 @@
 <div id="banner" class="banner" hidden></div>
 <div id="expiry-banner" class="banner expiry" hidden></div>
 
+<div id="dashboard">
 <main>
   <section class="card graph-card">
     <div class="card-head">
@@ -48,7 +49,7 @@
 
 <section class="card vault-card" id="vault-card" hidden>
   <div class="card-head">
-    <h2>Vault — <span id="vault-circle"></span></h2>
+    <h2>Vault</h2>
     <span id="vault-summary" class="muted"></span>
   </div>
   <div id="vault-mounts" class="muted" hidden></div>
@@ -74,6 +75,21 @@
   <ol id="feed"></ol>
 </section>
 
-<script src="app.js"></script>
+</div>
+
+<div id="bucket-page" hidden>
+  <nav class="breadcrumb" aria-label="Breadcrumb"><a href="/">Fabric</a><span aria-hidden="true">/</span><a href="/#vault-card">Buckets</a><span aria-hidden="true">/</span><span id="bucket-crumb" aria-current="page">Bucket</span></nav>
+  <div class="bucket-heading"><h1 id="bucket-title">Loading bucket…</h1><p id="bucket-subtitle" class="muted">Details from this device</p></div>
+  <p id="bucket-message" role="status" hidden></p>
+  <div id="bucket-content" hidden>
+    <div class="bucket-panels">
+      <section class="card"><div class="card-head"><h2>Overview</h2></div><div id="bucket-overview"></div></section>
+      <section class="card"><div class="card-head"><h2>On this device</h2></div><div id="bucket-local"></div></section>
+    </div>
+    <section class="card bucket-files"><div class="card-head"><h2>Files</h2><span class="muted">100 objects per page</span></div><div id="bucket-files"></div></section>
+  </div>
+</div>
+
+<script src="/app.js"></script>
 </body>
 </html>

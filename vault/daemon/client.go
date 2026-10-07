@@ -146,6 +146,27 @@ func (c *Client) List(bucket string, tags []string) ([]ObjectInfo, error) {
 	return out, nil
 }
 
+// ListPage uses a separate endpoint so an older daemon cannot silently return
+// its entire object list when it does not understand pagination parameters.
+func (c *Client) ListPage(ctx context.Context, bucket, after string, tags []string) (ObjectPage, error) {
+	q := url.Values{"after": {after}, "tags": {strings.Join(tags, ",")}}
+	var out ObjectPage
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://vault"+bucketPath(bucket, "/objects/page")+"?"+q.Encode(), nil)
+	if err != nil {
+		return out, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return out, decodeErr(resp)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	return out, err
+}
+
 func (c *Client) Put(bucket, name string, r io.Reader, tags []string) (ObjectInfo, error) {
 	var out ObjectInfo
 	q := "?name=" + url.QueryEscape(name)
