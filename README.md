@@ -257,6 +257,15 @@ it succeeds the edge turns solid, when it fails the relay keeps
 carrying the traffic, TUN included. A revoked member loses relay
 privileges with the same gossip that cuts its connections.
 
+While a peer remains relayed, Fabric also probes its known direct addresses
+every two minutes. A fresh signed address record triggers an earlier probe.
+These probes keep the relay open, share the recovery dial limits, and stop
+once a direct connection exists. libp2p's global UDP/IPv6 failure suppression
+is disabled: repeated failures to an offline device must not block working
+transports to other members or survive a laptop's change of network. Per-peer
+dial backoff remains enabled. Direct probes cannot repair unreachable addresses
+or firewall rules; coordinated NAT hole-punching still belongs to DCUtR.
+
 ### Sleep, wake, and address changes
 
 The daemon checks underlay interface addresses every 15 seconds and uses a
