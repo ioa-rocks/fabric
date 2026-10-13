@@ -36,6 +36,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/protocol/autonatv2"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 
 	ma "github.com/multiformats/go-multiaddr"
@@ -81,7 +82,8 @@ type Daemon struct {
 	// Per-address verdicts (autonat v2): which of our public addresses
 	// peers could actually dial back.
 	reachableAddrs, unreachableAddrs, unknownAddrs []string
-	lastDial                                       map[peer.ID]time.Time // mesh-fill backoff
+	lastDial                                       map[peer.ID]time.Time // mesh-fill backoff (direct retries and punches)
+	punch                                          *holepunch.Service    // DCUtR, driven by mesh-fill (holepunch.go)
 	dials                                          recoveryDials
 	recordsHash                                    [32]byte        // last persisted record-cache digest
 	pinnedBootstrap                                map[string]bool // queue-host addresses already made durable
@@ -161,11 +163,11 @@ func New(dir state.Dir) (*Daemon, error) {
 		libp2p.ConnectionGater(fabricnet.NewGater(store)),
 		recoveryTransportOption(),
 		// NAT traversal (connectivity-model memo): every node can
-		// hole-punch (DCUtR upgrades relayed connections to direct), and
-		// when autonat says we're private, autorelay reserves a slot on a
-		// lighthouse — the /p2p-circuit address then rides our signed
-		// address record like any other.
-		libp2p.EnableHolePunching(),
+		// hole-punch (DCUtR upgrades relayed connections to direct; the
+		// service is Fabric's own, see holepunch.go), and when autonat says
+		// we're private, autorelay reserves a slot on a lighthouse — the
+		// /p2p-circuit address then rides our signed address record like
+		// any other.
 		libp2p.EnableAutoRelayWithPeerSource(d.relayCandidates, recoveryRelayOptions()...),
 		// AutoNAT v2: per-address reachability. v1 above gives the single
 		// node verdict that drives autorelay; v2 answers the question v1
@@ -212,6 +214,10 @@ func New(dir state.Dir) (*Daemon, error) {
 		h.RemoveStreamHandler(autonatv2.DialProtocol)
 	}
 	d.Host = h
+	if err := d.startHolePunch(); err != nil {
+		h.Close()
+		return nil, fmt.Errorf("starting hole punching: %w", err)
+	}
 	d.hydrateStore()
 
 	// Hard-coded admission transparency (spec §5): every join is announced.
@@ -337,6 +343,9 @@ func (d *Daemon) Run() error {
 	}
 	if d.Bridge != nil {
 		d.Bridge.Close()
+	}
+	if d.punch != nil {
+		d.punch.Close()
 	}
 	return d.Host.Close()
 }
@@ -1010,7 +1019,9 @@ func (d *Daemon) meshFill() {
 			continue
 		}
 		if usableConnection(d.Host.Network().Connectedness(p)) {
-			d.retryDirect(p)
+			if !d.startPunch(p) {
+				d.retryDirect(p)
+			}
 			continue
 		}
 		if len(d.Host.Peerstore().Addrs(p)) == 0 {

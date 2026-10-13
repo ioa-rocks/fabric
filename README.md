@@ -257,14 +257,22 @@ it succeeds the edge turns solid, when it fails the relay keeps
 carrying the traffic, TUN included. A revoked member loses relay
 privileges with the same gossip that cuts its connections.
 
-While a peer remains relayed, Fabric also probes its known direct addresses
-every two minutes. A fresh signed address record triggers an earlier probe.
-These probes keep the relay open, share the recovery dial limits, and stop
-once a direct connection exists. libp2p's global UDP/IPv6 failure suppression
-is disabled: repeated failures to an offline device must not block working
+While a peer remains relayed, Fabric keeps trying to upgrade it every two
+minutes, and sooner when a fresh signed address record arrives. The side
+that accepted the relayed connection re-runs the DCUtR hole punch: both ends
+dial each other at the same instant, which is what two stateful firewalls
+(a home router, a mobile carrier) need to admit a UDP flow. libp2p's own
+service punches only once, right after the relayed connection is made, and a
+punch attempted while a laptop's uplink is flapping stays failed; Fabric
+therefore owns the service and drives it from mesh-fill. The side that dialed
+the relay cannot initiate a punch (the protocol rejects that direction) and
+falls back to a plain direct dial, which helps only when the peer has a real
+pinhole. Both kinds of attempt keep the relay open, share the recovery dial
+limits, and stop once a direct connection exists. Punch attempts are logged
+as `holepunch:` lines. libp2p's global UDP/IPv6 failure suppression is
+disabled: repeated failures to an offline device must not block working
 transports to other members or survive a laptop's change of network. Per-peer
-dial backoff remains enabled. Direct probes cannot repair unreachable addresses
-or firewall rules; coordinated NAT hole-punching still belongs to DCUtR.
+dial backoff remains enabled.
 
 ### Sleep, wake, and address changes
 

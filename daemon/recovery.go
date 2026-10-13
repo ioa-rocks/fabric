@@ -230,7 +230,9 @@ func (d *Daemon) addressesUpdated(p peer.ID, seq uint64) {
 	}
 	log.Printf("reconnect: peer=%s address_seq=%d refreshed", p, seq)
 	if usableConnection(d.Host.Network().Connectedness(p)) {
-		d.retryDirect(p)
+		if !d.startPunch(p) {
+			d.retryDirect(p)
+		}
 		return
 	}
 	d.startDial(peer.AddrInfo{ID: p, Addrs: d.Host.Peerstore().Addrs(p)}, "addresses")

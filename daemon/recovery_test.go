@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -399,4 +401,118 @@ func TestAutoRelaySingleLighthouseRecovery(t *testing.T) {
 	defer service.Close()
 	_ = private.Network().ClosePeer(relay.ID())
 	awaitReservation(25 * time.Second)
+}
+
+func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// Mesh-fill re-runs the DCUtR punch for a relayed member after libp2p's own
+// one-shot attempt is long gone. The services start without public
+// addresses so nothing punches at connect time; once addresses appear, one
+// mesh-fill tick on the side that accepted the relayed connection must
+// coordinate the punch and land a direct connection. The side that dialed
+// the relay cannot initiate (DCUtR resets such requests) and must fall back
+// to a direct retry instead.
+func TestRelayedMemberHolePunchesFromMeshFill(t *testing.T) {
+	var gate atomic.Bool
+	origAddrs, origTrace := punchAddrsOf, punchTrace
+	t.Cleanup(func() { punchAddrsOf, punchTrace = origAddrs, origTrace })
+	punchAddrsOf = func(h host.Host) []ma.Multiaddr {
+		if !gate.Load() {
+			return nil
+		}
+		var out []ma.Multiaddr // loopback stands in for public addresses
+		for _, a := range h.Addrs() {
+			if _, relayed := transportOf(a); !relayed {
+				out = append(out, a)
+			}
+		}
+		return out
+	}
+	var evMu sync.Mutex
+	events := map[string]int{}
+	punchTrace = func(e *holepunch.Event) {
+		evMu.Lock()
+		events[e.Type]++
+		evMu.Unlock()
+	}
+	count := func(typ string) int { evMu.Lock(); defer evMu.Unlock(); return events[typ] }
+
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	dialer, acceptor := newTestDaemon(t, key, "desk", nil), newTestDaemon(t, key, "carbon", nil)
+	dialer.Store.AddMember(acceptor.Host.ID(), acceptor.OwnCert())
+	acceptor.Store.AddMember(dialer.Host.ID(), dialer.OwnCert())
+	r, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	relay, err := relayv2.New(r, relayv2.WithInfiniteLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := client.Reserve(ctx, acceptor.Host, peer.AddrInfo{ID: r.ID(), Addrs: r.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	circuit := r.Addrs()[0].Encapsulate(ma.StringCast("/p2p/" + r.ID().String() + "/p2p-circuit"))
+	if err := dialer.Host.Connect(network.WithAllowLimitedConn(ctx, "test"), peer.AddrInfo{ID: acceptor.Host.ID(), Addrs: []ma.Multiaddr{circuit}}); err != nil {
+		t.Fatal(err)
+	}
+	if dialer.hasDirectConnection(acceptor.Host.ID()) {
+		t.Fatal("test bypassed relay")
+	}
+	if dialer.punchActive() || acceptor.punchActive() {
+		t.Fatal("hole punching active without public addresses")
+	}
+	gate.Store(true)
+	waitFor(t, "hole-punch services to activate", 15*time.Second, func() bool { return dialer.punchActive() && acceptor.punchActive() })
+	if dialer.canPunch(acceptor.Host.ID()) {
+		t.Fatal("relay dialer must not initiate a punch")
+	}
+	if !acceptor.canPunch(dialer.Host.ID()) {
+		t.Fatal("relay acceptor must initiate the punch")
+	}
+	// The dialer's peerstore holds the acceptor's loopback addresses from
+	// identify; keep only the circuit so its fallback direct retry cannot
+	// succeed and mask the punch.
+	dialer.Host.Peerstore().ClearAddrs(acceptor.Host.ID())
+	dialer.Host.Peerstore().AddAddr(acceptor.Host.ID(), circuit, time.Hour)
+	dialer.meshFill()
+	awaitRecoveryDials(t, dialer)
+	if dialer.hasDirectConnection(acceptor.Host.ID()) || count(holepunch.StartHolePunchEvtT) != 0 {
+		t.Fatalf("relay dialer upgraded on its own: direct=%v events=%v", dialer.hasDirectConnection(acceptor.Host.ID()), events)
+	}
+
+	acceptor.meshFill()
+	waitFor(t, "direct connection via punch", 15*time.Second, func() bool { return acceptor.hasDirectConnection(dialer.Host.ID()) })
+	awaitRecoveryDials(t, acceptor)
+	if count(holepunch.StartHolePunchEvtT) == 0 || count(holepunch.EndHolePunchEvtT) == 0 {
+		t.Fatalf("direct connection did not come from a punch: %v", events)
+	}
+	if !dialer.hasDirectConnection(acceptor.Host.ID()) {
+		t.Fatal("dialer side does not see the direct connection")
+	}
+	// Direct now: no further punches on later ticks or fresh records.
+	before := count(holepunch.StartHolePunchEvtT)
+	acceptor.teleMu.Lock()
+	acceptor.lastDial[dialer.Host.ID()] = time.Now().Add(-meshFillBackoff)
+	acceptor.teleMu.Unlock()
+	acceptor.meshFill()
+	acceptor.addressesUpdated(dialer.Host.ID(), 9)
+	awaitRecoveryDials(t, acceptor)
+	if n := count(holepunch.StartHolePunchEvtT); n != before {
+		t.Fatalf("punched again with a direct connection (%d -> %d)", before, n)
+	}
 }

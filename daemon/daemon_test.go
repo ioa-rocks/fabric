@@ -53,7 +53,13 @@ func newTestDaemon(t *testing.T, nsPriv ed25519.PrivateKey, name string, events 
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.Host.Close(); d.Stop() })
+	t.Cleanup(func() {
+		if d.punch != nil {
+			d.punch.Close()
+		}
+		d.Host.Close()
+		d.Stop()
+	})
 	return d
 }
 
