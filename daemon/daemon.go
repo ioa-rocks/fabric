@@ -159,6 +159,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
 		libp2p.ConnectionGater(fabricnet.NewGater(store)),
+		recoveryTransportOption(),
 		// NAT traversal (connectivity-model memo): every node can
 		// hole-punch (DCUtR upgrades relayed connections to direct), and
 		// when autonat says we're private, autorelay reserves a slot on a
@@ -997,15 +998,19 @@ func (d *Daemon) relayCandidates(ctx context.Context, num int) <-chan peer.AddrI
 const meshFillBackoff = 2 * time.Minute
 
 // meshFill opportunistically dials members we know addresses for but hold
-// no connection to (connectivity-model memo: the connection plane's lazy
-// side). Addresses come from gossiped signed peer records via the
+// no direct connection to. Relayed members get bounded direct probes while
+// keeping their working relay. Addresses come from signed peer records via the
 // certified addr book; libp2p races all known addresses, so the best
 // path wins — LAN over WAN, whichever side can dial. One connection
 // serves both directions.
 func (d *Daemon) meshFill() {
 	members, _ := d.Store.Snapshot()
 	for p := range members {
-		if p == d.Host.ID() || usableConnection(d.Host.Network().Connectedness(p)) {
+		if p == d.Host.ID() || d.hasDirectConnection(p) {
+			continue
+		}
+		if usableConnection(d.Host.Network().Connectedness(p)) {
+			d.retryDirect(p)
 			continue
 		}
 		if len(d.Host.Peerstore().Addrs(p)) == 0 {

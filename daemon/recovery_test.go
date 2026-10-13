@@ -4,16 +4,193 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"github.com/libp2p/go-libp2p/core/host"
+	"errors"
+	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
+	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	ma "github.com/multiformats/go-multiaddr"
 )
+
+// Seed the same failure history that a laptop accumulates on a dead network.
+// The daemon's transport policy must keep both families eligible afterwards.
+func TestRecoveryTransportDoesNotSuppressUDPOrIPv6(t *testing.T) {
+	udp := &swarm.BlackHoleSuccessCounter{N: 100, MinSuccesses: 5, Name: "UDP"}
+	ipv6 := &swarm.BlackHoleSuccessCounter{N: 100, MinSuccesses: 5, Name: "IPv6"}
+	for i := 0; i < 100; i++ {
+		udp.RecordResult(false)
+		ipv6.RecordResult(false)
+	}
+	var cfg libp2p.Config
+	if err := recoveryTransportOption()(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	opts := []swarm.Option{swarm.WithUDPBlackHoleSuccessCounter(udp), swarm.WithIPv6BlackHoleSuccessCounter(ipv6)}
+	opts = append(opts, cfg.SwarmOpts...)
+	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"), libp2p.SwarmOpts(opts...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	p, _ := peer.Decode("12D3KooWQoLHkebR5j3ZopDgj3a9GV5UxM3LG9QCSbeWyae1D7me")
+	for _, addr := range []string{
+		"/ip4/138.64.66.106/udp/11797/quic-v1",
+		"/ip6/2405:6580:3f00:7800:5043:355e:68a6:3721/tcp/4517",
+		"/ip6/2405:6580:3f00:7800:5043:355e:68a6:3721/udp/4517/quic-v1",
+	} {
+		if !h.Network().(*swarm.Swarm).CanDial(p, ma.StringCast(addr)) {
+			t.Fatalf("old failures still suppress %s", addr)
+		}
+	}
+}
+
+type directProbeHost struct {
+	host.Host
+	fail  atomic.Bool
+	calls chan peer.AddrInfo
+}
+
+func (h *directProbeHost) Connect(ctx context.Context, info peer.AddrInfo) error {
+	if force, _ := network.GetForceDirectDial(ctx); force {
+		h.calls <- info
+		if h.fail.Load() {
+			return errors.New("test: direct path unavailable")
+		}
+	}
+	return h.Host.Connect(ctx, info)
+}
+
+func awaitRecoveryDials(t *testing.T, d *Daemon) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		d.dials.Lock()
+		n := len(d.dials.active)
+		d.dials.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("recovery dial did not finish")
+}
+
+func TestRelayedMemberRetriesDirectWithoutDroppingRelay(t *testing.T) {
+	for _, trigger := range []string{"periodic", "fresh-addresses"} {
+		t.Run(trigger, func(t *testing.T) {
+			_, key, _ := ed25519.GenerateKey(rand.Reader)
+			a, b := newTestDaemon(t, key, "laptop", nil), newTestDaemon(t, key, "desk", nil)
+			a.Store.AddMember(b.Host.ID(), b.OwnCert())
+			b.Store.AddMember(a.Host.ID(), a.OwnCert())
+			r, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			relay, err := relayv2.New(r, relayv2.WithInfiniteLimits())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer relay.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if _, err := client.Reserve(ctx, b.Host, peer.AddrInfo{ID: r.ID(), Addrs: r.Addrs()}); err != nil {
+				t.Fatal(err)
+			}
+			circuit := r.Addrs()[0].Encapsulate(ma.StringCast("/p2p/" + r.ID().String() + "/p2p-circuit"))
+			if err := a.Host.Connect(network.WithAllowLimitedConn(ctx, "test"), peer.AddrInfo{ID: b.Host.ID(), Addrs: []ma.Multiaddr{circuit}}); err != nil {
+				t.Fatal(err)
+			}
+			if a.hasDirectConnection(b.Host.ID()) {
+				t.Fatal("test bypassed relay")
+			}
+			conn := a.Host.Network().ConnsToPeer(b.Host.ID())[0]
+			b.Host.SetStreamHandler("/test/recovery/1", func(s network.Stream) { defer s.Close(); io.Copy(s, s) })
+			checkRelay := func() {
+				t.Helper()
+				if conn.IsClosed() {
+					t.Fatal("upgrade probe closed the relay")
+				}
+				s, err := a.Host.NewStream(network.WithAllowLimitedConn(ctx, "test"), b.Host.ID(), "/test/recovery/1")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer s.Close()
+				s.SetDeadline(time.Now().Add(time.Second))
+				if _, err := s.Write([]byte("ok")); err != nil {
+					t.Fatal(err)
+				}
+				buf := make([]byte, 2)
+				if _, err := io.ReadFull(s, buf); err != nil || string(buf) != "ok" {
+					t.Fatalf("relay echo %q: %v", buf, err)
+				}
+			}
+			checkRelay()
+			h := &directProbeHost{Host: a.Host, calls: make(chan peer.AddrInfo, 10)}
+			h.fail.Store(true)
+			// Drive recovery explicitly without changing the Host used by the
+			// daemon's already-running protocol handlers.
+			a = &Daemon{Host: h, Store: a.Store, ctx: a.ctx, lastDial: make(map[peer.ID]time.Time)}
+			a.meshFill()
+			awaitRecoveryDials(t, a)
+			select {
+			case info := <-h.calls:
+				for _, addr := range info.Addrs {
+					if _, relayed := transportOf(addr); relayed {
+						t.Fatal("upgrade dial included relay")
+					}
+				}
+			default:
+				t.Fatal("relayed member never probed direct addresses")
+			}
+			checkRelay()
+			a.meshFill()
+			awaitRecoveryDials(t, a)
+			select {
+			case <-h.calls:
+				t.Fatal("direct retries ignored backoff")
+			default:
+			}
+			h.fail.Store(false)
+			if trigger == "periodic" {
+				a.teleMu.Lock()
+				a.lastDial[b.Host.ID()] = time.Now().Add(-meshFillBackoff)
+				a.teleMu.Unlock()
+				a.meshFill()
+			} else {
+				a.addressesUpdated(b.Host.ID(), 2)
+			}
+			awaitRecoveryDials(t, a)
+			if !a.hasDirectConnection(b.Host.ID()) {
+				t.Fatal("relay did not upgrade to a direct connection")
+			}
+			select {
+			case <-h.calls:
+			default:
+				t.Fatal("upgrade did not force a direct dial")
+			}
+			if conn.IsClosed() {
+				t.Fatal("upgrade unnecessarily closed relay")
+			}
+			a.meshFill()
+			a.addressesUpdated(b.Host.ID(), 3)
+			awaitRecoveryDials(t, a)
+			select {
+			case <-h.calls:
+				t.Fatal("already-direct peer was redialed")
+			default:
+			}
+		})
+	}
+}
 
 func TestRecoveryWatch(t *testing.T) {
 	start := time.Now()
