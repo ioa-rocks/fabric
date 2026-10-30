@@ -26,12 +26,10 @@ import (
 // flow only after the inside host sent first, which is exactly the
 // simultaneous open DCUtR coordinates.
 
-// punchAddrsOf lists the addresses this node tells a relayed peer to dial
-// during a punch: its public, non-circuit addresses. Tests on loopback
-// override it. Unlike libp2p's internal list this omits single-observer
-// identify observations, so IPv4 punching through the home CGNAT would need
-// that observed address added here; the home↔mobile pairs punch over
-// global IPv6 listen addresses today.
+// punchAddrsOf lists publicly advertised direct addresses. Tests on loopback
+// override it. NAT-observed endpoints are added separately by holePunchAddrs:
+// Host.Addrs alone can omit them when this node is private or observations
+// have not reached the normal advertisement threshold.
 var punchAddrsOf = func(h host.Host) []ma.Multiaddr {
 	var out []ma.Multiaddr
 	for _, a := range h.Addrs() {
@@ -40,6 +38,21 @@ var punchAddrsOf = func(h host.Host) []ma.Multiaddr {
 		}
 	}
 	return out
+}
+
+// holePunchAddrs mirrors libp2p's single-observer policy for DCUtR. A peer
+// behind NAT need not be independently dialable to participate in a coordinated
+// punch. These candidates are not promoted to advertised/signed addresses.
+func (d *Daemon) holePunchAddrs() []ma.Multiaddr {
+	addrs := punchAddrsOf(d.Host)
+	if d.observedAddrs != nil {
+		for _, addr := range d.observedAddrs.Addrs(1) {
+			if _, relayed := transportOf(addr); !relayed && manet.IsPublicAddr(addr) {
+				addrs = append(addrs, addr)
+			}
+		}
+	}
+	return ma.Unique(addrs)
 }
 
 // punchTrace receives every hole-punch event; tests capture it.
@@ -74,7 +87,7 @@ func (d *Daemon) startHolePunch() error {
 		return fmt.Errorf("host %T exposes no identify service", d.Host)
 	}
 	svc, err := holepunch.NewService(d.Host, ids.IDService(),
-		func() []ma.Multiaddr { return punchAddrsOf(d.Host) },
+		d.holePunchAddrs,
 		holepunch.WithTracer(punchTracer{}))
 	if err != nil {
 		return err

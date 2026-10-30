@@ -32,6 +32,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	basichost "github.com/libp2p/go-libp2p/p2p/host/basic"
+	"go.uber.org/fx"
 
 	"github.com/libp2p/go-libp2p/p2p/protocol/autonatv2"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
@@ -83,7 +85,8 @@ type Daemon struct {
 	// peers could actually dial back.
 	reachableAddrs, unreachableAddrs, unknownAddrs []string
 	lastDial                                       map[peer.ID]time.Time // mesh-fill backoff (direct retries and punches)
-	punch                                          *holepunch.Service    // DCUtR, driven by mesh-fill (holepunch.go)
+	observedAddrs                                  basichost.ObservedAddrsManager
+	punch                                          *holepunch.Service // DCUtR, driven by mesh-fill (holepunch.go)
 	dials                                          recoveryDials
 	recordsHash                                    [32]byte        // last persisted record-cache digest
 	pinnedBootstrap                                map[string]bool // queue-host addresses already made durable
@@ -159,6 +162,8 @@ func New(dir state.Dir) (*Daemon, error) {
 
 	opts := []libp2p.Option{
 		libp2p.Identity(priv),
+		// Share libp2p's observation tracker, including disconnect cleanup.
+		libp2p.WithFxOption(fx.Populate(&d.observedAddrs)),
 		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
 		libp2p.ConnectionGater(fabricnet.NewGater(store)),
 		recoveryTransportOption(),
