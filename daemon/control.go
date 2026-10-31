@@ -103,6 +103,10 @@ type StatusReply struct {
 	DNSActive        bool         `json:"dns_active"`
 	Addrs            []string     `json:"addrs"`
 	Peers            []StatusPeer `json:"peers"`
+	// Circles this node holds, with the lifecycle state of its own
+	// attestation in each (daemon.CircleService.Info); absent when the node
+	// serves no circle.
+	Circles []CircleInfo `json:"circles,omitempty"`
 }
 
 // EventInfo is a membership event as shown in the activity feed.
@@ -153,6 +157,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/deny", d.handleDeny)
 	mux.HandleFunc("POST /v0/revoke", d.handleRevoke)
 	mux.HandleFunc("POST /v0/renew", d.handleRenew)
+	mux.HandleFunc("POST /v0/circle/refresh", d.handleCircleRefresh)
 
 	srv := &http.Server{Handler: mux}
 	go srv.Serve(l)
@@ -180,6 +185,9 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	reply.ReachableAddrs, reply.UnreachableAddrs, reply.UnverifiedAddrs = d.AddrReachability()
 	ownExp := d.OwnCert().Expiry()
 	reply.CertExpiry = &ownExp
+	if d.Circle != nil {
+		reply.Circles = d.Circle.Info(time.Now())
+	}
 	for _, a := range d.Host.Addrs() {
 		reply.Addrs = append(reply.Addrs, fmt.Sprintf("%s/p2p/%s", a, d.Host.ID()))
 	}
@@ -717,4 +725,34 @@ func (c *Client) Renew(signedEvent []byte) error {
 
 func (c *Client) Deny(fingerprint string) error {
 	return c.post("/v0/deny", denyBody{Fingerprint: fingerprint}, nil)
+}
+
+// handleCircleRefresh re-runs the circle exchange with every connected
+// member: the CLI calls it after signing a revocation (or a fresh
+// attestation) into the circle directory, so the change reaches the devices
+// online now. The daemon reads the circle directory itself — nothing on the
+// socket can add or remove a revocation.
+func (d *Daemon) handleCircleRefresh(w http.ResponseWriter, r *http.Request) {
+	if d.Circle == nil {
+		http.Error(w, "this node serves no circle", http.StatusNotFound)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	n := d.Circle.Refresh(ctx)
+	writeJSON(w, circleRefreshReply{Reached: n})
+}
+
+type circleRefreshReply struct {
+	Reached int `json:"reached"` // connected members the exchange reached
+}
+
+// CircleRefresh asks the daemon to re-exchange circle state with every
+// connected member; returns how many it reached.
+func (c *Client) CircleRefresh() (int, error) {
+	var out circleRefreshReply
+	if err := c.post("/v0/circle/refresh", struct{}{}, &out); err != nil {
+		return 0, err
+	}
+	return out.Reached, nil
 }

@@ -169,9 +169,10 @@ func usage() {
   circle   circle init -name <label> — mint this node's circle (the owner's
            user key: what buckets and, next, subjects belong to)
            circle export <file> / circle join <file> — a second device of
-           the same owner; circle attest — sign this device into the circle
-           (peers sync only with attested devices); circle status — circle,
-           device attestation, buckets served, peers
+           the same owner; circle attest [-expiring] — sign this device into
+           the circle, or renew (attestations live a year, like certs);
+           circle revoke <member> — sign a device out (owner device);
+           circle status — circles, this device's attestation, buckets, peers
   bucket   buckets of the circle ('fabric bucket -h'): create, list, place
            (full|cache|none|folder <dir>), mount, put/ls/get/rm, policy…;
            a "vault" symlink to this binary is the same group
@@ -513,14 +514,38 @@ func printExpiryWarnings(s *daemon.StatusReply) {
 			lines = append(lines, fmt.Sprintf("%s expires in %dd (%s)", name, days(*p.CertExpiry), p.CertExpiry.Format("2006-01-02")))
 		}
 	}
-	if len(lines) == 0 {
+	// Circle attestations have the same lifecycle (circle.DefaultValidity):
+	// an expired or revoked one drops this device out of that circle's
+	// sync, as silently as a lapsed cert drops it off the mesh.
+	var circleLines []string
+	for _, ci := range s.Circles {
+		switch {
+		case ci.Revoked:
+			circleLines = append(circleLines, fmt.Sprintf("circle %q: this device is REVOKED — its peers refuse it; an owner device re-attests it to re-admit", ci.Name))
+		case ci.Expiry == nil:
+			// not attested at all — 'fabric circle status' says so
+		case !ci.Attested:
+			circleLines = append(circleLines, fmt.Sprintf("circle %q: this device's attestation EXPIRED %dd ago — fabric circle attest -circle %s", ci.Name, -days(*ci.Expiry), ci.Name))
+		case ci.Expiry.Sub(now) < loud:
+			circleLines = append(circleLines, fmt.Sprintf("circle %q: this device's attestation expires in %dd (%s) — fabric circle attest -expiring", ci.Name, days(*ci.Expiry), ci.Expiry.Format("2006-01-02")))
+		}
+	}
+	if len(lines) == 0 && len(circleLines) == 0 {
 		return
 	}
-	fmt.Println("!!! CERTIFICATES NEED ATTENTION — an expired device drops off the mesh and cannot be renewed any more:")
-	for _, l := range lines {
-		fmt.Printf("!!!   %s\n", l)
+	if len(lines) > 0 {
+		fmt.Println("!!! CERTIFICATES NEED ATTENTION — an expired device drops off the mesh and cannot be renewed any more:")
+		for _, l := range lines {
+			fmt.Printf("!!!   %s\n", l)
+		}
+		fmt.Println("!!!   renew on the master: fabric renew -expiring")
 	}
-	fmt.Println("!!!   renew on the master: fabric renew -expiring")
+	if len(circleLines) > 0 {
+		fmt.Println("!!! CIRCLE ATTESTATIONS NEED ATTENTION — an expired or revoked device drops out of that circle's sync:")
+		for _, l := range circleLines {
+			fmt.Printf("!!!   %s\n", l)
+		}
+	}
 }
 
 // cmdGraph prints the aggregated mesh map — every live link any reachable

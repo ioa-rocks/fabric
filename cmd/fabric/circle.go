@@ -8,7 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
+	"ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/state"
 	vaultcli "ioa.rocks/fabric/vault/cli"
 	vaultdaemon "ioa.rocks/fabric/vault/daemon"
@@ -24,7 +26,7 @@ import (
 // owns it — mesh membership alone grants nothing.
 func cmdCircle(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: fabric circle init|join|export|attest|status")
+		return fmt.Errorf("usage: fabric circle init|join|export|attest|revoke|status")
 	}
 	rest := args[1:]
 	switch args[0] {
@@ -36,10 +38,12 @@ func cmdCircle(args []string) error {
 		return cmdCircleExport(rest)
 	case "attest":
 		return cmdCircleAttest(rest)
+	case "revoke":
+		return cmdCircleRevoke(rest)
 	case "status":
 		return cmdCircleStatus(rest)
 	default:
-		return fmt.Errorf("usage: fabric circle init|join|export|attest|status")
+		return fmt.Errorf("usage: fabric circle init|join|export|attest|revoke|status")
 	}
 }
 
@@ -204,17 +208,20 @@ func attestDevice(statePath string, c *circle.Circle, pass string) error {
 	if err := c.SaveAttestation(a); err != nil {
 		return err
 	}
-	fmt.Printf("device attested into circle %q (%s) — a running daemon picks it up without restart\n", c.Config.Name, c.AttestationPath())
+	fmt.Printf("device attested into circle %q until %s (%s) — a running daemon picks it up without restart\n", c.Config.Name, a.Expiry().Format("2006-01-02"), c.AttestationPath())
 	return nil
 }
 
 // cmdCircleAttest (re)signs this device into its circles: for nodes that
 // joined a circle before attestations existed, or that joined the mesh
-// after the circle. Without -circle, every circle lacking an attestation.
+// after the circle, and for renewal. Without -circle, every circle lacking
+// a live attestation; with -expiring, also every one past half-life (the
+// mesh's `renew -expiring` rule). Needs the circle key on this device.
 func cmdCircleAttest(args []string) error {
 	fs := flag.NewFlagSet("circle attest", flag.ExitOnError)
 	statePath, vaultState := circleFlags(fs)
-	name := fs.String("circle", "", "attest into this circle only (default: every circle not yet attested)")
+	name := fs.String("circle", "", "attest into this circle only (default: every circle without a live attestation)")
+	expiring := fs.Bool("expiring", false, "also renew every attestation past half-life")
 	fs.Parse(args)
 	root, err := circleRoot(*statePath, *vaultState)
 	if err != nil {
@@ -232,13 +239,22 @@ func cmdCircleAttest(args []string) error {
 		if err != nil {
 			return err
 		}
+		now := time.Now()
 		for _, c := range all {
-			if _, err := c.LoadAttestation(); err != nil {
+			a, err := c.LoadAttestation()
+			switch {
+			case err != nil, a.Valid(now) != nil, c.Revoked(a, now):
+				targets = append(targets, c)
+			case *expiring && a.PastHalfLife(now):
 				targets = append(targets, c)
 			}
 		}
 		if len(targets) == 0 {
-			fmt.Println("this device is attested into every circle it holds")
+			if *expiring {
+				fmt.Println("this device holds a live attestation in every circle it holds, none past half-life")
+			} else {
+				fmt.Println("this device holds a live attestation in every circle it holds ('-expiring' renews those past half-life)")
+			}
 			return nil
 		}
 	}
@@ -270,13 +286,36 @@ func cmdCircleStatus(args []string) error {
 		fmt.Printf("no circle on this node (%s) — 'fabric circle init -name <name>' mints one, 'fabric circle join <file>' joins an existing one\n", root)
 		return nil
 	}
+	now := time.Now()
 	for _, c := range circles {
 		fmt.Printf("circle %q  %s\n", c.Config.Name, c.Config.DID)
 		fmt.Printf("  %s\n", c.Path)
-		if _, err := c.LoadAttestation(); err == nil {
-			fmt.Println("  device: attested (peers of the circle serve this device)")
+		if _, err := os.Stat(c.KeyPath()); err == nil {
+			fmt.Println("  role: owner device (holds the circle key)")
 		} else {
+			fmt.Println("  role: member device (no circle key)")
+		}
+		a, err := c.LoadAttestation()
+		switch {
+		case err != nil:
 			fmt.Printf("  device: NOT attested — run 'fabric circle attest -circle %s'; until then no peer syncs this circle with this device\n", c.Config.Name)
+		case c.Revoked(a, now):
+			fmt.Printf("  device: REVOKED by the circle (as of its revocation list) — peers refuse this device; an owner device re-attests it to re-admit\n")
+		case a.Valid(now) != nil:
+			fmt.Printf("  device: attestation EXPIRED %s — run 'fabric circle attest -circle %s' (needs the circle key)\n", a.Expiry().Format("2006-01-02"), c.Config.Name)
+		default:
+			left := int(a.Expiry().Sub(now).Hours() / 24)
+			note := ""
+			if a.Legacy() {
+				note = "; legacy attestation, window implied from issue date"
+			}
+			if a.PastHalfLife(now) {
+				note += "; past half-life — renew with 'fabric circle attest -expiring'"
+			}
+			fmt.Printf("  device: attested until %s (%dd left%s)\n", a.Expiry().Format("2006-01-02"), left, note)
+		}
+		if rs, err := c.Revocations(now); err == nil && len(rs) > 0 {
+			fmt.Printf("  revocations: %d held (latest %s)\n", len(rs), rs[len(rs)-1].Time().Format("2006-01-02"))
 		}
 	}
 	cl := vaultdaemon.TryClient(*vaultState)
@@ -324,5 +363,101 @@ func cmdCircleStatus(args []string) error {
 			fmt.Printf("  %-16s (mesh member, no vault)\n", p.Name)
 		}
 	}
+	return nil
+}
+
+// cmdCircleRevoke signs a device out of a circle: every attestation it holds
+// for the circle, issued up to now, is dead; devices of the circle learn it
+// on their next circle exchange, and the running daemon here pushes it to
+// the ones connected now. Needs the circle key — an owner device. A later
+// attestation (an owner re-attesting the device) is a re-admission and
+// stands.
+func cmdCircleRevoke(args []string) error {
+	fs := flag.NewFlagSet("circle revoke", flag.ExitOnError)
+	statePath, vaultState := circleFlags(fs)
+	name := fs.String("circle", "", "which circle (required when the node holds several)")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: fabric circle revoke [-circle <name>] <member-name | peer-id | fingerprint | did:key:…>")
+	}
+	target := fs.Arg(0)
+	root, err := circleRoot(*statePath, *vaultState)
+	if err != nil {
+		return err
+	}
+	c, err := pickCircle(root, *name)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(c.KeyPath()); err != nil {
+		return fmt.Errorf("this device holds no key for circle %q — revoke from an owner device", c.Config.Name)
+	}
+	dir, err := state.Open(*statePath)
+	if err != nil {
+		return err
+	}
+	var client *daemon.Client
+	if _, err := dir.LoadDeviceKey(); err == nil {
+		client = daemon.NewClient(dir)
+	}
+
+	deviceDID, label := target, target
+	if !strings.HasPrefix(target, "did:key:") {
+		if client == nil {
+			return fmt.Errorf("resolving %q needs this node's fabric identity and running daemon; give the device's did:key instead", target)
+		}
+		members, err := client.Members()
+		if err != nil {
+			return fmt.Errorf("resolving %q needs the running node daemon ('fabric up'), or give the device's did:key: %w", target, err)
+		}
+		var matches []daemon.MemberInfo
+		for _, m := range members {
+			if memberMatches(m, target) {
+				matches = append(matches, m)
+			}
+		}
+		switch len(matches) {
+		case 0:
+			return fmt.Errorf("no mesh member matches %q (see 'fabric status'); a device outside the mesh is revoked by its did:key", target)
+		case 1:
+		default:
+			for _, m := range matches {
+				fmt.Fprintf(os.Stderr, "  %s  %-16s %s\n", m.Fingerprint, m.Name, m.ID)
+			}
+			return fmt.Errorf("%q is ambiguous — %d members match", target, len(matches))
+		}
+		m := matches[0]
+		if m.Self {
+			return fmt.Errorf("%q is this device — revoke it from another owner device of the circle", m.Name)
+		}
+		deviceDID, label = cert.DIDForKey(ed25519.PublicKey(m.DevicePub)), m.Name
+	}
+
+	pass, err := passFor(c)
+	if err != nil {
+		return err
+	}
+	priv, err := c.Unlock(pass)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	r, err := circle.Revoke(priv, deviceDID, now)
+	if err != nil {
+		return err
+	}
+	if _, err := c.AddRevocations(now, r); err != nil {
+		return err
+	}
+	fmt.Printf("revoked %s from circle %q as of %s\n", label, c.Config.Name, now.Format(time.RFC3339))
+	fmt.Println("the device keeps whatever it already synced; devices of the circle stop serving it as they learn of this")
+	if client != nil {
+		if n, err := client.CircleRefresh(); err == nil {
+			fmt.Printf("pushed to %d connected member(s); others learn it at their next circle exchange\n", n)
+		} else {
+			fmt.Println("no running node daemon here — connected devices learn it at their next circle exchange ('fabric up' pushes it)")
+		}
+	}
+	fmt.Println("to re-admit the device later, attest it again on an owner device (an attestation issued after the revocation stands)")
 	return nil
 }

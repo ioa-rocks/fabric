@@ -106,8 +106,12 @@ other among mesh members by the `/vault/hello/1` protocol
 blobs only to verified devices of their own circle**: each device holds
 a *device attestation* signed by the circle key (`circle init`/`join`
 mint it; `fabric circle attest` for a device that joined earlier), and
-peers check it on `/fabric/circle/1` after membership auth. A mesh
+peers check it on `/fabric/circle/3` after membership auth. A mesh
 member outside the circle sees the hello card and nothing else.
+Attestations live one year and renew by re-signing (`fabric circle
+attest -expiring`); an owner device signs one out with `fabric circle
+revoke`, and the revocation travels on the same exchange (fabric
+README, *Circle attestations*).
 Mesh-level debugging: `fabric status`; `fabric circle status` shows
 whether this device is attested and which peers verify as same-circle.
 

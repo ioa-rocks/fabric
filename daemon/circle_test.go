@@ -194,3 +194,109 @@ func tryStream(ctx context.Context, from host.Host, to peer.ID, proto string) er
 	}
 	return nil
 }
+
+// Lifecycle: a revocation signed on an owner device kills the device's
+// attestation everywhere the circle's devices talk (pushed by Refresh to the
+// ones online, carried on every later exchange), a re-admission issued after
+// it stands, and an expired attestation is worth nothing.
+func TestCircleRevocationAndExpiry(t *testing.T) {
+	nsPub, nsRoot, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alex, alexDID := mintCircle(t, "alex")
+	desk := newCircleTestNode(t, nsPub, nsRoot, "desk", []*circle.Bundle{alex}, true)
+	nas := newCircleTestNode(t, nsPub, nsRoot, "nas", []*circle.Bundle{alex}, true)
+	laptop := newCircleTestNode(t, nsPub, nsRoot, "laptop", []*circle.Bundle{alex}, true)
+	meshConnect(t, nas, desk)
+	meshConnect(t, laptop, desk)
+	meshConnect(t, laptop, nas)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	for _, n := range []*circleTestNode{desk, nas} {
+		if got := n.svc.Shared(ctx, laptop.h.ID()); !slices.Equal(got, []string{alexDID}) {
+			t.Fatalf("baseline: %v shares %v with laptop, want [alex]", n.h.ID(), got)
+		}
+	}
+
+	// The desk (owner) revokes the laptop.
+	dc, err := circle.ByDID(desk.root, alexDID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priv, err := dc.Unlock("pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := circle.Revoke(priv, cert.DIDForKey(laptop.devPub), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dc.AddRevocations(time.Now(), r); err != nil {
+		t.Fatal(err)
+	}
+	if n := desk.svc.Refresh(ctx); n != 2 {
+		t.Fatalf("Refresh reached %d members, want 2", n)
+	}
+	if got := desk.svc.Shared(ctx, laptop.h.ID()); len(got) != 0 {
+		t.Fatalf("desk still shares %v with the revoked laptop", got)
+	}
+	// nas learned the revocation from the desk's push, persisted it, and
+	// dropped its cached view of the laptop.
+	nc, _ := circle.ByDID(nas.root, alexDID)
+	if rs, _ := nc.Revocations(time.Now()); len(rs) != 1 {
+		t.Fatalf("nas holds %d revocations, want 1", len(rs))
+	}
+	if got := nas.svc.Shared(ctx, laptop.h.ID()); len(got) != 0 {
+		t.Fatalf("nas still shares %v with the revoked laptop", got)
+	}
+	if got := desk.svc.Shared(ctx, nas.h.ID()); !slices.Equal(got, []string{alexDID}) {
+		t.Fatalf("desk∩nas = %v after revoking a third device", got)
+	}
+	// The laptop itself learned it is revoked (the desk pushed to it too)
+	// and no longer counts itself attested.
+	lc, _ := circle.ByDID(laptop.root, alexDID)
+	if laptop.svc.Attested(lc) {
+		t.Fatal("the revoked laptop still considers itself attested")
+	}
+
+	// Re-admission: an attestation issued after the revocation stands.
+	// Attestation times are whole seconds, so step past the revocation's.
+	time.Sleep(1100 * time.Millisecond)
+	a, err := circle.Attest(priv, laptop.devPub, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lc.SaveAttestation(a); err != nil {
+		t.Fatal(err)
+	}
+	if !laptop.svc.Attested(lc) {
+		t.Fatal("re-admitted laptop does not consider itself attested")
+	}
+	desk.svc.Refresh(ctx)
+	if got := desk.svc.Shared(ctx, laptop.h.ID()); !slices.Equal(got, []string{alexDID}) {
+		t.Fatalf("desk∩laptop after re-admission = %v, want [alex]", got)
+	}
+
+	// Expired: a device whose attestation ran out is in no circle.
+	stale := newCircleTestNode(t, nsPub, nsRoot, "stale", []*circle.Bundle{alex}, false)
+	sc, _ := circle.ByDID(stale.root, alexDID)
+	old, err := circle.AttestFor(priv, stale.devPub, time.Now().Add(-2*time.Hour), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.SaveAttestation(old); err != nil {
+		t.Fatal(err)
+	}
+	if stale.svc.Attested(sc) {
+		t.Fatal("expired attestation counted as attested")
+	}
+	meshConnect(t, stale, desk)
+	if got := desk.svc.Shared(ctx, stale.h.ID()); len(got) != 0 {
+		t.Fatalf("desk shares %v with a device holding only an expired attestation", got)
+	}
+	if info := desk.svc.Info(time.Now()); len(info) != 1 || !info[0].Attested || info[0].Revocations != 1 {
+		t.Fatalf("desk Info = %+v", info)
+	}
+}

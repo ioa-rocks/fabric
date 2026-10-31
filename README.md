@@ -371,6 +371,31 @@ revocation records self-delete once the cert they kill would have
 expired anyway. Re-admitting a revoked device means a fresh
 `fabric join`.
 
+### Circle attestations: the same lifecycle, one layer up
+
+A device's *circle attestation* (what makes peers of a circle sync with
+it) lives one year like a cert and renews by re-signing on a device
+that holds the circle key:
+
+```sh
+fabric circle attest -expiring            # renew every attestation past half-life
+fabric circle revoke her-pc -circle family # an owner device signs a device out
+```
+
+Revocation is a circle-signed record kept beside the circle
+(`circles/<name>/revocations.cbor`). Devices of the circle swap their
+revocation sets on every circle exchange (`/fabric/circle/3`), and the
+daemon on the revoking node pushes the new one to every member connected
+right now, so the revoked device drops out of that circle's sync at
+once wherever the news reaches, and at the next connect elsewhere.
+Expiry is the backstop. A revocation kills the device's attestations
+issued up to that moment; attesting the device again afterwards is a
+deliberate re-admission and stands. `fabric status` warns loudly about
+expired, expiring and revoked attestations, as it does for certs.
+Attestations minted before 2026-10-31 carry no window and count as
+valid for one year from issue; nodes older than that verify newer
+attestations but enforce neither expiry nor revocation until upgraded.
+
 ## The TUN bridge — plain IP over the mesh
 
 Every device gets an overlay address at approval time, signed into its
@@ -588,9 +613,10 @@ the UI and daemon use a non-default Astral state directory.
 | `fabric announce add <hostname\|ip\|multiaddr>` | cloud/1:1-NAT nodes | also advertise an address no local interface carries; ports, transports, and resolved IPs derived automatically |
 | `fabric announce txt` | lighthouse | print the DNS TXT record enabling hostname joins |
 | `fabric circle init -name <name>` | any device | mint a circle — a user key that buckets (and next, subjects) belong to. A node holds any number of circles under `<state>/circles/<name>`: the owner's personal one, a shared `family` one, … |
-| `fabric circle attest` | each device of a circle | sign this device into the circle (done automatically by `circle init`/`join` when the node already has a fabric identity). Peers sync buckets and serve blobs only to attested devices of their own circle — mesh membership alone no longer grants vault access |
+| `fabric circle attest [-expiring]` | each device of a circle | sign this device into the circle (done automatically by `circle init`/`join` when the node already has a fabric identity), or renew: attestations live one year like certs; `-expiring` re-signs every one past half-life. Peers sync buckets and serve blobs only to attested devices of their own circle — mesh membership alone no longer grants vault access |
+| `fabric circle revoke [-circle <name>] <member \| did:key>` | an owner device of the circle | sign a device out of the circle; devices of the circle learn it on their next circle exchange, the running daemon pushes it to those connected now (see *Circle attestations*) |
 | `fabric circle export [-circle <name>] <file>` / `fabric circle join <file>` | another device | carry a circle to another device, which then holds its key and is attested into it (interim until sub-key grants). A shared circle is how two people share buckets: both devices hold it, neither holds the other's personal circle |
-| `fabric circle status` | any member | circles held and attested, buckets per circle, mounts, folders, mesh, and which circles each vault peer verifiably shares |
+| `fabric circle status` | any member | circles held, this device's role and attestation (expiry, revoked), revocations held, buckets per circle, mounts, folders, mesh, and which circles each vault peer verifiably shares |
 | `fabric bucket ...` | any member | the circle's buckets: `create`, `list`, `place <b> full\|cache\|none\|folder <dir>`, `mount`, `put/ls/get/rm/…` (`fabric bucket -h`; a `vault` symlink means the same) |
 | `fabric astral ...` | any member | inspect and use the coordination plane (`fabric astral -h`) |
 
