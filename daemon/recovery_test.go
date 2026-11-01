@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/connmgr"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -22,35 +23,60 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-// Seed the same failure history that a laptop accumulates on a dead network.
-// The daemon's transport policy must keep both families eligible afterwards.
+// Refuse at the address gate, after black-hole filtering but before network
+// traffic. This distinguishes an eligible candidate from global suppression.
+type probeAddressGate struct{ connmgr.ConnectionGater }
+
+func (probeAddressGate) InterceptPeerDial(peer.ID) bool               { return true }
+func (probeAddressGate) InterceptAddrDial(peer.ID, ma.Multiaddr) bool { return false }
+
 func TestRecoveryTransportDoesNotSuppressUDPOrIPv6(t *testing.T) {
-	udp := &swarm.BlackHoleSuccessCounter{N: 100, MinSuccesses: 5, Name: "UDP"}
-	ipv6 := &swarm.BlackHoleSuccessCounter{N: 100, MinSuccesses: 5, Name: "IPv6"}
-	for i := 0; i < 100; i++ {
-		udp.RecordResult(false)
-		ipv6.RecordResult(false)
-	}
-	var cfg libp2p.Config
-	if err := recoveryTransportOption()(&cfg); err != nil {
-		t.Fatal(err)
-	}
-	opts := []swarm.Option{swarm.WithUDPBlackHoleSuccessCounter(udp), swarm.WithIPv6BlackHoleSuccessCounter(ipv6)}
-	opts = append(opts, cfg.SwarmOpts...)
-	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"), libp2p.SwarmOpts(opts...))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer h.Close()
-	p, _ := peer.Decode("12D3KooWQoLHkebR5j3ZopDgj3a9GV5UxM3LG9QCSbeWyae1D7me")
-	for _, addr := range []string{
-		"/ip4/138.64.66.106/udp/11797/quic-v1",
-		"/ip6/2405:6580:3f00:7800:5043:355e:68a6:3721/tcp/4517",
-		"/ip6/2405:6580:3f00:7800:5043:355e:68a6:3721/udp/4517/quic-v1",
-	} {
-		if !h.Network().(*swarm.Swarm).CanDial(p, ma.StringCast(addr)) {
-			t.Fatalf("old failures still suppress %s", addr)
+	for _, recovery := range []bool{false, true} {
+		name := "default-suppresses"
+		if recovery {
+			name = "recovery-allows"
 		}
+		t.Run(name, func(t *testing.T) {
+			udp := &swarm.BlackHoleSuccessCounter{N: 100, MinSuccesses: 5, Name: "UDP"}
+			ipv6 := &swarm.BlackHoleSuccessCounter{N: 100, MinSuccesses: 5, Name: "IPv6"}
+			for i := 0; i < 100; i++ {
+				udp.RecordResult(false)
+				ipv6.RecordResult(false)
+			}
+			opts := []libp2p.Option{
+				libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
+				libp2p.UDPBlackHoleSuccessCounter(udp),
+				libp2p.IPv6BlackHoleSuccessCounter(ipv6),
+				libp2p.ConnectionGater(probeAddressGate{}),
+			}
+			if recovery {
+				opts = append(opts, recoveryTransportOption())
+			}
+			h, err := libp2p.New(opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Close()
+			p, _ := peer.Decode("12D3KooWQoLHkebR5j3ZopDgj3a9GV5UxM3LG9QCSbeWyae1D7me")
+			for _, addr := range []string{
+				"/ip4/138.64.66.106/udp/11797/quic-v1",
+				"/ip6/2405:6580:3f00:7800:5043:355e:68a6:3721/tcp/4517",
+				"/ip6/2405:6580:3f00:7800:5043:355e:68a6:3721/udp/4517/quic-v1",
+			} {
+				h.Peerstore().ClearAddrs(p)
+				h.Network().(*swarm.Swarm).Backoff().Clear(p)
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				err := h.Connect(ctx, peer.AddrInfo{ID: p, Addrs: []ma.Multiaddr{ma.StringCast(addr)}})
+				cancel()
+				want := swarm.ErrDialRefusedBlackHole
+				if recovery {
+					want = swarm.ErrGaterDisallowedConnection
+				}
+				if !errors.Is(err, want) {
+					t.Fatalf("%s: got %v, want %v", addr, err, want)
+				}
+			}
+		})
 	}
 }
 

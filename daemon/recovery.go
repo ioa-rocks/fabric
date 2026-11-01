@@ -84,9 +84,11 @@ func usableConnection(c network.Connectedness) bool {
 // networks. There is no public reset API in libp2p v0.48. Keep per-peer dial
 // backoff and our bounded recovery workers instead of these global filters.
 func recoveryTransportOption() libp2p.Option {
-	return libp2p.SwarmOpts(
-		swarm.WithUDPBlackHoleSuccessCounter(nil),
-		swarm.WithIPv6BlackHoleSuccessCounter(nil),
+	// Use the host-level options: libp2p appends its configured counters
+	// after SwarmOpts, so setting nil only at the swarm level is overwritten.
+	return libp2p.ChainOptions(
+		libp2p.UDPBlackHoleSuccessCounter(nil),
+		libp2p.IPv6BlackHoleSuccessCounter(nil),
 	)
 }
 
