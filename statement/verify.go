@@ -350,13 +350,20 @@ func (c *Compiled) Check(roots Roots, revs Revocations, want Want) error {
 	if !c.Allows(want.Sub, want.Res, want.Verb) {
 		return fmt.Errorf("chain does not grant %s on %s/%s in %s", want.Verb, want.Res.Kind, want.Res.Name, short(want.Sub))
 	}
-	if revs != nil {
-		if err := revoked(c.Auth, roots, revs); err != nil {
-			return fmt.Errorf("authority %w", err)
-		}
-		if err := revoked(c.Ident, roots, revs); err != nil {
-			return fmt.Errorf("identity %w", err)
-		}
+	return c.RevokedBy(roots, revs)
+}
+
+// RevokedBy is the revocation half of Check on its own: rule 3 over both
+// lineages. nil revs means no revocations are known.
+func (c *Compiled) RevokedBy(roots Roots, revs Revocations) error {
+	if revs == nil {
+		return nil
+	}
+	if err := revoked(c.Auth, roots, revs); err != nil {
+		return fmt.Errorf("authority %w", err)
+	}
+	if err := revoked(c.Ident, roots, revs); err != nil {
+		return fmt.Errorf("identity %w", err)
 	}
 	return nil
 }

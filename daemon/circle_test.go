@@ -203,6 +203,35 @@ func tryStream(ctx context.Context, from host.Host, to peer.ID, proto string) er
 // attestation everywhere the circle's devices talk (pushed by Refresh to the
 // ones online, carried on every later exchange), a re-admission issued after
 // it stands, and an expired attestation is worth nothing.
+// Statement-form attestations and revocations are presented only on the v4
+// exchange; older peers get the legacy forms they can parse.
+func TestOlderExchangeVersionsSeeOnlyLegacyForms(t *testing.T) {
+	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
+	owner, err := circle.Init(t.TempDir(), "alex", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := owner.Export()
+	n := newCircleTestNode(t, nsPub, nsPriv, "nas", []*circle.Bundle{b}, true)
+	now := time.Now()
+	if own, _ := n.svc.ownAttestations(now, true); len(own) != 1 {
+		t.Fatalf("v4 presents %d attestations, want 1", len(own))
+	}
+	if own, _ := n.svc.ownAttestations(now, false); len(own) != 0 {
+		t.Fatalf("v3 presents %d statement attestations, want 0", len(own))
+	}
+	priv, _ := owner.Unlock("pw")
+	r, _ := circle.Revoke(priv, cert.DIDForKey(n.devPub), now)
+	c, _ := circle.ByDID(n.root, owner.Config.DID)
+	c.AddRevocations(now, r)
+	if revs, _ := n.svc.ownRevocations(now, true); len(revs) != 1 {
+		t.Fatalf("v4 presents %d revocations, want 1", len(revs))
+	}
+	if revs, _ := n.svc.ownRevocations(now, false); len(revs) != 0 {
+		t.Fatalf("v3 presents %d statement revocations, want 0", len(revs))
+	}
+}
+
 func TestCircleRevocationAndExpiry(t *testing.T) {
 	nsPub, nsRoot, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

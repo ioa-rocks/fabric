@@ -28,13 +28,17 @@ import (
 // control plane (always within scope); what it unlocks is the circle-gated
 // data planes.
 //
-// Version 3 (2026-10-31) adds the attestation lifecycle: each side also
-// sends the revocations it holds for its circles, so a revoked device is
-// cut off everywhere the circle's devices talk, and expired attestations
-// are no longer honoured. Version 2 (attestations only, as a bare list) is
-// still served and dialled for peers that predate it; such peers neither
-// learn nor enforce revocations until upgraded — expiry is their backstop.
+// Version 4 (2026-11-02) carries statements (package statement): attestations
+// and revocations in the one signed-statement format, legacy forms included
+// while devices still hold them. Version 3 (2026-10-31) added the
+// attestation lifecycle — revocations travel with the attestations — in the
+// bespoke payloads; it is still served and dialled, carrying only legacy
+// forms so an older peer never sees bytes it cannot parse. Version 2
+// (attestations only, as a bare list) likewise. Peers on the older versions
+// do not see statement-form attestations, so re-attest devices only once
+// their peers are upgraded.
 const (
+	CircleProtocolV4ID = "/fabric/circle/4"
 	CircleProtocolID   = "/fabric/circle/3"
 	CircleProtocolV2ID = "/fabric/circle/2"
 )
@@ -80,6 +84,7 @@ const noCircleTTL = 30 * time.Second
 // root (listed on demand — circles added later need no restart).
 func NewCircleService(h host.Host, auth *fabricnet.AuthService, root string) *CircleService {
 	s := &CircleService{h: h, auth: auth, root: root, peers: map[peer.ID]circleEntry{}}
+	h.SetStreamHandler(CircleProtocolV4ID, auth.RequireMember(s.handleV4))
 	h.SetStreamHandler(CircleProtocolID, auth.RequireMember(s.handleV3))
 	h.SetStreamHandler(CircleProtocolV2ID, auth.RequireMember(s.handleV2))
 	nb := &network.NotifyBundle{DisconnectedF: func(n network.Network, conn network.Conn) {
@@ -164,6 +169,7 @@ func (s *CircleService) Info(now time.Time) []CircleInfo {
 
 // Close detaches the service.
 func (s *CircleService) Close() {
+	s.h.RemoveStreamHandler(CircleProtocolV4ID)
 	s.h.RemoveStreamHandler(CircleProtocolID)
 	s.h.RemoveStreamHandler(CircleProtocolV2ID)
 	s.stop()
@@ -171,12 +177,16 @@ func (s *CircleService) Close() {
 
 // ownAttestations is what this node presents: its live attestations. A
 // dead one (expired, or revoked by the circle) is not shown — peers would
-// refuse it anyway, and showing it would poison the list.
-func (s *CircleService) ownAttestations(now time.Time) ([][]byte, error) {
+// refuse it anyway, and showing it would poison the list. Statement-form
+// attestations go only to peers that speak v4.
+func (s *CircleService) ownAttestations(now time.Time, statements bool) ([][]byte, error) {
 	var out [][]byte
 	for _, c := range s.Circles() {
 		a, err := c.LoadAttestation()
 		if err != nil || a.Valid(now) != nil || c.Revoked(a, now) {
+			continue
+		}
+		if a.IsStatement() && !statements {
 			continue
 		}
 		raw, err := a.Marshal()
@@ -189,8 +199,8 @@ func (s *CircleService) ownAttestations(now time.Time) ([][]byte, error) {
 }
 
 // ownRevocations is every live revocation this node holds, across its
-// circles.
-func (s *CircleService) ownRevocations(now time.Time) ([][]byte, error) {
+// circles; statement-form ones only for v4 peers.
+func (s *CircleService) ownRevocations(now time.Time, statements bool) ([][]byte, error) {
 	var out [][]byte
 	for _, c := range s.Circles() {
 		rs, err := c.Revocations(now)
@@ -198,6 +208,9 @@ func (s *CircleService) ownRevocations(now time.Time) ([][]byte, error) {
 			return nil, err
 		}
 		for _, r := range rs {
+			if r.IsStatement() && !statements {
+				continue
+			}
 			raw, err := r.Marshal()
 			if err != nil {
 				return nil, err
@@ -227,6 +240,15 @@ func (s *CircleService) forgetDevice(deviceDID string) {
 	}
 }
 
+// forgetAll drops every cached result: a by-id revocation names a statement,
+// not a device, so every connected peer re-runs the exchange on its next
+// question.
+func (s *CircleService) forgetAll() {
+	s.mu.Lock()
+	s.peers = map[peer.ID]circleEntry{}
+	s.mu.Unlock()
+}
+
 // CirclesOf returns the member's verified circles, if a current exchange
 // result exists (an empty list means it presented no attestation, within
 // noCircleTTL).
@@ -246,7 +268,7 @@ func (s *CircleService) Ensure(ctx context.Context, p peer.ID) ([]string, error)
 	if dids, ok := s.CirclesOf(p); ok {
 		return dids, nil
 	}
-	st, err := s.h.NewStream(ctx, p, CircleProtocolID, CircleProtocolV2ID)
+	st, err := s.h.NewStream(ctx, p, CircleProtocolV4ID, CircleProtocolID, CircleProtocolV2ID)
 	if err != nil {
 		return nil, err
 	}
@@ -254,8 +276,8 @@ func (s *CircleService) Ensure(ctx context.Context, p peer.ID) ([]string, error)
 	if dl, ok := ctx.Deadline(); ok {
 		_ = st.SetDeadline(dl)
 	}
-	v3 := st.Protocol() == protocol.ID(CircleProtocolID)
-	if err := s.writeOwn(st, v3); err != nil {
+	v := versionOf(st.Protocol())
+	if err := s.writeOwn(st, v); err != nil {
 		st.Reset()
 		return nil, err
 	}
@@ -264,13 +286,25 @@ func (s *CircleService) Ensure(ctx context.Context, p peer.ID) ([]string, error)
 		st.Reset()
 		return nil, err
 	}
-	dids, err := s.readHello(st, pub, v3)
+	dids, err := s.readHello(st, pub, v)
 	if err != nil {
 		st.Reset()
 		return nil, err
 	}
 	s.remember(p, dids)
 	return dids, nil
+}
+
+// versionOf maps a negotiated protocol ID to the exchange version.
+func versionOf(id protocol.ID) int {
+	switch id {
+	case protocol.ID(CircleProtocolV4ID):
+		return 4
+	case protocol.ID(CircleProtocolID):
+		return 3
+	default:
+		return 2
+	}
 }
 
 // Refresh drops every cached result and re-runs the exchange with each
@@ -339,11 +373,12 @@ func (s *CircleService) RequireAny(next network.StreamHandler) network.StreamHan
 	})
 }
 
-func (s *CircleService) handleV3(st network.Stream) { s.handle(st, true) }
-func (s *CircleService) handleV2(st network.Stream) { s.handle(st, false) }
+func (s *CircleService) handleV4(st network.Stream) { s.handle(st, 4) }
+func (s *CircleService) handleV3(st network.Stream) { s.handle(st, 3) }
+func (s *CircleService) handleV2(st network.Stream) { s.handle(st, 2) }
 
 // handle is the responder side: read theirs, answer with ours.
-func (s *CircleService) handle(st network.Stream, v3 bool) {
+func (s *CircleService) handle(st network.Stream, v int) {
 	defer st.Close()
 	_ = st.SetDeadline(time.Now().Add(10 * time.Second))
 	pub, err := ed25519Of(st.Conn().RemotePublicKey())
@@ -351,28 +386,28 @@ func (s *CircleService) handle(st network.Stream, v3 bool) {
 		st.Reset()
 		return
 	}
-	dids, err := s.readHello(st, pub, v3)
+	dids, err := s.readHello(st, pub, v)
 	if err != nil {
 		st.Reset()
 		return
 	}
 	s.remember(st.Conn().RemotePeer(), dids)
-	if err := s.writeOwn(st, v3); err != nil {
+	if err := s.writeOwn(st, v); err != nil {
 		st.Reset()
 	}
 }
 
-// writeOwn sends this node's attestations (and, on v3, revocations) as one
+// writeOwn sends this node's attestations (and, from v3, revocations) as one
 // frame. Empty when the node is in no circle, or not yet attested into any.
-func (s *CircleService) writeOwn(st network.Stream, v3 bool) error {
+func (s *CircleService) writeOwn(st network.Stream, v int) error {
 	now := time.Now()
-	own, err := s.ownAttestations(now)
+	own, err := s.ownAttestations(now, v >= 4)
 	if err != nil {
 		return err
 	}
 	var raw []byte
-	if v3 {
-		revs, err := s.ownRevocations(now)
+	if v >= 3 {
+		revs, err := s.ownRevocations(now, v >= 4)
 		if err != nil {
 			return err
 		}
@@ -389,14 +424,14 @@ func (s *CircleService) writeOwn(st network.Stream, v3 bool) error {
 // readHello reads one frame, ingests any revocations in it, and verifies
 // every attestation against the peer key the transport authenticated.
 // Returns the circle DIDs the peer is a live device of.
-func (s *CircleService) readHello(st network.Stream, devicePub ed25519.PublicKey, v3 bool) ([]string, error) {
+func (s *CircleService) readHello(st network.Stream, devicePub ed25519.PublicKey, v int) ([]string, error) {
 	raw, err := wire.ReadFrame(st, maxAttestationsWireSize)
 	if err != nil {
 		return nil, fmt.Errorf("reading attestations: %w", err)
 	}
 	var hello circleHello
 	if len(raw) > 0 {
-		if v3 {
+		if v >= 3 {
 			err = cbor.Unmarshal(raw, &hello)
 		} else {
 			err = cbor.Unmarshal(raw, &hello.Attestations)
@@ -417,10 +452,11 @@ func (s *CircleService) readHello(st network.Stream, devicePub ed25519.PublicKey
 }
 
 // verifyAttestations checks each attestation: a forgery — wrong device,
-// bad signature — fails the whole exchange (a peer presenting a forgery is
-// not trusted for the rest of its list either); a merely dead one —
-// expired, or revoked by a circle we hold — is skipped, since an honest
-// device can lag a renewal or a revocation.
+// bad signature, a statement chain that does not verify — fails the whole
+// exchange (a peer presenting a forgery is not trusted for the rest of its
+// list either); a merely dead one — expired, or revoked by a circle we
+// hold — is skipped, since an honest device can lag a renewal or a
+// revocation.
 func (s *CircleService) verifyAttestations(list [][]byte, devicePub ed25519.PublicKey, now time.Time) ([]string, error) {
 	dids := make([]string, 0, len(list))
 	for _, item := range list {
@@ -466,8 +502,13 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) error {
 			return fmt.Errorf("storing revocation for circle %q: %w", c.Config.Name, err)
 		}
 		for _, r := range added {
-			log.Printf("circle %q: device %s revoked as of %s (learned from a peer)", c.Config.Name, r.Device, r.Time().Format(time.RFC3339))
-			s.forgetDevice(r.Device)
+			if r.Device != "" {
+				log.Printf("circle %q: device %s revoked as of %s (learned from a peer)", c.Config.Name, r.Device, r.Time().Format(time.RFC3339))
+				s.forgetDevice(r.Device)
+			} else {
+				log.Printf("circle %q: statement %s revoked (learned from a peer)", c.Config.Name, r.ID()[:8])
+				s.forgetAll()
+			}
 		}
 	}
 	return nil

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/statement"
 )
 
 func TestRevocationKillsEarlierAttestationsOnly(t *testing.T) {
@@ -46,16 +47,26 @@ func TestRevocationKillsEarlierAttestationsOnly(t *testing.T) {
 	if back.Kills(otherDev) {
 		t.Fatal("revocation killed a different device")
 	}
-	if back.Spent(t0.Add(DefaultValidity-time.Hour)) || !back.Spent(t0.Add(DefaultValidity)) {
+	// A sweep is spent once nothing issued up to its cut-off can still
+	// verify: before + MaxValidity (the enforced maximum, not the default).
+	if back.Spent(t0.Add(statement.MaxValidity-time.Hour)) || !back.Spent(t0.Add(statement.MaxValidity)) {
 		t.Fatal("Spent is wrong")
 	}
 
-	// Forged: another key signs the same payload.
-	_, forger, _ := ed25519.GenerateKey(rand.Reader)
-	forged := *back
-	forged.Sig = ed25519.Sign(forger, back.raw)
-	if err := forged.Verify(); err == nil {
-		t.Fatal("revocation with a foreign signature verified")
+	// Tampered: flip a signature byte on the wire.
+	raw2, _ := back.Marshal()
+	raw2[len(raw2)-1] ^= 1
+	if forged, err := UnmarshalRevocation(raw2); err == nil && forged.Verify() == nil {
+		t.Fatal("revocation with a tampered signature verified")
+	}
+	// Signed by a stranger with no chain: refused as neither root nor delegated.
+	_, stranger, _ := ed25519.GenerateKey(rand.Reader)
+	rogue, err := RevokeAs(stranger, nil, back.Circle, statement.Target{Aud: back.Device, Before: t0.Unix()}, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rogue.Verify(); err == nil {
+		t.Fatal("stranger's revocation verified")
 	}
 }
 
@@ -103,7 +114,7 @@ func TestRevocationStorage(t *testing.T) {
 	}
 
 	// Spent records fall out on read.
-	if rs, _ := c.Revocations(now.Add(DefaultValidity)); len(rs) != 0 {
+	if rs, _ := c.Revocations(now.Add(statement.MaxValidity)); len(rs) != 0 {
 		t.Fatalf("spent revocation still listed: %d", len(rs))
 	}
 
@@ -113,9 +124,86 @@ func TestRevocationStorage(t *testing.T) {
 	if _, err := c.AddRevocations(now, foreign); err == nil {
 		t.Fatal("stored a revocation for a different circle")
 	}
-	forged := *r
-	forged.Sig = ed25519.Sign(otherPriv, r.raw)
-	if _, err := c.AddRevocations(now, &forged); err == nil {
+	forged, _ := RevokeAs(otherPriv, nil, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub), Before: now.Unix()}, now)
+	if _, err := c.AddRevocations(now, forged); err == nil {
 		t.Fatal("stored a forged revocation")
+	}
+
+	// A by-id revocation kills exactly that statement; the device's next
+	// attestation stands.
+	victim, _ := Attest(priv, dpub, now.Add(2*time.Second))
+	vid := victim.Stmt.ID()
+	byID, err := RevokeAs(priv, nil, c.Config.DID, statement.Target{ID: vid[:]}, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.AddRevocations(now, byID); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Revoked(victim, now.Add(3*time.Second)) {
+		t.Fatal("by-id revocation did not kill its target")
+	}
+	next, _ := Attest(priv, dpub, now.Add(4*time.Second))
+	if c.Revoked(next, now.Add(4*time.Second)) {
+		t.Fatal("by-id revocation killed a different statement")
+	}
+}
+
+// A desk holding an admin assert attests devices under it and revokes them
+// under it; its revocation does not reach a device the root attested.
+func TestDelegatedAttestAndRevoke(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Init(dir, "alex", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _ := c.Unlock("pw")
+	deskPub, deskPriv, _ := ed25519.GenerateKey(rand.Reader)
+	dpub, _, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+	deskA, err := statement.Sign(root, statement.Payload{
+		Aud: cert.DIDForKey(deskPub), Sub: c.Config.DID,
+		Res:   []statement.Resource{{Kind: statement.Any, Name: statement.Any}},
+		Verbs: append(append([]string{}, DeviceVerbs...), statement.VerbAdmin),
+		Del:   3, Iat: now.Unix(), Nbf: now.Unix(), Exp: now.Add(DefaultValidity).Unix(),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byDesk, err := AttestAs(deskPriv, deskA, c.Config.DID, dpub, now, DefaultValidity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := byDesk.Verify(dpub, now); err != nil {
+		t.Fatalf("desk-issued attestation: %v", err)
+	}
+	byRoot, _ := Attest(root, dpub, now)
+
+	// The desk sweeps the device under its assert: kills its own
+	// attestation of it, not the root's.
+	r, err := RevokeAs(deskPriv, deskA, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub), Before: now.Unix()}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.AddRevocations(now, r); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Revoked(byDesk, now) {
+		t.Fatal("desk's revocation did not reach the device it attested")
+	}
+	if c.Revoked(byRoot, now) {
+		t.Fatal("desk's revocation reached a root-attested device")
+	}
+	// The root revoking the desk's assert kills the desk-issued attestation.
+	deskID := deskA.ID()
+	rr, _ := RevokeAs(root, nil, c.Config.DID, statement.Target{ID: deskID[:]}, now)
+	c.AddRevocations(now, rr)
+	if !c.Revoked(byDesk, now) {
+		t.Fatal("root revoking the desk did not cascade")
+	}
+	// Legacy-looking storage round trip: both forms survive the file.
+	rs, _ := c.Revocations(now)
+	if len(rs) != 2 {
+		t.Fatalf("stored %d revocations, want 2", len(rs))
 	}
 }

@@ -14,27 +14,32 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/did"
+	"ioa.rocks/fabric/statement"
 )
 
-// Revocation is the circle's signed statement that a device is no longer
-// one of its own: it kills every attestation of that device in this circle
-// issued at or before At. An attestation issued *after* the revocation is a
-// deliberate re-admission and stands — so a device whose key was never
-// compromised can be let back in without waiting out the old attestation.
+// Revocation is a signed statement that kills attestations in a circle.
+// Since 2026-11-02 it is a statement revoke (package statement) with one of
+// two targets: {aud, before} — every attestation of that device issued up
+// to before, today's lost-device sweep — or {id}, one statement. It is
+// signed by the root (kills anything in the circle) or by an admin desk
+// under its own assert (kills only what chains through that assert;
+// verifier rule 3). An attestation issued after a sweep's `before` is a
+// deliberate re-admission and stands.
 //
 // Revocations travel inside the circle: devices of the circle swap their
 // sets on every circle exchange (daemon.CircleService), and a fresh one is
 // pushed to connected devices at once. Expiry remains the backstop for a
-// device the gossip never reached. A revocation is spent — safe to drop —
-// once every attestation it could kill has expired on its own: At plus
-// DefaultValidity (the same rule as event.Log.GC for the mesh).
+// device the gossip never reached. Legacy (v3) revocations — root-signed
+// device sweeps in the bespoke revokePayload — still decode and apply.
 type Revocation struct {
-	Circle string // circle owner DID
-	Device string // revoked device key, did:key
-	At     int64  // unix seconds; attestations with Iat <= At are dead
-	Sig    []byte
-	raw    []byte
+	Circle   string // circle DID
+	Device   string // swept device key, did:key; "" for a by-id revocation
+	TargetID []byte // revoked statement ID; nil for a sweep
+	At       int64  // unix seconds; sweeps kill attestations with Iat <= At
+	Sig      []byte
+	Stmt     *statement.Statement // statement form; nil for legacy bytes
+	raw      []byte
 }
 
 type revokePayload struct {
@@ -50,31 +55,73 @@ type wireRevocation struct {
 
 const revocationsFile = "revocations.cbor"
 
-// Revoke signs the statement "deviceDID is no longer a device of this
-// circle, as of now".
+// Revoke signs, with the circle's root key, the statement "deviceDID is no
+// longer a device of this circle, as of now".
 func Revoke(circlePriv ed25519.PrivateKey, deviceDID string, now time.Time) (*Revocation, error) {
-	if _, err := cert.KeyForDID(deviceDID); err != nil {
+	if _, err := did.KeyFor(deviceDID); err != nil {
 		return nil, fmt.Errorf("device: %w", err)
 	}
-	p := revokePayload{
-		Circle: cert.DIDForKey(circlePriv.Public().(ed25519.PublicKey)),
-		Device: deviceDID,
-		At:     now.Unix(),
-	}
-	msg, err := encMode.Marshal(p)
+	circleDID := did.ForKey(circlePriv.Public().(ed25519.PublicKey))
+	return RevokeAs(circlePriv, nil, circleDID, statement.Target{Aud: deviceDID, Before: now.Unix()}, now)
+}
+
+// RevokeAs signs any revocation: by the root (own == nil) or by an admin
+// desk under its own assert (own), targeting a device sweep or a statement
+// ID in circleDID.
+func RevokeAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, target statement.Target, now time.Time) (*Revocation, error) {
+	s, err := statement.Revoke(priv, circleDID, own, target, now)
 	if err != nil {
 		return nil, err
 	}
-	return &Revocation{Circle: p.Circle, Device: p.Device, At: p.At, Sig: ed25519.Sign(circlePriv, msg), raw: msg}, nil
+	return revocationFromStatement(s)
 }
 
-// Verify checks that the embedded circle key signed the revocation.
+func revocationFromStatement(s *statement.Statement) (*Revocation, error) {
+	p := s.Payload
+	if p.Typ != statement.TypeRevoke || p.Target == nil {
+		return nil, errors.New("not a revocation")
+	}
+	r := &Revocation{Circle: p.Sub, At: p.At, Sig: s.Sig, Stmt: s}
+	if len(p.Target.ID) != 0 {
+		r.TargetID = p.Target.ID
+	} else {
+		r.Device = p.Target.Aud
+		r.At = p.Target.Before
+	}
+	return r, nil
+}
+
+// Verify checks the revocation's signatures and shape: a legacy or
+// root-signed one must be signed by the circle's root; a delegated one must
+// ride a chain whose leaf names the revoker, in this circle. Whether a
+// delegated revocation actually reaches a given attestation is rule 3, in
+// Circle.Revoked.
 func (r *Revocation) Verify() error {
-	circlePub, err := cert.KeyForDID(r.Circle)
+	if r.Stmt != nil {
+		set := statement.NewRevocationSet()
+		if _, err := set.Add(r.Stmt); err != nil {
+			return err
+		}
+		if r.Stmt.IsRootIssued() {
+			k, err := r.Stmt.IssuerKey()
+			if err != nil {
+				return err
+			}
+			rootKey, err := did.KeyFor(r.Circle)
+			if err != nil {
+				return fmt.Errorf("revocation circle: %w", err)
+			}
+			if !bytes.Equal(k, rootKey) {
+				return errors.New("revocation is signed neither by the circle root nor under a chain")
+			}
+		}
+		return nil
+	}
+	circlePub, err := did.KeyFor(r.Circle)
 	if err != nil {
 		return fmt.Errorf("revocation circle: %w", err)
 	}
-	if _, err := cert.KeyForDID(r.Device); err != nil {
+	if _, err := did.KeyFor(r.Device); err != nil {
 		return fmt.Errorf("revocation device: %w", err)
 	}
 	msg, err := r.payloadBytes()
@@ -87,23 +134,47 @@ func (r *Revocation) Verify() error {
 	return nil
 }
 
-// Kills reports whether this revocation voids the attestation: same circle,
-// same device, and the attestation was issued no later than the revocation.
+// Delegated reports whether the revocation rides an admin chain rather than
+// the root's signature.
+func (r *Revocation) Delegated() bool { return r.Stmt != nil && !r.Stmt.IsRootIssued() }
+
+// Kills reports whether this revocation voids the attestation on its own:
+// same circle and, for a sweep, same device issued no later than the
+// sweep; for a by-id revocation, that very statement. Only root authority
+// is judged here; a delegated revocation is applied by Circle.Revoked
+// through the verifier, since whether it reaches the attestation depends
+// on the attestation's chain.
 func (r *Revocation) Kills(a *Attestation) bool {
-	return a.Circle == r.Circle && a.Device == r.Device && a.Iat <= r.At
+	if a.Circle != r.Circle || r.Delegated() {
+		return false
+	}
+	if r.TargetID != nil {
+		if a.Stmt == nil {
+			return false
+		}
+		id := a.Stmt.ID()
+		return bytes.Equal(r.TargetID, id[:])
+	}
+	return a.Device == r.Device && a.Iat <= r.At
 }
 
-// Time is when the revocation was signed.
+// Time is when the revocation was signed (sweeps: the cut-off).
 func (r *Revocation) Time() time.Time { return time.Unix(r.At, 0) }
 
 // Spent reports whether every attestation this revocation could kill has
-// expired on its own, so the record can be dropped.
+// expired on its own, so the record can be dropped (task file, Retention).
 func (r *Revocation) Spent(now time.Time) bool {
+	if r.Stmt != nil {
+		return statement.Spent(r.Stmt, time.Time{}, now)
+	}
 	return !now.Before(r.Time().Add(DefaultValidity))
 }
 
 // ID is the dedup key: the hash of the signed payload bytes.
 func (r *Revocation) ID() string {
+	if r.Stmt != nil {
+		return r.Stmt.IDHex()
+	}
 	msg, err := r.payloadBytes()
 	if err != nil {
 		panic(fmt.Sprintf("circle: encoding revocation: %v", err))
@@ -121,6 +192,9 @@ func (r *Revocation) payloadBytes() ([]byte, error) {
 
 // Marshal encodes the revocation for the wire or disk, payload verbatim.
 func (r *Revocation) Marshal() ([]byte, error) {
+	if r.Stmt != nil {
+		return r.Stmt.Bytes()
+	}
 	msg, err := r.payloadBytes()
 	if err != nil {
 		return nil, err
@@ -128,11 +202,23 @@ func (r *Revocation) Marshal() ([]byte, error) {
 	return encMode.Marshal(wireRevocation{Payload: msg, Sig: r.Sig})
 }
 
-// UnmarshalRevocation decodes a revocation. Untrusted until Verify.
+// IsStatement reports whether the revocation is in statement form (v4
+// exchange only).
+func (r *Revocation) IsStatement() bool { return r.Stmt != nil }
+
+// UnmarshalRevocation decodes a revocation of either form. Untrusted until
+// Verify.
 func UnmarshalRevocation(data []byte) (*Revocation, error) {
 	var w wireRevocation
 	if err := cbor.Unmarshal(data, &w); err != nil {
 		return nil, fmt.Errorf("decoding revocation: %w", err)
+	}
+	if isStatementBytes(w.Payload) {
+		s, err := statement.Decode(data)
+		if err != nil {
+			return nil, fmt.Errorf("decoding revocation: %w", err)
+		}
+		return revocationFromStatement(s)
 	}
 	var p revokePayload
 	if err := cbor.Unmarshal(w.Payload, &p); err != nil {
@@ -145,8 +231,8 @@ func UnmarshalRevocation(data []byte) (*Revocation, error) {
 func (c *Circle) RevocationsPath() string { return filepath.Join(c.Path, revocationsFile) }
 
 // Revocations loads the circle's revocation set: every record that
-// verifies against this circle's key and is not yet spent, in time order.
-// A missing file is an empty set.
+// verifies for this circle and is not yet spent, in time order. A missing
+// file is an empty set.
 func (c *Circle) Revocations(now time.Time) ([]*Revocation, error) {
 	raw, err := os.ReadFile(c.RevocationsPath())
 	if errors.Is(err, os.ErrNotExist) {
@@ -231,19 +317,54 @@ func (c *Circle) AddRevocations(now time.Time, rs ...*Revocation) ([]*Revocation
 	return added, nil
 }
 
+// RevocationSet indexes the circle's statement-form revocations for the
+// verifier (delegated ones included).
+func (c *Circle) RevocationSet(now time.Time) (*statement.RevocationSet, error) {
+	rs, err := c.Revocations(now)
+	if err != nil {
+		return nil, err
+	}
+	set := statement.NewRevocationSet()
+	for _, r := range rs {
+		if r.Stmt != nil {
+			if _, err := set.Add(r.Stmt); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return set, nil
+}
+
 // Revoked reports whether the attestation is dead under this circle's
-// revocation set.
+// revocation set: a root sweep or by-id revocation (Kills), or — for a
+// statement attestation — a delegated revocation whose chain is an
+// ancestor of the attestation's (verifier rule 3).
 func (c *Circle) Revoked(a *Attestation, now time.Time) bool {
 	rs, err := c.Revocations(now)
 	if err != nil {
 		return false
 	}
+	delegated := false
 	for _, r := range rs {
 		if r.Kills(a) {
 			return true
 		}
+		delegated = delegated || r.Delegated()
 	}
-	return false
+	if !delegated || a.Stmt == nil {
+		return false
+	}
+	compiled, err := a.compile()
+	if err != nil {
+		return false // a chain that does not verify is refused elsewhere
+	}
+	set := statement.NewRevocationSet()
+	for _, r := range rs {
+		if r.Stmt != nil {
+			set.Add(r.Stmt)
+		}
+	}
+	return compiled.RevokedBy(c.Roots(), set) != nil
 }
 
 func sortRevocations(rs []*Revocation) {

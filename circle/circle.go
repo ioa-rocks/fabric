@@ -24,7 +24,7 @@ import (
 	"sort"
 	"strings"
 
-	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
 )
@@ -170,7 +170,7 @@ func Init(root, name, passphrase string) (*Circle, error) {
 	if err := keystore.SaveSeed(keyPath(path), seed, passphrase); err != nil {
 		return nil, fmt.Errorf("saving user key: %w", err)
 	}
-	cfg := Config{Name: name, DID: cert.DIDForKey(priv.Public().(ed25519.PublicKey))}
+	cfg := Config{Name: name, DID: did.ForKey(priv.Public().(ed25519.PublicKey))}
 	if err := writeConfig(path, cfg); err != nil {
 		return nil, err
 	}

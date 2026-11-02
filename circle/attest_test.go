@@ -51,12 +51,14 @@ func TestAttestationRoundTrip(t *testing.T) {
 	if back.PastHalfLife(now.Add(time.Hour)) || !back.PastHalfLife(now.Add(DefaultValidity/2+time.Hour)) {
 		t.Fatal("PastHalfLife is wrong")
 	}
-	// Forged circle: re-sign the same payload with another key.
-	_, forger, _ := ed25519.GenerateKey(rand.Reader)
-	forged := *back
-	forged.Sig = ed25519.Sign(forger, back.raw)
-	if err := forged.Verify(dpub, now); err == nil {
-		t.Fatal("attestation with a foreign signature verified")
+	// Tampered signature (the statement form carries it in Stmt).
+	raw2, _ := back.Marshal()
+	raw2[len(raw2)-1] ^= 1
+	if forged, err := UnmarshalAttestation(raw2); err == nil && forged.Verify(dpub, now) == nil {
+		t.Fatal("attestation with a tampered signature verified")
+	}
+	if !back.IsStatement() || back.Stmt.Label() != "attestation" {
+		t.Fatalf("fresh attestation should be a statement labelled attestation, got %v", back.Stmt)
 	}
 }
 
