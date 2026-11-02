@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"flag"
 	"fmt"
@@ -108,9 +109,6 @@ func cmdRootMerge(args []string) error {
 	if err != nil {
 		return err
 	}
-	if !dir.IsMaster() {
-		return fmt.Errorf("no namespace root key in %s — the merge runs on the master", dir.Path)
-	}
 	cfg, err := dir.LoadConfig()
 	if err != nil {
 		return err
@@ -123,28 +121,58 @@ func cmdRootMerge(args []string) error {
 	if err != nil {
 		return err
 	}
-	if c.Config.DID == cfg.NamespaceDID {
-		return fmt.Errorf("circle %q already is the namespace root (%s)", c.Config.Name, c.Config.DID)
-	}
 	if _, err := os.Stat(c.KeyPath()); err != nil {
 		return fmt.Errorf("this device holds no key for circle %q", c.Config.Name)
 	}
 	client := daemon.NewClient(dir)
-	members, err := client.Members()
+	st, err := client.Status()
 	if err != nil {
 		return fmt.Errorf("the merge needs the running node daemon ('fabric up'): %w", err)
 	}
-
-	var live []daemon.MemberInfo
-	for _, m := range members {
-		if m.Expired {
-			fmt.Fprintf(os.Stderr, "skipping %q: cert expired — it re-joins under the new root\n", m.Name)
-			continue
-		}
-		live = append(live, m)
+	members, err := client.Members()
+	if err != nil {
+		return err
 	}
-	fmt.Printf("moving namespace %s\n       onto circle %q %s\n", cfg.NamespaceDID, c.Config.Name, c.Config.DID)
-	fmt.Printf("%d member cert(s) will be re-issued under the circle key; the old root stays honoured until 'fabric root retire'\n", len(live))
+
+	// The merge is three steps with a publish in the middle of each, and
+	// the daemon considers the move done after the first. So the command is
+	// idempotent: when the daemon already names the circle as the root,
+	// root-moved was published and this run resumes — re-issuing only the
+	// certs the log lacks and installing the key only if that is still
+	// pending. Rerun it until it reports nothing left to do (Codex review,
+	// 2026-11-02).
+	resuming := st.NamespaceDID == c.Config.DID
+	oldDID := cfg.NamespaceDID
+	if resuming {
+		oldDID = ""
+		for _, r := range st.HonouredRoots {
+			oldDID = r
+			break
+		}
+	}
+	retired := dir.KeystorePath() + ".retired-" + shortDID(oldDID)
+	if !dir.IsMaster() && !exists(retired) {
+		return fmt.Errorf("no namespace root key in %s — the merge runs on the master", dir.Path)
+	}
+
+	var live, pending []daemon.MemberInfo
+	for _, m := range members {
+		switch {
+		case m.Expired:
+			fmt.Fprintf(os.Stderr, "skipping %q: cert expired — it re-joins under the new root\n", m.Name)
+		case certSub(m) == c.Config.DID:
+			live = append(live, m) // already re-issued (earlier run)
+		default:
+			live = append(live, m)
+			pending = append(pending, m)
+		}
+	}
+	if resuming {
+		fmt.Printf("resuming the move onto circle %q %s (root-moved already published)\n", c.Config.Name, c.Config.DID)
+	} else {
+		fmt.Printf("moving namespace %s\n       onto circle %q %s\n", cfg.NamespaceDID, c.Config.Name, c.Config.DID)
+	}
+	fmt.Printf("%d member cert(s) to re-issue under the circle key (%d already done); the old root stays honoured until 'fabric root retire'\n", len(pending), len(live)-len(pending))
 
 	pass, err := passFor(c)
 	if err != nil {
@@ -154,36 +182,38 @@ func cmdRootMerge(args []string) error {
 	if err != nil {
 		return err
 	}
-	oldRoot, err := unlockRootKey(dir)
-	if err != nil {
-		return err
-	}
-	if cert.DIDForKey(oldRoot.Public().(ed25519.PublicKey)) != cfg.NamespaceDID {
-		return fmt.Errorf("the root key container does not match namespace %s", cfg.NamespaceDID)
-	}
 
-	// 1. The old root hands over. Signed first and timestamped first, so
-	//    every log replays it before the admissions it makes verifiable.
 	now := time.Now()
-	moved, err := event.NewRootMoved(oldRoot, c.Config.DID, now)
-	if err != nil {
-		return err
+	if !resuming {
+		oldRoot, err := unlockRootKey(dir)
+		if err != nil {
+			return err
+		}
+		if cert.DIDForKey(oldRoot.Public().(ed25519.PublicKey)) != cfg.NamespaceDID {
+			return fmt.Errorf("the root key container does not match namespace %s", cfg.NamespaceDID)
+		}
+		// 1. The old root hands over. Signed first and timestamped first, so
+		//    every log replays it before the admissions it makes verifiable.
+		moved, err := event.NewRootMoved(oldRoot, c.Config.DID, now)
+		if err != nil {
+			return err
+		}
+		raw, err := moved.Marshal()
+		if err != nil {
+			return err
+		}
+		if err := client.Publish(raw); err != nil {
+			return fmt.Errorf("publishing root-moved: %w", err)
+		}
+		fmt.Println("root-moved published: nodes now honour the circle key")
 	}
-	raw, err := moved.Marshal()
-	if err != nil {
-		return err
-	}
-	if err := client.Publish(raw); err != nil {
-		return fmt.Errorf("publishing root-moved: %w", err)
-	}
-	fmt.Println("root-moved published: nodes now honour the circle key")
 
 	// 2. Every live member gets its cert again, under the new root: same
 	//    device, name, role, address and scope — only the issuer changes.
 	//    Certs are valid from now; their events are stamped a second after
 	//    the move so every log replays root-moved first.
 	later := now.Add(time.Second)
-	for _, m := range live {
+	for _, m := range pending {
 		old, err := cert.Unmarshal(m.Cert)
 		if err != nil {
 			return fmt.Errorf("roster cert for %q: %w", m.Name, err)
@@ -201,31 +231,49 @@ func cmdRootMerge(args []string) error {
 			return err
 		}
 		if err := client.Publish(raw); err != nil {
-			return fmt.Errorf("publishing %q's new cert: %w", m.Name, err)
+			return fmt.Errorf("publishing %q's new cert: %w (rerun 'fabric root merge' to resume)", m.Name, err)
 		}
 		fmt.Printf("re-issued: %q\n", m.Name)
 	}
 
 	// 3. The master signs with the circle key from now on: the root-key
 	//    container becomes a copy of the circle's; the old one is kept.
-	retired := dir.KeystorePath() + ".retired-" + shortDID(cfg.NamespaceDID)
-	if err := os.Rename(dir.KeystorePath(), retired); err != nil {
-		return fmt.Errorf("setting the old root aside: %w", err)
-	}
+	//    Each sub-step is skipped when an earlier run already did it.
 	keyBytes, err := os.ReadFile(c.KeyPath())
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(dir.KeystorePath(), keyBytes, 0o600); err != nil {
-		return fmt.Errorf("installing the circle key as the root key: %w", err)
+	cur, err := os.ReadFile(dir.KeystorePath())
+	switch {
+	case err == nil && bytes.Equal(cur, keyBytes):
+		fmt.Printf("root key container already holds circle %q's key\n", c.Config.Name)
+	case err == nil:
+		if exists(retired) {
+			retired += "-" + fmt.Sprint(now.Unix())
+		}
+		if err := os.Rename(dir.KeystorePath(), retired); err != nil {
+			return fmt.Errorf("setting the old root aside: %w (rerun 'fabric root merge' to resume)", err)
+		}
+		fallthrough
+	default:
+		if err := os.WriteFile(dir.KeystorePath(), keyBytes, 0o600); err != nil {
+			return fmt.Errorf("installing the circle key as the root key: %w (rerun 'fabric root merge' to resume)", err)
+		}
+		fmt.Printf("root key container now holds circle %q's key (passphrase: the circle's); old root kept at %s\n", c.Config.Name, retired)
 	}
-	fmt.Printf("root key container now holds circle %q's key (passphrase: the circle's); old root kept at %s\n", c.Config.Name, retired)
 	fmt.Println()
 	fmt.Println("next:")
 	fmt.Printf("  1. update the _fabric DNS TXT record to the new DID ('fabric announce txt' prints it)\n")
 	fmt.Printf("  2. watch 'fabric root status' until every member has presented a cert under %s\n", c.Config.DID)
-	fmt.Printf("  3. 'fabric root retire %s' — after that, certs under the old root stop verifying everywhere\n", cfg.NamespaceDID)
+	if oldDID != "" {
+		fmt.Printf("  3. 'fabric root retire %s' — after that, certs under the old root stop verifying everywhere\n", oldDID)
+	}
 	return nil
+}
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func cmdRootRetire(args []string) error {
