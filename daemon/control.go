@@ -266,7 +266,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	// Bootstrap peers we have not yet authenticated with.
-	for _, addr := range d.Config.Bootstrap {
+	for _, addr := range d.bootstrapAddrs() {
 		if info, err := peerInfo(addr); err == nil && !seen[info.ID.String()] && info.ID != d.Host.ID() {
 			reply.Peers = append(reply.Peers, StatusPeer{
 				ID:        info.ID.String(),

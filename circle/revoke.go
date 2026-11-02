@@ -349,22 +349,26 @@ func (c *Circle) RevocationSet(now time.Time) (*statement.RevocationSet, error) 
 }
 
 // Revoked reports whether the attestation is dead under this circle's
-// revocation set: a root sweep or by-id revocation (Kills), or — for a
-// statement attestation — a delegated revocation whose chain is an
-// ancestor of the attestation's (verifier rule 3).
+// revocation set: a root sweep or by-id revocation of the attestation
+// itself (Kills), or — for a statement attestation — any statement
+// revocation reaching a link of its chain (verifier rule 3: the root
+// revoking a desk's assert kills what the desk attested; a delegated
+// revocation kills what lies under its chain). Kills alone sees only the
+// leaf, so the chain check runs whenever a statement revocation exists,
+// not only a delegated one (Codex review, 2026-11-02).
 func (c *Circle) Revoked(a *Attestation, now time.Time) bool {
 	rs, err := c.Revocations(now)
 	if err != nil {
 		return false
 	}
-	delegated := false
+	statements := false
 	for _, r := range rs {
 		if r.Kills(a) {
 			return true
 		}
-		delegated = delegated || r.Delegated()
+		statements = statements || r.Stmt != nil
 	}
-	if !delegated || a.Stmt == nil {
+	if !statements || a.Stmt == nil {
 		return false
 	}
 	compiled, err := a.compile()

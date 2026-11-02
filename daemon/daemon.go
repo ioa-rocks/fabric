@@ -156,7 +156,7 @@ func New(dir state.Dir) (*Daemon, error) {
 			}
 		}
 	}
-	for _, addr := range cfg.Bootstrap {
+	for _, addr := range append(append([]string{}, cfg.Bootstrap...), cfg.DiscoveredBootstrap...) {
 		if _, err := peerInfo(addr); err != nil {
 			log.Printf("bad bootstrap addr %q: %v", addr, err)
 		}
@@ -242,10 +242,12 @@ func New(dir state.Dir) (*Daemon, error) {
 	// the lighthouses), not of any member: a phone on carrier NAT would
 	// otherwise open the dark gater to everyone behind that NAT.
 	d.Gater.SetConnSource(h.Network().Conns)
-	d.Gater.SetOracle(func(p peer.ID) bool {
-		protos, err := h.Peerstore().SupportsProtocols(p, autonatv2.DialProtocol)
-		return err == nil && len(protos) > 0
-	})
+	// Which members count as oracles is decided locally: the lighthouses
+	// the operator configured (join target, `fabric peer add`), not
+	// whoever advertises the dial protocol — a member could advertise it
+	// itself and open the gater to its NAT neighbours (Codex review,
+	// 2026-11-02). Pinned-by-discovery lighthouses do not qualify.
+	d.Gater.SetOracle(d.isConfiguredBootstrap)
 	if err := d.startHolePunch(); err != nil {
 		h.Close()
 		return nil, fmt.Errorf("starting hole punching: %w", err)
@@ -1071,7 +1073,7 @@ func (d *Daemon) pinQueueHosts() {
 			// Deduplicate addresses found on multiple connections in this pass.
 			d.pinnedBootstrap[bootstrap] = true
 			added = append(added, bootstrap)
-			cfg.Bootstrap = append(cfg.Bootstrap, bootstrap)
+			cfg.DiscoveredBootstrap = append(cfg.DiscoveredBootstrap, bootstrap)
 		}
 	}
 	if len(added) == 0 {
@@ -1109,8 +1111,31 @@ func durableBootstrapAddr(addr ma.Multiaddr, p peer.ID) (string, bool) {
 	return withPeer.String(), true
 }
 
+// bootstrapAddrs lists every address the node dials for recovery: the
+// operator-configured lighthouses plus those pinned from discovery.
+func (d *Daemon) bootstrapAddrs() []string {
+	d.cfgMu.Lock()
+	defer d.cfgMu.Unlock()
+	return append(append([]string{}, d.Config.Bootstrap...), d.Config.DiscoveredBootstrap...)
+}
+
+// isConfiguredBootstrap reports whether the peer is one of the
+// operator-configured bootstrap lighthouses (Config.Bootstrap, not the
+// discovered list): the local trust anchor for the NAT-oracle exemption.
+func (d *Daemon) isConfiguredBootstrap(p peer.ID) bool {
+	d.cfgMu.Lock()
+	addrs := append([]string{}, d.Config.Bootstrap...)
+	d.cfgMu.Unlock()
+	for _, addr := range addrs {
+		if info, err := peerInfo(addr); err == nil && info.ID == p {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *Daemon) connectBootstrap() {
-	infos := groupedBootstrap(d.Config.Bootstrap)
+	infos := groupedBootstrap(d.bootstrapAddrs())
 	// Give peers skipped by the concurrency limit the first slots next tick.
 	d.teleMu.Lock()
 	sort.SliceStable(infos, func(i, j int) bool { return d.lastDial[infos[i].ID].Before(d.lastDial[infos[j].ID]) })
@@ -1149,7 +1174,7 @@ func (d *Daemon) relayCandidates(ctx context.Context, num int) <-chan peer.AddrI
 				return false
 			}
 		}
-		for _, info := range groupedBootstrap(d.Config.Bootstrap) {
+		for _, info := range groupedBootstrap(d.bootstrapAddrs()) {
 			if info.ID != d.Host.ID() {
 				if !emit(info) {
 					return

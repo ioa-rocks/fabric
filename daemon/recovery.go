@@ -212,7 +212,7 @@ func (d *Daemon) recoverNetwork(reason string, staleConnections bool) {
 		for _, p := range d.Host.Peerstore().Peers() {
 			s.Backoff().Clear(p)
 		}
-		for _, info := range groupedBootstrap(d.Config.Bootstrap) {
+		for _, info := range groupedBootstrap(d.bootstrapAddrs()) {
 			s.Backoff().Clear(info.ID)
 		}
 	}

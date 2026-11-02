@@ -38,10 +38,15 @@ type Config struct {
 	// the daemon from gossip; edit by hand only to bootstrap a node that
 	// missed the move.
 	HonouredRoots []string `json:"honoured_roots,omitempty"`
-	Bootstrap     []string `json:"bootstrap"`            // multiaddrs including /p2p/<peer-id>
-	Subnet        string   `json:"subnet,omitempty"`     // overlay CIDR; master only (allocation)
-	TUN           string   `json:"tun,omitempty"`        // "" = auto (try, fall back), "off"
-	QueueHost     bool     `json:"queue_host,omitempty"` // run the admission queue (lighthouse role)
+	Bootstrap     []string `json:"bootstrap"` // multiaddrs including /p2p/<peer-id>; operator-configured (join, peer add): the lighthouses this node trusts as NAT oracles
+	// DiscoveredBootstrap are lighthouse addresses pinned from what connected
+	// members advertised (daemon.pinQueueHosts): dialed like Bootstrap for
+	// recovery, but not trusted for anything — a member can advertise a
+	// protocol on its own.
+	DiscoveredBootstrap []string `json:"discovered_bootstrap,omitempty"`
+	Subnet              string   `json:"subnet,omitempty"`     // overlay CIDR; master only (allocation)
+	TUN                 string   `json:"tun,omitempty"`        // "" = auto (try, fall back), "off"
+	QueueHost           bool     `json:"queue_host,omitempty"` // run the admission queue (lighthouse role)
 	// Listed opens the connection gater to inbound peers this node holds
 	// no cert for (they still have to authenticate). Off = dark: unknown
 	// peers are refused before anything above the transport runs. Queue

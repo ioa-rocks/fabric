@@ -207,6 +207,30 @@ func TestDelegatedAttestAndRevoke(t *testing.T) {
 		t.Fatalf("stored %d revocations, want 2", len(rs))
 	}
 
+	// With the root's revocation of the desk alone — no delegated one in
+	// the file — the desk-issued attestation is dead too (the chain check
+	// must not depend on a delegated revocation being present).
+	c2, _ := Init(t.TempDir(), "alex2", "pw")
+	root2, _ := c2.Unlock("pw")
+	deskA2, _ := statement.Sign(root2, statement.Payload{
+		Aud: cert.DIDForKey(deskPub), Sub: c2.Config.DID,
+		Res:   []statement.Resource{{Kind: statement.Any, Name: statement.Any, Sub: statement.Any}},
+		Verbs: append(append([]string{}, DeviceVerbs...), statement.VerbAdmin),
+		Del:   3, Iat: now.Unix(), Nbf: now.Unix(), Exp: now.Add(DefaultValidity).Unix(),
+	}, nil)
+	byDesk2, _ := AttestAs(deskPriv, deskA2, c2.Config.DID, dpub, now, DefaultValidity)
+	if c2.Revoked(byDesk2, now) {
+		t.Fatal("fresh desk-issued attestation reported revoked")
+	}
+	desk2ID := deskA2.ID()
+	rootOnly, _ := RevokeAs(root2, nil, c2.Config.DID, statement.Target{ID: desk2ID[:]}, now)
+	if _, err := c2.AddRevocations(now, rootOnly); err != nil {
+		t.Fatal(err)
+	}
+	if !c2.Revoked(byDesk2, now) {
+		t.Fatal("root revoking the desk did not cascade without a delegated revocation present")
+	}
+
 	// A revocation riding a chain that is not rooted in this circle (two
 	// throwaway keys claiming the circle's DID) is refused at ingest, not
 	// merely ignored by rule 3: otherwise anyone could fill the file and
