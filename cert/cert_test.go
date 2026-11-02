@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
+
+	"ioa.rocks/fabric/statement"
 )
 
 func genKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
@@ -154,13 +156,59 @@ func TestVerifyRejections(t *testing.T) {
 			t.Fatal("verified a cert with a foreign signature")
 		}
 	})
-	t.Run("non-empty prf rejected", func(t *testing.T) {
-		c := valid(t)
+	t.Run("legacy cert with prf rejected", func(t *testing.T) {
+		c := legacyCert(t, nsPriv, devPub, CmdMember, Meta{Name: "x"}, now, time.Hour)
 		c.Payload.Prf = [][]byte{{0x01}}
+		c.raw = nil
 		if err := Verify(c, nsPub, now); err == nil {
-			t.Fatal("verified a cert with a proof chain before delegation support")
+			t.Fatal("verified a legacy cert with a proof chain")
 		}
 	})
+	t.Run("delegated cert verifies through its chain", func(t *testing.T) {
+		deskPub, deskPriv := genKey(t)
+		desk, err := Issue(nsPriv, deskPub, CmdAdmin, Meta{Name: "desk"}, now, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := IssueAs(deskPriv, desk.Stmt, DIDForKey(nsPub), devPub, CmdMember, Meta{Name: "nas"}, now, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire, _ := c.Marshal()
+		back, err := Unmarshal(wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := Verify(back, nsPub, now.Add(time.Minute)); err != nil {
+			t.Fatalf("desk-issued cert: %v", err)
+		}
+		if back.Payload.Iss != DIDForKey(deskPub) || back.Payload.Sub != DIDForKey(nsPub) || back.Payload.Cmd != CmdMember {
+			t.Fatalf("view: %+v", back.Payload)
+		}
+		// A device (no admin) cannot issue certs.
+		member, _ := Issue(nsPriv, deskPub, CmdMember, Meta{Name: "laptop"}, now, time.Hour)
+		rogue, err := IssueAs(deskPriv, member.Stmt, DIDForKey(nsPub), devPub, CmdMember, Meta{Name: "nas"}, now, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := Verify(rogue, nsPub, now.Add(time.Minute)); err == nil {
+			t.Fatal("a member device issued a verifying cert")
+		}
+	})
+}
+
+// legacyCert mints a pre-statement certificate the way the old binary did,
+// so the legacy decode/verify path stays exercised.
+func legacyCert(t *testing.T, rootPriv ed25519.PrivateKey, devPub ed25519.PublicKey, cmd string, meta Meta, nbf time.Time, validity time.Duration) *Cert {
+	t.Helper()
+	rootDID := DIDForKey(rootPriv.Public().(ed25519.PublicKey))
+	p := Payload{Iss: rootDID, Aud: DIDForKey(devPub), Sub: rootDID, Cmd: cmd, Meta: meta,
+		Nbf: nbf.Unix(), Exp: nbf.Add(validity).Unix(), Nonce: make([]byte, nonceSize), Prf: [][]byte{}}
+	msg, err := encMode.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Cert{Payload: p, Sig: ed25519.Sign(rootPriv, msg), raw: msg}
 }
 
 func TestRenewPreservesPayload(t *testing.T) {
@@ -284,36 +332,59 @@ func TestVerifyAndForwardUnknownPayloadFields(t *testing.T) {
 	}
 }
 
-// The wire shape must not have changed: a cert issued and marshalled here
-// decodes with the pre-raw-payload layout (payload map + sig).
-func TestWireShapeUnchanged(t *testing.T) {
-	_, nsPriv := genKey(t)
+// A fresh cert is a statement on the wire: it decodes with package
+// statement, labels as a device assert, and the Payload view derives role
+// and scope from its verbs. A legacy cert still round-trips byte-for-byte
+// and renews into a statement.
+func TestStatementCertWireAndLegacyRenewal(t *testing.T) {
+	nsPub, nsPriv := genKey(t)
 	devPub, _ := genKey(t)
-	c, err := Issue(nsPriv, devPub, CmdMember, Meta{Name: "nas", IP: "100.64.0.9/24"}, time.Now(), time.Hour)
+	now := time.Now()
+	c, err := Issue(nsPriv, devPub, CmdAdmin, Meta{Name: "desk", IP: "100.64.0.1/24", Scope: []string{ScopeTun, ScopeVault}}, now, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wire, err := c.Marshal()
+	wire, _ := c.Marshal()
+	s, err := statement.Decode(wire)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var legacy struct {
-		Payload Payload `cbor:"payload"`
-		Sig     []byte  `cbor:"sig"`
+	if s.Label() != "admin assert" || s.Payload.Del != 3 {
+		t.Fatalf("label %q del %d", s.Label(), s.Payload.Del)
 	}
-	if err := cbor.Unmarshal(wire, &legacy); err != nil {
+	back, _ := Unmarshal(wire)
+	if !back.IsStatement() || back.Payload.Cmd != CmdAdmin || !slices.Equal(back.Payload.Meta.Scope, []string{ScopeTun, ScopeVault}) ||
+		back.Payload.Meta.IP != "100.64.0.1/24" || !back.Allows(ScopeTun) || back.Allows(ScopeAstral) || !back.Allows("") {
+		t.Fatalf("view: %+v", back.Payload)
+	}
+	if err := Verify(back, nsPub, now); err != nil {
 		t.Fatal(err)
 	}
-	if !metaEqual(legacy.Payload.Meta, c.Payload.Meta) || legacy.Payload.Aud != c.Payload.Aud || legacy.Payload.Exp != c.Payload.Exp ||
-		!bytes.Equal(legacy.Payload.Nonce, c.Payload.Nonce) || !bytes.Equal(legacy.Sig, c.Sig) {
-		t.Fatal("legacy layout decode differs")
-	}
-	relegacy, err := encMode.Marshal(legacy)
+
+	legacy := legacyCert(t, nsPriv, devPub, CmdMember, Meta{Name: "nas", Scope: []string{ScopeVault}}, now, time.Hour)
+	lw, _ := legacy.Marshal()
+	lb, err := Unmarshal(lw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(relegacy, wire) {
-		t.Fatal("legacy re-encoding is not byte-identical to the new Marshal")
+	if lb.IsStatement() {
+		t.Fatal("legacy bytes decoded as a statement")
+	}
+	if err := Verify(lb, nsPub, now); err != nil {
+		t.Fatalf("legacy verify: %v", err)
+	}
+	if again, _ := lb.Marshal(); !bytes.Equal(again, lw) {
+		t.Fatal("legacy re-marshal changed bytes")
+	}
+	renewed, err := Renew(nsPriv, lb, now.Add(time.Minute), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !renewed.IsStatement() || renewed.Payload.Aud != lb.Payload.Aud || !renewed.Allows(ScopeVault) || renewed.Allows(ScopeTun) {
+		t.Fatalf("legacy renewal: %+v", renewed.Payload)
+	}
+	if err := Verify(renewed, nsPub, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
 	}
 }
 
