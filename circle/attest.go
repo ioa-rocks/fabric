@@ -106,11 +106,13 @@ func AttestAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID strin
 		return nil, errors.New("attestation validity must be positive")
 	}
 	s, err := statement.Sign(priv, statement.Payload{
-		Aud:   did.ForKey(devicePub),
-		Sub:   circleDID,
-		Res:   []statement.Resource{{Kind: statement.Any, Name: statement.Any}},
+		Aud: did.ForKey(devicePub),
+		Sub: circleDID,
+		// Any resource in any circle, as for certs: lets the device present
+		// grants other circles gave its circle (rule 5); no authority by itself.
+		Res:   []statement.Resource{{Kind: statement.Any, Name: statement.Any, Sub: statement.Any}},
 		Verbs: DeviceVerbs,
-		Del:   1,
+		Del:   1, // sub-keys only: rule 8 keeps admission verbs out of them
 		Iat:   now.Unix(),
 		Nbf:   now.Unix(),
 		Exp:   now.Add(validity).Unix(),

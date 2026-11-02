@@ -215,6 +215,13 @@ func readAndValidateCert(r io.Reader, roots statement.Roots, remote peer.ID) (*c
 	if err := cert.VerifyRoots(c, roots, time.Now()); err != nil {
 		return nil, fmt.Errorf("invalid membership cert: %w", err)
 	}
+	// Until the member store indexes revocations by chain ancestor (build
+	// step 5, with keystore-backed desk signing), a cert issued under
+	// another cert is not accepted on transport: revoking the issuer would
+	// not reach what it issued (agy review, 2026-11-02).
+	if c.Stmt != nil && c.Stmt.Parent() != nil {
+		return nil, errors.New("delegated membership certs are not accepted on transport yet")
+	}
 	devKey, err := c.DeviceKey()
 	if err != nil {
 		return nil, err

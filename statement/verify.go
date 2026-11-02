@@ -105,9 +105,23 @@ func Compile(authority, identity *Statement, sub string, roots Roots) (*Compiled
 	}
 
 	// Identity chain: anchored at the authority leaf's aud (rule 1 note). A
-	// circle DID this node holds resolves through roots; anything else must
-	// be a did:key (a device or bare key, or a foreign circle's did:key).
+	// circle DID this node holds resolves through roots and the chain must
+	// start there (root → device → sub-key, every link checked). Anything
+	// else must be a did:key — a device or bare key, or a foreign circle's
+	// did:key — and the chain joins where that key appears: as the issuer
+	// of the first link, or as the recipient of an interior link, in which
+	// case the links above it (the presenter's own home chain, which this
+	// node cannot judge and need not) are dropped and the suffix compiles
+	// from the anchor (task §"Two chains, one join point"; agy review,
+	// 2026-11-02).
 	anchor := leaf.Payload.Aud
+	ident := identity.Chain()
+	isub := ident[0].Payload.Sub
+	for _, l := range ident {
+		if l.Payload.Sub != isub {
+			return nil, errors.New("identity links span several circles")
+		}
+	}
 	anchorKeys := roots.RootKeys(anchor)
 	if len(anchorKeys) > 0 {
 		c.IdentAnchor = anchor
@@ -117,12 +131,16 @@ func Compile(authority, identity *Statement, sub string, roots Roots) (*Compiled
 			return nil, fmt.Errorf("identity anchor %q is neither a held circle nor a did:key", anchor)
 		}
 		anchorKeys = []ed25519.PublicKey{k}
-	}
-	ident := identity.Chain()
-	isub := ident[0].Payload.Sub
-	for _, l := range ident {
-		if l.Payload.Sub != isub {
-			return nil, errors.New("identity links span several circles")
+		for i, l := range ident {
+			if l.Payload.Aud == anchor {
+				ident = ident[i+1:]
+				break
+			}
+		}
+		if len(ident) == 0 {
+			// The anchor is the last link's recipient: the presenter is the
+			// anchor itself and the chain adds nothing.
+			return c, nil
 		}
 	}
 	links, inbf, iexp, err := compileChain(ident, anchorKeys, "identity")
@@ -405,7 +423,7 @@ func revoked(links []Link, roots Roots, revs Revocations) error {
 				continue
 			}
 			if r.IsRootIssued() {
-				if rootSigned(r, roots.RootKeys(l.Sub)) {
+				if rootSigned(r, rootKeysOrDID(roots, l.Sub)) {
 					return fmt.Errorf("link %s revoked by the root", short(l.Aud))
 				}
 				continue
@@ -434,6 +452,20 @@ func targets(r *Statement, l Link) bool {
 		return bytes.Equal(t.ID, l.ID[:])
 	}
 	return t.Aud == l.Aud && l.Iat <= t.Before
+}
+
+// rootKeysOrDID resolves a circle's root keys through roots, falling back
+// to the did:key itself for a circle this node does not hold — so a root
+// revocation on an identity link in a foreign circle (the presenter's home
+// root revoking its device) is recognised, as Compile recognises that root.
+func rootKeysOrDID(roots Roots, circleDID string) []ed25519.PublicKey {
+	if keys := roots.RootKeys(circleDID); len(keys) > 0 {
+		return keys
+	}
+	if k, err := did.KeyFor(circleDID); err == nil {
+		return []ed25519.PublicKey{k}
+	}
+	return nil
 }
 
 func rootSigned(r *Statement, rootKeys []ed25519.PublicKey) bool {

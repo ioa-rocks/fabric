@@ -54,6 +54,7 @@ type Gater struct {
 	refused        atomic.Uint64 // inbound connections refused as unknown (dark)
 	admittedByHost atomic.Uint64 // unknown inbound admitted from a member's IP
 	conns          atomic.Pointer[func() []network.Conn]
+	oracle         atomic.Pointer[func(peer.ID) bool] // which connected members may be dial-back hosts
 
 	mu        sync.Mutex
 	lastLog   map[peer.ID]time.Time // last "refused" log line per peer
@@ -102,6 +103,13 @@ func (g *Gater) Listed() bool { return g.listed.Load() }
 // exemption applies.
 func (g *Gater) SetConnSource(f func() []network.Conn) { g.conns.Store(&f) }
 
+// SetOracle names which connected members count as dial-back hosts for the
+// member-host exemption: the NAT oracles (lighthouses serving AutoNAT v2),
+// not every member. Without an oracle predicate no inbound unknown peer is
+// exempted — a member on a carrier or café NAT must not open the dark gater
+// to everyone sharing its IP (agy review, 2026-11-02).
+func (g *Gater) SetOracle(f func(peer.ID) bool) { g.oracle.Store(&f) }
+
 // Posture names the posture for status output.
 func (g *Gater) Posture() string {
 	if g.Listed() {
@@ -143,12 +151,12 @@ func (g *Gater) InterceptUpgraded(network.Conn) (bool, control.DisconnectReason)
 	return true, 0
 }
 
-// fromMemberHost reports whether the connection comes from the IP of a peer
-// this node currently holds a member connection with (the AutoNAT dial-back
-// case; see the type comment).
+// fromMemberHost reports whether the connection comes from the IP of a
+// NAT-oracle member this node currently holds a connection with (the
+// AutoNAT dial-back case; see the type comment and SetOracle).
 func (g *Gater) fromMemberHost(addrs network.ConnMultiaddrs, now time.Time) bool {
-	src := g.conns.Load()
-	if src == nil || addrs == nil {
+	src, oracle := g.conns.Load(), g.oracle.Load()
+	if src == nil || oracle == nil || addrs == nil {
 		return false
 	}
 	ip, err := manet.ToIP(addrs.RemoteMultiaddr())
@@ -156,7 +164,7 @@ func (g *Gater) fromMemberHost(addrs network.ConnMultiaddrs, now time.Time) bool
 		return false
 	}
 	for _, c := range (*src)() {
-		if !g.store.IsMember(c.RemotePeer(), now) {
+		if !g.store.IsMember(c.RemotePeer(), now) || !(*oracle)(c.RemotePeer()) {
 			continue
 		}
 		if other, err := manet.ToIP(c.RemoteMultiaddr()); err == nil && other.Equal(ip) {

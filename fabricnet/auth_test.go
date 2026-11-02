@@ -2,9 +2,11 @@ package fabricnet
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -199,6 +201,43 @@ func TestStrangerIsRejectedAndDisconnected(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("stranger still connected after grace period")
+}
+
+// A cert issued under another cert verifies as a statement but is not
+// accepted on transport until revocations cascade along the chain (build
+// step 5): the member store indexes revocations by the leaf's peer only.
+func TestDelegatedCertRefusedOnTransport(t *testing.T) {
+	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
+	deskPub, deskPriv, _ := ed25519.GenerateKey(rand.Reader)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+	desk, err := cert.IssueAsDel(nsPriv, nil, cert.DIDForKey(nsPub), deskPub, cert.CmdAdmin, cert.Meta{Name: "desk"}, now, time.Hour, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegated, err := cert.IssueAs(deskPriv, desk.Stmt, cert.DIDForKey(nsPub), devPub, cert.CmdMember, cert.Meta{Name: "nas"}, now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := statement.NewDIDRoots(cert.DIDForKey(nsPub))
+	if err := cert.VerifyRoots(delegated, roots, now.Add(time.Minute)); err != nil {
+		t.Fatalf("premise: the delegated cert verifies as a statement: %v", err)
+	}
+	p, _ := PeerIDForKey(devPub)
+	var buf bytes.Buffer
+	if err := writeCert(&buf, delegated); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readAndValidateCert(&buf, roots, p); err == nil || !strings.Contains(err.Error(), "delegated") {
+		t.Fatalf("delegated cert on transport: %v, want refusal", err)
+	}
+	// A root-issued cert passes the same reader.
+	direct, _ := cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, now, time.Hour)
+	buf.Reset()
+	_ = writeCert(&buf, direct)
+	if _, err := readAndValidateCert(&buf, roots, p); err != nil {
+		t.Fatalf("root-issued cert on transport: %v", err)
+	}
 }
 
 func TestForeignNamespaceCertRejected(t *testing.T) {

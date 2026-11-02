@@ -166,7 +166,18 @@ func TestVerifyRejections(t *testing.T) {
 	})
 	t.Run("delegated cert verifies through its chain", func(t *testing.T) {
 		deskPub, deskPriv := genKey(t)
-		desk, err := Issue(nsPriv, deskPub, CmdAdmin, Meta{Name: "desk"}, now, time.Hour)
+		// A plain admin cert is not delegable (hot device key); a desk assert
+		// is issued delegable explicitly.
+		plain, _ := Issue(nsPriv, deskPub, CmdAdmin, Meta{Name: "desk"}, now, time.Hour)
+		if plain.Stmt.Payload.Del != 0 {
+			t.Fatalf("admin cert del %d, want 0", plain.Stmt.Payload.Del)
+		}
+		if viaPlain, _ := IssueAs(deskPriv, plain.Stmt, DIDForKey(nsPub), devPub, CmdMember, Meta{Name: "nas"}, now, time.Hour); viaPlain != nil {
+			if err := Verify(viaPlain, nsPub, now.Add(time.Minute)); err == nil {
+				t.Fatal("a cert issued under a non-delegable admin cert verified")
+			}
+		}
+		desk, err := IssueAsDel(nsPriv, nil, DIDForKey(nsPub), deskPub, CmdAdmin, Meta{Name: "desk"}, now, time.Hour, 3)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -349,7 +360,7 @@ func TestStatementCertWireAndLegacyRenewal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Label() != "admin assert" || s.Payload.Del != 3 {
+	if s.Label() != "admin assert" || s.Payload.Del != 0 {
 		t.Fatalf("label %q del %d", s.Label(), s.Payload.Del)
 	}
 	back, _ := Unmarshal(wire)

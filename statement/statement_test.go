@@ -401,6 +401,22 @@ func TestForeignGrantWithIdentityChain(t *testing.T) {
 	if c.PresentingKey != h.sub.did || len(c.Ident) != 1 {
 		t.Fatal("identity chain not compiled")
 	}
+	// The real shape: the sub-key carries its full home chain (root → desk
+	// → device → sub-key) and the grant joins at the device, an interior
+	// link. P compiles only the suffix below the device.
+	full := assert(t, h.dev, h.devA, h.sub.did, h.did, []Resource{{Kind: KindSubject, Name: "jobs/*", Sub: p.did}}, []string{VerbClaim}, nil, 0)
+	c, err = Verify(grant, full, pRoots, nil, want(p.did, KindSubject, "jobs/1", VerbClaim, h.sub.did))
+	if err != nil {
+		t.Fatalf("full-chain sub-key under a device grant: %v", err)
+	}
+	if len(c.Ident) != 1 || c.Ident[0].ID != full.ID() {
+		t.Fatalf("identity suffix: %d link(s), want just the sub-key", len(c.Ident))
+	}
+	// The device itself presenting with its home chain as identity: the
+	// anchor is the last recipient, nothing to compile.
+	if c, err := Verify(grant, h.devA, pRoots, nil, want(p.did, KindSubject, "jobs/1", VerbClaim, h.dev.did)); err != nil || len(c.Ident) != 0 {
+		t.Fatalf("device presenting its own chain: %v, %d ident links", err, len(c.Ident))
+	}
 	// A sub-key whose assert does not list P's subject is refused.
 	narrow := assert(t, h.dev, nil, h.sub.did, h.did, []Resource{{Kind: KindSubject, Name: "jobs/*"}}, []string{VerbClaim}, nil, 0)
 	_, err = Verify(grant, narrow, pRoots, nil, want(p.did, KindSubject, "jobs/1", VerbClaim, h.sub.did))
@@ -427,6 +443,10 @@ func TestForeignGrantWithIdentityChain(t *testing.T) {
 	revs.Add(r)
 	roots := RootMap{p.did: {p.pub}, h.did: {h.root.pub}}
 	_, err = Verify(wide, devWide, roots, revs, want(p.did, KindSubject, "jobs/2", VerbClaim, h.dev.did))
+	mustFail(t, err, "identity link")
+	// ... and P need not hold the worker's circle for that: a did:key
+	// circle's root revocation is recognised through the DID itself.
+	_, err = Verify(wide, devWide, pRoots, revs, want(p.did, KindSubject, "jobs/2", VerbClaim, h.dev.did))
 	mustFail(t, err, "identity link")
 }
 

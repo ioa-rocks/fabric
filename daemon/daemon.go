@@ -237,7 +237,15 @@ func New(dir state.Dir) (*Daemon, error) {
 		h.RemoveStreamHandler(autonatv2.DialProtocol)
 	}
 	d.Host = h
-	d.Gater.SetConnSource(h.Network().Conns) // member-host exemption for AutoNAT dial-backs
+	// Member-host exemption for AutoNAT dial-backs: only from the IP of a
+	// connected member that is a NAT oracle (serves the v2 dial protocol —
+	// the lighthouses), not of any member: a phone on carrier NAT would
+	// otherwise open the dark gater to everyone behind that NAT.
+	d.Gater.SetConnSource(h.Network().Conns)
+	d.Gater.SetOracle(func(p peer.ID) bool {
+		protos, err := h.Peerstore().SupportsProtocols(p, autonatv2.DialProtocol)
+		return err == nil && len(protos) > 0
+	})
 	if err := d.startHolePunch(); err != nil {
 		h.Close()
 		return nil, fmt.Errorf("starting hole punching: %w", err)
@@ -820,6 +828,11 @@ func (d *Daemon) hydrateStore() {
 func (d *Daemon) applyEvent(e *event.Event) {
 	if e.IsRootEvent() {
 		d.applyRootEvent(e, true)
+		// root-retired is the last event of a move; nothing follows it to
+		// flush the log, and Run does not save on shutdown — without this
+		// a restart forgets the retirement (agy review, 2026-11-02).
+		d.refreshRoutes()
+		d.persistEvents()
 		return
 	}
 	devKey, err := e.DeviceKey()

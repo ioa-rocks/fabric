@@ -114,6 +114,19 @@ func (r *Revocation) Verify() error {
 			if !bytes.Equal(k, rootKey) {
 				return errors.New("revocation is signed neither by the circle root nor under a chain")
 			}
+			return nil
+		}
+		// Delegated: the chain it rides must compile against this circle's
+		// root and be delegable, or anyone could flood a circle with
+		// revocations under throwaway keys (stored for MaxValidity,
+		// re-gossiped, cache-thrashing) — whether a revocation reaches a
+		// given attestation is still rule 3 (agy review, 2026-11-02).
+		parent := r.Stmt.Parent()
+		if _, err := statement.Compile(parent, nil, r.Circle, didKeyRoots{}); err != nil {
+			return fmt.Errorf("revocation chain: %w", err)
+		}
+		if parent.Payload.Del < 1 {
+			return errors.New("revocation chain leaf is not delegable: nothing can be under it")
 		}
 		return nil
 	}

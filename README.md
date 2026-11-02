@@ -112,10 +112,13 @@ inbound connections. A queue host is *listed* (strangers must reach it
 to join); `"listed": true` in `config.json` lists any other node that
 has to accept unknown peers. Outbound dials are never gated by
 posture: the node chose them, and the handshake settles who answered.
-One exemption: an unknown inbound peer arriving from the IP of a member
-this node is connected to right now is admitted, because libp2p's
-AutoNAT dials back from a throwaway identity on the lighthouse's
-machine; the grace watchdog still closes it unless it authenticates.
+One exemption: an unknown inbound peer arriving from the IP of a
+connected member that serves as NAT oracle (a lighthouse: it offers the
+AutoNAT v2 dial protocol) is admitted, because libp2p's AutoNAT dials
+back from a throwaway identity on the lighthouse's machine; the grace
+watchdog still closes it unless it authenticates. Ordinary members do
+not earn the exemption: a phone on carrier NAT would otherwise open the
+dark node to everyone sharing its address.
 
 **4. Start the new node:**
 

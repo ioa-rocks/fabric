@@ -258,7 +258,9 @@ var familyVerbs = map[string][]string{
 func VerbsForScope(cmd string, scope []string) []string {
 	verbs := []string{statement.VerbMember}
 	if cmd == CmdAdmin {
-		verbs = append(verbs, statement.VerbAdmin)
+		// terminate rides with admin so an admin assert can attenuate it
+		// onto a gateway grant; it means nothing on a device itself.
+		verbs = append(verbs, statement.VerbAdmin, statement.VerbTerminate)
 	}
 	for _, f := range AllScopes() {
 		if ScopeAllows(scope, f) {
@@ -307,22 +309,43 @@ func Issue(rootPriv ed25519.PrivateKey, devicePub ed25519.PublicKey, cmd string,
 // may: the root (own == nil) or an admin desk under its own admin assert
 // (own), in which case the cert chains through it and dies with it
 // (verifier rule 8 lets only such issuers hand out member/tun/ip).
+//
+// Delegation depth defaults to DefaultDel(cmd): a member cert may hand out
+// one level of sub-keys (del 1; rule 8 keeps admission verbs out of them),
+// an admin cert none (del 0). The daemon's device key is hot and
+// unencrypted; a delegable admin cert on it would let anyone who reads the
+// state directory mint members without the root passphrase (agy review,
+// 2026-11-02). Delegable admin asserts come with keystore-backed desk
+// signing (build step 5); until then IssueAsDel is for tests and tooling.
 func IssueAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, devicePub ed25519.PublicKey, cmd string, meta Meta, nbf time.Time, validity time.Duration) (*Cert, error) {
+	return IssueAsDel(priv, own, circleDID, devicePub, cmd, meta, nbf, validity, DefaultDel(cmd))
+}
+
+// DefaultDel is the delegation depth IssueAs gives a cert of this role.
+func DefaultDel(cmd string) int {
+	if cmd == CmdAdmin {
+		return 0
+	}
+	return 1
+}
+
+// IssueAsDel is IssueAs with an explicit delegation depth.
+func IssueAsDel(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, devicePub ed25519.PublicKey, cmd string, meta Meta, nbf time.Time, validity time.Duration, del int) (*Cert, error) {
 	if cmd != CmdMember && cmd != CmdAdmin {
 		return nil, fmt.Errorf("unknown command path %q", cmd)
-	}
-	del := 1
-	if cmd == CmdAdmin {
-		del = 3
 	}
 	var m *statement.Meta
 	if meta.Name != "" || meta.IP != "" {
 		m = &statement.Meta{Name: meta.Name, IP: meta.IP}
 	}
 	s, err := statement.Sign(priv, statement.Payload{
-		Aud:   did.ForKey(devicePub),
-		Sub:   circleDID,
-		Res:   []statement.Resource{{Kind: statement.Any, Name: statement.Any}},
+		Aud: did.ForKey(devicePub),
+		Sub: circleDID,
+		// Any resource in any circle: a member may use whatever grants its
+		// circle or its key receives from other circles (the identity chain
+		// must cover the foreign resource too; rule 5). This gives no
+		// authority anywhere on its own — the foreign authority chain does.
+		Res:   []statement.Resource{{Kind: statement.Any, Name: statement.Any, Sub: statement.Any}},
 		Verbs: VerbsForScope(cmd, meta.Scope),
 		Meta:  m,
 		Del:   del,

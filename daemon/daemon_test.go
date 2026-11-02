@@ -362,4 +362,20 @@ func TestRootMoveAndRetire(t *testing.T) {
 	if cfg, _ := b.Dir.LoadConfig(); cfg.NamespaceDID != d2 || len(cfg.HonouredRoots) != 0 {
 		t.Fatalf("B's config after retirement: %+v", cfg)
 	}
+	// root-retired is the last event of the move; it must reach the event
+	// file on both sides without waiting for a later event to flush it, or
+	// a restart (and every peer syncing from it) forgets the retirement.
+	for _, d := range []*Daemon{a, b} {
+		evs, err := d.Dir.LoadEvents()
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, e := range evs {
+			found = found || e.Payload.Kind == event.KindRootRetired
+		}
+		if !found {
+			t.Fatalf("%s did not persist root-retired", d.Config.Name)
+		}
+	}
 }

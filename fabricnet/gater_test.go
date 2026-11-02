@@ -189,6 +189,11 @@ func TestDarkNodeRefusesUnknownUntilGossip(t *testing.T) {
 	// IP exactly like a dial-back host does.
 	dark.store.AddMember(listed.host.ID(), listed.own)
 	dark.gater.SetConnSource(dark.host.Network().Conns)
+	// Only NAT oracles earn the exemption: with the lighthouse not counted
+	// as one, the stranger is refused like anyone else.
+	dark.gater.SetOracle(func(peer.ID) bool { return false })
+	assertRefused(t, stranger, dark, "stranger from a non-oracle member's IP")
+	dark.gater.SetOracle(func(p peer.ID) bool { return p == listed.host.ID() })
 	if err := tryConnect(stranger, dark); err != nil {
 		t.Fatalf("stranger from a member's IP refused: %v", err)
 	}

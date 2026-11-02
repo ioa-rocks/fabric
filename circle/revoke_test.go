@@ -163,7 +163,7 @@ func TestDelegatedAttestAndRevoke(t *testing.T) {
 	now := time.Now()
 	deskA, err := statement.Sign(root, statement.Payload{
 		Aud: cert.DIDForKey(deskPub), Sub: c.Config.DID,
-		Res:   []statement.Resource{{Kind: statement.Any, Name: statement.Any}},
+		Res:   []statement.Resource{{Kind: statement.Any, Name: statement.Any, Sub: statement.Any}},
 		Verbs: append(append([]string{}, DeviceVerbs...), statement.VerbAdmin),
 		Del:   3, Iat: now.Unix(), Nbf: now.Unix(), Exp: now.Add(DefaultValidity).Unix(),
 	}, nil)
@@ -205,5 +205,49 @@ func TestDelegatedAttestAndRevoke(t *testing.T) {
 	rs, _ := c.Revocations(now)
 	if len(rs) != 2 {
 		t.Fatalf("stored %d revocations, want 2", len(rs))
+	}
+
+	// A revocation riding a chain that is not rooted in this circle (two
+	// throwaway keys claiming the circle's DID) is refused at ingest, not
+	// merely ignored by rule 3: otherwise anyone could fill the file and
+	// the gossip with it.
+	k1Pub, k1, _ := ed25519.GenerateKey(rand.Reader)
+	k2Pub, k2, _ := ed25519.GenerateKey(rand.Reader)
+	fakeDesk, _ := statement.Sign(k1, statement.Payload{
+		Aud: cert.DIDForKey(k2Pub), Sub: c.Config.DID,
+		Res:   []statement.Resource{{Kind: statement.Any, Name: statement.Any, Sub: statement.Any}},
+		Verbs: []string{statement.VerbAdmin, statement.VerbMember},
+		Del:   3, Iat: now.Unix(), Nbf: now.Unix(), Exp: now.Add(DefaultValidity).Unix(),
+	}, nil)
+	_ = k1Pub
+	bogus, err := RevokeAs(k2, fakeDesk, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub), Before: now.Unix()}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bogus.Verify(); err == nil {
+		t.Fatal("revocation under a chain not rooted in the circle verified")
+	}
+	if added, _ := c.AddRevocations(now, bogus); len(added) != 0 {
+		t.Fatal("bogus revocation was stored")
+	}
+	// A sub-key (del 0) has nothing beneath it: its revocations are refused too.
+	lPub, lPriv, _ := ed25519.GenerateKey(rand.Reader)
+	sPub, sPriv, _ := ed25519.GenerateKey(rand.Reader)
+	devA, _ := Attest(root, lPub, now)
+	subA, err := statement.Sign(lPriv, statement.Payload{
+		Aud: cert.DIDForKey(sPub), Sub: c.Config.DID,
+		Res:   []statement.Resource{{Kind: statement.KindSubject, Name: "jobs/*"}},
+		Verbs: []string{statement.VerbClaim},
+		Del:   0, Iat: now.Unix(), Nbf: now.Unix(), Exp: now.Add(time.Hour).Unix(),
+	}, devA.Stmt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := RevokeAs(sPriv, subA, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub), Before: now.Unix()}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := leaf.Verify(); err == nil {
+		t.Fatal("revocation under a non-delegable leaf verified")
 	}
 }

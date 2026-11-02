@@ -194,8 +194,12 @@ func (s *CircleService) Info(now time.Time) []CircleInfo {
 			ci.Revocations = len(rs)
 		}
 		a, err := c.LoadAttestation()
-		if err != nil {
-			a = s.homeAttestation(c)
+		if err != nil || a.Valid(now) != nil {
+			// No file, or a stale one left from before the mesh-root merge:
+			// the home-circle cert is the attestation now.
+			if h := s.homeAttestation(c); h != nil {
+				a = h
+			}
 		}
 		if a != nil {
 			exp := a.Expiry()
