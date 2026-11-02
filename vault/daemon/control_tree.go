@@ -86,6 +86,7 @@ func (d *Daemon) handlePutEntry(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
+	d.kickFolders(h.ID())
 	d.kickSync()
 	writeJSON(w, Info(o))
 }
@@ -123,6 +124,7 @@ func (d *Daemon) handleSetAttr(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
+	d.kickFolders(h.ID())
 	d.kickSync()
 	writeJSON(w, Info(o))
 }
@@ -156,6 +158,7 @@ func (d *Daemon) handleSetPolicy(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
+	d.kickFolders(h.ID())
 	d.kickSync()
 	writeJSON(w, h.CurrentPolicy())
 }
@@ -198,6 +201,7 @@ func (d *Daemon) handleRestore(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
+	d.kickFolders(h.ID())
 	d.kickSync()
 	writeJSON(w, Info(o))
 }
@@ -245,6 +249,7 @@ func (d *Daemon) handleResolve(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
+	d.kickFolders(h.ID())
 	d.kickSync()
 	writeJSON(w, Info(o))
 }
@@ -286,6 +291,7 @@ func (d *Daemon) heldDecision(w http.ResponseWriter, r *http.Request, decide fun
 		httpErr(w, err)
 		return
 	}
+	d.kickFolders(h.ID())
 	d.kickSync()
 	writeJSON(w, countBody{Count: n})
 }

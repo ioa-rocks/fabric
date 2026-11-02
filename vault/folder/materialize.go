@@ -114,6 +114,8 @@ func (r *Replica) Materialize() (Report, error) {
 	}
 	if len(rep.Errors) > 0 {
 		r.lastErr = rep.Errors[0]
+	} else {
+		r.lastErr = ""
 	}
 	return rep, nil
 }

@@ -131,9 +131,10 @@ func TestFolderReplicaOverMesh(t *testing.T) {
 		}
 		return false
 	})
-	waitFor(t, "B to see the conflict", func() bool {
+	waitFor(t, "B to see and hold the conflict", func() bool {
 		cs, _ := clB.Conflicts("sync-lab")
-		return len(cs) == 1
+		bs, _ := clB.Buckets()
+		return len(cs) == 1 && len(bs) == 1 && bs[0].Objects == 32 && bs[0].Held == 32
 	})
 
 	// rm -rf docs in the folder: held, not propagated.
@@ -148,15 +149,28 @@ func TestFolderReplicaOverMesh(t *testing.T) {
 	if bs, _ := clB.Buckets(); bs[0].Objects != 32 { // 30 notes + link + from-nas
 		t.Fatalf("held deletion leaked to B: %d live", bs[0].Objects)
 	}
+	if cs, _ := clB.Conflicts("sync-lab"); len(cs) != 1 {
+		t.Fatalf("rm -rf silently resolved the conflict on B: %d", len(cs))
+	}
 	if n, err := clA.RejectHeld("sync-lab"); err != nil || n < 30 {
 		t.Fatalf("reject: %d %v", n, err)
 	}
-	waitFor(t, "rejected files to come back in the folder", func() bool {
-		body, err := os.ReadFile(filepath.Join(dir, "docs", "n29.md"))
-		return err == nil && string(body) == "note 29"
+	waitFor(t, "rejected files and conflict copy to come back in the folder", func() bool {
+		b29, err1 := os.ReadFile(filepath.Join(dir, "docs", "n29.md"))
+		b01, err2 := os.ReadFile(filepath.Join(dir, "docs", "n01.md"))
+		if err1 != nil || string(b29) != "note 29" || err2 != nil || string(b01) != "desk version" {
+			return false
+		}
+		ents, _ := os.ReadDir(filepath.Join(dir, "docs"))
+		for _, e := range ents {
+			if strings.HasPrefix(e.Name(), "n01.conflict-") {
+				return true
+			}
+		}
+		return false
 	})
 	fs, _ := clA.Folders()
-	if len(fs) != 1 || !fs[0].Open || !fs[0].Available || fs[0].Held != 0 {
+	if len(fs) != 1 || !fs[0].Open || !fs[0].Available || fs[0].Held != 0 || fs[0].Error != "" {
 		t.Fatalf("folder status: %+v", fs)
 	}
 }

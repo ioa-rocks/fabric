@@ -217,9 +217,11 @@ func (h *Handle) AcceptHeld() (int, error) {
 	return n, h.writeHeld(set)
 }
 
-// RejectHeld keeps the objects: each parked tombstone is merged and then
+// RejectHeld keeps the objects: a peer's parked tombstone is merged and then
 // superseded by a live revision that dominates it, so the deleting peer
-// converges on the restore too. Returns how many were restored.
+// converges on the restore too; a local tombstone was never merged or sent,
+// so dropping it leaves the index (including any unresolved conflicts) as it
+// was before the scan. Returns how many were restored.
 func (h *Handle) RejectHeld() (int, error) {
 	h.heldMu.Lock()
 	defer h.heldMu.Unlock()
@@ -229,6 +231,16 @@ func (h *Handle) RejectHeld() (int, error) {
 	}
 	n := 0
 	for id, rec := range set {
+		if rec.From == "local" {
+			if cur, err := h.Index.GetObject(id); err == nil && cur.IsDeleted() {
+				if _, err := h.Restore(cur); err != nil {
+					return n, err
+				}
+			}
+			delete(set, id)
+			n++
+			continue
+		}
 		in, err := index.UnmarshalObject(rec.Record)
 		if err != nil {
 			return n, err

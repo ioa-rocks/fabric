@@ -391,3 +391,77 @@ func TestFolderConflictAndHold(t *testing.T) {
 	}
 	_ = io.EOF
 }
+
+// Regression for tasks/done/folder-sync-held-deletions.md: removing a
+// directory that holds both a conflicted file and its .conflict-* copy must
+// hold every deletion regardless of Go's map iteration order in Scan, keep
+// the conflict intact across RejectHeld, and apply cleanly on AcceptHeld.
+func TestBulkDeleteWithConflict(t *testing.T) {
+	a := newDevice(t, "desk", nil, nil)
+	genesis, policy, _ := a.c.BucketRaw(a.h.ID())
+	b := newDevice(t, "nas", genesis, policy)
+	link(a, b)
+	for i := 0; i < 30; i++ {
+		write(t, a, fmt.Sprintf("docs/n%02d.md", i), fmt.Sprintf("note %d", i))
+	}
+	sync2(t, a, b)
+
+	write(t, b, "docs/n01.md", "nas version")
+	time.Sleep(5 * time.Millisecond)
+	write(t, a, "docs/n01.md", "desk version")
+	sync2(t, a, b)
+
+	// Repeat rm -rf + reject across enough scans to hit both map orders
+	// ("docs/n01.md" before "docs/n01.conflict-*" and vice versa).
+	for round := 0; round < 8; round++ {
+		if err := os.RemoveAll(filepath.Join(a.dir, "docs")); err != nil {
+			t.Fatal(err)
+		}
+		rep := scan(t, a)
+		if rep.Held != 30 || rep.Removed != 0 {
+			t.Fatalf("round %d: expected 30 held / 0 removed, got %s", round, rep)
+		}
+		exchange(t, a, b)
+		if live, _, _ := b.h.Stats(); live != 30 {
+			t.Fatalf("round %d: held deletion leaked to B (%d live)", round, live)
+		}
+		if cs, _ := b.h.Conflicts(); len(cs) != 1 {
+			t.Fatalf("round %d: rm -rf resolved the conflict on B (%d conflicts)", round, len(cs))
+		}
+		if n, err := a.h.RejectHeld(); err != nil || n != 30 {
+			t.Fatalf("round %d: reject %d %v", round, n, err)
+		}
+		materialize(t, a)
+		if got := read(t, a, "docs/n01.md"); got != "nas version" {
+			t.Fatalf("round %d: restored n01.md = %q", round, got)
+		}
+		ents, _ := os.ReadDir(filepath.Join(a.dir, "docs"))
+		hasConflict := false
+		for _, e := range ents {
+			if strings.HasPrefix(e.Name(), "n01.conflict-") {
+				hasConflict = true
+				if got := read(t, a, "docs/"+e.Name()); got != "desk version" {
+					t.Fatalf("round %d: restored conflict copy = %q", round, got)
+				}
+			}
+		}
+		if !hasConflict {
+			t.Fatalf("round %d: conflict copy was not restored after reject", round)
+		}
+	}
+
+	// AcceptHeld tombstones all 30 on both sides.
+	if err := os.RemoveAll(filepath.Join(a.dir, "docs")); err != nil {
+		t.Fatal(err)
+	}
+	if rep := scan(t, a); rep.Held != 30 {
+		t.Fatalf("final scan: %s", rep)
+	}
+	if n, err := a.h.AcceptHeld(); err != nil || n != 30 {
+		t.Fatalf("accept: %d %v", n, err)
+	}
+	sync2(t, a, b)
+	if tr, _ := b.h.Trash(); len(tr) != 30 {
+		t.Fatalf("accepted deletion trashed %d on B, want 30", len(tr))
+	}
+}

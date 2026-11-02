@@ -124,8 +124,12 @@ func (r *Replica) Scan() (Report, error) {
 			continue
 		}
 		if e.ConflictOf != "" {
-			// A deleted conflict copy resolves its object.
-			if o, err := r.Handle.Index.GetObject(e.ConflictOf); err == nil && len(o.Conflicts()) > 0 {
+			// A deleted conflict copy resolves its object — only while the kept
+			// file itself is still in the folder. Removing both at once (rm -rf)
+			// deletes the object rather than choosing a winner; resolving here
+			// raced the tombstone in map order and let the live resolve beat
+			// the delete past the bulk hold.
+			if o, err := r.Handle.Index.GetObject(e.ConflictOf); err == nil && len(o.Conflicts()) > 0 && seen[o.Name.V] {
 				if _, err := r.Handle.Resolve(o); err != nil {
 					rep.Errors = append(rep.Errors, err.Error())
 				}
