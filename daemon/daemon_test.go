@@ -67,10 +67,10 @@ func newTestDaemon(t *testing.T, nsPriv ed25519.PrivateKey, name string, events 
 // TestSelfHealOneWayKnownPair reproduces the gate-hetz field incident: A's
 // event log holds B's admission, B's log does not hold A's (a lighthouse-
 // joined node whose log predates the master's own MemberAdded event). A
-// dials B and — knowing B already — never initiates the handshake; before
+// dials B and — knowing B already — never initiated the handshake; before
 // the self-heal, B just watched an unauthenticated stranger until the grace
-// watchdog cut the connection, forever. Now B initiates the handshake
-// itself and the pair settles.
+// watchdog cut the connection, forever. Now the dialer handshakes on every
+// outbound connection, known peer or not, and the pair settles.
 func TestSelfHealOneWayKnownPair(t *testing.T) {
 	nsPub, nsPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

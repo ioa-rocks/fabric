@@ -226,6 +226,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		h.RemoveStreamHandler(autonatv2.DialProtocol)
 	}
 	d.Host = h
+	d.Gater.SetConnSource(h.Network().Conns) // member-host exemption for AutoNAT dial-backs
 	if err := d.startHolePunch(); err != nil {
 		h.Close()
 		return nil, fmt.Errorf("starting hole punching: %w", err)
@@ -242,25 +243,27 @@ func New(dir state.Dir) (*Daemon, error) {
 	d.Sync = fabricnet.NewEventSync(h, evLog, store, d.applyEvent)
 	d.Auth.SetOnAuthenticated(d.Sync.ExchangeAsync)
 
-	// Self-heal for one-way-known pairs: a dialer that already knows the
-	// peer never initiates the handshake, so a member whose admission event
-	// never reached us would sit unauthenticated until the grace watchdog
-	// cuts it — and reconnect, forever. If a peer we don't know connects
-	// (either direction), initiate the handshake ourselves: its cert settles
-	// who it is. Strangers simply fail it and the watchdog proceeds. On a
-	// dark node only outbound connections reach this point (the bootstrap
-	// dial before the lighthouse's cert is held); the inbound half of the
-	// story happens on listed nodes, and a dark node learns the newcomer by
-	// gossip from them before admitting it.
+	// The dialer proves itself on every outbound connection. This is the
+	// self-heal for one-way-known pairs (the gate-hetz incident: A knew B,
+	// B did not know A; A dialed and, knowing B, never handshook, so B
+	// watched a stranger until the grace watchdog cut it — forever). The
+	// earlier fix had the *accepting* side initiate on any unknown
+	// connection, which made a listed node write its own cert to every
+	// anonymous scanner that connected (Authenticate sends first; Gemini,
+	// 2026-11-02). Now only the side that chose the dial sends first, to a
+	// peer it chose (a member, or its bootstrap), and the accepting side
+	// never speaks before it has read a valid cert. Inbound strangers on a
+	// listed node just time out; a dark node refused them already.
 	h.Network().Notify(&network.NotifyBundle{ConnectedF: func(_ network.Network, c network.Conn) {
-		p := c.RemotePeer()
-		if d.Store.IsMember(p, time.Now()) || d.OwnCert() == nil {
+		if c.Stat().Direction != network.DirOutbound || d.OwnCert() == nil {
 			return
 		}
+		p := c.RemotePeer()
+		known := d.Store.IsMember(p, time.Now())
 		go func() {
 			ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
 			defer cancel()
-			if err := d.Auth.Authenticate(ctx, p); err == nil {
+			if err := d.Auth.Authenticate(ctx, p); err == nil && !known {
 				log.Printf("mesh: authenticated %s on connect (was not in the member store)", p)
 			}
 		}()

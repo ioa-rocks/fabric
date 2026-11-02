@@ -180,6 +180,31 @@ func TestDarkNodeRefusesUnknownUntilGossip(t *testing.T) {
 	if err := tryConnect(dark, listed); err != nil {
 		t.Fatalf("dark node could not dial out to an unknown listed peer: %v", err)
 	}
+
+	// Member-host exemption (AutoNAT dial-back shape): once the dark node
+	// holds a member connection to the lighthouse, an unknown peer from the
+	// same IP is admitted at the gater (and left to the grace watchdog).
+	// Everything here is loopback, so the stranger shares the lighthouse's
+	// IP exactly like a dial-back host does.
+	dark.store.AddMember(listed.host.ID(), listed.own)
+	dark.gater.SetConnSource(dark.host.Network().Conns)
+	if err := tryConnect(stranger, dark); err != nil {
+		t.Fatalf("stranger from a member's IP refused: %v", err)
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	if s, err := stranger.host.NewStream(ctx2, dark.host.ID(), ProtocolID); err != nil {
+		t.Fatalf("stranger from a member's IP could not open a stream: %v", err)
+	} else {
+		s.Reset()
+	}
+	if dark.gater.admittedByHost.Load() == 0 {
+		t.Fatal("admittedByHost counter not incremented")
+	}
+	// Protected protocols still refuse it: the gater is not the boundary.
+	if _, err := echo(stranger, dark.host.ID(), "nope"); err == nil {
+		t.Fatal("stranger reached a protected protocol via the member-host exemption")
+	}
 }
 
 // assertRefused dials `to` from `from` and checks that no connection
