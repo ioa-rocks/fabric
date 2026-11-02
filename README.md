@@ -45,8 +45,11 @@ fabric up
 
 `init` asks for a passphrase; the root key is stored encrypted (age,
 scrypt) at `<state>/namespace.key.age`. **Back that file up and test the
-restore** — losing it means re-keying the mesh. `up` logs the node's
-addresses:
+restore** — losing it means re-keying the mesh. The same key is minted as
+the node's *home circle* (`-circle`, default `home`): the namespace DID is
+the circle DID, and a device's membership cert is also its attestation
+into that circle, so buckets and queues of the home circle need no extra
+`circle attest`. `up` logs the node's addresses:
 
 ```
 listening on /ip4/…/tcp/4517/p2p/12D3KooW…
@@ -614,7 +617,10 @@ the UI and daemon use a non-default Astral state directory.
 
 | Command | Where | What |
 |---|---|---|
-| `fabric init -name <label>` | first device | mint the namespace, become master |
+| `fabric init -name <label> [-circle <name>]` | first device | mint the namespace, become master; the root key is also the home circle (default `home`) |
+| `fabric root status` | any member | current root, roots still honoured during a move, members not yet on the new root |
+| `fabric root merge -circle <name>` | master | move the namespace onto a circle's key: re-issues every cert under it, publishes `root-moved` (signed by the old root), installs the circle key as the root container; the old root stays honoured |
+| `fabric root retire [-force] <did>` | master | publish `root-retired` (signed by the new root): the old root stops verifying everywhere; refuses while live members still hold old certs unless `-force` |
 | `fabric up` | any member | run the node daemon (serves buckets when the node has a circle; `-no-vault` / `-vault-state <dir>`) |
 | `fabric status` | any member | node, membership, and connection state |
 | `fabric graph [-json]` | any member | whole-mesh link map, human or machine readable |
@@ -646,18 +652,29 @@ user key) to skip the interactive prompts (CI, scripts).
 
 ## Packages
 
-- `cert` — membership certificates: minimal ed25519-signed
-  deterministic-CBOR structs whose fields mirror the UCAN 1.0 delegation
-  payload (`iss`/`aud`/`sub`/`cmd`/`nbf`/`exp`/`prf`), so a future
-  migration to real UCANs changes serialization, not the data model.
-  `did:key` codec included (it's 30 lines; no DID library).
+- `statement` — the one signed statement and the one verifier
+  (`tasks/open/statement-format.md`): UCAN-ordered payload (`iss`/`aud`/
+  `sub`/`res`/`verbs`/`del`/`meta`/`prf`), `{payload bytes, sig}` on the
+  wire, id = sha256(payload). `Compile` does signatures, chaining,
+  attenuation, delegation depth, overlay metadata and admission authority
+  once per chain; `Compiled.Check` is the cheap per-verb step (presenter,
+  window, scope, revocations by statement-ID ancestry). Attestations,
+  grants, sub-keys and revocations are instances, not types.
+- `did` — the `did:key` codec for ed25519 keys (30 lines; no DID library),
+  shared by `cert`, `circle` and `statement`.
+- `cert` — membership certificates as statements: the device assert
+  {member (+admin) (+tun) + scope verbs, name, ip}. `Payload` stays the
+  view every caller reads; certs minted before 2026-11-02 still decode,
+  verify and renew into statements.
 - `keystore` — the namespace root seed at rest: an age-encrypted file
   (passphrase / scrypt). The seed exists in memory only during a signing
   session — approval happens in the CLI process; the daemon never holds
   the root key.
-- `event` — signed membership events (`MemberAdded` / `MemberRevoked`)
-  and the deduplicating, expiry-GC'd event log they accumulate in: the
-  durable membership view every node carries.
+- `event` — signed membership events (`MemberAdded` / `MemberRevoked`,
+  plus `root-moved` / `root-retired` for the mesh-root merge) and the
+  deduplicating, expiry-GC'd event log they accumulate in: the durable
+  membership view every node carries. Verified against the node's
+  honoured roots (`namespace_did` + `honoured_roots` in config).
 - `fabricnet` — membership enforcement on a libp2p host, layered:
   a connection gater (hard-denies revoked peers; dark by default, so a
   node refuses inbound peers outside its member store before any
