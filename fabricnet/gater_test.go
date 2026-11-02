@@ -1,9 +1,12 @@
 package fabricnet
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,12 +82,18 @@ func TestGaterDecisions(t *testing.T) {
 }
 
 // TestRefusedLogMapIsBounded floods the gater with distinct unknown peer IDs
-// and checks the rate-limit map never exceeds its cap.
+// and checks that the rate-limit map never exceeds its cap and that the log
+// sees at most the per-window budget of lines (summary lines only roll over
+// with time, so none appear inside one window).
 func TestRefusedLogMapIsBounded(t *testing.T) {
 	nsPub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var logged bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(prev) })
 	g := NewGater(NewMemberStore(nsPub))
 	for i := 0; i < 3*refusedLogCap; i++ {
 		pub, _, err := ed25519.GenerateKey(rand.Reader)
@@ -107,6 +116,22 @@ func TestRefusedLogMapIsBounded(t *testing.T) {
 	}
 	if g.RefusedInbound() != uint64(3*refusedLogCap) {
 		t.Fatalf("RefusedInbound = %d", g.RefusedInbound())
+	}
+	if lines := strings.Count(logged.String(), "\n"); lines > refusedLogBudget {
+		t.Fatalf("%d log lines for %d refusals, budget %d per window", lines, 3*refusedLogCap, refusedLogBudget)
+	}
+	// Roll the window: the next refusal emits exactly one summary carrying
+	// the suppressed count.
+	g.mu.Lock()
+	g.windowStart = time.Now().Add(-2 * refusedLogWindow)
+	g.mu.Unlock()
+	logged.Reset()
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	p, _ := PeerIDForKey(pub)
+	g.InterceptSecured(network.DirInbound, p, nil)
+	out := logged.String()
+	if strings.Count(out, "\n") != 2 || !strings.Contains(out, "more inbound connection(s)") {
+		t.Fatalf("after window roll-over, want one summary + one per-peer line, got:\n%s", out)
 	}
 }
 

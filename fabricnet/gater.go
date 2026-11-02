@@ -47,6 +47,11 @@ type Gater struct {
 	mu        sync.Mutex
 	lastLog   map[peer.ID]time.Time // last "refused" log line per peer
 	lastSweep time.Time
+	// Global log budget: per-peer limiting alone still yields one line per
+	// distinct unknown peer, and peer IDs are free to mint.
+	windowStart time.Time
+	windowLines int
+	suppressed  uint64 // refusals not logged in the current window
 }
 
 var _ connmgr.ConnectionGater = (*Gater)(nil)
@@ -54,6 +59,14 @@ var _ connmgr.ConnectionGater = (*Gater)(nil)
 // refusedLogEvery rate-limits the "refused unknown peer" log line per peer:
 // a member not yet learned by gossip retries every reconnect tick.
 const refusedLogEvery = 5 * time.Minute
+
+// refusedLogBudget is the most per-peer "refused" lines the gater writes
+// per refusedLogWindow; beyond it, refusals are counted and reported in one
+// summary line when the window rolls over.
+const (
+	refusedLogBudget = 10
+	refusedLogWindow = time.Minute
+)
 
 // refusedLogCap bounds the rate-limit map. A flood of distinct unknown peer
 // IDs (cheap to mint) must not grow memory or slow refusals: past the cap
@@ -113,9 +126,20 @@ func (g *Gater) InterceptUpgraded(network.Conn) (bool, control.DisconnectReason)
 func (g *Gater) noteRefused(p peer.ID, addrs network.ConnMultiaddrs, now time.Time) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if now.Sub(g.windowStart) >= refusedLogWindow {
+		if g.suppressed > 0 {
+			log.Printf("dark: refused %d more inbound connection(s) from unknown peers in the last %s (per-peer lines rate-limited)", g.suppressed, refusedLogWindow)
+		}
+		g.windowStart, g.windowLines, g.suppressed = now, 0, 0
+	}
 	if last, ok := g.lastLog[p]; ok && now.Sub(last) < refusedLogEvery {
 		return
 	}
+	if g.windowLines >= refusedLogBudget {
+		g.suppressed++
+		return
+	}
+	g.windowLines++
 	if now.Sub(g.lastSweep) >= refusedLogEvery { // amortised expiry, not per refusal
 		for q, t := range g.lastLog {
 			if now.Sub(t) >= refusedLogEvery {
