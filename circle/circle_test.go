@@ -131,3 +131,34 @@ func TestExportJoinAndMigrate(t *testing.T) {
 		t.Fatal("migrated from an empty dir")
 	}
 }
+
+func TestRekey(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "circles")
+	c, err := Init(root, "alex", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := c.Unlock("pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Rekey("wrong", "stronger"); err == nil {
+		t.Fatal("rekey with the wrong current passphrase succeeded")
+	}
+	if err := c.Rekey("pw", "stronger"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Unlock("pw"); err == nil {
+		t.Fatal("old passphrase still unlocks")
+	}
+	after, err := c.Unlock("stronger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Equal(before) {
+		t.Fatal("rekey changed the key")
+	}
+	if _, err := os.Stat(c.KeyPath() + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("temp container left behind")
+	}
+}

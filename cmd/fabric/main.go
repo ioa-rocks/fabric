@@ -177,6 +177,8 @@ func usage() {
            the same owner; circle attest [-expiring] — sign this device into
            the circle, or renew (attestations live a year, like certs);
            circle revoke <member> — sign a device out (owner device);
+           circle passphrase [-circle <name>] — re-encrypt the key container
+           under a new passphrase (the key is unchanged; per device);
            circle status — circles, this device's attestation, buckets, peers
   bucket   buckets of the circle ('fabric bucket -h'): create, list, place
            (full|cache|none|folder <dir>), mount, put/ls/get/rm, policy…;

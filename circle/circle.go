@@ -217,6 +217,23 @@ func (c *Circle) Unlock(passphrase string) (ed25519.PrivateKey, error) {
 	return ed25519.NewKeyFromSeed(seed), nil
 }
 
+// Rekey re-encrypts the user-key container under a new passphrase. The key
+// itself does not change, so nothing signed and nothing on the wire is
+// affected; only this device's container is rewritten (atomically). Every
+// other device holding the circle (export/join) keeps the old passphrase
+// until the same is done there.
+func (c *Circle) Rekey(oldPass, newPass string) error {
+	seed, err := keystore.LoadSeed(keyPath(c.Path), oldPass)
+	if err != nil {
+		return fmt.Errorf("unlocking user key: %w", err)
+	}
+	tmp := keyPath(c.Path) + ".tmp"
+	if err := keystore.SaveSeed(tmp, seed, newPass); err != nil {
+		return err
+	}
+	return os.Rename(tmp, keyPath(c.Path))
+}
+
 // Bundle is the portable form of a circle identity: what a second device
 // of the same owner needs to join the circle. Interim until capability
 // grants let a device hold a sub-key instead of the root user key (ADR

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/daemon"
+	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
 	vaultcli "ioa.rocks/fabric/vault/cli"
 	vaultdaemon "ioa.rocks/fabric/vault/daemon"
@@ -26,7 +28,7 @@ import (
 // owns it — mesh membership alone grants nothing.
 func cmdCircle(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: fabric circle init|join|export|attest|revoke|status")
+		return fmt.Errorf("usage: fabric circle init|join|export|attest|revoke|passphrase|status")
 	}
 	rest := args[1:]
 	switch args[0] {
@@ -40,10 +42,12 @@ func cmdCircle(args []string) error {
 		return cmdCircleAttest(rest)
 	case "revoke":
 		return cmdCircleRevoke(rest)
+	case "passphrase":
+		return cmdCirclePassphrase(rest)
 	case "status":
 		return cmdCircleStatus(rest)
 	default:
-		return fmt.Errorf("usage: fabric circle init|join|export|attest|revoke|status")
+		return fmt.Errorf("usage: fabric circle init|join|export|attest|revoke|passphrase|status")
 	}
 }
 
@@ -267,6 +271,65 @@ func cmdCircleAttest(args []string) error {
 			return fmt.Errorf("circle %q: %w", c.Config.Name, err)
 		}
 	}
+	return nil
+}
+
+// cmdCirclePassphrase re-encrypts a circle's key container under a new
+// passphrase on this device. The key is unchanged, so nothing is re-signed;
+// when the circle is the mesh root (root merge), the root key container is
+// the same key and is rewritten too. Other devices holding the circle are
+// not reached: run it there as well, or re-export.
+func cmdCirclePassphrase(args []string) error {
+	fs := flag.NewFlagSet("circle passphrase", flag.ExitOnError)
+	statePath, vaultState := circleFlags(fs)
+	name := fs.String("circle", "", "which circle (required when the node holds several)")
+	fs.Parse(args)
+	if os.Getenv("CIRCLE_PASSPHRASE") != "" || os.Getenv("VAULT_PASSPHRASE") != "" {
+		return fmt.Errorf("circle passphrase: unset CIRCLE_PASSPHRASE / VAULT_PASSPHRASE — the current and the new passphrase are both prompted")
+	}
+	root, err := circleRoot(*statePath, *vaultState)
+	if err != nil {
+		return err
+	}
+	c, err := pickCircle(root, *name)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "circle %q — current ", c.Config.Name)
+	oldPass, err := vaultcli.Passphrase()
+	if err != nil {
+		return err
+	}
+	priv, err := c.Unlock(oldPass)
+	if err != nil {
+		return err
+	}
+	newPass, err := vaultcli.NewPassphrase()
+	if err != nil {
+		return err
+	}
+	if newPass == oldPass {
+		return fmt.Errorf("circle passphrase: the new passphrase equals the current one")
+	}
+	if err := c.Rekey(oldPass, newPass); err != nil {
+		return err
+	}
+	fmt.Printf("circle %q: key container re-encrypted (%s) — the key is unchanged, nothing to re-sign\n", c.Config.Name, c.KeyPath())
+	// The root key container is this circle's key after the mesh-root merge:
+	// keep both openable with one passphrase.
+	if dir, err := state.Open(*statePath); err == nil {
+		if rootSeed, err := keystore.LoadSeed(dir.KeystorePath(), oldPass); err == nil && bytes.Equal(rootSeed, priv.Seed()) {
+			tmp := dir.KeystorePath() + ".tmp"
+			if err := keystore.SaveSeed(tmp, rootSeed, newPass); err != nil {
+				return fmt.Errorf("re-encrypting the root key container: %w", err)
+			}
+			if err := os.Rename(tmp, dir.KeystorePath()); err != nil {
+				return fmt.Errorf("re-encrypting the root key container: %w", err)
+			}
+			fmt.Printf("root key container re-encrypted too (%s): it holds this circle's key since the mesh-root merge\n", dir.KeystorePath())
+		}
+	}
+	fmt.Println("other devices holding this circle (circle export/join) still open it with the old passphrase — run 'fabric circle passphrase' there too, or re-export")
 	return nil
 }
 
