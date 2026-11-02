@@ -44,8 +44,9 @@ type Gater struct {
 
 	refused atomic.Uint64 // inbound connections refused as unknown (dark)
 
-	mu      sync.Mutex
-	lastLog map[peer.ID]time.Time
+	mu        sync.Mutex
+	lastLog   map[peer.ID]time.Time // last "refused" log line per peer
+	lastSweep time.Time
 }
 
 var _ connmgr.ConnectionGater = (*Gater)(nil)
@@ -53,6 +54,11 @@ var _ connmgr.ConnectionGater = (*Gater)(nil)
 // refusedLogEvery rate-limits the "refused unknown peer" log line per peer:
 // a member not yet learned by gossip retries every reconnect tick.
 const refusedLogEvery = 5 * time.Minute
+
+// refusedLogCap bounds the rate-limit map. A flood of distinct unknown peer
+// IDs (cheap to mint) must not grow memory or slow refusals: past the cap
+// the map is dropped and the next refusal of every peer logs once more.
+const refusedLogCap = 1024
 
 // NewGater returns a dark gater; SetListed(true) opens it to unknown
 // inbound peers.
@@ -110,12 +116,18 @@ func (g *Gater) noteRefused(p peer.ID, addrs network.ConnMultiaddrs, now time.Ti
 	if last, ok := g.lastLog[p]; ok && now.Sub(last) < refusedLogEvery {
 		return
 	}
-	g.lastLog[p] = now
-	for q, t := range g.lastLog { // keep the map bounded
-		if now.Sub(t) >= refusedLogEvery && q != p {
-			delete(g.lastLog, q)
+	if now.Sub(g.lastSweep) >= refusedLogEvery { // amortised expiry, not per refusal
+		for q, t := range g.lastLog {
+			if now.Sub(t) >= refusedLogEvery {
+				delete(g.lastLog, q)
+			}
 		}
+		g.lastSweep = now
 	}
+	if len(g.lastLog) >= refusedLogCap {
+		g.lastLog = make(map[peer.ID]time.Time)
+	}
+	g.lastLog[p] = now
 	from := ""
 	if addrs != nil {
 		from = " from " + addrs.RemoteMultiaddr().String()

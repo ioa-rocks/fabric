@@ -78,6 +78,38 @@ func TestGaterDecisions(t *testing.T) {
 	}
 }
 
+// TestRefusedLogMapIsBounded floods the gater with distinct unknown peer IDs
+// and checks the rate-limit map never exceeds its cap.
+func TestRefusedLogMapIsBounded(t *testing.T) {
+	nsPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := NewGater(NewMemberStore(nsPub))
+	for i := 0; i < 3*refusedLogCap; i++ {
+		pub, _, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := PeerIDForKey(pub)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g.InterceptSecured(network.DirInbound, p, nil) {
+			t.Fatal("unknown inbound admitted on a dark gater")
+		}
+		g.mu.Lock()
+		n := len(g.lastLog)
+		g.mu.Unlock()
+		if n > refusedLogCap {
+			t.Fatalf("rate-limit map holds %d entries, cap %d", n, refusedLogCap)
+		}
+	}
+	if g.RefusedInbound() != uint64(3*refusedLogCap) {
+		t.Fatalf("RefusedInbound = %d", g.RefusedInbound())
+	}
+}
+
 // TestDarkNodeRefusesUnknownUntilGossip is the step-2 story end to end on
 // real hosts: a dark member refuses an inbound connection from a member it
 // has not learned yet (nothing after the transport handshake runs), admits
