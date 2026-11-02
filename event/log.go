@@ -1,26 +1,29 @@
 package event
 
 import (
-	"crypto/ed25519"
 	"sort"
 	"sync"
 	"time"
 
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/statement"
 )
 
 // Log is the deduplicated set of membership events a node has seen — the
 // unit exchanged in anti-entropy gossip and persisted across restarts.
 // Everything in the log passed Verify on the way in.
 type Log struct {
-	nsPub ed25519.PublicKey
+	roots statement.Roots // honoured roots; shared with the member store
 
 	mu     sync.Mutex
 	events map[string]*Event // by Event.ID()
 }
 
-func NewLog(nsPub ed25519.PublicKey) *Log {
-	return &Log{nsPub: nsPub, events: make(map[string]*Event)}
+// NewLog returns an empty log verifying against roots. A root-moved or
+// root-retired event applied by the daemon changes what roots honours, and
+// the log sees it at once.
+func NewLog(roots statement.Roots) *Log {
+	return &Log{roots: roots, events: make(map[string]*Event)}
 }
 
 // Add verifies an event and inserts it, reporting whether it was new. An
@@ -30,11 +33,11 @@ func NewLog(nsPub ed25519.PublicKey) *Log {
 // events are rejected — that is the log's garbage collection working on
 // ingest.
 func (l *Log) Add(e *Event, now time.Time) (bool, error) {
-	if err := Verify(e, l.nsPub, now); err != nil {
+	if err := Verify(e, l.roots, now); err != nil {
 		if !Lapsed(e, now) {
 			return false, err
 		}
-		if err := Verify(e, l.nsPub, lastValid(e)); err != nil {
+		if err := Verify(e, l.roots, lastValid(e)); err != nil {
 			return false, err
 		}
 	}
@@ -104,10 +107,12 @@ func (l *Log) GC(now time.Time) {
 				delete(l.events, id)
 			}
 		case KindRevoked:
-			if !now.Before(e.Time().Add(cert.DefaultValidity)) {
+			if !now.Before(e.Time().Add(cert.MaxValidity)) {
 				delete(l.events, id)
 			}
 		}
+		// Root events are kept: a late joiner must still learn how the
+		// circle's root moved.
 	}
 }
 

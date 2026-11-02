@@ -181,7 +181,8 @@ func (q *Queue) Deny(fingerprint string) error {
 }
 
 // Attach wires the queue onto a host as the /fabric/join/1 responder.
-func Attach(h host.Host, q *Queue, namespaceDID string) {
+// namespaceDID is read per request: a root move changes it live.
+func Attach(h host.Host, q *Queue, namespaceDID func() string) {
 	h.SetStreamHandler(ProtocolID, func(s network.Stream) {
 		defer s.Close()
 		_ = s.SetDeadline(time.Now().Add(30 * time.Second))
@@ -196,7 +197,7 @@ func Attach(h host.Host, q *Queue, namespaceDID string) {
 			return
 		}
 		status, certBytes := q.Submit(req)
-		resp := JoinResponse{Status: status, NamespaceDID: namespaceDID, Cert: certBytes}
+		resp := JoinResponse{Status: status, NamespaceDID: namespaceDID(), Cert: certBytes}
 		out, err := cbor.Marshal(resp)
 		if err != nil {
 			s.Reset()

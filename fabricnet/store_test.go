@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/statement"
 )
 
 // Renewal correctness: membership events arrive in no particular order
@@ -38,7 +39,7 @@ func TestAddMemberKeepsLaterExpiry(t *testing.T) {
 	}
 
 	// Renewed first, stale second: the stale cert must not regress the store.
-	s := NewMemberStore(nsPub)
+	s := NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
 	s.AddMember(p, renewed)
 	s.AddMember(p, old)
 	if c, _ := s.Cert(p); !c.Expiry().Equal(renewed.Expiry()) {
@@ -46,7 +47,7 @@ func TestAddMemberKeepsLaterExpiry(t *testing.T) {
 	}
 
 	// Stale first, renewed second: the renewal must upgrade the store.
-	s = NewMemberStore(nsPub)
+	s = NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
 	s.AddMember(p, old)
 	s.AddMember(p, renewed)
 	if c, _ := s.Cert(p); !c.Expiry().Equal(renewed.Expiry()) {
@@ -78,7 +79,7 @@ func TestExpiredMemberIsLapsedNotMember(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := NewMemberStore(nsPub)
+	s := NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
 	s.AddMember(p, expired)
 	if s.IsMember(p, now) {
 		t.Fatal("expired cert made the peer a member")

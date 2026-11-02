@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -20,10 +21,12 @@ import (
 
 	"ioa.rocks/fabric/admission"
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/fabricdns"
 	"ioa.rocks/fabric/fabricnet"
 	"ioa.rocks/fabric/state"
+	"ioa.rocks/fabric/statement"
 	"ioa.rocks/fabric/tunbridge"
 
 	"github.com/godbus/dbus/v5"
@@ -58,6 +61,11 @@ type Daemon struct {
 	Gater  *fabricnet.Gater // dark (default) or listed posture; see fabricnet.Gater
 	Auth   *fabricnet.AuthService
 	Log    *event.Log // membership events: admissions + revocations (spec §5)
+	// Roots is the honoured-roots store: the home circle (config
+	// namespace_did) plus roots kept during a root move. Shared by Store
+	// and Log; changed only by applyRootEvent.
+	Roots *statement.DIDRoots
+	cfgMu sync.Mutex // guards Config writes (root moves, bootstrap pins)
 
 	bridgeIP string // overlay address fabric0 was brought up with (renumbering notice)
 	Sync     *fabricnet.EventSync
@@ -117,33 +125,36 @@ func New(dir state.Dir) (*Daemon, error) {
 	if own == nil {
 		return nil, fmt.Errorf("no membership certificate in %s — run 'fabric join' first", dir.Path)
 	}
-	nsPub, err := cert.KeyForDID(cfg.NamespaceDID)
-	if err != nil {
-		return nil, fmt.Errorf("config namespace_did: %w", err)
+	if !did.IsKey(cfg.NamespaceDID) {
+		return nil, fmt.Errorf("config namespace_did %q is not a did:key", cfg.NamespaceDID)
 	}
+	roots := statement.NewDIDRoots(append([]string{cfg.NamespaceDID}, cfg.HonouredRoots...)...)
+	store := fabricnet.NewMemberStore(roots)
+	evLog := event.NewLog(roots)
 
-	store := fabricnet.NewMemberStore(nsPub)
+	ctx, cancel := context.WithCancel(context.Background())
+	d := &Daemon{
+		Dir: dir, Config: cfg, Store: store, Gater: fabricnet.NewGater(store), Log: evLog, Roots: roots,
+		ownCert: own, ctx: ctx, cancel: cancel,
+		rtt: make(map[peer.ID]time.Duration), reachability: "unknown",
+		lastDial:        make(map[peer.ID]time.Time),
+		pinnedBootstrap: make(map[string]bool),
+	}
 
 	// The persisted event log is the durable membership view: it survives
 	// restarts, so a revocation learned yesterday still holds today even if
-	// the master is offline.
-	evLog := event.NewLog(nsPub)
+	// the master is offline. Root events are applied as they load, so the
+	// admissions signed by a root that took over mid-log verify too.
 	if evs, err := dir.LoadEvents(); err != nil {
 		log.Printf("event log unreadable, starting empty: %v", err)
 	} else {
 		now := time.Now()
 		for _, e := range evs {
-			_, _ = evLog.Add(e, now) // stale/invalid entries drop out here
+			fresh, _ := evLog.Add(e, now) // stale/invalid entries drop out here
+			if fresh && e.IsRootEvent() {
+				d.applyRootEvent(e, false)
+			}
 		}
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	d := &Daemon{
-		Dir: dir, Config: cfg, Store: store, Gater: fabricnet.NewGater(store), Log: evLog,
-		ownCert: own, ctx: ctx, cancel: cancel,
-		rtt: make(map[peer.ID]time.Duration), reachability: "unknown",
-		lastDial:        make(map[peer.ID]time.Time),
-		pinnedBootstrap: make(map[string]bool),
 	}
 	for _, addr := range cfg.Bootstrap {
 		if _, err := peerInfo(addr); err != nil {
@@ -293,7 +304,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		d.Queue = admission.NewQueue(func(p admission.PendingInfo) {
 			log.Printf("join request pending: %q fingerprint=%s (fabric approve %s)", p.Name, p.Fingerprint, p.Fingerprint)
 		})
-		admission.Attach(h, d.Queue, cfg.NamespaceDID)
+		admission.Attach(h, d.Queue, d.NamespaceDID)
 		admission.AttachQueue(h, d.Queue, d.Auth.RequireMember, d.isAdmin, func(eventBytes []byte) error {
 			e, err := event.Unmarshal(eventBytes)
 			if err != nil {
@@ -745,6 +756,9 @@ func (d *Daemon) adoptOwnCert(c *cert.Cert) {
 func (d *Daemon) hydrateStore() {
 	now := time.Now()
 	for _, e := range d.Log.All() {
+		if e.IsRootEvent() {
+			continue // applied while loading (New)
+		}
 		devKey, err := e.DeviceKey()
 		if err != nil {
 			continue
@@ -774,6 +788,10 @@ func (d *Daemon) hydrateStore() {
 // store (revocations also cut live connections), surface the spec-§5
 // notification, and persist the log.
 func (d *Daemon) applyEvent(e *event.Event) {
+	if e.IsRootEvent() {
+		d.applyRootEvent(e, true)
+		return
+	}
 	devKey, err := e.DeviceKey()
 	if err != nil {
 		return
@@ -836,6 +854,89 @@ func (d *Daemon) Ingest(e *event.Event) error {
 	d.applyEvent(e)
 	d.Sync.Publish([]*event.Event{e})
 	return nil
+}
+
+// NamespaceDID is the home circle's DID as of now (a root move changes it).
+func (d *Daemon) NamespaceDID() string {
+	d.cfgMu.Lock()
+	defer d.cfgMu.Unlock()
+	return d.Config.NamespaceDID
+}
+
+// HonouredRoots lists the circle DIDs whose certs this node admits: the
+// home circle first, then roots kept during a move.
+func (d *Daemon) HonouredRoots() []string { return d.Roots.DIDs() }
+
+// applyRootEvent is the mesh-root merge in motion. root-moved (signed by
+// the current root, verified on ingest): the circle continues under To —
+// To becomes the home circle, the old root stays honoured so certs issued
+// under it keep verifying until root-retired (signed by the new root) names
+// it, at which point members still on it are forgotten (not revoked: they
+// re-join). Config is persisted so a restart starts from the moved state;
+// live is false while replaying the log at start.
+func (d *Daemon) applyRootEvent(e *event.Event, live bool) {
+	d.cfgMu.Lock()
+	cfg := d.Config
+	changed := false
+	var forget []peer.ID
+	switch e.Payload.Kind {
+	case event.KindRootMoved:
+		if cfg.NamespaceDID != e.Payload.To {
+			old := cfg.NamespaceDID
+			cfg.NamespaceDID = e.Payload.To
+			cfg.HonouredRoots = addDID(removeDID(cfg.HonouredRoots, e.Payload.To), old, e.Payload.Ns)
+			changed = true
+		}
+	case event.KindRootRetired:
+		if e.Payload.Root != cfg.NamespaceDID && slices.Contains(cfg.HonouredRoots, e.Payload.Root) {
+			cfg.HonouredRoots = removeDID(cfg.HonouredRoots, e.Payload.Root)
+			changed = true
+			forget = d.Store.MembersIn(e.Payload.Root)
+		}
+	}
+	if changed {
+		d.Config = cfg
+		d.Roots.Set(append([]string{cfg.NamespaceDID}, cfg.HonouredRoots...))
+		if err := d.Dir.SaveConfig(cfg); err != nil {
+			log.Printf("persisting config after %s: %v", e.Payload.Kind, err)
+		}
+	}
+	d.cfgMu.Unlock()
+	if !changed {
+		return
+	}
+	switch e.Payload.Kind {
+	case event.KindRootMoved:
+		log.Printf("ROOT MOVED: this circle now continues under %s; %s stays honoured until retired", e.Payload.To, e.Payload.Ns)
+	case event.KindRootRetired:
+		log.Printf("root retired: %s is no longer honoured; %d member(s) still on it forgotten", e.Payload.Root, len(forget))
+		for _, p := range forget {
+			d.Store.Forget(p)
+			if live && d.Host != nil && p != d.Host.ID() {
+				d.Host.ConnManager().Unprotect(p, "fabric-member")
+				_ = d.Host.Network().ClosePeer(p)
+			}
+		}
+	}
+}
+
+func addDID(list []string, dids ...string) []string {
+	for _, d := range dids {
+		if d != "" && !slices.Contains(list, d) {
+			list = append(list, d)
+		}
+	}
+	return list
+}
+
+func removeDID(list []string, did string) []string {
+	out := list[:0:0]
+	for _, d := range list {
+		if d != did {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 func (d *Daemon) persistEvents() {
@@ -914,6 +1015,8 @@ func (d *Daemon) reconnectLoop() {
 // identified as a queue host, retain its publicly useful addresses in the
 // bootstrap configuration for future cold starts.
 func (d *Daemon) pinQueueHosts() {
+	d.cfgMu.Lock()
+	defer d.cfgMu.Unlock()
 	cfg := d.Config
 	var added []string
 	for _, p := range d.queueHosts() {
@@ -938,6 +1041,7 @@ func (d *Daemon) pinQueueHosts() {
 		log.Printf("pinning discovered lighthouse: %v", err)
 		return
 	}
+	d.Config = cfg
 	log.Printf("lighthouse bootstrap: discovered public queue-host addresses saved")
 }
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/statement"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -23,7 +24,7 @@ func TestGaterDecisions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := NewMemberStore(nsPub)
+	store := NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
 	g := NewGater(store)
 
 	mkPeer := func(name string, add bool) peer.ID {
@@ -94,7 +95,7 @@ func TestRefusedLogMapIsBounded(t *testing.T) {
 	prev := log.Writer()
 	log.SetOutput(&logged)
 	t.Cleanup(func() { log.SetOutput(prev) })
-	g := NewGater(NewMemberStore(nsPub))
+	g := NewGater(NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub))))
 	for i := 0; i < 3*refusedLogCap; i++ {
 		pub, _, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {

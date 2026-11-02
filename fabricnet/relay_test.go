@@ -5,6 +5,8 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/statement"
 	"strings"
 	"testing"
 	"time"
@@ -45,7 +47,7 @@ func TestRelayIsMembersOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	relayStore := NewMemberStore(nsPub)
+	relayStore := NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
 	r := newRelayHost(t, relayStore)
 	rInfo := peer.AddrInfo{ID: r.ID(), Addrs: r.Addrs()}
 

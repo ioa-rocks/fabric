@@ -87,10 +87,13 @@ type MemberInfo struct {
 type StatusReply struct {
 	Name         string `json:"name"`
 	PeerID       string `json:"peer_id"`
-	NamespaceDID string `json:"namespace_did"`
-	Master       bool   `json:"master"`     // holds the namespace root key
-	QueueHost    bool   `json:"queue_host"` // runs the admission queue (lighthouse role)
-	Posture      string `json:"posture"`    // gater posture: dark (unknown inbound refused) / listed
+	NamespaceDID string `json:"namespace_did"` // the home circle's DID
+	// Further roots still honoured (a root move in progress); empty when
+	// the mesh has one root.
+	HonouredRoots []string `json:"honoured_roots,omitempty"`
+	Master        bool     `json:"master"`     // holds the namespace root key
+	QueueHost     bool     `json:"queue_host"` // runs the admission queue (lighthouse role)
+	Posture       string   `json:"posture"`    // gater posture: dark (unknown inbound refused) / listed
 	// Inbound connections refused as unknown since start (dark posture): a
 	// non-zero count with a member missing from `peers` usually means its
 	// MemberAdded event has not reached this node yet.
@@ -162,6 +165,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/deny", d.handleDeny)
 	mux.HandleFunc("POST /v0/revoke", d.handleRevoke)
 	mux.HandleFunc("POST /v0/renew", d.handleRenew)
+	mux.HandleFunc("POST /v0/publish", d.handlePublish)
 	mux.HandleFunc("POST /v0/circle/refresh", d.handleCircleRefresh)
 
 	srv := &http.Server{Handler: mux}
@@ -179,7 +183,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	reply := StatusReply{
 		Name:         d.Config.Name,
 		PeerID:       d.Host.ID().String(),
-		NamespaceDID: d.Config.NamespaceDID,
+		NamespaceDID: d.NamespaceDID(),
 		Master:       d.Dir.IsMaster(),
 		QueueHost:    d.Queue != nil,
 		Posture:      d.Gater.Posture(),
@@ -189,6 +193,9 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		DNSActive:    d.DNS != nil,
 	}
 	reply.RefusedInbound = d.Gater.RefusedInbound()
+	if roots := d.HonouredRoots(); len(roots) > 1 {
+		reply.HonouredRoots = roots[1:]
+	}
 	reply.ReachableAddrs, reply.UnreachableAddrs, reply.UnverifiedAddrs = d.AddrReachability()
 	ownExp := d.OwnCert().Expiry()
 	reply.CertExpiry = &ownExp
@@ -449,6 +456,28 @@ func (d *Daemon) handleRenew(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"result": "renewed"})
 }
 
+// handlePublish ingests any signed membership event (root moves and
+// retirements included). As everywhere, Ingest verifies the signature
+// against the honoured roots; the socket carries no authority of its own.
+func (d *Daemon) handlePublish(w http.ResponseWriter, r *http.Request) {
+	var body renewBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	e, err := decodeEvent(body.EventB64, "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := d.Ingest(e); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]string{"result": "published", "kind": e.Payload.Kind})
+}
+
+// decodeEvent decodes a base64 event; wantKind "" accepts any kind.
 func decodeEvent(b64, wantKind string) (*event.Event, error) {
 	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
@@ -458,7 +487,7 @@ func decodeEvent(b64, wantKind string) (*event.Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	if e.Payload.Kind != wantKind {
+	if wantKind != "" && e.Payload.Kind != wantKind {
 		return nil, fmt.Errorf("expected a %s event, got %q", wantKind, e.Payload.Kind)
 	}
 	return e, nil
@@ -722,6 +751,12 @@ func (c *Client) Revoke(signedEvent []byte) error {
 	return c.post("/v0/revoke", revokeBody{
 		EventB64: base64.StdEncoding.EncodeToString(signedEvent),
 	}, nil)
+}
+
+// Publish delivers any signed event (a root move or retirement) for ingest
+// and gossip.
+func (c *Client) Publish(signedEvent []byte) error {
+	return c.post("/v0/publish", renewBody{EventB64: base64.StdEncoding.EncodeToString(signedEvent)}, nil)
 }
 
 func (c *Client) Renew(signedEvent []byte) error {

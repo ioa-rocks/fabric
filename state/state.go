@@ -31,11 +31,17 @@ import (
 type Config struct {
 	Name         string   `json:"name"`
 	ListenAddrs  []string `json:"listen_addrs"`
-	NamespaceDID string   `json:"namespace_did"`
-	Bootstrap    []string `json:"bootstrap"`            // multiaddrs including /p2p/<peer-id>
-	Subnet       string   `json:"subnet,omitempty"`     // overlay CIDR; master only (allocation)
-	TUN          string   `json:"tun,omitempty"`        // "" = auto (try, fall back), "off"
-	QueueHost    bool     `json:"queue_host,omitempty"` // run the admission queue (lighthouse role)
+	NamespaceDID string   `json:"namespace_did"` // the home circle's DID: the root certs verify against
+	// HonouredRoots are further circle DIDs whose certs this node still
+	// admits: the previous root during a mesh-root merge, until the new
+	// root retires it (event.KindRootMoved / KindRootRetired). Maintained by
+	// the daemon from gossip; edit by hand only to bootstrap a node that
+	// missed the move.
+	HonouredRoots []string `json:"honoured_roots,omitempty"`
+	Bootstrap     []string `json:"bootstrap"`            // multiaddrs including /p2p/<peer-id>
+	Subnet        string   `json:"subnet,omitempty"`     // overlay CIDR; master only (allocation)
+	TUN           string   `json:"tun,omitempty"`        // "" = auto (try, fall back), "off"
+	QueueHost     bool     `json:"queue_host,omitempty"` // run the admission queue (lighthouse role)
 	// Listed opens the connection gater to inbound peers this node holds
 	// no cert for (they still have to authenticate). Off = dark: unknown
 	// peers are refused before anything above the transport runs. Queue

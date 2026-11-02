@@ -5,11 +5,11 @@
 package fabricnet
 
 import (
-	"crypto/ed25519"
 	"sync"
 	"time"
 
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/statement"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -26,7 +26,7 @@ import (
 // what keeps the device's overlay address reserved until it is back or
 // revoked.
 type MemberStore struct {
-	namespacePub ed25519.PublicKey
+	roots statement.Roots // honoured roots; certs verify against these
 
 	mu      sync.RWMutex
 	members map[peer.ID]*cert.Cert
@@ -34,18 +34,40 @@ type MemberStore struct {
 	revoked map[peer.ID]time.Time  // peer -> revoked cert's expiry
 }
 
-func NewMemberStore(namespacePub ed25519.PublicKey) *MemberStore {
+func NewMemberStore(roots statement.Roots) *MemberStore {
 	return &MemberStore{
-		namespacePub: namespacePub,
-		members:      make(map[peer.ID]*cert.Cert),
-		lapsed:       make(map[peer.ID]*cert.Cert),
-		revoked:      make(map[peer.ID]time.Time),
+		roots:   roots,
+		members: make(map[peer.ID]*cert.Cert),
+		lapsed:  make(map[peer.ID]*cert.Cert),
+		revoked: make(map[peer.ID]time.Time),
 	}
 }
 
-// NamespaceKey returns the namespace root public key this store verifies
-// against.
-func (s *MemberStore) NamespaceKey() ed25519.PublicKey { return s.namespacePub }
+// Roots returns the honoured-roots store certs are verified against.
+func (s *MemberStore) Roots() statement.Roots { return s.roots }
+
+// Forget drops a peer from the member and lapsed sets without marking it
+// revoked: what a root retirement does to members whose cert is in the
+// retired circle (they re-join or receive a new cert; they are not banned).
+func (s *MemberStore) Forget(p peer.ID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.members, p)
+	delete(s.lapsed, p)
+}
+
+// MembersIn lists the members whose cert is in the given circle.
+func (s *MemberStore) MembersIn(circleDID string) []peer.ID {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []peer.ID
+	for p, c := range s.members {
+		if c.Payload.Sub == circleDID {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 // AddMember records a verified certificate for a peer. The caller must have
 // validated the cert's signature and the aud == peer-ID binding first; a

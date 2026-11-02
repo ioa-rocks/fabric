@@ -38,7 +38,7 @@ func TestJoinFlow(t *testing.T) {
 
 	var notified atomic.Int32
 	q := NewQueue(func(PendingInfo) { notified.Add(1) })
-	Attach(master, q, nsDID)
+	Attach(master, q, func() string { return nsDID })
 
 	devicePub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -110,7 +110,7 @@ func TestDenyFlow(t *testing.T) {
 	joiner.Peerstore().AddAddrs(master.ID(), master.Addrs(), time.Hour)
 
 	q := NewQueue(nil)
-	Attach(master, q, cert.DIDForKey(nsPub))
+	Attach(master, q, func() string { return cert.DIDForKey(nsPub) })
 
 	devicePub, _, _ := ed25519.GenerateKey(rand.Reader)
 	req := JoinRequest{DevicePub: devicePub, Name: "intruder", Version: "test"}

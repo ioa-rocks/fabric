@@ -239,3 +239,100 @@ func TestOverlayRoutesHonourScope(t *testing.T) {
 		}
 	}
 }
+
+// TestRootMoveAndRetire is the mesh-root merge end to end on two daemons:
+// the old root signs root-moved, every node starts honouring the new root
+// while the old stays valid, re-issued certs are adopted live, and
+// root-retired ends the old root everywhere — persisted, so a restart starts
+// from the moved state.
+func TestRootMoveAndRetire(t *testing.T) {
+	r1Pub, r1, _ := ed25519.GenerateKey(rand.Reader)
+	r2Pub, r2, _ := ed25519.GenerateKey(rand.Reader)
+	d1, d2 := cert.DIDForKey(r1Pub), cert.DIDForKey(r2Pub)
+
+	a := newTestDaemon(t, r1, "node-a", nil)
+	aAdded, _ := event.NewAdded(r1, a.OwnCert(), time.Now())
+	b := newTestDaemon(t, r1, "node-b", []*event.Event{aAdded})
+	bAdded, _ := event.NewAdded(r1, b.OwnCert(), time.Now())
+	if err := a.Ingest(bAdded); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := b.Host.Connect(ctx, peer.AddrInfo{ID: a.Host.ID(), Addrs: a.Host.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	waitFor("mutual membership", func() bool {
+		return a.Store.IsMember(b.Host.ID(), time.Now()) && b.Store.IsMember(a.Host.ID(), time.Now())
+	})
+
+	// 1. The old root hands over; B learns it by gossip.
+	moved, err := event.NewRootMoved(r1, d2, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Ingest(moved); err != nil {
+		t.Fatal(err)
+	}
+	if a.NamespaceDID() != d2 || !a.Roots.Honours(d1) {
+		t.Fatalf("A after move: ns %s honours %v", a.NamespaceDID(), a.HonouredRoots())
+	}
+	waitFor("B to learn the move", func() bool { return b.NamespaceDID() == d2 && b.Roots.Honours(d1) })
+	if cfg, _ := b.Dir.LoadConfig(); cfg.NamespaceDID != d2 || len(cfg.HonouredRoots) != 1 || cfg.HonouredRoots[0] != d1 {
+		t.Fatalf("B's config not persisted after the move: %+v", cfg)
+	}
+
+	// 2. Certs re-issued under the new root are adopted live.
+	// Certs valid from now; the events a second after the move so every
+	// log replays root-moved first.
+	now, later := time.Now(), time.Now().Add(time.Second)
+	for _, d := range []*Daemon{a, b} {
+		devPub, _ := d.OwnCert().DeviceKey()
+		fresh, err := cert.IssueAs(r2, nil, d2, devPub, d.OwnCert().Payload.Cmd, d.OwnCert().Payload.Meta, now, cert.DefaultValidity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ev, _ := event.NewAdded(r2, fresh, later)
+		if err := a.Ingest(ev); err != nil {
+			t.Fatalf("ingesting %q's new cert: %v", d.Config.Name, err)
+		}
+	}
+	waitFor("B to adopt its new cert", func() bool { return b.OwnCert().Payload.Sub == d2 })
+	waitFor("A to hold B's new cert", func() bool {
+		c, ok := a.Store.Cert(b.Host.ID())
+		return ok && c.Payload.Sub == d2
+	})
+	// An old-root cert still verifies on both while the old root is honoured.
+	strayPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	oldCert, _ := cert.Issue(r1, strayPub, cert.CmdMember, cert.Meta{Name: "stray"}, time.Now(), time.Hour)
+	if err := cert.VerifyRoots(oldCert, b.Roots, time.Now()); err != nil {
+		t.Fatalf("old-root cert refused before retirement: %v", err)
+	}
+
+	// 3. The new root retires the old one; B drops it and old certs die.
+	retired, _ := event.NewRootRetired(r2, d1, time.Now().Add(2*time.Second))
+	if err := a.Ingest(retired); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("B to drop the old root", func() bool { return !b.Roots.Honours(d1) })
+	if err := cert.VerifyRoots(oldCert, b.Roots, time.Now()); err == nil {
+		t.Fatal("old-root cert still verifies after retirement")
+	}
+	if !a.Store.IsMember(b.Host.ID(), time.Now()) || !b.Store.IsMember(a.Host.ID(), time.Now()) {
+		t.Fatal("members on the new root were forgotten by the retirement")
+	}
+	if cfg, _ := b.Dir.LoadConfig(); cfg.NamespaceDID != d2 || len(cfg.HonouredRoots) != 0 {
+		t.Fatalf("B's config after retirement: %+v", cfg)
+	}
+}

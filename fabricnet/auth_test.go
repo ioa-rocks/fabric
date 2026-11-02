@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/statement"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -50,7 +51,7 @@ func newScopedNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.Private
 		t.Fatal(err)
 	}
 
-	n := &node{store: NewMemberStore(nsPub)}
+	n := &node{store: NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub)))}
 	// Listed posture: these tests exercise the handshake, which on a dark
 	// node only an already-known member reaches (gater_test.go covers dark).
 	n.gater = NewGater(n.store)

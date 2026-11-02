@@ -11,6 +11,7 @@ import (
 
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/internal/wire"
+	"ioa.rocks/fabric/statement"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -119,7 +120,7 @@ func (a *AuthService) Authenticate(ctx context.Context, p peer.ID) error {
 	if err := writeCert(s, own); err != nil {
 		return err
 	}
-	theirs, err := readAndValidateCert(s, a.store.NamespaceKey(), p)
+	theirs, err := readAndValidateCert(s, a.store.Roots(), p)
 	if err != nil {
 		s.Reset()
 		return err
@@ -133,7 +134,7 @@ func (a *AuthService) handleInbound(s network.Stream) {
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(30 * time.Second))
 	p := s.Conn().RemotePeer()
-	theirs, err := readAndValidateCert(s, a.store.NamespaceKey(), p)
+	theirs, err := readAndValidateCert(s, a.store.Roots(), p)
 	if err != nil {
 		s.Reset()
 		return
@@ -198,9 +199,10 @@ func (a *AuthService) Allows(p peer.ID, protocolID string) bool {
 	return a.store.Allows(p, protocolID, time.Now())
 }
 
-// readAndValidateCert reads one cert frame and checks both signatures-level
-// validity and the binding to the remote peer's identity key.
-func readAndValidateCert(r io.Reader, namespacePub ed25519.PublicKey, remote peer.ID) (*cert.Cert, error) {
+// readAndValidateCert reads one cert frame and checks both chain validity
+// against the honoured roots and the binding to the remote peer's identity
+// key.
+func readAndValidateCert(r io.Reader, roots statement.Roots, remote peer.ID) (*cert.Cert, error) {
 	data, err := wire.ReadFrame(r, maxCertWireSize)
 	if err != nil {
 		return nil, fmt.Errorf("reading cert: %w", err)
@@ -209,7 +211,7 @@ func readAndValidateCert(r io.Reader, namespacePub ed25519.PublicKey, remote pee
 	if err != nil {
 		return nil, err
 	}
-	if err := cert.Verify(c, namespacePub, time.Now()); err != nil {
+	if err := cert.VerifyRoots(c, roots, time.Now()); err != nil {
 		return nil, fmt.Errorf("invalid membership cert: %w", err)
 	}
 	devKey, err := c.DeviceKey()

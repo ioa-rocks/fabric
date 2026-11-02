@@ -18,6 +18,7 @@ import (
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/fabricnet"
+	"ioa.rocks/fabric/statement"
 )
 
 type circleTestNode struct {
@@ -37,7 +38,7 @@ func newCircleTestNode(t *testing.T, nsPub ed25519.PublicKey, nsRoot ed25519.Pri
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := fabricnet.NewMemberStore(nsPub)
+	store := fabricnet.NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
 	// Listed: these nodes meet by handshake, not by gossip (dark posture is
 	// covered in daemon_test.go and fabricnet/gater_test.go).
 	gater := fabricnet.NewGater(store)
@@ -229,6 +230,38 @@ func TestOlderExchangeVersionsSeeOnlyLegacyForms(t *testing.T) {
 	}
 	if revs, _ := n.svc.ownRevocations(now, false); len(revs) != 0 {
 		t.Fatalf("v3 presents %d statement revocations, want 0", len(revs))
+	}
+}
+
+// A node's membership cert doubles as its attestation into its home circle
+// (the circle whose DID is the namespace DID): no separate `circle attest`.
+func TestHomeCircleAttestedByCert(t *testing.T) {
+	owner, err := circle.Init(t.TempDir(), "home", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootPriv, _ := owner.Unlock("pw")
+	rootPub := rootPriv.Public().(ed25519.PublicKey)
+	b, _ := owner.Export()
+	n := newCircleTestNode(t, rootPub, rootPriv, "desk", []*circle.Bundle{b}, false)
+	c, _ := circle.ByDID(n.root, owner.Config.DID)
+	if n.svc.Attested(c) {
+		t.Fatal("attested without cert or attestation")
+	}
+	own, err := cert.Issue(rootPriv, n.devPub, cert.CmdAdmin, cert.Meta{Name: "desk"}, time.Now(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.svc.SetOwnCert(func() *cert.Cert { return own })
+	if !n.svc.Attested(c) {
+		t.Fatal("home-circle cert not accepted as attestation")
+	}
+	if own, _ := n.svc.ownAttestations(time.Now(), true); len(own) != 1 {
+		t.Fatalf("presents %d attestations, want the cert", len(own))
+	}
+	info := n.svc.Info(time.Now())
+	if len(info) != 1 || !info[0].Attested {
+		t.Fatalf("Info: %+v", info)
 	}
 }
 

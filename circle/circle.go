@@ -152,18 +152,28 @@ func keyPath(path string) string { return filepath.Join(path, keyFile) }
 // key (spec §1 discipline): unlocked per signing operation, never
 // resident in the daemon.
 func Init(root, name, passphrase string) (*Circle, error) {
+	seed := make([]byte, ed25519.SeedSize)
+	if _, err := rand.Read(seed); err != nil {
+		return nil, err
+	}
+	return InitFromSeed(root, name, seed, passphrase)
+}
+
+// InitFromSeed mints a circle around an existing key: how `fabric init`
+// makes the namespace root and the home circle one key (the mesh-root
+// merge; statement-format task, decision 4).
+func InitFromSeed(root, name string, seed []byte, passphrase string) (*Circle, error) {
 	if err := validName(name); err != nil {
 		return nil, err
+	}
+	if len(seed) != ed25519.SeedSize {
+		return nil, errors.New("circle seed is not an ed25519 seed")
 	}
 	path := filepath.Join(root, name)
 	if Exists(path) {
 		return nil, fmt.Errorf("this node already holds a circle named %q (%s)", name, path)
 	}
 	if err := os.MkdirAll(path, 0o700); err != nil {
-		return nil, err
-	}
-	seed := make([]byte, ed25519.SeedSize)
-	if _, err := rand.Read(seed); err != nil {
 		return nil, err
 	}
 	priv := ed25519.NewKeyFromSeed(seed)

@@ -130,6 +130,8 @@ func main() {
 		err = cmdAnnounce(args)
 	case "circle":
 		err = cmdCircle(args)
+	case "root":
+		err = cmdRoot(args)
 	default:
 		fmt.Fprintf(os.Stderr, "fabric: unknown command %q\n\n", cmd)
 		usage()
@@ -159,6 +161,9 @@ func usage() {
            -expiring renews everything past half-life, this node included
   ui       serve the topology/admin web UI on localhost
   queue    queue on|off — run the admission queue on this node (lighthouse)
+  root     root status | root merge -circle <name> | root retire <did> —
+           move the namespace onto a circle's key (mesh-root merge) and,
+           once every member holds a cert under it, retire the old root
   dns      dns on|off; sudo dns setup — allow resolver self-registration
   peer     peer add <multiaddr> — add a bootstrap peer
   announce announce add <hostname|ip|multiaddr> — also advertise an address
@@ -211,6 +216,7 @@ func cmdInit(args []string) error {
 	name := fs.String("name", "", "human label for this device (required)")
 	listen := fs.String("listen", defaultListen, "listen multiaddrs, comma-separated")
 	subnet := fs.String("subnet", "100.64.0.0/24", "overlay subnet for the TUN bridge (empty to disable overlay addressing)")
+	circleName := fs.String("circle", "home", "name of the home circle minted around the root key (the namespace and the circle are one key)")
 	fs.Parse(args)
 	if *name == "" {
 		return fmt.Errorf("init: -name is required")
@@ -256,6 +262,11 @@ func cmdInit(args []string) error {
 	if err := keystore.SaveSeed(dir.KeystorePath(), seed, pass); err != nil {
 		return err
 	}
+	// The home circle is the same key: the namespace DID is the circle DID,
+	// the device cert is the home-circle attestation (mesh-root merge).
+	if _, err := circle.InitFromSeed(circle.Root(dir.Path), *circleName, seed, pass); err != nil {
+		return fmt.Errorf("minting the home circle: %w", err)
+	}
 
 	devicePubRaw, err := priv.GetPublic().Raw()
 	if err != nil {
@@ -290,7 +301,7 @@ func cmdInit(args []string) error {
 	}
 
 	fmt.Printf("namespace created: %s\n", nsDID)
-	fmt.Printf("this device (%q) is the master and holds the root key\n", *name)
+	fmt.Printf("this device (%q) is the master and holds the root key; home circle %q is the same key\n", *name, *circleName)
 	if masterIP != "" {
 		fmt.Printf("overlay subnet %s; this device is %s\n", *subnet, masterIP)
 	}
@@ -346,6 +357,7 @@ func cmdUp(args []string) error {
 			// circles a mesh member is a device of. Vault gates on it;
 			// astral will.
 			d.Circle = daemon.NewCircleService(d.Host, d.Auth, root)
+			d.Circle.SetOwnCert(d.OwnCert)
 			vd, err = vaultdaemon.New(st, d)
 			if err != nil {
 				return fmt.Errorf("vault subsystem: %w", err)

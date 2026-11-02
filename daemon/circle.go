@@ -63,6 +63,11 @@ type CircleService struct {
 	h    host.Host
 	auth *fabricnet.AuthService
 	root string
+	// ownCert, when set, is this node's membership cert: for the home
+	// circle (the circle whose DID is the namespace DID) it *is* the device
+	// attestation — one assert per device (mesh-root merge) — so a node
+	// needs no separate `circle attest` into its own home circle.
+	ownCert func() *cert.Cert
 
 	mu    sync.RWMutex
 	peers map[peer.ID]circleEntry
@@ -103,6 +108,44 @@ func NewCircleService(h host.Host, auth *fabricnet.AuthService, root string) *Ci
 // Root is the circle root this node serves.
 func (s *CircleService) Root() string { return s.root }
 
+// SetOwnCert lets the service present the node's membership cert as its
+// home-circle attestation (see ownCert).
+func (s *CircleService) SetOwnCert(f func() *cert.Cert) { s.ownCert = f }
+
+// homeAttestation returns the node's cert read as an attestation into c,
+// when c is the node's home circle and the cert is a statement; nil
+// otherwise.
+func (s *CircleService) homeAttestation(c *circle.Circle) *circle.Attestation {
+	if s.ownCert == nil {
+		return nil
+	}
+	own := s.ownCert()
+	if own == nil || own.Stmt == nil || own.Payload.Sub != c.Config.DID {
+		return nil
+	}
+	raw, err := own.Marshal()
+	if err != nil {
+		return nil
+	}
+	a, err := circle.UnmarshalAttestation(raw)
+	if err != nil {
+		return nil
+	}
+	return a
+}
+
+// liveAttestation is the attestation this node presents for c: the stored
+// one when live, else the home-circle cert. nil when the node has none.
+func (s *CircleService) liveAttestation(c *circle.Circle, now time.Time) *circle.Attestation {
+	if a, err := c.LoadAttestation(); err == nil && a.Valid(now) == nil && !c.Revoked(a, now) {
+		return a
+	}
+	if a := s.homeAttestation(c); a != nil && a.Valid(now) == nil && !c.Revoked(a, now) {
+		return a
+	}
+	return nil
+}
+
 // Circles lists the circles this node holds right now.
 func (s *CircleService) Circles() []*circle.Circle {
 	cs, _ := circle.List(s.root)
@@ -127,12 +170,7 @@ func (s *CircleService) circleByDID(did string) *circle.Circle {
 // circle — valid now and not revoked by the circle. Without one, no peer
 // treats it as part of that circle.
 func (s *CircleService) Attested(c *circle.Circle) bool {
-	a, err := c.LoadAttestation()
-	if err != nil {
-		return false
-	}
-	now := time.Now()
-	return a.Valid(now) == nil && !c.Revoked(a, now)
+	return s.liveAttestation(c, time.Now()) != nil
 }
 
 // CircleInfo is the lifecycle view of one circle this node holds, for
@@ -155,7 +193,11 @@ func (s *CircleService) Info(now time.Time) []CircleInfo {
 		if rs, err := c.Revocations(now); err == nil {
 			ci.Revocations = len(rs)
 		}
-		if a, err := c.LoadAttestation(); err == nil {
+		a, err := c.LoadAttestation()
+		if err != nil {
+			a = s.homeAttestation(c)
+		}
+		if a != nil {
 			exp := a.Expiry()
 			ci.Expiry = &exp
 			ci.Legacy = a.Legacy()
@@ -182,11 +224,8 @@ func (s *CircleService) Close() {
 func (s *CircleService) ownAttestations(now time.Time, statements bool) ([][]byte, error) {
 	var out [][]byte
 	for _, c := range s.Circles() {
-		a, err := c.LoadAttestation()
-		if err != nil || a.Valid(now) != nil || c.Revoked(a, now) {
-			continue
-		}
-		if a.IsStatement() && !statements {
+		a := s.liveAttestation(c, now)
+		if a == nil || (a.IsStatement() && !statements) {
 			continue
 		}
 		raw, err := a.Marshal()

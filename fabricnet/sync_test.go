@@ -9,6 +9,7 @@ import (
 
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/event"
+	"ioa.rocks/fabric/statement"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -32,7 +33,7 @@ type syncNode struct {
 func newSyncNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.PrivateKey, name string) *syncNode {
 	t.Helper()
 	n := &syncNode{node: newNode(t, nsPub, nsPriv, name, true, 5*time.Second)}
-	n.log = event.NewLog(nsPub)
+	n.log = event.NewLog(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
 	n.sync = NewEventSync(n.host, n.log, n.store, func(e *event.Event) {
 		if e.Payload.Kind != event.KindRevoked {
 			return
