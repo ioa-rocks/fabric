@@ -55,6 +55,7 @@ type Daemon struct {
 	Config state.Config
 	Host   host.Host
 	Store  *fabricnet.MemberStore
+	Gater  *fabricnet.Gater // dark (default) or listed posture; see fabricnet.Gater
 	Auth   *fabricnet.AuthService
 	Log    *event.Log // membership events: admissions + revocations (spec §5)
 
@@ -138,7 +139,7 @@ func New(dir state.Dir) (*Daemon, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Daemon{
-		Dir: dir, Config: cfg, Store: store, Log: evLog,
+		Dir: dir, Config: cfg, Store: store, Gater: fabricnet.NewGater(store), Log: evLog,
 		ownCert: own, ctx: ctx, cancel: cancel,
 		rtt: make(map[peer.ID]time.Duration), reachability: "unknown",
 		lastDial:        make(map[peer.ID]time.Time),
@@ -165,7 +166,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		// Share libp2p's observation tracker, including disconnect cleanup.
 		libp2p.WithFxOption(fx.Populate(&d.observedAddrs)),
 		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
-		libp2p.ConnectionGater(fabricnet.NewGater(store)),
+		libp2p.ConnectionGater(d.Gater),
 		recoveryTransportOption(),
 		// NAT traversal (connectivity-model memo): every node can
 		// hole-punch (DCUtR upgrades relayed connections to direct; the
@@ -185,6 +186,12 @@ func New(dir state.Dir) (*Daemon, error) {
 			return advertiseAddrs(addrs, *d.announced.Load())
 		}),
 	}
+	// Members-dark by default (memo l0-overlapping-circles §12.6): only a
+	// node strangers must be able to reach — a queue host taking joins, or
+	// one the operator lists explicitly — accepts inbound connections from
+	// peers outside its member store. Everyone else learns new members by
+	// gossip first and refuses the unknown before multistream runs.
+	d.Gater.SetListed(cfg.QueueHost || cfg.Listed)
 	if cfg.QueueHost {
 		// The lighthouse is also the mesh's relay and NAT oracle: a
 		// members-only circuit-relay-v2 service (unlimited — it may carry
@@ -240,7 +247,11 @@ func New(dir state.Dir) (*Daemon, error) {
 	// never reached us would sit unauthenticated until the grace watchdog
 	// cuts it — and reconnect, forever. If a peer we don't know connects
 	// (either direction), initiate the handshake ourselves: its cert settles
-	// who it is. Strangers simply fail it and the watchdog proceeds.
+	// who it is. Strangers simply fail it and the watchdog proceeds. On a
+	// dark node only outbound connections reach this point (the bootstrap
+	// dial before the lighthouse's cert is held); the inbound half of the
+	// story happens on listed nodes, and a dark node learns the newcomer by
+	// gossip from them before admitting it.
 	h.Network().Notify(&network.NotifyBundle{ConnectedF: func(_ network.Network, c network.Conn) {
 		p := c.RemotePeer()
 		if d.Store.IsMember(p, time.Now()) || d.OwnCert() == nil {
@@ -325,6 +336,11 @@ func (d *Daemon) Run() error {
 	}
 	if d.Queue != nil {
 		log.Printf("admission queue active (master)")
+	}
+	if d.Gater.Listed() {
+		log.Printf("posture: listed — inbound connections from unknown peers are admitted for the %s auth grace", AuthGrace)
+	} else {
+		log.Printf("posture: dark — inbound connections from peers outside the member store are refused before any protocol runs")
 	}
 
 	stopControl, err := d.serveControl()

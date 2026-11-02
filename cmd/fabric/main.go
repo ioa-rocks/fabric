@@ -422,7 +422,13 @@ func cmdStatus(args []string) error {
 	if s.QueueHost && !s.Master {
 		role += ", queue host"
 	}
+	if s.Posture != "" {
+		role += ", " + s.Posture
+	}
 	fmt.Printf("%s (%s)  peer %s\n", s.Name, role, s.PeerID)
+	if s.RefusedInbound > 0 {
+		fmt.Printf("dark: refused %d inbound connection(s) from peers not in the member store since start\n", s.RefusedInbound)
+	}
 	fmt.Printf("namespace %s\n", s.NamespaceDID)
 	if s.OverlayIP != "" {
 		tun := "tun down (other transports still work)"

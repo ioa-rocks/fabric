@@ -88,9 +88,14 @@ type StatusReply struct {
 	Name         string `json:"name"`
 	PeerID       string `json:"peer_id"`
 	NamespaceDID string `json:"namespace_did"`
-	Master       bool   `json:"master"`       // holds the namespace root key
-	QueueHost    bool   `json:"queue_host"`   // runs the admission queue (lighthouse role)
-	Reachability string `json:"reachability"` // autonat v1 node verdict: public / private / unknown
+	Master       bool   `json:"master"`     // holds the namespace root key
+	QueueHost    bool   `json:"queue_host"` // runs the admission queue (lighthouse role)
+	Posture      string `json:"posture"`    // gater posture: dark (unknown inbound refused) / listed
+	// Inbound connections refused as unknown since start (dark posture): a
+	// non-zero count with a member missing from `peers` usually means its
+	// MemberAdded event has not reached this node yet.
+	RefusedInbound uint64 `json:"refused_inbound,omitempty"`
+	Reachability   string `json:"reachability"` // autonat v1 node verdict: public / private / unknown
 	// Per-address verdicts (autonat v2): which public addresses peers
 	// could actually dial back. On dual-stack NAT'd lines these carry the
 	// real story the single word above can't.
@@ -177,11 +182,13 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		NamespaceDID: d.Config.NamespaceDID,
 		Master:       d.Dir.IsMaster(),
 		QueueHost:    d.Queue != nil,
+		Posture:      d.Gater.Posture(),
 		Reachability: d.Reachability(),
 		OverlayIP:    d.OwnCert().Payload.Meta.IP,
 		TUNActive:    d.Bridge != nil,
 		DNSActive:    d.DNS != nil,
 	}
+	reply.RefusedInbound = d.Gater.RefusedInbound()
 	reply.ReachableAddrs, reply.UnreachableAddrs, reply.UnverifiedAddrs = d.AddrReachability()
 	ownExp := d.OwnCert().Expiry()
 	reply.CertExpiry = &ownExp

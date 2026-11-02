@@ -12,6 +12,7 @@ import (
 	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/state"
 
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -78,6 +79,7 @@ func TestSelfHealOneWayKnownPair(t *testing.T) {
 	_ = nsPub
 
 	b := newTestDaemon(t, nsPriv, "node-b", nil)
+	b.Gater.SetListed(true) // gate-hetz was a lighthouse: unknown inbound admitted for the handshake
 	bAdded, err := event.NewAdded(nsPriv, b.OwnCert(), time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -106,6 +108,63 @@ func TestSelfHealOneWayKnownPair(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("B never learned A is a member — one-way-known pair did not self-heal")
+}
+
+// TestDarkNodeAdmitsMemberOnlyAfterGossip is the same asymmetry on a dark
+// node (the default posture, build queue step 2): B does not know A, so B
+// refuses A's inbound connection before any protocol runs; once A's
+// MemberAdded event reaches B (here applied directly, in the field by gossip
+// from a lighthouse), A's next dial succeeds and the pair settles.
+func TestDarkNodeAdmitsMemberOnlyAfterGossip(t *testing.T) {
+	_, nsPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := newTestDaemon(t, nsPriv, "node-b", nil)
+	bAdded, err := event.NewAdded(nsPriv, b.OwnCert(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newTestDaemon(t, nsPriv, "node-a", []*event.Event{bAdded})
+	if b.Gater.Listed() {
+		t.Fatal("precondition: a plain member daemon should be dark")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = a.Host.Connect(ctx, peer.AddrInfo{ID: b.Host.ID(), Addrs: b.Host.Addrs()})
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && (len(b.Host.Network().ConnsToPeer(a.Host.ID())) > 0 || b.Gater.RefusedInbound() == 0) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := len(b.Host.Network().ConnsToPeer(a.Host.ID())); n != 0 || b.Gater.RefusedInbound() == 0 {
+		t.Fatalf("dark B kept %d connection(s) from unknown A (refused=%d)", n, b.Gater.RefusedInbound())
+	}
+	if b.Store.IsMember(a.Host.ID(), time.Now()) {
+		t.Fatal("B learned A without any gossip")
+	}
+
+	// Gossip arrives.
+	aAdded, err := event.NewAdded(nsPriv, a.OwnCert(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Log.Add(aAdded, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	b.applyEvent(aAdded)
+	if err := a.Host.Connect(ctx, peer.AddrInfo{ID: b.Host.ID(), Addrs: b.Host.Addrs()}); err != nil {
+		t.Fatalf("A → B after gossip: %v", err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if a.Store.IsMember(b.Host.ID(), time.Now()) && b.Store.IsMember(a.Host.ID(), time.Now()) &&
+			b.Host.Network().Connectedness(a.Host.ID()) == network.Connected {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("pair did not settle after B learned A by gossip")
 }
 
 func TestDurableBootstrapAddr(t *testing.T) {

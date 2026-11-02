@@ -1,0 +1,155 @@
+package fabricnet
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"testing"
+	"time"
+
+	"ioa.rocks/fabric/cert"
+
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+)
+
+// TestGaterDecisions pins the posture table: revoked never; outbound to
+// anyone else; inbound only from known members unless listed.
+func TestGaterDecisions(t *testing.T) {
+	nsPub, nsPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewMemberStore(nsPub)
+	g := NewGater(store)
+
+	mkPeer := func(name string, add bool) peer.ID {
+		pub, _, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := PeerIDForKey(pub)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if add {
+			c, err := cert.Issue(nsPriv, pub, cert.CmdMember, cert.Meta{Name: name}, time.Now(), time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store.AddMember(p, c)
+		}
+		return p
+	}
+	member := mkPeer("member", true)
+	stranger := mkPeer("stranger", false)
+	revoked := mkPeer("revoked", true)
+	store.Revoke(revoked, time.Now())
+
+	cases := []struct {
+		name   string
+		listed bool
+		dir    network.Direction
+		p      peer.ID
+		want   bool
+	}{
+		{"dark inbound member", false, network.DirInbound, member, true},
+		{"dark inbound stranger", false, network.DirInbound, stranger, false},
+		{"dark outbound stranger", false, network.DirOutbound, stranger, true},
+		{"dark inbound revoked", false, network.DirInbound, revoked, false},
+		{"dark outbound revoked", false, network.DirOutbound, revoked, false},
+		{"listed inbound stranger", true, network.DirInbound, stranger, true},
+		{"listed inbound revoked", true, network.DirInbound, revoked, false},
+	}
+	for _, tc := range cases {
+		g.SetListed(tc.listed)
+		if got := g.InterceptSecured(tc.dir, tc.p, nil); got != tc.want {
+			t.Errorf("%s: InterceptSecured = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	if g.InterceptPeerDial(revoked) {
+		t.Error("InterceptPeerDial allowed a revoked peer")
+	}
+	if !g.InterceptPeerDial(stranger) {
+		t.Error("InterceptPeerDial refused an unknown peer (bootstrap must stay dialable)")
+	}
+	if g.RefusedInbound() != 1 {
+		t.Errorf("RefusedInbound = %d, want 1 (only the dark inbound stranger case)", g.RefusedInbound())
+	}
+}
+
+// TestDarkNodeRefusesUnknownUntilGossip is the step-2 story end to end on
+// real hosts: a dark member refuses an inbound connection from a member it
+// has not learned yet (nothing after the transport handshake runs), admits
+// it as soon as the cert is in its store, and still dials out to peers it
+// does not know.
+func TestDarkNodeRefusesUnknownUntilGossip(t *testing.T) {
+	nsPub, nsPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dark := newNode(t, nsPub, nsPriv, "dark", true, 5*time.Second)
+	dark.gater.SetListed(false)
+	fresh := newNode(t, nsPub, nsPriv, "fresh", true, 5*time.Second)
+	stranger := newNode(t, nsPub, nsPriv, "stranger", false, 5*time.Second)
+
+	// A stranger never holds a connection to a dark node: the dialer may
+	// see its transport handshake complete, but the dark side refuses
+	// before upgrading and nothing above the transport ever runs.
+	assertRefused(t, stranger, dark, "stranger")
+	// Neither does a member whose admission has not reached the dark node.
+	assertRefused(t, fresh, dark, "unknown member")
+	if dark.gater.RefusedInbound() < 2 {
+		t.Fatalf("RefusedInbound = %d, want >= 2", dark.gater.RefusedInbound())
+	}
+	// Gossip arrives (here: the cert lands in the store) → the retry works
+	// and the handshake settles the pair.
+	dark.store.AddMember(fresh.host.ID(), fresh.own)
+	if err := tryConnect(fresh, dark); err != nil {
+		t.Fatalf("known member refused by dark node: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := fresh.auth.Authenticate(ctx, dark.host.ID()); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	if got, err := echo(fresh, dark.host.ID(), "hi"); err != nil || got != "hi" {
+		t.Fatalf("echo = %q, %v", got, err)
+	}
+
+	// Outbound from a dark node to a peer it does not know is allowed: the
+	// bootstrap dial happens before the lighthouse's cert is held.
+	listed := newNode(t, nsPub, nsPriv, "lighthouse", true, 5*time.Second)
+	if err := tryConnect(dark, listed); err != nil {
+		t.Fatalf("dark node could not dial out to an unknown listed peer: %v", err)
+	}
+}
+
+// assertRefused dials `to` from `from` and checks that no connection
+// survives on the refusing side and no stream can be opened over it.
+func assertRefused(t *testing.T, from, to *node, who string) {
+	t.Helper()
+	before := to.gater.RefusedInbound()
+	_ = tryConnect(from, to) // the dialer's view of the handshake is not the verdict
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if s, err := from.host.NewStream(ctx, to.host.ID(), ProtocolID); err == nil {
+		s.Reset()
+		t.Fatalf("%s opened a stream to a dark node", who)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(to.host.Network().ConnsToPeer(from.host.ID())) == 0 && to.gater.RefusedInbound() > before {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s: dark node still holds %d connection(s), refused count %d → %d", who,
+		len(to.host.Network().ConnsToPeer(from.host.ID())), before, to.gater.RefusedInbound())
+}
+
+func tryConnect(from, to *node) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return from.host.Connect(ctx, peer.AddrInfo{ID: to.host.ID(), Addrs: to.host.Addrs()})
+}

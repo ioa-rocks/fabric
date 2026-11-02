@@ -38,7 +38,11 @@ func newCircleTestNode(t *testing.T, nsPub ed25519.PublicKey, nsRoot ed25519.Pri
 		t.Fatal(err)
 	}
 	store := fabricnet.NewMemberStore(nsPub)
-	h, err := libp2p.New(libp2p.Identity(priv), libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"), libp2p.ConnectionGater(fabricnet.NewGater(store)))
+	// Listed: these nodes meet by handshake, not by gossip (dark posture is
+	// covered in daemon_test.go and fabricnet/gater_test.go).
+	gater := fabricnet.NewGater(store)
+	gater.SetListed(true)
+	h, err := libp2p.New(libp2p.Identity(priv), libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"), libp2p.ConnectionGater(gater))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -98,6 +98,18 @@ workable: the master only ever dials out.
 Queue restarts are harmless (joiners re-enter by polling). Several
 queue hosts can run at once; the master aggregates them.
 
+**Posture: dark vs listed.** Every node is *dark* by default: an
+inbound connection from a peer ID it holds no current cert for is
+refused right after the transport handshake, before multistream,
+identify or the auth protocol run. Members are learned by gossip from
+the lighthouses first, so a freshly admitted member may be refused by a
+dark node for one reconnect tick until its `MemberAdded` event arrives;
+`fabric status` shows the posture and a count of refused unknown
+inbound connections. A queue host is *listed* (strangers must reach it
+to join); `"listed": true` in `config.json` lists any other node that
+has to accept unknown peers. Outbound dials are never gated by
+posture: the node chose them, and the handshake settles who answered.
+
 **4. Start the new node:**
 
 ```sh
@@ -643,8 +655,10 @@ user key) to skip the interactive prompts (CI, scripts).
   and the deduplicating, expiry-GC'd event log they accumulate in: the
   durable membership view every node carries.
 - `fabricnet` — membership enforcement on a libp2p host, layered:
-  a connection gater (hard-denies revoked peers, admits strangers only
-  long enough to authenticate), the `/fabric/auth/1` mutual certificate
+  a connection gater (hard-denies revoked peers; dark by default, so a
+  node refuses inbound peers outside its member store before any
+  protocol runs, and listed on lighthouses so joiners and not-yet-gossiped
+  members can authenticate), the `/fabric/auth/1` mutual certificate
   handshake, per-protocol member checks (`RequireMember`), revocation
   that closes live connections, and `/fabric/events/1` gossip — full-log
   anti-entropy on every connect plus rumor-mill relay of fresh events.

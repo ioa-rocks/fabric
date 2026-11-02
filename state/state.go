@@ -32,11 +32,16 @@ type Config struct {
 	Name         string   `json:"name"`
 	ListenAddrs  []string `json:"listen_addrs"`
 	NamespaceDID string   `json:"namespace_did"`
-	Bootstrap    []string `json:"bootstrap"`        // multiaddrs including /p2p/<peer-id>
+	Bootstrap    []string `json:"bootstrap"`            // multiaddrs including /p2p/<peer-id>
 	Subnet       string   `json:"subnet,omitempty"`     // overlay CIDR; master only (allocation)
 	TUN          string   `json:"tun,omitempty"`        // "" = auto (try, fall back), "off"
 	QueueHost    bool     `json:"queue_host,omitempty"` // run the admission queue (lighthouse role)
-	DNS          string   `json:"dns,omitempty"`        // "" = serve .fabric when TUN is up, "off"
+	// Listed opens the connection gater to inbound peers this node holds
+	// no cert for (they still have to authenticate). Off = dark: unknown
+	// peers are refused before anything above the transport runs. Queue
+	// hosts are listed regardless, since joiners must reach them.
+	Listed bool   `json:"listed,omitempty"`
+	DNS    string `json:"dns,omitempty"` // "" = serve .fabric when TUN is up, "off"
 	// AnnounceAddrs are advertised in addition to the interface-derived
 	// addresses — for reachable addresses no local interface carries, e.g.
 	// a cloud instance's 1:1-NAT'd public IP or DNS name. Entries may be a

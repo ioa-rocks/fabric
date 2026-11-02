@@ -28,6 +28,7 @@ const vaultEchoProtocol = "/vault/test-echo/1"
 type node struct {
 	host  host.Host
 	store *MemberStore
+	gater *Gater
 	auth  *AuthService
 	own   *cert.Cert // nil for strangers
 	joins atomic.Int32
@@ -50,12 +51,16 @@ func newScopedNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.Private
 	}
 
 	n := &node{store: NewMemberStore(nsPub)}
+	// Listed posture: these tests exercise the handshake, which on a dark
+	// node only an already-known member reaches (gater_test.go covers dark).
+	n.gater = NewGater(n.store)
+	n.gater.SetListed(true)
 	// QUIC + TCP, like the real daemon — the QUIC path must stay exercised
 	// (a quic-go/Go-toolchain mismatch once panicked only on real dials).
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings("/ip4/127.0.0.1/udp/0/quic-v1", "/ip4/127.0.0.1/tcp/0"),
-		libp2p.ConnectionGater(NewGater(n.store)),
+		libp2p.ConnectionGater(n.gater),
 	)
 	if err != nil {
 		t.Fatal(err)
