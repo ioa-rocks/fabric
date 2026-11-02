@@ -618,9 +618,9 @@ the UI and daemon use a non-default Astral state directory.
 | Command | Where | What |
 |---|---|---|
 | `fabric init -name <label> [-circle <name>]` | first device | mint the namespace, become master; the root key is also the home circle (default `home`) |
-| `fabric root status` | any member | current root, roots still honoured during a move, members not yet on the new root |
+| `fabric root status` | any member | current root, roots still honoured during a move, members that have not yet *presented* a cert under the new root in a handshake with this daemon (the log alone only proves the cert was issued) |
 | `fabric root merge -circle <name>` | master | move the namespace onto a circle's key: re-issues every cert under it, publishes `root-moved` (signed by the old root), installs the circle key as the root container; the old root stays honoured |
-| `fabric root retire [-force] <did>` | master | publish `root-retired` (signed by the new root): the old root stops verifying everywhere; refuses while live members still hold old certs unless `-force` |
+| `fabric root retire [-force] <did>` | master | publish `root-retired` (signed by the new root): the old root stops verifying everywhere; refuses while a live member has not presented a new-root cert to this daemon unless `-force` (those members are cut off and must re-join) |
 | `fabric up` | any member | run the node daemon (serves buckets when the node has a circle; `-no-vault` / `-vault-state <dir>`) |
 | `fabric status` | any member | node, membership, and connection state |
 | `fabric graph [-json]` | any member | whole-mesh link map, human or machine readable |

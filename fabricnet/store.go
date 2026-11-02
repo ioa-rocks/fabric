@@ -28,19 +28,49 @@ import (
 type MemberStore struct {
 	roots statement.Roots // honoured roots; certs verify against these
 
-	mu      sync.RWMutex
-	members map[peer.ID]*cert.Cert
-	lapsed  map[peer.ID]*cert.Cert // expired, unrevoked, within retention
-	revoked map[peer.ID]time.Time  // peer -> revoked cert's expiry
+	mu        sync.RWMutex
+	members   map[peer.ID]*cert.Cert
+	lapsed    map[peer.ID]*cert.Cert // expired, unrevoked, within retention
+	revoked   map[peer.ID]time.Time  // peer -> revoked cert's expiry
+	presented map[peer.ID]presented  // the cert each peer last showed in a handshake
+}
+
+// presented is what a peer proved it holds, as opposed to what the event
+// log says was issued to it. The two differ during a root move: the master
+// publishes every re-issued cert into the log at once, but a device has
+// adopted its own only when it presents it (Codex review, 2026-11-02).
+type presented struct {
+	cert *cert.Cert
+	at   time.Time
 }
 
 func NewMemberStore(roots statement.Roots) *MemberStore {
 	return &MemberStore{
-		roots:   roots,
-		members: make(map[peer.ID]*cert.Cert),
-		lapsed:  make(map[peer.ID]*cert.Cert),
-		revoked: make(map[peer.ID]time.Time),
+		roots:     roots,
+		members:   make(map[peer.ID]*cert.Cert),
+		lapsed:    make(map[peer.ID]*cert.Cert),
+		revoked:   make(map[peer.ID]time.Time),
+		presented: make(map[peer.ID]presented),
 	}
+}
+
+// NotePresented records the cert a peer showed in a handshake just now. It
+// is handshake-only memory (not persisted, not fed by gossip): what
+// `fabric root status` and `root retire` read to know which devices have
+// really moved to a new root.
+func (s *MemberStore) NotePresented(p peer.ID, c *cert.Cert) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.presented[p] = presented{cert: c, at: time.Now()}
+}
+
+// Presented returns the cert a peer last showed in a handshake since this
+// process started, and when.
+func (s *MemberStore) Presented(p peer.ID) (*cert.Cert, time.Time, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	pr, ok := s.presented[p]
+	return pr.cert, pr.at, ok
 }
 
 // Roots returns the honoured-roots store certs are verified against.
@@ -54,6 +84,7 @@ func (s *MemberStore) Forget(p peer.ID) {
 	defer s.mu.Unlock()
 	delete(s.members, p)
 	delete(s.lapsed, p)
+	delete(s.presented, p)
 }
 
 // MembersIn lists the members whose cert is in the given circle.
@@ -89,14 +120,32 @@ func (s *MemberStore) AddMember(p peer.ID, c *cert.Cert) {
 		s.lapsed[p] = c
 		return
 	}
-	// Later-expiring cert wins: added-events arrive in no particular order
-	// (gossip, anti-entropy, handshakes), so a stale event must not clobber
-	// a renewed cert.
-	if cur, ok := s.members[p]; ok && c.Expiry().Before(cur.Expiry()) {
+	if cur, ok := s.members[p]; ok && !s.prefer(cur, c) {
 		return
 	}
 	s.members[p] = c
 	delete(s.lapsed, p)
+}
+
+// prefer decides whether next replaces cur. Later-expiring cert wins:
+// added-events arrive in no particular order (gossip, anti-entropy,
+// handshakes), so a stale event must not clobber a renewed cert. The one
+// exception is a root move: a cert under the primary root beats a cert
+// under an old, still-honoured root regardless of expiry, otherwise an old
+// cert with a longer remaining lifetime would keep the migration from ever
+// completing (Codex review, 2026-11-02).
+func (s *MemberStore) prefer(cur, next *cert.Cert) bool {
+	if cur.Payload.Sub != next.Payload.Sub {
+		if pr, ok := s.roots.(interface{ Primary() string }); ok {
+			switch pr.Primary() {
+			case next.Payload.Sub:
+				return true
+			case cur.Payload.Sub:
+				return false
+			}
+		}
+	}
+	return !next.Expiry().Before(cur.Expiry())
 }
 
 // IsMember reports whether the peer holds a currently valid, unrevoked cert.
@@ -184,6 +233,7 @@ func (s *MemberStore) Revoke(p peer.ID, now time.Time) {
 	s.revoked[p] = exp
 	delete(s.members, p)
 	delete(s.lapsed, p)
+	delete(s.presented, p)
 }
 
 // IsRevoked reports whether the peer is currently revoked.

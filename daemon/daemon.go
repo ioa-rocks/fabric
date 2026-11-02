@@ -727,12 +727,19 @@ func (d *Daemon) OwnCert() *cert.Cert {
 
 // adoptOwnCert swaps in a re-signed certificate for this device (spec §5
 // renewal): persist it and present it in handshakes from now on — no
-// restart. Only a cert that outlives the current one is adopted.
+// restart. Only a cert that outlives the current one is adopted, except
+// during a root move, where a cert under the new (primary) root replaces
+// one under an old root whatever the expiries — otherwise a long-lived old
+// cert would keep this device from ever moving (Codex review, 2026-11-02).
 func (d *Daemon) adoptOwnCert(c *cert.Cert) {
+	ns := d.NamespaceDID()
 	d.certMu.Lock()
-	if d.ownCert != nil && !c.Expiry().After(d.ownCert.Expiry()) {
-		d.certMu.Unlock()
-		return
+	if cur := d.ownCert; cur != nil {
+		moving := cur.Payload.Sub != c.Payload.Sub && c.Payload.Sub == ns
+		if !moving && (cur.Payload.Sub == ns && c.Payload.Sub != ns || !c.Expiry().After(cur.Expiry())) {
+			d.certMu.Unlock()
+			return
+		}
 	}
 	d.ownCert = c
 	d.certMu.Unlock()
@@ -746,8 +753,31 @@ func (d *Daemon) adoptOwnCert(c *cert.Cert) {
 	}
 	if d.Auth != nil {
 		d.Auth.SetOwn(c)
+		go d.representCert()
 	}
 	log.Printf("own certificate renewed — now expires %s", c.Expiry().Format(time.RFC3339))
+}
+
+// representCert re-runs the handshake with every connected member after
+// this node adopted a new cert, so peers record what this device now
+// presents (MemberStore.NotePresented). That record is how the master knows
+// a device has really moved during a root merge; gossip alone only proves
+// the master issued the cert, not that the device holds it.
+func (d *Daemon) representCert() {
+	if d.Host == nil || d.ctx == nil {
+		return
+	}
+	for _, p := range d.Host.Network().Peers() {
+		if p == d.Host.ID() || !d.Store.IsMember(p, time.Now()) {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
+		err := d.Auth.Authenticate(ctx, p)
+		cancel()
+		if err != nil {
+			log.Printf("re-presenting cert to %s: %v", p, err)
+		}
+	}
 }
 
 // hydrateStore replays the event log into the member store at startup, in

@@ -82,6 +82,12 @@ type MemberInfo struct {
 	Connected   bool      `json:"connected"`
 	Self        bool      `json:"self,omitempty"`    // the answering daemon's own entry
 	Expired     bool      `json:"expired,omitempty"` // lapsed: not a member, cert expired; re-join needed
+	// What the peer last presented in a handshake with this daemon (since it
+	// started), as opposed to what the log says was issued to it. Empty when
+	// the peer has not handshaken with this daemon yet. `fabric root
+	// status|retire` read this to know who has really adopted a new root.
+	PresentedSub string     `json:"presented_sub,omitempty"`
+	PresentedAt  *time.Time `json:"presented_at,omitempty"`
 }
 
 type StatusReply struct {
@@ -290,7 +296,7 @@ func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
 		if err != nil {
 			return
 		}
-		out = append(out, MemberInfo{
+		info := MemberInfo{
 			ID:          p.String(),
 			Name:        c.Payload.Meta.Name,
 			Fingerprint: admission.Fingerprint(devKey),
@@ -302,7 +308,14 @@ func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
 			Connected:   self || d.Host.Network().Connectedness(p) == network.Connected,
 			Self:        self,
 			Expired:     expired,
-		})
+		}
+		if self {
+			info.PresentedSub = c.Payload.Sub
+		} else if pc, at, ok := d.Store.Presented(p); ok {
+			info.PresentedSub = pc.Payload.Sub
+			info.PresentedAt = &at
+		}
+		out = append(out, info)
 	}
 	// The store never holds this node's own cert — include it explicitly so
 	// the signing side can renew every member of the mesh, itself included.

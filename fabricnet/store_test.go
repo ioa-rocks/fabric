@@ -55,6 +55,50 @@ func TestAddMemberKeepsLaterExpiry(t *testing.T) {
 	}
 }
 
+// During a root move a cert under the new (primary) root must replace one
+// under the old root even when the old one expires later; otherwise a
+// long-lived old cert would keep the migration from completing. A stale
+// old-root cert arriving afterwards must not undo the move.
+func TestAddMemberPrefersPrimaryRootOverExpiry(t *testing.T) {
+	r1Pub, r1, _ := ed25519.GenerateKey(rand.Reader)
+	r2Pub, r2, _ := ed25519.GenerateKey(rand.Reader)
+	d1, d2 := cert.DIDForKey(r1Pub), cert.DIDForKey(r2Pub)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	p, err := PeerIDForKey(devPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	old, err := cert.IssueAs(r1, nil, d1, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, now, cert.MaxValidity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := cert.IssueAs(r2, nil, d2, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, now, cert.DefaultValidity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fresh.Expiry().Before(old.Expiry()) {
+		t.Fatal("test premise: the old cert must outlive the new one")
+	}
+	for _, order := range [][]*cert.Cert{{old, fresh}, {fresh, old}, {old, fresh, old}} {
+		s := NewMemberStore(statement.NewDIDRoots(d2, d1)) // moved onto d2; d1 still honoured
+		for _, c := range order {
+			s.AddMember(p, c)
+		}
+		if c, _ := s.Cert(p); c.Payload.Sub != d2 {
+			t.Fatalf("store kept the old-root cert (sub %s) over the primary root's", c.Payload.Sub)
+		}
+	}
+	// Without a move (same sub) expiry still decides.
+	s := NewMemberStore(statement.NewDIDRoots(d1))
+	shorter, _ := cert.IssueAs(r1, nil, d1, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, now, cert.DefaultValidity)
+	s.AddMember(p, old)
+	s.AddMember(p, shorter)
+	if c, _ := s.Cert(p); !c.Expiry().Equal(old.Expiry()) {
+		t.Fatal("a shorter cert under the same root replaced a longer one")
+	}
+}
+
 // An expired cert is roster memory, not membership: the device is known by
 // name (LapsedCert) and listed (Lapsed) but admitted nowhere; a valid cert
 // for the same device lifts it out; revocation forgets it; GC moves a

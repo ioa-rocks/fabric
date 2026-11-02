@@ -51,6 +51,7 @@ type Compiled struct {
 	Nbf, Exp      time.Time // max(nbf), min(exp) across both chains
 	Auth          []Link    // root-first
 	Ident         []Link    // root-first; empty when the presenter is the authority leaf's aud
+	IdentAnchor   string    // circle DID the identity chain was anchored at through roots; "" when anchored at a did:key
 	UnknownVerbs  []string  // verbs on the authority leaf this binary does not know
 }
 
@@ -108,7 +109,9 @@ func Compile(authority, identity *Statement, sub string, roots Roots) (*Compiled
 	// be a did:key (a device or bare key, or a foreign circle's did:key).
 	anchor := leaf.Payload.Aud
 	anchorKeys := roots.RootKeys(anchor)
-	if len(anchorKeys) == 0 {
+	if len(anchorKeys) > 0 {
+		c.IdentAnchor = anchor
+	} else {
 		k, err := did.KeyFor(anchor)
 		if err != nil {
 			return nil, fmt.Errorf("identity anchor %q is neither a held circle nor a did:key", anchor)
@@ -335,9 +338,32 @@ func linkAllows(p Payload, sub string, res Resource, verb string) bool {
 	return false
 }
 
-// Check is the per-verb half: presenter, window at now, scope, and
-// revocations over both lineages. Errors say which rule failed.
+// Check is the per-verb half: roots still honoured, presenter, window at
+// now, scope, and revocations over both lineages. Errors say which rule
+// failed.
+//
+// The root check is repeated here, cheaply (a key comparison, no
+// signature), because a Compiled is meant to be cached: a chain compiled
+// while its root was honoured must stop working the moment that root is
+// retired (root-retired event), without waiting for the cache to notice
+// (Codex review, 2026-11-02).
 func (c *Compiled) Check(roots Roots, revs Revocations, want Want) error {
+	if !rootSigned(c.Auth[0].Stmt, roots.RootKeys(c.Sub)) {
+		return errors.New("authority chain root is no longer honoured for the circle")
+	}
+	if c.IdentAnchor != "" {
+		keys := roots.RootKeys(c.IdentAnchor)
+		if len(keys) == 0 {
+			// The circle is no longer held here; as in Compile, a did:key
+			// anchor still resolves on its own.
+			if k, err := did.KeyFor(c.IdentAnchor); err == nil {
+				keys = []ed25519.PublicKey{k}
+			}
+		}
+		if !rootSigned(c.Ident[0].Stmt, keys) {
+			return errors.New("identity chain anchor is no longer honoured")
+		}
+	}
 	if want.PresentingKey != c.PresentingKey {
 		return fmt.Errorf("presented by %s, chain is for %s", short(want.PresentingKey), short(c.PresentingKey))
 	}

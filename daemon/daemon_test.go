@@ -276,6 +276,18 @@ func TestRootMoveAndRetire(t *testing.T) {
 	waitFor("mutual membership", func() bool {
 		return a.Store.IsMember(b.Host.ID(), time.Now()) && b.Store.IsMember(a.Host.ID(), time.Now())
 	})
+	// B holds a long-lived old-root cert (MaxValidity): the re-issued
+	// 365-day cert expires earlier, and the move must still win.
+	devB, _ := b.OwnCert().DeviceKey()
+	long, err := cert.IssueAs(r1, nil, d1, devB, cert.CmdMember, b.OwnCert().Payload.Meta, time.Now(), cert.MaxValidity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	longEv, _ := event.NewAdded(r1, long, time.Now())
+	if err := a.Ingest(longEv); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("B to adopt the long cert", func() bool { return b.OwnCert().Expiry().Equal(long.Expiry()) })
 
 	// 1. The old root hands over; B learns it by gossip.
 	moved, err := event.NewRootMoved(r1, d2, time.Now())
@@ -313,6 +325,21 @@ func TestRootMoveAndRetire(t *testing.T) {
 		c, ok := a.Store.Cert(b.Host.ID())
 		return ok && c.Payload.Sub == d2
 	})
+	// B re-presents its new cert on adoption, so A's handshake memory (what
+	// `root status`/`root retire` go by) shows B has really moved.
+	waitFor("A to see B present a cert under the new root", func() bool {
+		pc, _, ok := a.Store.Presented(b.Host.ID())
+		return ok && pc.Payload.Sub == d2
+	})
+	// A late old-root renewal (longer-lived still) does not undo the move.
+	late, _ := cert.IssueAs(r1, nil, d1, devB, cert.CmdMember, b.OwnCert().Payload.Meta, time.Now(), cert.MaxValidity)
+	lateEv, _ := event.NewAdded(r1, late, time.Now().Add(2*time.Second))
+	if err := a.Ingest(lateEv); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := a.Store.Cert(b.Host.ID()); c.Payload.Sub != d2 {
+		t.Fatal("late old-root cert displaced B's new one in A's store")
+	}
 	// An old-root cert still verifies on both while the old root is honoured.
 	strayPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	oldCert, _ := cert.Issue(r1, strayPub, cert.CmdMember, cert.Meta{Name: "stray"}, time.Now(), time.Hour)
@@ -321,7 +348,7 @@ func TestRootMoveAndRetire(t *testing.T) {
 	}
 
 	// 3. The new root retires the old one; B drops it and old certs die.
-	retired, _ := event.NewRootRetired(r2, d1, time.Now().Add(2*time.Second))
+	retired, _ := event.NewRootRetired(r2, d1, time.Now().Add(3*time.Second))
 	if err := a.Ingest(retired); err != nil {
 		t.Fatal(err)
 	}

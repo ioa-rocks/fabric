@@ -430,6 +430,48 @@ func TestForeignGrantWithIdentityChain(t *testing.T) {
 	mustFail(t, err, "identity link")
 }
 
+func TestCheckRechecksHonouredRoots(t *testing.T) {
+	// A Compiled is meant to be cached. Retiring a root (root-retired during
+	// a mesh-root move) must stop a cached chain at its next Check, without
+	// recompiling.
+	h := newHome(t)
+	roots := NewDIDRoots(h.did)
+	c, err := Compile(h.devA, nil, h.did, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := want(h.did, KindSubject, "x", VerbMember, h.dev.did)
+	if err := c.Check(roots, nil, w); err != nil {
+		t.Fatal(err)
+	}
+	roots.Set(nil)
+	mustFail(t, c.Check(roots, nil, w), "no longer honoured")
+
+	// The identity anchor is re-checked too when it was a held circle: the
+	// circle moving to a new key ends chains anchored at the old one.
+	p := newKey(t)
+	wide := assert(t, p, nil, h.did, p.did, []Resource{{Kind: KindSubject, Name: "jobs/*"}}, []string{VerbClaim}, nil, 0)
+	devWide := assert(t, h.root, nil, h.dev.did, h.did, all, []string{VerbMember, VerbClaim}, nil, 1)
+	both := RootMap{p.did: {p.pub}, h.did: {h.root.pub}}
+	c2, err := Compile(wide, devWide, p.did, both)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.IdentAnchor != h.did {
+		t.Fatalf("identity anchor %q, want the held circle %s", c2.IdentAnchor, h.did)
+	}
+	w2 := want(p.did, KindSubject, "jobs/2", VerbClaim, h.dev.did)
+	if err := c2.Check(both, nil, w2); err != nil {
+		t.Fatal(err)
+	}
+	moved := newKey(t)
+	mustFail(t, c2.Check(RootMap{p.did: {p.pub}, h.did: {moved.pub}}, nil, w2), "anchor is no longer honoured")
+	// Dropping the circle altogether falls back to the did:key, as Compile does.
+	if err := c2.Check(RootMap{p.did: {p.pub}}, nil, w2); err != nil {
+		t.Fatalf("did:key fallback for the anchor: %v", err)
+	}
+}
+
 func TestRevocationSetShapeChecks(t *testing.T) {
 	h := newHome(t)
 	revs := NewRevocationSet()

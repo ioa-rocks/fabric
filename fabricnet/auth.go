@@ -150,6 +150,7 @@ func (a *AuthService) handleInbound(s network.Stream) {
 
 func (a *AuthService) noteMember(p peer.ID, c *cert.Cert) {
 	_, known := a.store.Cert(p)
+	a.store.NotePresented(p, c)
 	a.store.AddMember(p, c)
 	a.h.ConnManager().Protect(p, "fabric-member")
 	if !known && a.onJoin != nil {

@@ -45,6 +45,20 @@ func (r *DIDRoots) DIDs() []string {
 	return slices.Clone(r.dids)
 }
 
+// Primary is the circle DID this node's own membership continues under:
+// the first honoured root. During a root move the others are old roots,
+// honoured only until retired; a cert under the primary root is preferred
+// over one under an old root whatever their expiries (see
+// fabricnet.MemberStore.AddMember).
+func (r *DIDRoots) Primary() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.dids) == 0 {
+		return ""
+	}
+	return r.dids[0]
+}
+
 // Honours reports whether the DID is in the set.
 func (r *DIDRoots) Honours(circleDID string) bool {
 	r.mu.RLock()
