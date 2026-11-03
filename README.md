@@ -622,8 +622,28 @@ registers follow their entity's subject; a registry announcement is kept
 only for refs the announcer may `host`. A member outside the circle is
 refused, not parked. Pre-statement certs and attestations carry no verbs
 and count as the full device set. Consumer-name strings are still not
-authorization; sub-keys and foreign grantees presenting their own chain
-are the next slices (`tasks/open/astral-per-circle.md`).
+authorization.
+
+**Sub-keys.** An agent or worker on a device gets a key of its own, chained
+under the device's assert in one circle and narrowed to named subjects and
+verbs:
+
+```sh
+fabric astral key new -circle did:key:z6Mk…team -res subject:jobs -verbs claim -exp 720h -out worker.key
+fabric astral claim subject:jobs -key worker.key -consumer w1 -wait 30
+fabric astral key list
+fabric astral key revoke 3f9a2c1e        # reaches members online now; the rest on their next exchange
+```
+
+The daemon signs with the hot device key (member certs are `del 1`, the
+sub-key is `del 0`), keeps a record per key, and never keeps the seed —
+the key file is the only copy. A call made with `-key` is signed by the
+sub-key over the operation (op, circle, name, event id, consumer, value,
+time) and carries its chain; the host, local or remote, verifies the
+signature and checks the chain for the verb, so a claim-only key cannot
+publish even on its own node. Leases and sources name the key
+(`<consumer>@<key8>@<member>`). Foreign grantees present their chain the
+same way (next slices, `tasks/open/astral-per-circle.md`).
 
 ```sh
 fabric astral subject subject:queues/agents/concierge/inbox -delivery exclusive -accepts user,system

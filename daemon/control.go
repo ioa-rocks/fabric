@@ -173,6 +173,9 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/renew", d.handleRenew)
 	mux.HandleFunc("POST /v0/publish", d.handlePublish)
 	mux.HandleFunc("POST /v0/circle/refresh", d.handleCircleRefresh)
+	mux.HandleFunc("GET /v0/keys", d.handleKeys)
+	mux.HandleFunc("POST /v0/keys/issue", d.handleKeyIssue)
+	mux.HandleFunc("POST /v0/keys/revoke", d.handleKeyRevoke)
 
 	srv := &http.Server{Handler: mux}
 	go srv.Serve(l)
@@ -810,4 +813,79 @@ func (c *Client) CircleRefresh() (int, error) {
 		return 0, err
 	}
 	return out.Reached, nil
+}
+
+// --- sub-keys (step 4, slice D) ---
+
+// IssueKeyBody is POST /v0/keys/issue.
+type IssueKeyBody struct {
+	Circle    string   `json:"circle,omitempty"` // default: home circle
+	Res       []string `json:"res"`              // subject names, or "*"
+	Verbs     []string `json:"verbs"`
+	ValidityS int64    `json:"validity_s,omitempty"`
+	Label     string   `json:"label,omitempty"`
+}
+
+type revokeKeyBody struct {
+	ID string `json:"id"`
+}
+
+func (d *Daemon) handleKeys(w http.ResponseWriter, r *http.Request) {
+	ks, err := d.Keys()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if ks == nil {
+		ks = []KeyRecord{}
+	}
+	writeJSON(w, ks)
+}
+
+func (d *Daemon) handleKeyIssue(w http.ResponseWriter, r *http.Request) {
+	var body IssueKeyBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	k, err := d.IssueKey(body.Circle, body.Res, body.Verbs, time.Duration(body.ValidityS)*time.Second, body.Label)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, k)
+}
+
+func (d *Daemon) handleKeyRevoke(w http.ResponseWriter, r *http.Request) {
+	var body revokeKeyBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := d.RevokeKey(body.ID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]string{"result": "revoked"})
+}
+
+// Keys lists the sub-keys this device issued.
+func (c *Client) Keys() ([]KeyRecord, error) {
+	var out []KeyRecord
+	err := c.get("/v0/keys", &out)
+	return out, err
+}
+
+// IssueKey mints a sub-key under this device's assert (see Daemon.IssueKey).
+func (c *Client) IssueKey(body IssueKeyBody) (*IssuedKey, error) {
+	var out IssuedKey
+	if err := c.post("/v0/keys/issue", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// RevokeKey revokes an issued sub-key by statement ID (a unique prefix will do).
+func (c *Client) RevokeKey(id string) error {
+	return c.post("/v0/keys/revoke", revokeKeyBody{ID: id}, nil)
 }

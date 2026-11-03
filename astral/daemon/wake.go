@@ -89,20 +89,23 @@ func (d *Daemon) waitLocal(ctx context.Context, ref astral.Ref, timeout time.Dur
 // Wait parks until ref has pending mail (wherever it is hosted) or
 // timeout. Remote waits ride one stream per wait; the host's deadline is
 // timeout plus slack.
-func (d *Daemon) Wait(ctx context.Context, ref astral.Ref, timeout time.Duration) (Woke, error) {
+func (d *Daemon) Wait(ctx context.Context, pr *astral.Principal, ref astral.Ref, timeout time.Duration) (Woke, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 	if _, ok, err := d.Store.Subject(ref); err != nil {
 		return "", err
 	} else if ok {
+		if err := d.localAuthorize(pr, OpWait, ref, "", "", ""); err != nil {
+			return "", err
+		}
 		return d.waitLocal(ctx, ref, timeout)
 	}
 	host, ok, err := d.Store.Host(ref)
 	if err != nil || !ok {
 		return "", orUnknown(err)
 	}
-	resp, err := d.remoteWithin(host, request{Op: OpWait, Circle: ref.Circle, Name: ref.Name, LeaseNS: int64(timeout)}, timeout+5*time.Second)
+	resp, err := d.remoteWithin(host, request{Op: OpWait, Circle: ref.Circle, Name: ref.Name, LeaseNS: int64(timeout), Principal: pr}, timeout+5*time.Second)
 	if err != nil {
 		return "", err
 	}
@@ -114,30 +117,36 @@ func (d *Daemon) Wait(ctx context.Context, ref astral.Ref, timeout time.Duration
 // Heartbeat extends an entity's liveness lease on the host of
 // subject:<entity> in the entity's circle (an entity with no placed inbox
 // is monitored here).
-func (d *Daemon) Heartbeat(entity astral.Ref, ttl time.Duration) error {
+func (d *Daemon) Heartbeat(pr *astral.Principal, entity astral.Ref, ttl time.Duration) error {
 	host, remote, err := d.entityHost(entity)
 	if err != nil {
 		return err
 	}
 	if !remote {
+		if err := d.localAuthorize(pr, OpHeartbeat, entity, "", "", ""); err != nil {
+			return err
+		}
 		_, err := d.Store.Heartbeat(entity, ttl)
 		return err
 	}
-	_, err = d.remote(host, request{Op: OpHeartbeat, Circle: entity.Circle, Name: entity.Name, LeaseNS: int64(ttl)})
+	_, err = d.remote(host, request{Op: OpHeartbeat, Circle: entity.Circle, Name: entity.Name, LeaseNS: int64(ttl), Principal: pr})
 	return err
 }
 
 // Watch subscribes a watcher subject (same circle) to entity's death
 // notices.
-func (d *Daemon) Watch(entity astral.Ref, watcher string) error {
+func (d *Daemon) Watch(pr *astral.Principal, entity astral.Ref, watcher string) error {
 	host, remote, err := d.entityHost(entity)
 	if err != nil {
 		return err
 	}
 	if !remote {
+		if err := d.localAuthorize(pr, OpWatch, entity, "", watcher, ""); err != nil {
+			return err
+		}
 		return d.Store.Watch(entity, astral.Ref{Circle: entity.Circle, Name: watcher})
 	}
-	_, err = d.remote(host, request{Op: OpWatch, Circle: entity.Circle, Name: entity.Name, Consumer: watcher})
+	_, err = d.remote(host, request{Op: OpWatch, Circle: entity.Circle, Name: entity.Name, Consumer: watcher, Principal: pr})
 	return err
 }
 
@@ -215,7 +224,7 @@ func (d *Daemon) sweepMonitors() {
 		notice := astral.DeathNotice(l.Entity.Name, l.Gen, time.Now().UnixNano())
 		ok := true
 		for _, w := range l.Watchers {
-			if _, err := d.Append(w, notice); err != nil {
+			if _, err := d.Append(nil, w, notice); err != nil {
 				log.Printf("astral: death notice for %s → %s: %v", l.Entity, w, err)
 				ok = false
 			}

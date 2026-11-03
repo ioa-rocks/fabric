@@ -28,6 +28,9 @@ import (
 	"sync"
 	"time"
 
+	"crypto/rand"
+	"encoding/hex"
+
 	"github.com/fxamacker/cbor/v2"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -81,6 +84,7 @@ const (
 	OpHeartbeat Op = "heartbeat" // Name = entity, LeaseNS = ttl
 	OpWatch     Op = "watch"     // Name = entity, Consumer = watcher subject
 	OpRegistry  Op = "registry"  // exchange refs hosted by each endpoint
+	OpPresent   Op = "present"   // Principal.Chain: compile and remember a chain for this connection
 )
 
 type request struct {
@@ -95,6 +99,25 @@ type request struct {
 	Value    string       `cbor:"value,omitempty"`
 	Names    []string     `cbor:"names,omitempty"` // v1 registry: bare names
 	Refs     []astral.Ref `cbor:"refs,omitempty"`  // v2 registry
+
+	// Principal is set when the connection peer acts for a sub-key (or a
+	// grantee): the host verifies the envelope and checks that chain, not
+	// the peer's own assert.
+	Principal *astral.Principal `cbor:"principal,omitempty"`
+}
+
+// digestFields are the request fields the principal's signature covers.
+func (r request) digestFields() (eventID, consumer, value string) {
+	switch r.Op {
+	case OpAppend:
+		return r.Event.ID, "", ""
+	case OpAck:
+		return r.EventID, r.Consumer, ""
+	case OpSet:
+		return "", "", r.Value
+	default:
+		return "", r.Consumer, ""
+	}
 }
 
 func (r request) ref() astral.Ref { return astral.Ref{Circle: r.Circle, Name: r.Name} }
@@ -285,11 +308,11 @@ func (d *Daemon) MemberName() string {
 // elsewhere → stream, outbox on failure. Source is stamped with this
 // node's member name; a remote host re-stamps it from the authenticated
 // peer, so a client cannot impersonate another member.
-func (d *Daemon) Append(ref astral.Ref, ev astral.Event) (fresh bool, err error) {
+func (d *Daemon) Append(pr *astral.Principal, ref astral.Ref, ev astral.Event) (fresh bool, err error) {
 	if err := ref.Valid(); err != nil {
 		return false, err
 	}
-	ev.Source = stampSource(ev.Source, d.MemberName())
+	ev.Source = stampSource(ev.Source, d.principalLabel(pr))
 	if ev.At == 0 {
 		ev.At = time.Now().UnixNano()
 	}
@@ -300,6 +323,9 @@ func (d *Daemon) Append(ref astral.Ref, ev astral.Event) (fresh bool, err error)
 	if _, ok, err := d.Store.Subject(ref); err != nil {
 		return false, err
 	} else if ok {
+		if err := d.localAuthorize(pr, OpAppend, ref, ev.ID, "", ""); err != nil {
+			return false, err
+		}
 		return d.appendLocal(ref, ev)
 	}
 	host, ok, err := d.Store.Host(ref)
@@ -314,7 +340,7 @@ func (d *Daemon) Append(ref astral.Ref, ev astral.Event) (fresh bool, err error)
 		}
 		return false, astral.ErrUnknownSubject
 	}
-	resp, err := d.remote(host, request{Op: OpAppend, Circle: ref.Circle, Name: ref.Name, Event: ev})
+	resp, err := d.remote(host, request{Op: OpAppend, Circle: ref.Circle, Name: ref.Name, Event: ev, Principal: pr})
 	if err != nil {
 		// The host answered and refused (expired, kind rejected, full):
 		// that is a loud semantic outcome, never parked — the outbox is
@@ -347,11 +373,14 @@ func (d *Daemon) appendLocal(ref astral.Ref, ev astral.Event) (bool, error) {
 }
 
 // Claim leases events from a ref, wherever it is hosted.
-func (d *Daemon) Claim(ref astral.Ref, consumer string, lease time.Duration, n int) ([]astral.Claimed, error) {
+func (d *Daemon) Claim(pr *astral.Principal, ref astral.Ref, consumer string, lease time.Duration, n int) ([]astral.Claimed, error) {
 	if _, ok, err := d.Store.Subject(ref); err != nil {
 		return nil, err
 	} else if ok {
-		c, err := d.Store.Claim(ref, consumer, lease, n)
+		if err := d.localAuthorize(pr, OpClaim, ref, "", consumer, ""); err != nil {
+			return nil, err
+		}
+		c, err := d.Store.Claim(ref, d.localConsumer(pr, consumer), lease, n)
 		d.learnReplyRoutes(ref.Circle, c)
 		return c, err
 	}
@@ -359,7 +388,7 @@ func (d *Daemon) Claim(ref astral.Ref, consumer string, lease time.Duration, n i
 	if err != nil || !ok {
 		return nil, orUnknown(err)
 	}
-	resp, err := d.remote(host, request{Op: OpClaim, Circle: ref.Circle, Name: ref.Name, Consumer: consumer, LeaseNS: int64(lease), N: n})
+	resp, err := d.remote(host, request{Op: OpClaim, Circle: ref.Circle, Name: ref.Name, Consumer: consumer, LeaseNS: int64(lease), N: n, Principal: pr})
 	if err != nil {
 		return nil, err
 	}
@@ -398,17 +427,20 @@ func (d *Daemon) learnReplyRoutes(circle string, claimed []astral.Claimed) {
 }
 
 // Ack force-acks an event, wherever the ref is hosted.
-func (d *Daemon) Ack(ref astral.Ref, consumer, eventID string) error {
+func (d *Daemon) Ack(pr *astral.Principal, ref astral.Ref, consumer, eventID string) error {
 	if _, ok, err := d.Store.Subject(ref); err != nil {
 		return err
 	} else if ok {
-		return d.Store.Ack(ref, consumer, eventID)
+		if err := d.localAuthorize(pr, OpAck, ref, eventID, consumer, ""); err != nil {
+			return err
+		}
+		return d.Store.Ack(ref, d.localConsumer(pr, consumer), eventID)
 	}
 	host, ok, err := d.Store.Host(ref)
 	if err != nil || !ok {
 		return orUnknown(err)
 	}
-	_, err = d.remote(host, request{Op: OpAck, Circle: ref.Circle, Name: ref.Name, Consumer: consumer, EventID: eventID})
+	_, err = d.remote(host, request{Op: OpAck, Circle: ref.Circle, Name: ref.Name, Consumer: consumer, EventID: eventID, Principal: pr})
 	return err
 }
 
@@ -416,7 +448,7 @@ func (d *Daemon) Ack(ref astral.Ref, consumer, eventID string) error {
 // entity they describe: `register:<entity>/<key>` follows the placement of
 // `subject:<entity>` in the same circle; an entity with no placed inbox
 // keeps its registers locally.
-func (d *Daemon) Set(ref astral.Ref, value string) error {
+func (d *Daemon) Set(pr *astral.Principal, ref astral.Ref, value string) error {
 	if err := astral.ValidRegister(ref.Name); err != nil {
 		return err
 	}
@@ -425,14 +457,17 @@ func (d *Daemon) Set(ref astral.Ref, value string) error {
 		return err
 	}
 	if !remote {
-		return d.Store.Set(astral.Register{Circle: ref.Circle, Name: ref.Name, Value: value, By: d.MemberName()})
+		if err := d.localAuthorize(pr, OpSet, ref, "", "", value); err != nil {
+			return err
+		}
+		return d.Store.Set(astral.Register{Circle: ref.Circle, Name: ref.Name, Value: value, By: d.principalLabel(pr)})
 	}
-	_, err = d.remote(host, request{Op: OpSet, Circle: ref.Circle, Name: ref.Name, Value: value})
+	_, err = d.remote(host, request{Op: OpSet, Circle: ref.Circle, Name: ref.Name, Value: value, Principal: pr})
 	return err
 }
 
 // Get reads a register.
-func (d *Daemon) Get(ref astral.Ref) (astral.Register, bool, error) {
+func (d *Daemon) Get(pr *astral.Principal, ref astral.Ref) (astral.Register, bool, error) {
 	if err := astral.ValidRegister(ref.Name); err != nil {
 		return astral.Register{}, false, err
 	}
@@ -441,9 +476,12 @@ func (d *Daemon) Get(ref astral.Ref) (astral.Register, bool, error) {
 		return astral.Register{}, false, err
 	}
 	if !remote {
+		if err := d.localAuthorize(pr, OpGet, ref, "", "", ""); err != nil {
+			return astral.Register{}, false, err
+		}
 		return d.Store.Get(ref)
 	}
-	resp, err := d.remote(host, request{Op: OpGet, Circle: ref.Circle, Name: ref.Name})
+	resp, err := d.remote(host, request{Op: OpGet, Circle: ref.Circle, Name: ref.Name, Principal: pr})
 	if err != nil || resp.Reg == nil {
 		return astral.Register{}, false, err
 	}
@@ -471,6 +509,14 @@ func orUnknown(err error) error {
 	return astral.ErrUnknownSubject
 }
 
+// NewEventID is a random event ID for callers that must know the ID before
+// the host sees the event (a signing principal covers it).
+func NewEventID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
 // stampSource enforces "<tool>@<member>": the part after '@' is always the
 // authenticated member, never client-supplied.
 func stampSource(src, member string) string {
@@ -482,6 +528,80 @@ func stampSource(src, member string) string {
 		return tool
 	}
 	return tool + "@" + member
+}
+
+// principalLabel is the member part of Source/By for a local call: the
+// member alone for the device, `<key8>@<member>` for a sub-key.
+func (d *Daemon) principalLabel(pr *astral.Principal) string {
+	if pr == nil {
+		return d.MemberName()
+	}
+	return keyLabel(pr.Key) + "@" + d.MemberName()
+}
+
+// localConsumer suffixes a sub-key's consumer string the way a remote host
+// would, so leases carry the principal.
+func (d *Daemon) localConsumer(pr *astral.Principal, consumer string) string {
+	if pr == nil {
+		return consumer
+	}
+	return consumer + "@" + keyLabel(pr.Key)
+}
+
+// keyLabel is a short handle for a did:key in labels and logs.
+func keyLabel(key string) string {
+	if len(key) > 16 {
+		return key[len(key)-8:]
+	}
+	return key
+}
+
+// localAuthorize checks a local call made under a sub-key against the
+// chain it presents (the device's own calls are local trust). The host is
+// this node, so the chain is presented against our own peer ID.
+func (d *Daemon) localAuthorize(pr *astral.Principal, op Op, ref astral.Ref, eventID, consumer, value string) error {
+	if pr == nil {
+		return nil
+	}
+	if d.Fabric == nil || d.Fabric.Circle == nil {
+		return fmt.Errorf("%w: sub-keys need a mesh node", ErrDenied)
+	}
+	ownLease := false
+	if op == OpAck {
+		holder, live, _ := d.Store.LeaseHolder(ref, eventID, time.Now())
+		ownLease = live && holder == d.localConsumer(pr, consumer)
+	}
+	return d.authorizePrincipal(d.Fabric.Host.ID(), pr, op, ref, eventID, consumer, value, ownLease)
+}
+
+// authorizePrincipal verifies an envelope: the chain is presented (or was),
+// the signature over the op digest holds and is fresh, and the chain grants
+// the verb on the resource — unless ownLease (a claimant acking its own
+// live lease needs no ack verb).
+func (d *Daemon) authorizePrincipal(p peer.ID, pr *astral.Principal, op Op, ref astral.Ref, eventID, consumer, value string, ownLease bool) error {
+	if d.Fabric == nil || d.Fabric.Circle == nil {
+		return fmt.Errorf("%w: no circle service on this node", ErrDenied)
+	}
+	if len(pr.Chain) > 0 {
+		if _, err := d.Fabric.Circle.Present(p, pr.Chain); err != nil {
+			return fmt.Errorf("%w: %v", ErrDenied, err)
+		}
+	}
+	if err := pr.Verify(string(op), ref, eventID, consumer, value, time.Now()); err != nil {
+		return fmt.Errorf("%w: %v", ErrDenied, err)
+	}
+	verb, res := verbFor(op, ref)
+	if verb == "" || ownLease {
+		return nil
+	}
+	err := d.Fabric.Circle.VerifyPresented(p, pr.AuthID(), pr.Key, statement.Want{
+		Sub: res.Circle, Res: statement.Resource{Kind: statement.KindSubject, Name: res.Name},
+		Verb: verb, Now: time.Now(),
+	})
+	if err != nil {
+		return fmt.Errorf("%w: %s on %s as %s: %v", ErrDenied, verb, res, keyLabel(pr.Key), err)
+	}
+	return nil
 }
 
 // --- stream side ---
@@ -633,15 +753,39 @@ func (d *Daemon) serve(req request, remote peer.ID) (resp response) {
 	// Remote verbs act on refs hosted here only — no forwarding chains.
 	if _, ok, err := d.Store.Subject(ref); err != nil {
 		return fail(err)
-	} else if !ok && req.Op != OpGet && req.Op != OpSet && req.Op != OpHeartbeat && req.Op != OpWatch && req.Op != OpRegistry {
+	} else if !ok && req.Op != OpGet && req.Op != OpSet && req.Op != OpHeartbeat && req.Op != OpWatch && req.Op != OpRegistry && req.Op != OpPresent {
 		if exp, _ := d.Store.Expired(ref); exp {
 			return fail(fmt.Errorf("%w: %s", astral.ErrSubjectExpired, ref))
 		}
 		return fail(fmt.Errorf("%w: %s not hosted on %s", astral.ErrUnknownSubject, ref, d.MemberName()))
 	}
-	// Authorization at the verb. A claimant acking its own live lease
-	// needs no ack verb (ack is the janitor's authority over any lease).
-	if verb, res := verbFor(req.Op, ref); verb != "" {
+	if req.Op == OpPresent {
+		if req.Principal == nil || len(req.Principal.Chain) == 0 {
+			return fail(fmt.Errorf("%w: present carries no chain", ErrDenied))
+		}
+		if _, err := d.Fabric.Circle.Present(remote, req.Principal.Chain); err != nil {
+			return fail(fmt.Errorf("%w: %v", ErrDenied, err))
+		}
+		return response{}
+	}
+	// A sub-key (or grantee) acting through the connection peer: its own
+	// chain and signature decide, and it is named in Source and consumer.
+	if req.Principal != nil {
+		eventID, consumer, value := req.digestFields()
+		asKey := keyLabel(req.Principal.Key) + "@" + from
+		ownLease := false
+		if req.Op == OpAck {
+			holder, live, _ := d.Store.LeaseHolder(ref, req.EventID, time.Now())
+			ownLease = live && holder == req.Consumer+"@"+asKey
+		}
+		if err := d.authorizePrincipal(remote, req.Principal, req.Op, ref, eventID, consumer, value, ownLease); err != nil {
+			return fail(err)
+		}
+		from = asKey
+	} else if verb, res := verbFor(req.Op, ref); verb != "" {
+		// Authorization at the verb for the device itself. A claimant
+		// acking its own live lease needs no ack verb (ack is the
+		// janitor's authority over any lease).
 		ownLease := false
 		if req.Op == OpAck {
 			holder, live, _ := d.Store.LeaseHolder(ref, req.EventID, time.Now())

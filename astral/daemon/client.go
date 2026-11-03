@@ -18,9 +18,30 @@ import (
 
 // Client is a plane client over a running subsystem's control socket.
 // Circle selects which circle names refer to; "" is the node's home circle.
+// Signer, when set, makes every call act as that sub-key: the client signs
+// the operation and the daemon (and the remote host) check the key's chain
+// instead of the device's own assert.
 type Client struct {
 	Circle string
+	Signer *astral.Signer
 	http   http.Client
+}
+
+// WithKey returns a client acting as the sub-key in a key file; the key's
+// circle becomes the client's.
+func (c *Client) WithKey(s *astral.Signer) *Client {
+	cc := *c
+	cc.Signer = s
+	cc.Circle = s.Circle
+	return &cc
+}
+
+// sign builds the envelope for one call, or nil for the device itself.
+func (c *Client) sign(op Op, name, eventID, consumer, value string) *astral.Principal {
+	if c.Signer == nil {
+		return nil
+	}
+	return c.Signer.Sign(string(op), astral.Ref{Circle: c.Circle, Name: name}, eventID, consumer, value, time.Now())
 }
 
 // NewClient builds a client for a state dir's control socket.
@@ -121,7 +142,10 @@ func (c *Client) SetHost(name, host string) error {
 // whether it was new.
 func (c *Client) Append(name string, ev astral.Event) (id string, fresh bool, err error) {
 	var r appendReply
-	if err := c.post("/v0/append", appendBody{Circle: c.Circle, Name: name, Event: ev}, &r); err != nil {
+	if c.Signer != nil && ev.ID == "" {
+		ev.ID = NewEventID()
+	}
+	if err := c.post("/v0/append", appendBody{Principal: c.sign(OpAppend, name, ev.ID, "", ""), Circle: c.Circle, Name: name, Event: ev}, &r); err != nil {
 		return "", false, err
 	}
 	return r.ID, r.Fresh, nil
@@ -130,18 +154,18 @@ func (c *Client) Append(name string, ev astral.Event) (id string, fresh bool, er
 // Claim leases up to n events for lease seconds.
 func (c *Client) Claim(name, consumer string, leaseS, n int) ([]astral.Claimed, error) {
 	var out []astral.Claimed
-	err := c.post("/v0/claim", claimBody{Circle: c.Circle, Name: name, Consumer: consumer, LeaseS: leaseS, N: n}, &out)
+	err := c.post("/v0/claim", claimBody{Principal: c.sign(OpClaim, name, "", consumer, ""), Circle: c.Circle, Name: name, Consumer: consumer, LeaseS: leaseS, N: n}, &out)
 	return out, err
 }
 
 // Ack force-acks an event for consumer.
 func (c *Client) Ack(name, consumer, eventID string) error {
-	return c.post("/v0/ack", ackBody{Circle: c.Circle, Name: name, Consumer: consumer, EventID: eventID}, nil)
+	return c.post("/v0/ack", ackBody{Principal: c.sign(OpAck, name, eventID, consumer, ""), Circle: c.Circle, Name: name, Consumer: consumer, EventID: eventID}, nil)
 }
 
 // Set writes a register.
 func (c *Client) Set(name, value string) error {
-	return c.post("/v0/set", setBody{Circle: c.Circle, Name: name, Value: value}, nil)
+	return c.post("/v0/set", setBody{Principal: c.sign(OpSet, name, "", "", value), Circle: c.Circle, Name: name, Value: value}, nil)
 }
 
 // Get reads a register; ok=false when unset.
@@ -168,16 +192,16 @@ func (c *Client) Get(name string) (astral.Register, bool, error) {
 // Wait parks until name has mail or timeoutS elapses (the timer wake).
 func (c *Client) Wait(name string, timeoutS int) (Woke, error) {
 	var r waitReply
-	err := c.post("/v0/wait", waitBody{Circle: c.Circle, Name: name, TimeoutS: timeoutS}, &r)
+	err := c.post("/v0/wait", waitBody{Principal: c.sign(OpWait, name, "", "", ""), Circle: c.Circle, Name: name, TimeoutS: timeoutS}, &r)
 	return r.Woke, err
 }
 
 // Heartbeat extends entity's liveness lease by ttlS seconds.
 func (c *Client) Heartbeat(entity string, ttlS int) error {
-	return c.post("/v0/heartbeat", heartbeatBody{Circle: c.Circle, Entity: entity, TTLS: ttlS}, nil)
+	return c.post("/v0/heartbeat", heartbeatBody{Principal: c.sign(OpHeartbeat, entity, "", "", ""), Circle: c.Circle, Entity: entity, TTLS: ttlS}, nil)
 }
 
 // Watch subscribes watcher (a subject) to entity's death notices.
 func (c *Client) Watch(entity, watcher string) error {
-	return c.post("/v0/watch", watchBody{Circle: c.Circle, Entity: entity, Watcher: watcher}, nil)
+	return c.post("/v0/watch", watchBody{Principal: c.sign(OpWatch, entity, "", watcher, ""), Circle: c.Circle, Entity: entity, Watcher: watcher}, nil)
 }

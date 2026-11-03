@@ -77,9 +77,10 @@ type hostBody struct {
 }
 
 type appendBody struct {
-	Circle string       `json:"circle,omitempty"`
-	Name   string       `json:"name"`
-	Event  astral.Event `json:"event"`
+	Principal *astral.Principal `json:"principal,omitempty"`
+	Circle    string            `json:"circle,omitempty"`
+	Name      string            `json:"name"`
+	Event     astral.Event      `json:"event"`
 }
 
 type appendReply struct {
@@ -88,24 +89,27 @@ type appendReply struct {
 }
 
 type claimBody struct {
-	Circle   string `json:"circle,omitempty"`
-	Name     string `json:"name"`
-	Consumer string `json:"consumer"`
-	LeaseS   int    `json:"lease_s,omitempty"`
-	N        int    `json:"n,omitempty"`
+	Principal *astral.Principal `json:"principal,omitempty"`
+	Circle    string            `json:"circle,omitempty"`
+	Name      string            `json:"name"`
+	Consumer  string            `json:"consumer"`
+	LeaseS    int               `json:"lease_s,omitempty"`
+	N         int               `json:"n,omitempty"`
 }
 
 type ackBody struct {
-	Circle   string `json:"circle,omitempty"`
-	Name     string `json:"name"`
-	Consumer string `json:"consumer"`
-	EventID  string `json:"event_id"`
+	Principal *astral.Principal `json:"principal,omitempty"`
+	Circle    string            `json:"circle,omitempty"`
+	Name      string            `json:"name"`
+	Consumer  string            `json:"consumer"`
+	EventID   string            `json:"event_id"`
 }
 
 type waitBody struct {
-	Circle   string `json:"circle,omitempty"`
-	Name     string `json:"name"`
-	TimeoutS int    `json:"timeout_s,omitempty"`
+	Principal *astral.Principal `json:"principal,omitempty"`
+	Circle    string            `json:"circle,omitempty"`
+	Name      string            `json:"name"`
+	TimeoutS  int               `json:"timeout_s,omitempty"`
 }
 
 type waitReply struct {
@@ -113,21 +117,24 @@ type waitReply struct {
 }
 
 type heartbeatBody struct {
-	Circle string `json:"circle,omitempty"`
-	Entity string `json:"entity"`
-	TTLS   int    `json:"ttl_s,omitempty"`
+	Principal *astral.Principal `json:"principal,omitempty"`
+	Circle    string            `json:"circle,omitempty"`
+	Entity    string            `json:"entity"`
+	TTLS      int               `json:"ttl_s,omitempty"`
 }
 
 type watchBody struct {
-	Circle  string `json:"circle,omitempty"`
-	Entity  string `json:"entity"`
-	Watcher string `json:"watcher"`
+	Principal *astral.Principal `json:"principal,omitempty"`
+	Circle    string            `json:"circle,omitempty"`
+	Entity    string            `json:"entity"`
+	Watcher   string            `json:"watcher"`
 }
 
 type setBody struct {
-	Circle string `json:"circle,omitempty"`
-	Name   string `json:"name"`
-	Value  string `json:"value"`
+	Principal *astral.Principal `json:"principal,omitempty"`
+	Circle    string            `json:"circle,omitempty"`
+	Name      string            `json:"name"`
+	Value     string            `json:"value"`
 }
 
 func (d *Daemon) serveControl() (func(), error) {
@@ -176,6 +183,8 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, astral.ErrKindRejected), errors.Is(err, astral.ErrBadName),
 		errors.Is(err, astral.ErrBadCircle), errors.Is(err, astral.ErrSubjectFull):
 		code = http.StatusBadRequest
+	case errors.Is(err, ErrDenied):
+		code = http.StatusForbidden
 	}
 	http.Error(w, err.Error(), code)
 }
@@ -302,12 +311,16 @@ func (d *Daemon) ctlAppend(w http.ResponseWriter, r *http.Request) {
 	}
 	defer d.end()
 	ev := b.Event
-	ev.Source = stampSource(ev.Source, d.MemberName())
+	ev.Source = stampSource(ev.Source, d.principalLabel(b.Principal))
 	if ev.At == 0 {
 		ev.At = time.Now().UnixNano()
 	}
+	if b.Principal != nil && ev.ID == "" {
+		writeErr(w, errors.New("astral: a signed append needs an explicit event id"))
+		return
+	}
 	ev.DeriveID()
-	fresh, err := d.Append(d.Ref(b.Circle, b.Name), ev)
+	fresh, err := d.Append(b.Principal, d.Ref(b.Circle, b.Name), ev)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -326,7 +339,7 @@ func (d *Daemon) ctlClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	c, err := d.Claim(d.Ref(b.Circle, b.Name), b.Consumer, time.Duration(b.LeaseS)*time.Second, b.N)
+	c, err := d.Claim(b.Principal, d.Ref(b.Circle, b.Name), b.Consumer, time.Duration(b.LeaseS)*time.Second, b.N)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -348,7 +361,7 @@ func (d *Daemon) ctlAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	if err := d.Ack(d.Ref(b.Circle, b.Name), b.Consumer, b.EventID); err != nil {
+	if err := d.Ack(b.Principal, d.Ref(b.Circle, b.Name), b.Consumer, b.EventID); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -366,7 +379,7 @@ func (d *Daemon) ctlSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	if err := d.Set(d.Ref(b.Circle, b.Name), b.Value); err != nil {
+	if err := d.Set(b.Principal, d.Ref(b.Circle, b.Name), b.Value); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -380,7 +393,7 @@ func (d *Daemon) ctlGet(w http.ResponseWriter, r *http.Request) {
 	}
 	defer d.end()
 	q := r.URL.Query()
-	reg, ok, err := d.Get(d.Ref(q.Get("circle"), q.Get("name")))
+	reg, ok, err := d.Get(nil, d.Ref(q.Get("circle"), q.Get("name")))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -403,7 +416,7 @@ func (d *Daemon) ctlWait(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	woke, err := d.Wait(r.Context(), d.Ref(b.Circle, b.Name), time.Duration(b.TimeoutS)*time.Second)
+	woke, err := d.Wait(r.Context(), b.Principal, d.Ref(b.Circle, b.Name), time.Duration(b.TimeoutS)*time.Second)
 	if err != nil && woke == "" {
 		writeErr(w, err)
 		return
@@ -422,7 +435,7 @@ func (d *Daemon) ctlHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	if err := d.Heartbeat(d.Ref(b.Circle, b.Entity), time.Duration(b.TTLS)*time.Second); err != nil {
+	if err := d.Heartbeat(b.Principal, d.Ref(b.Circle, b.Entity), time.Duration(b.TTLS)*time.Second); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -440,7 +453,7 @@ func (d *Daemon) ctlWatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	if err := d.Watch(d.Ref(b.Circle, b.Entity), b.Watcher); err != nil {
+	if err := d.Watch(b.Principal, d.Ref(b.Circle, b.Entity), b.Watcher); err != nil {
 		writeErr(w, err)
 		return
 	}

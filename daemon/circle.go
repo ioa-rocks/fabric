@@ -77,9 +77,18 @@ type CircleService struct {
 	roots  statement.Roots
 	certOf func(peer.ID) (*cert.Cert, bool)
 
-	mu    sync.RWMutex
-	peers map[peer.ID]circleEntry
-	stop  func()
+	mu        sync.RWMutex
+	peers     map[peer.ID]circleEntry
+	presented map[peer.ID]map[presentKey]*statement.Compiled // chains presented on a connection (sub-keys, grantees)
+	stop      func()
+}
+
+// presentKey identifies a presented chain on one connection: the authority
+// leaf and the key that must sign for it (statement-format task, "Size,
+// presentation and cache invalidation").
+type presentKey struct {
+	auth [32]byte
+	key  string
 }
 
 // circleEntry is one exchange result. A result with circles holds for the
@@ -103,7 +112,7 @@ const noCircleTTL = 30 * time.Second
 // NewCircleService attaches the exchange to the host for the circles under
 // root (listed on demand — circles added later need no restart).
 func NewCircleService(h host.Host, auth *fabricnet.AuthService, root string) *CircleService {
-	s := &CircleService{h: h, auth: auth, root: root, peers: map[peer.ID]circleEntry{}}
+	s := &CircleService{h: h, auth: auth, root: root, peers: map[peer.ID]circleEntry{}, presented: map[peer.ID]map[presentKey]*statement.Compiled{}}
 	h.SetStreamHandler(CircleProtocolV4ID, auth.RequireMember(s.handleV4))
 	h.SetStreamHandler(CircleProtocolID, auth.RequireMember(s.handleV3))
 	h.SetStreamHandler(CircleProtocolV2ID, auth.RequireMember(s.handleV2))
@@ -112,6 +121,7 @@ func NewCircleService(h host.Host, auth *fabricnet.AuthService, root string) *Ci
 		if n.Connectedness(p) != network.Connected {
 			s.mu.Lock()
 			delete(s.peers, p)
+			delete(s.presented, p)
 			s.mu.Unlock()
 		}
 	}}
@@ -422,7 +432,80 @@ func (s *CircleService) forgetDevice(deviceDID string) {
 func (s *CircleService) forgetAll() {
 	s.mu.Lock()
 	s.peers = map[peer.ID]circleEntry{}
+	s.presented = map[peer.ID]map[presentKey]*statement.Compiled{}
 	s.mu.Unlock()
+}
+
+// ErrNotPresented is a verb under a chain this connection never presented.
+var ErrNotPresented = errors.New("chain not presented on this connection")
+
+// rootsFor is the Roots view for a circle this node answers for: the
+// honoured roots for the home circle, the circle's own key when held.
+func (s *CircleService) rootsFor(circleDID string) (statement.Roots, error) {
+	if s.home != nil && circleDID == s.home() && s.roots != nil {
+		return s.roots, nil
+	}
+	if s.circleByDID(circleDID) == nil {
+		return nil, fmt.Errorf("circle %s is not held by this node", shortDID(circleDID))
+	}
+	return statement.NewDIDRoots(circleDID), nil
+}
+
+// Present compiles a chain a connection peer shows for a principal below
+// (or beside) itself — a sub-key, later a foreign grantee — and remembers
+// it for the connection under (authority leaf, presenting key). The
+// expensive half runs once; VerifyPresented runs Check per verb.
+func (s *CircleService) Present(p peer.ID, raw []byte) (*statement.Compiled, error) {
+	st, err := statement.Decode(raw)
+	if err != nil {
+		return nil, fmt.Errorf("presented chain: %w", err)
+	}
+	roots, err := s.rootsFor(st.Payload.Sub)
+	if err != nil {
+		return nil, err
+	}
+	c, err := statement.Compile(st, nil, st.Payload.Sub, roots)
+	if err != nil {
+		return nil, fmt.Errorf("presented chain: %w", err)
+	}
+	s.mu.Lock()
+	m := s.presented[p]
+	if m == nil {
+		m = map[presentKey]*statement.Compiled{}
+		s.presented[p] = m
+	}
+	m[presentKey{auth: c.AuthLeafID(), key: c.PresentingKey}] = c
+	s.mu.Unlock()
+	return c, nil
+}
+
+// VerifyPresented is Verify for a presented chain: the principal named by
+// key, under the authority leaf auth, on this connection.
+func (s *CircleService) VerifyPresented(p peer.ID, auth [32]byte, key string, want statement.Want) error {
+	s.mu.RLock()
+	c := s.presented[p][presentKey{auth: auth, key: key}]
+	s.mu.RUnlock()
+	if c == nil {
+		return ErrNotPresented
+	}
+	if want.Sub == "" {
+		want.Sub = c.Sub
+	}
+	want.PresentingKey = key
+	if want.Now.IsZero() {
+		want.Now = time.Now()
+	}
+	roots, err := s.rootsFor(want.Sub)
+	if err != nil {
+		return err
+	}
+	var revs statement.Revocations
+	if hc := s.circleByDID(want.Sub); hc != nil {
+		if set, err := hc.RevocationSet(want.Now); err == nil {
+			revs = set
+		}
+	}
+	return c.Check(roots, revs, want)
 }
 
 // CirclesOf returns the member's verified circles, if a current exchange
