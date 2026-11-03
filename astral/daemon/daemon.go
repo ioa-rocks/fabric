@@ -204,7 +204,7 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		log.Printf("astral: %d journal key(s) moved into circle %s (layout %d)", n, d.Home(), astral.Layout)
 	}
 	if fd != nil {
-		fd.Host.SetStreamHandler(Protocol, fd.Auth.RequireMember(d.handleStreamV2))
+		fd.Host.SetStreamHandler(Protocol, d.gateStream(d.handleStreamV2))
 		fd.Host.SetStreamHandler(ProtocolV1, fd.Auth.RequireMember(d.handleStreamV1))
 		// Chain onto whatever on-auth hook is already installed (fabric's
 		// own anti-entropy, vault's sync) rather than replacing it.
@@ -737,6 +737,36 @@ func (d *Daemon) authorizePrincipal(p peer.ID, pr *astral.Principal, op Op, ref 
 
 // --- stream side ---
 
+// gateStream admits a v2 stream from a member (RequireMember's rule: its
+// cert admits the astral family, and so does ours) or, on a listed node,
+// from a stranger — who must then carry a chain on every request until the
+// host has it (memo §17 item 1: stream acceptance on a listed gate takes a
+// presented grant). A dark node never sees a stranger: the gater refused
+// the connection.
+func (d *Daemon) gateStream(next network.StreamHandler) network.StreamHandler {
+	return func(s network.Stream) {
+		p := s.Conn().RemotePeer()
+		if own := d.Fabric.OwnCert(); own != nil && !own.Allows("astral") {
+			s.Reset()
+			return
+		}
+		if d.Fabric.Auth.Allows(p, Protocol) {
+			next(s)
+			return
+		}
+		if !d.Fabric.Gater.Listed() || d.Fabric.Circle == nil {
+			s.Reset()
+			return
+		}
+		next(s)
+	}
+}
+
+// isMember reports whether a connection peer is a mesh member.
+func (d *Daemon) isMember(p peer.ID) bool {
+	return d.Fabric != nil && d.Fabric.Auth.Allows(p, Protocol)
+}
+
 // handleStreamV2: framed CBOR, circle on the wire.
 func (d *Daemon) handleStreamV2(s network.Stream) {
 	defer s.Close()
@@ -909,6 +939,14 @@ func (d *Daemon) serve(ctx context.Context, req request, remote peer.ID) (resp r
 	fail := func(err error) response { return response{Err: err.Error()} }
 	from := d.peerName(remote)
 	ref := req.ref()
+	if !d.isMember(remote) {
+		// A grantee: it is nothing on the roster, only what its chain
+		// says, so every request carries that chain (or presented it).
+		if req.Principal == nil {
+			return fail(fmt.Errorf("%w: not a member; present a grant", ErrDenied))
+		}
+		from = keyLabel(remote.String())
+	}
 	// Remote verbs act on refs hosted here only — no forwarding chains.
 	if _, ok, err := d.Store.Subject(ref); err != nil {
 		return fail(err)

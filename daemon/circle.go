@@ -80,6 +80,7 @@ type CircleService struct {
 	mu           sync.RWMutex
 	peers        map[peer.ID]circleEntry
 	presented    map[peer.ID]map[presentKey]*statement.Compiled // chains presented on a connection (sub-keys, grantees)
+	extraRevs    map[string]*statement.RevocationSet            // revocations for circles not held here (a gate's home circle)
 	onInvalidate []func()
 	stop         func()
 }
@@ -132,7 +133,7 @@ const noCircleTTL = 30 * time.Second
 // NewCircleService attaches the exchange to the host for the circles under
 // root (listed on demand — circles added later need no restart).
 func NewCircleService(h host.Host, auth *fabricnet.AuthService, root string) *CircleService {
-	s := &CircleService{h: h, auth: auth, root: root, peers: map[peer.ID]circleEntry{}, presented: map[peer.ID]map[presentKey]*statement.Compiled{}}
+	s := &CircleService{h: h, auth: auth, root: root, peers: map[peer.ID]circleEntry{}, presented: map[peer.ID]map[presentKey]*statement.Compiled{}, extraRevs: map[string]*statement.RevocationSet{}}
 	h.SetStreamHandler(CircleProtocolV4ID, auth.RequireMember(s.handleV4))
 	h.SetStreamHandler(CircleProtocolID, auth.RequireMember(s.handleV3))
 	h.SetStreamHandler(CircleProtocolV2ID, auth.RequireMember(s.handleV2))
@@ -296,6 +297,21 @@ func (s *CircleService) ownAttestations(now time.Time, statements bool) ([][]byt
 // circles; statement-form ones only for v4 peers.
 func (s *CircleService) ownRevocations(now time.Time, statements bool) ([][]byte, error) {
 	var out [][]byte
+	if statements {
+		s.mu.RLock()
+		for circleDID, set := range s.extraRevs {
+			for _, st := range set.All() {
+				r, err := circle.RevocationFromStatement(st)
+				if err != nil || r.Circle != circleDID {
+					continue
+				}
+				if raw, err := r.Marshal(); err == nil {
+					out = append(out, raw)
+				}
+			}
+		}
+		s.mu.RUnlock()
+	}
 	for _, c := range s.Circles() {
 		rs, err := c.Revocations(now)
 		if err != nil {
@@ -372,11 +388,7 @@ func (s *CircleService) Verify(ctx context.Context, p peer.ID, want statement.Wa
 	if chain == nil {
 		return legacyAllows(circle.DeviceVerbs, want)
 	}
-	revs, err := c.RevocationSet(want.Now)
-	if err != nil {
-		return err
-	}
-	return chain.Check(statement.NewDIDRoots(c.Config.DID), revs, want)
+	return chain.Check(statement.NewDIDRoots(c.Config.DID), s.revsFor(want.Sub, want.Now), want)
 }
 
 // verifyHome is Verify for the home circle: the chain is the membership
@@ -406,13 +418,35 @@ func (s *CircleService) verifyHome(p peer.ID, want statement.Want) error {
 		s.peers[p] = e
 		s.mu.Unlock()
 	}
-	var revs statement.Revocations
-	if hc := s.circleByDID(want.Sub); hc != nil {
-		if set, err := hc.RevocationSet(want.Now); err == nil {
-			revs = set
+	return chain.Check(s.roots, s.revsFor(want.Sub, want.Now), want)
+}
+
+// revsFor is the revocation view for a circle: the circle's own set when
+// held here, else what the exchange delivered for it (a gate without a
+// circle directory still learns revocations for its home circle).
+func (s *CircleService) revsFor(circleDID string, now time.Time) statement.Revocations {
+	if c := s.circleByDID(circleDID); c != nil {
+		if set, err := c.RevocationSet(now); err == nil {
+			return set
 		}
 	}
-	return chain.Check(s.roots, revs, want)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if set := s.extraRevs[circleDID]; set != nil {
+		return set
+	}
+	return nil
+}
+
+// AddRevocation ingests a verified revocation signed for one of this
+// node's circles (or its home circle) as if a peer had sent it: stored,
+// caches dropped, holders re-checked. The CLI uses it after signing.
+func (s *CircleService) AddRevocation(r *circle.Revocation) error {
+	raw, err := r.Marshal()
+	if err != nil {
+		return err
+	}
+	return s.ingestRevocations([][]byte{raw}, time.Now())
 }
 
 // legacyAllows is the verb check for a pre-statement cert or attestation:
@@ -491,6 +525,15 @@ func (s *CircleService) Present(p peer.ID, raw []byte) (*statement.Compiled, err
 	if err != nil {
 		return nil, fmt.Errorf("presented chain: %w", err)
 	}
+	// A chain that compiles is not yet one that passes Check (window,
+	// revocations); do that once here so a dead chain cannot keep a
+	// stranger's connection open.
+	if err := c.Check(roots, s.revsFor(st.Payload.Sub, time.Now()), statement.Want{
+		Sub: st.Payload.Sub, Res: firstRes(c), Verb: firstVerb(c),
+		PresentingKey: c.PresentingKey, Now: time.Now(),
+	}); err != nil {
+		return nil, fmt.Errorf("presented chain: %w", err)
+	}
 	s.mu.Lock()
 	m := s.presented[p]
 	if m == nil {
@@ -499,7 +542,29 @@ func (s *CircleService) Present(p peer.ID, raw []byte) (*statement.Compiled, err
 	}
 	m[presentKey{auth: c.AuthLeafID(), key: c.PresentingKey}] = c
 	s.mu.Unlock()
+	if s.auth != nil && p != s.h.ID() {
+		s.auth.Keep(p)
+	}
 	return c, nil
+}
+
+// firstRes is a resource the chain's leaf names, for a Check that asks
+// only about window and revocations (its own scope always covers it).
+func firstRes(c *statement.Compiled) statement.Resource {
+	leaf := c.Auth[len(c.Auth)-1].Stmt.Payload
+	if len(leaf.Res) > 0 {
+		return statement.Resource{Kind: leaf.Res[0].Kind, Name: leaf.Res[0].Name}
+	}
+	return statement.Resource{Kind: statement.Any, Name: statement.Any}
+}
+
+// firstVerb is any verb the chain's leaf carries, for a scope-free Check.
+func firstVerb(c *statement.Compiled) string {
+	leaf := c.Auth[len(c.Auth)-1].Stmt.Payload
+	if len(leaf.Verbs) > 0 {
+		return leaf.Verbs[0]
+	}
+	return statement.VerbMember
 }
 
 // VerifyPresented is Verify for a presented chain: the principal named by
@@ -522,13 +587,7 @@ func (s *CircleService) VerifyPresented(p peer.ID, auth [32]byte, key string, wa
 	if err != nil {
 		return err
 	}
-	var revs statement.Revocations
-	if hc := s.circleByDID(want.Sub); hc != nil {
-		if set, err := hc.RevocationSet(want.Now); err == nil {
-			revs = set
-		}
-	}
-	return c.Check(roots, revs, want)
+	return c.Check(roots, s.revsFor(want.Sub, want.Now), want)
 }
 
 // CirclesOf returns the member's verified circles, if a current exchange
@@ -785,6 +844,26 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) error {
 		}
 		c := s.circleByDID(r.Circle)
 		if c == nil {
+			// Not held here (a gate and its home circle): keep the
+			// verified revocation in memory for presented chains.
+			if r.Stmt == nil {
+				continue
+			}
+			s.mu.Lock()
+			set := s.extraRevs[r.Circle]
+			if set == nil {
+				set = statement.NewRevocationSet()
+				s.extraRevs[r.Circle] = set
+			}
+			fresh, err := set.Add(r.Stmt)
+			s.mu.Unlock()
+			if err != nil {
+				return fmt.Errorf("peer revocation: %w", err)
+			}
+			if fresh {
+				log.Printf("circle %s: statement revoked (learned from a peer; circle not held here)", shortDID(r.Circle))
+				s.forgetAll()
+			}
 			continue
 		}
 		added, err := c.AddRevocations(now, r)

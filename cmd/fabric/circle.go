@@ -3,17 +3,25 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"ioa.rocks/fabric/astral"
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/daemon"
+	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
+	"ioa.rocks/fabric/statement"
 	vaultcli "ioa.rocks/fabric/vault/cli"
 	vaultdaemon "ioa.rocks/fabric/vault/daemon"
 	vaultstore "ioa.rocks/fabric/vault/store"
@@ -28,7 +36,7 @@ import (
 // owns it — mesh membership alone grants nothing.
 func cmdCircle(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: fabric circle init|join|export|attest|revoke|passphrase|status")
+		return fmt.Errorf("usage: fabric circle init|join|export|attest|revoke|passphrase|grant|status")
 	}
 	rest := args[1:]
 	switch args[0] {
@@ -44,10 +52,12 @@ func cmdCircle(args []string) error {
 		return cmdCircleRevoke(rest)
 	case "passphrase":
 		return cmdCirclePassphrase(rest)
+	case "grant":
+		return cmdCircleGrant(rest)
 	case "status":
 		return cmdCircleStatus(rest)
 	default:
-		return fmt.Errorf("usage: fabric circle init|join|export|attest|revoke|passphrase|status")
+		return fmt.Errorf("usage: fabric circle init|join|export|attest|revoke|passphrase|grant|status")
 	}
 }
 
@@ -524,3 +534,258 @@ func cmdCircleRevoke(args []string) error {
 	fmt.Println("to re-admit the device later, attest it again on an owner device (an attestation issued after the revocation stands)")
 	return nil
 }
+
+// --- grants (step 4, slice G): a circle hands a bare key the right to a
+// verb on a resource, no membership anywhere (memo §14: external operator's worker).
+
+type grantRecord struct {
+	ID      string   `json:"id"`
+	DID     string   `json:"did"`
+	Res     []string `json:"res"`
+	Verbs   []string `json:"verbs"`
+	Exp     int64    `json:"exp"`
+	Issued  int64    `json:"issued"`
+	Revoked int64    `json:"revoked,omitempty"`
+	Label   string   `json:"label,omitempty"`
+}
+
+func grantsPath(c *circle.Circle) string { return filepath.Join(c.Path, "grants.json") }
+
+func loadGrants(c *circle.Circle) ([]grantRecord, error) {
+	raw, err := os.ReadFile(grantsPath(c))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []grantRecord
+	return out, json.Unmarshal(raw, &out)
+}
+
+func saveGrants(c *circle.Circle, gs []grantRecord) error {
+	raw, err := json.MarshalIndent(gs, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(grantsPath(c), raw, 0o600)
+}
+
+func cmdCircleGrant(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: fabric circle grant new|list|revoke")
+	}
+	switch args[0] {
+	case "new":
+		return cmdCircleGrantNew(args[1:])
+	case "list":
+		return cmdCircleGrantList(args[1:])
+	case "revoke":
+		return cmdCircleGrantRevoke(args[1:])
+	}
+	return fmt.Errorf("usage: fabric circle grant new|list|revoke")
+}
+
+// cmdCircleGrantNew mints a worker key and a root-signed grant for it in
+// one key file: the file is the credential, hand it over privately.
+func cmdCircleGrantNew(args []string) error {
+	fs := flag.NewFlagSet("circle grant new", flag.ExitOnError)
+	statePath, vaultState := circleFlags(fs)
+	name := fs.String("circle", "", "which circle (required when the node holds several)")
+	res := fs.String("res", "", "comma-separated subjects the grant covers (required)")
+	verbs := fs.String("verbs", "claim", "comma-separated verbs: claim,publish,ack,read")
+	exp := fs.Duration("exp", 90*24*time.Hour, "validity")
+	label := fs.String("label", "", "a label for 'grant list'")
+	out := fs.String("out", "", "key file to write (required; the grantee's only credential)")
+	var gates stringList
+	fs.Var(&gates, "gate", "listed gate multiaddr the grantee dials (repeatable; default: this node's announced addresses)")
+	fs.Parse(args)
+	if *res == "" || *out == "" {
+		return fmt.Errorf("usage: fabric circle grant new -res <subjects> [-verbs claim] [-exp 2160h] -out worker.key [-gate addr]… [-circle name]")
+	}
+	root, err := circleRoot(*statePath, *vaultState)
+	if err != nil {
+		return err
+	}
+	c, err := pickCircle(root, *name)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(c.KeyPath()); err != nil {
+		return fmt.Errorf("this device holds no key for circle %q — grant from an owner device", c.Config.Name)
+	}
+	if len(gates) == 0 {
+		if dir, err := state.Open(*statePath); err == nil {
+			if st, err := daemon.NewClient(dir).Status(); err == nil {
+				// Verified-reachable addresses first; else everything announced.
+				cands := st.ReachableAddrs
+				if len(cands) == 0 {
+					cands = st.Addrs
+				}
+				for _, a := range cands {
+					if strings.Contains(a, "/p2p/") && !strings.Contains(a, "127.0.0.1") && !strings.Contains(a, "/ip6/::1") && !strings.Contains(a, "192.168.") && !strings.Contains(a, "p2p-circuit") {
+						gates = append(gates, a)
+					}
+				}
+			}
+		}
+	}
+	pass, err := passFor(c)
+	if err != nil {
+		return err
+	}
+	priv, err := c.Unlock(pass)
+	if err != nil {
+		return err
+	}
+	pub, workerPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	var rs []statement.Resource
+	resList := strings.Split(*res, ",")
+	for _, n := range resList {
+		rs = append(rs, statement.Resource{Kind: statement.KindSubject, Name: strings.TrimSpace(n), Sub: c.Config.DID})
+	}
+	verbList := strings.Split(*verbs, ",")
+	st, err := statement.Sign(priv, statement.Payload{
+		Aud: did.ForKey(pub), Sub: c.Config.DID, Res: rs, Verbs: verbList,
+		Nbf: now.Unix(), Exp: now.Add(*exp).Unix(), Iat: now.Unix(), Del: 0,
+	}, nil)
+	if err != nil {
+		return err
+	}
+	wireBytes, err := st.Bytes()
+	if err != nil {
+		return err
+	}
+	if err := astral.WriteKeyFile(*out, astral.KeyFile{
+		ID: st.IDHex(), DID: did.ForKey(pub), Circle: c.Config.DID, Res: resList, Verbs: verbList, Exp: now.Add(*exp).Unix(),
+		Seed: base64.StdEncoding.EncodeToString(workerPriv.Seed()), Chain: base64.StdEncoding.EncodeToString(wireBytes),
+		Gates: gates, Label: *label,
+	}); err != nil {
+		return err
+	}
+	gs, err := loadGrants(c)
+	if err != nil {
+		return err
+	}
+	if err := saveGrants(c, append(gs, grantRecord{ID: st.IDHex(), DID: did.ForKey(pub), Res: resList, Verbs: verbList, Exp: now.Add(*exp).Unix(), Issued: now.Unix(), Label: *label})); err != nil {
+		return err
+	}
+	fmt.Printf("grant %s in circle %q to %s\n  %s on %s until %s\n  gates: %s\n  written to %s — the grantee's only credential; move it privately\n",
+		st.IDHex()[:8], c.Config.Name, did.ForKey(pub), *verbs, *res, now.Add(*exp).Format("2006-01-02"), strings.Join(gates, " "), *out)
+	if len(gates) == 0 {
+		fmt.Println("  (no gates recorded: the grantee must pass -gate; the queue's host must be a listed gate)")
+	}
+	return nil
+}
+
+func cmdCircleGrantList(args []string) error {
+	fs := flag.NewFlagSet("circle grant list", flag.ExitOnError)
+	statePath, vaultState := circleFlags(fs)
+	name := fs.String("circle", "", "which circle")
+	fs.Parse(args)
+	root, err := circleRoot(*statePath, *vaultState)
+	if err != nil {
+		return err
+	}
+	c, err := pickCircle(root, *name)
+	if err != nil {
+		return err
+	}
+	gs, err := loadGrants(c)
+	if err != nil {
+		return err
+	}
+	if len(gs) == 0 {
+		fmt.Printf("no grants issued by circle %q on this device\n", c.Config.Name)
+		return nil
+	}
+	for _, g := range gs {
+		state := "live"
+		switch {
+		case g.Revoked != 0:
+			state = "REVOKED " + time.Unix(g.Revoked, 0).Format("2006-01-02")
+		case time.Now().Unix() > g.Exp:
+			state = "expired"
+		}
+		fmt.Printf("%s  %-10s %s on %s  to %s…  until %s  %s\n", g.ID[:8], g.Label, strings.Join(g.Verbs, ","), strings.Join(g.Res, ","), g.DID[len(g.DID)-8:], time.Unix(g.Exp, 0).Format("2006-01-02"), state)
+	}
+	return nil
+}
+
+// cmdCircleGrantRevoke signs a by-ID revocation with the circle root,
+// stores it, and has the running daemon push it to connected members.
+func cmdCircleGrantRevoke(args []string) error {
+	fs := flag.NewFlagSet("circle grant revoke", flag.ExitOnError)
+	statePath, vaultState := circleFlags(fs)
+	name := fs.String("circle", "", "which circle")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: fabric circle grant revoke [-circle name] <id-prefix>")
+	}
+	root, err := circleRoot(*statePath, *vaultState)
+	if err != nil {
+		return err
+	}
+	c, err := pickCircle(root, *name)
+	if err != nil {
+		return err
+	}
+	gs, err := loadGrants(c)
+	if err != nil {
+		return err
+	}
+	i := -1
+	for j, g := range gs {
+		if strings.HasPrefix(g.ID, fs.Arg(0)) {
+			if i >= 0 {
+				return fmt.Errorf("%q matches several grants", fs.Arg(0))
+			}
+			i = j
+		}
+	}
+	if i < 0 {
+		return fmt.Errorf("no grant %q in circle %q", fs.Arg(0), c.Config.Name)
+	}
+	id, err := hex.DecodeString(gs[i].ID)
+	if err != nil {
+		return err
+	}
+	pass, err := passFor(c)
+	if err != nil {
+		return err
+	}
+	priv, err := c.Unlock(pass)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	r, err := circle.RevokeAs(priv, nil, c.Config.DID, statement.Target{ID: id}, now)
+	if err != nil {
+		return err
+	}
+	if _, err := c.AddRevocations(now, r); err != nil {
+		return err
+	}
+	gs[i].Revoked = now.Unix()
+	if err := saveGrants(c, gs); err != nil {
+		return err
+	}
+	if dir, err := state.Open(*statePath); err == nil {
+		if n, err := daemon.NewClient(dir).CircleRefresh(); err == nil {
+			fmt.Printf("revoked grant %s; %d connected member(s) told, the rest learn on their next exchange\n", gs[i].ID[:8], n)
+			return nil
+		}
+	}
+	fmt.Printf("revoked grant %s (stored; members learn it on their next exchange with this node)\n", gs[i].ID[:8])
+	return nil
+}
+
+// stringList is a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string     { return strings.Join(*l, ",") }
+func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }

@@ -5,6 +5,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -40,6 +41,9 @@ const usage = `usage: fabric astral <command> [flags] [args]
                                        mint a sub-key under this device's assert in -circle
   key list                             sub-keys this device issued
   key revoke <id-prefix>               revoke an issued sub-key (reaches members online now)
+  worker claim|wait|append|ack|heartbeat -key worker.key [-gate addr] <name> …
+                                       act as a grantee against a listed gate, no daemon
+                                       (the key file from 'fabric circle grant new')
 
 Every command accepts -state <dir> (default ` + "`" + `%s` + "`" + `),
 -circle <did> — the circle the name belongs to (default: this node's home
@@ -79,6 +83,8 @@ func Main(args []string) int {
 		err = cmdGet(rest)
 	case "key":
 		err = cmdKey(rest)
+	case "worker":
+		err = cmdWorker(rest)
 	default:
 		fmt.Fprintf(os.Stderr, "astral: unknown command %q\n", cmd)
 		fmt.Fprintf(os.Stderr, usage, daemon.DefaultPath())
@@ -431,3 +437,99 @@ func cmdWatch(args []string) error {
 	}
 	return client(fs, st).Watch(pos[0], pos[1])
 }
+
+// cmdWorker is the grantee's side: a key file with a grant and gate hints,
+// a direct connection to a listed gate, no daemon or state directory.
+func cmdWorker(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: worker claim|wait|append|ack|heartbeat -key worker.key [-gate addr] <name> …")
+	}
+	verb, rest := args[0], args[1:]
+	fs := flag.NewFlagSet("astral worker "+verb, flag.ExitOnError)
+	keyPath := fs.String("key", "", "the grantee's key file (required)")
+	var gates stringList
+	fs.Var(&gates, "gate", "listed gate multiaddr (repeatable; default: the key file's hints)")
+	consumer := fs.String("consumer", "worker", "consumer identity")
+	lease := fs.Int("lease", 30, "lease seconds (claim)")
+	n := fs.Int("n", 1, "max events (claim)")
+	wait := fs.Int("wait", 0, "park up to this many seconds for mail (claim/wait)")
+	kind := fs.String("kind", "result", "event kind (append)")
+	source := fs.String("source", "worker", "source tool (append)")
+	corr := fs.String("corr", "", "correlation id: the request this answers (append)")
+	ttl := fs.Int("ttl", 30, "lease seconds (heartbeat)")
+	pos := parse(fs, rest)
+	if *keyPath == "" || len(pos) < 1 {
+		return fmt.Errorf("usage: worker %s -key worker.key [-gate addr] <name> …", verb)
+	}
+	signer, err := astral.LoadKeyFile(*keyPath)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	w, err := daemon.DialGate(ctx, signer, gates...)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+	name := pos[0]
+	switch verb {
+	case "claim":
+		if *wait > 0 {
+			if _, err := w.Wait(ctx, name, time.Duration(*wait)*time.Second); err != nil {
+				return err
+			}
+		}
+		c, err := w.Claim(ctx, name, *consumer, time.Duration(*lease)*time.Second, *n)
+		if err != nil {
+			return err
+		}
+		enc := json.NewEncoder(os.Stdout)
+		for _, cl := range c {
+			if err := enc.Encode(cl.Event); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "wait":
+		woke, err := w.Wait(ctx, name, time.Duration(*wait)*time.Second)
+		if err != nil {
+			return err
+		}
+		fmt.Println(woke)
+		return nil
+	case "append":
+		if len(pos) != 2 {
+			return fmt.Errorf("usage: worker append -key worker.key <name> [-corr request-id] <content|->")
+		}
+		content := pos[1]
+		if content == "-" {
+			b, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				return err
+			}
+			content = strings.TrimRight(string(b), "\n")
+		}
+		fresh, err := w.Append(ctx, name, astral.Event{Kind: *kind, Source: *source, Content: content, CorrelationID: *corr})
+		if err != nil {
+			return err
+		}
+		if !fresh {
+			fmt.Println("(duplicate)")
+		}
+		return nil
+	case "ack":
+		if len(pos) != 2 {
+			return fmt.Errorf("usage: worker ack -key worker.key <name> <event-id>")
+		}
+		return w.Ack(ctx, name, *consumer, pos[1])
+	case "heartbeat":
+		return w.Heartbeat(ctx, name, time.Duration(*ttl)*time.Second)
+	}
+	return fmt.Errorf("worker: unknown verb %q", verb)
+}
+
+// stringList is a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string     { return strings.Join(*l, ",") }
+func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }

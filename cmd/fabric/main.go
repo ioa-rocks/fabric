@@ -179,6 +179,8 @@ func usage() {
            circle revoke <member> — sign a device out (owner device);
            circle passphrase [-circle <name>] — re-encrypt the key container
            under a new passphrase (the key is unchanged; per device);
+           circle grant new|list|revoke — a root-signed grant on subjects to
+           a bare key (a worker that joins nothing; fabric astral worker);
            circle status — circles, this device's attestation, buckets, peers
   bucket   buckets of the circle ('fabric bucket -h'): create, list, place
            (full|cache|none|folder <dir>), mount, put/ls/get/rm, policy…;

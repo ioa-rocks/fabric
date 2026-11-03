@@ -76,6 +76,11 @@ func RevokeAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID strin
 	return revocationFromStatement(s)
 }
 
+// RevocationFromStatement wraps a decoded revocation statement.
+func RevocationFromStatement(s *statement.Statement) (*Revocation, error) {
+	return revocationFromStatement(s)
+}
+
 func revocationFromStatement(s *statement.Statement) (*Revocation, error) {
 	p := s.Payload
 	if p.Typ != statement.TypeRevoke || p.Target == nil {

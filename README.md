@@ -667,6 +667,30 @@ the host it published through, the worker's to the host it claimed from.
 A slot idles out after ten minutes and a late reply is refused loudly, not
 parked. Quota: 100 live slots per principal per host.
 
+**Grantees: a worker that joins nothing.** A circle can hand a bare key
+the right to a verb on a subject, with no membership anywhere (the team
+shape, overlapping-circles memo §14):
+
+```sh
+# on an owner device of the circle (asks for its passphrase)
+fabric circle grant new -circle team -res subject:jobs -verbs claim -exp 2160h -out worker.key
+fabric circle grant list
+fabric circle grant revoke 3f9a2c1e          # root-signed; pushed to members online now
+
+# on the worker's machine — no daemon, no state, just the file
+fabric astral worker claim -key worker.key subject:jobs -consumer crawler -wait 30
+fabric astral worker append -key worker.key subject:queues/_reply/<request-id> -corr <request-id> "done"
+```
+
+The key file is the credential: the worker's key, the root-signed grant
+and the gates to dial. The worker connects to a *listed* gate that hosts
+the subject, presents the chain on its first request and signs every
+request; the gate keeps the connection past the auth grace once a chain
+verified, and drops it when the chain dies. The gate must hold the
+subject's circle to host it; the home circle needs no circle directory,
+and a gate without one still learns that circle's revocations from the
+exchange. A dark node never lets a stranger connect at all.
+
 ```sh
 fabric astral subject subject:queues/agents/concierge/inbox -delivery exclusive -accepts user,system
 fabric astral append subject:queues/agents/concierge/inbox -kind user "translate this"
@@ -709,6 +733,7 @@ the UI and daemon use a non-default Astral state directory.
 | `fabric circle revoke [-circle <name>] <member \| did:key>` | an owner device of the circle | sign a device out of the circle; devices of the circle learn it on their next circle exchange, the running daemon pushes it to those connected now (see *Circle attestations*) |
 | `fabric circle export [-circle <name>] <file>` / `fabric circle join <file>` | another device | carry a circle to another device, which then holds its key and is attested into it (interim until sub-key grants). A shared circle is how two people share buckets: both devices hold it, neither holds the other's personal circle |
 | `fabric circle passphrase [-circle <name>]` | each device holding the circle | re-encrypt the circle's key container under a new passphrase. The key does not change, so nothing is re-signed or re-sent; when the circle is the mesh root (after `root merge`) the root key container is rewritten with it. Other devices holding the circle keep the old passphrase until the same is run there (or they re-join from a fresh `export`). There is no recovery for a forgotten passphrase: back up the container (`circles/<name>/user.key.age`) and the passphrase off the device |
+| `fabric circle grant new -res <subjects> [-verbs claim] [-exp 2160h] -out worker.key [-gate addr]…` / `grant list` / `grant revoke <id>` | an owner device of the circle | hand a new key a root-signed grant on named subjects, written as one key file with gate hints (the grantee's only credential); list them; revoke one by ID (stored, pushed to connected members) |
 | `fabric circle status` | any member | circles held, this device's role and attestation (expiry, revoked), revocations held, buckets per circle, mounts, folders, mesh, and which circles each vault peer verifiably shares |
 | `fabric bucket ...` | any member | the circle's buckets: `create`, `list`, `place <b> full\|cache\|none\|folder <dir>`, `mount`, `put/ls/get/rm/…` (`fabric bucket -h`; a `vault` symlink means the same) |
 | `fabric astral ...` | any member | inspect and use the coordination plane (`fabric astral -h`) |

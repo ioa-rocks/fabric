@@ -83,8 +83,10 @@ type KeyFile struct {
 	Res    []string `json:"res"`
 	Verbs  []string `json:"verbs"`
 	Exp    int64    `json:"exp"`
-	Seed   string   `json:"seed"`  // base64 ed25519 seed
-	Chain  string   `json:"chain"` // base64 statement wire bytes
+	Seed   string   `json:"seed"`            // base64 ed25519 seed
+	Chain  string   `json:"chain"`           // base64 statement wire bytes
+	Gates  []string `json:"gates,omitempty"` // multiaddrs of listed gates to dial (a grantee's hints)
+	Label  string   `json:"label,omitempty"`
 }
 
 // Signer signs operations for a key file.
@@ -94,6 +96,7 @@ type Signer struct {
 	Circle string
 	Auth   [32]byte
 	Chain  []byte
+	Gates  []string // where to dial as a grantee (from the key file)
 }
 
 // LoadKeyFile reads a key file and prepares its signer.
@@ -122,7 +125,7 @@ func LoadKeyFile(path string) (*Signer, error) {
 	if did.ForKey(priv.Public().(ed25519.PublicKey)) != st.Payload.Aud {
 		return nil, fmt.Errorf("key file %s: seed does not match the chain's recipient", path)
 	}
-	return &Signer{Priv: priv, Key: st.Payload.Aud, Circle: st.Payload.Sub, Auth: st.ID(), Chain: chain}, nil
+	return &Signer{Priv: priv, Key: st.Payload.Aud, Circle: st.Payload.Sub, Auth: st.ID(), Chain: chain, Gates: kf.Gates}, nil
 }
 
 // WriteKeyFile stores a freshly issued key for its holder (mode 0600).

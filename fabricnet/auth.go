@@ -44,17 +44,24 @@ type AuthService struct {
 	onAuth    func(peer.ID)
 	stopWatch func()
 
-	mu  sync.RWMutex
-	own *cert.Cert // presented in handshakes; swapped on renewal (SetOwn)
+	mu   sync.RWMutex
+	own  *cert.Cert           // presented in handshakes; swapped on renewal (SetOwn)
+	kept map[peer.ID]struct{} // non-members kept past the grace: they presented a verified chain
 }
 
 // NewAuthService wires the handshake handler and the grace-period watchdog
 // onto the host. ownCert may be nil on a not-yet-admitted node (it can still
 // verify others, e.g. while waiting in the pending queue). onJoin may be nil.
 func NewAuthService(h host.Host, store *MemberStore, ownCert *cert.Cert, grace time.Duration, onJoin JoinObserver) *AuthService {
-	a := &AuthService{h: h, store: store, own: ownCert, grace: grace, onJoin: onJoin}
+	a := &AuthService{h: h, store: store, own: ownCert, grace: grace, onJoin: onJoin, kept: map[peer.ID]struct{}{}}
 	h.SetStreamHandler(ProtocolID, a.handleInbound)
-	nb := &network.NotifyBundle{ConnectedF: a.onConnected}
+	nb := &network.NotifyBundle{ConnectedF: a.onConnected, DisconnectedF: func(n network.Network, c network.Conn) {
+		if p := c.RemotePeer(); n.Connectedness(p) != network.Connected {
+			a.mu.Lock()
+			delete(a.kept, p)
+			a.mu.Unlock()
+		}
+	}}
 	h.Network().Notify(nb)
 	a.stopWatch = func() { h.Network().StopNotify(nb) }
 	return a
@@ -96,10 +103,40 @@ func (a *AuthService) Close() {
 func (a *AuthService) onConnected(_ network.Network, c network.Conn) {
 	p := c.RemotePeer()
 	time.AfterFunc(a.grace, func() {
-		if !a.store.IsMember(p, time.Now()) {
+		if !a.store.IsMember(p, time.Now()) && !a.IsKept(p) {
 			_ = a.h.Network().ClosePeer(p)
 		}
 	})
+}
+
+// Keep marks a non-member connection as one to hold past the grace: the
+// peer presented a chain that verified on a stream (a grantee at a listed
+// gate; memo §12.35, §17 item 1). Membership is still what the roster,
+// relaying and dialing go by.
+func (a *AuthService) Keep(p peer.ID) {
+	a.mu.Lock()
+	a.kept[p] = struct{}{}
+	a.mu.Unlock()
+	a.h.ConnManager().Protect(p, "fabric-grantee")
+}
+
+// IsKept reports whether a non-member connection is held by Keep.
+func (a *AuthService) IsKept(p peer.ID) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	_, ok := a.kept[p]
+	return ok
+}
+
+// Drop ends a kept connection (its chain died).
+func (a *AuthService) Drop(p peer.ID) {
+	a.mu.Lock()
+	delete(a.kept, p)
+	a.mu.Unlock()
+	a.h.ConnManager().Unprotect(p, "fabric-grantee")
+	if !a.store.IsMember(p, time.Now()) {
+		_ = a.h.Network().ClosePeer(p)
+	}
 }
 
 // Authenticate runs the handshake with a peer as the initiator and records
