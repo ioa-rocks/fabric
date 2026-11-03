@@ -343,6 +343,18 @@ func cmdUp(args []string) error {
 	// A pre-hoist circle still living in the store directory is adopted
 	// into the node's state first (ADR 0017: the circle is fabric's).
 	var vd *vaultdaemon.Daemon
+	// The circle instance of the namespace engine: which of our circles a
+	// mesh member is a device of, and what its chain lets it do. Vault and
+	// astral gate on it; the home circle is answered from membership
+	// certs, so a node with no circle directory (a gate) still verifies.
+	// Attached whenever either data plane runs (agy: `-no-vault` must not
+	// leave astral without it).
+	circlesRoot := circle.Root(*statePath)
+	if !*noVault || !*noAstral {
+		d.Circle = daemon.NewCircleService(d.Host, d.Auth, circlesRoot)
+		d.Circle.SetOwnCert(d.OwnCert)
+		d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.Cert)
+	}
 	if !*noVault {
 		root := circle.Root(*statePath)
 		// Older layouts: the single <state>/circle directory, and before
@@ -355,14 +367,6 @@ func cmdUp(args []string) error {
 				log.Printf("circle adopted from %s into %s (the old copy is left in place, unused)", legacy, root)
 			}
 		}
-		// The circle instance of the namespace engine: which of our
-		// circles a mesh member is a device of, and what its chain lets it
-		// do. Vault and astral gate on it; the home circle is answered
-		// from membership certs, so a node with no circle directory (a
-		// gate) still verifies.
-		d.Circle = daemon.NewCircleService(d.Host, d.Auth, root)
-		d.Circle.SetOwnCert(d.OwnCert)
-		d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.Cert)
 		if circle.Any(root) {
 			st, err := vaultstore.Open(*vaultState, root)
 			if err != nil {

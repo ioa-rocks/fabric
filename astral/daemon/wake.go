@@ -159,13 +159,16 @@ func (d *Daemon) Wait(ctx context.Context, pr *astral.Principal, ref astral.Ref,
 		return "", err
 	} else if ok {
 		if m.IsReplySlot() {
-			if err := d.replyAccess(m, d.principalLabel(pr)); err != nil {
+			if err := d.localAuthorizeValid(pr); err != nil {
+				return "", err
+			}
+			if err := d.replyAccess(m, d.localPrincipal(pr)); err != nil {
 				return "", err
 			}
 		} else if err := d.localAuthorize(pr, OpWait, ref, "", "", ""); err != nil {
 			return "", err
 		}
-		return d.waitHeld(ctx, ref, timeout, holdOf("", pr))
+		return d.waitHeld(ctx, ref, timeout, holdOf("", d.localPrincipal(pr), pr))
 	}
 	host, ok, err := d.Store.Host(ref)
 	if err != nil || !ok {
@@ -211,7 +214,7 @@ func (d *Daemon) Watch(pr *astral.Principal, entity astral.Ref, watcher string) 
 		if err := d.localAuthorize(pr, OpWatch, entity, "", watcher, ""); err != nil {
 			return err
 		}
-		return d.Store.WatchAs(entity, astral.Ref{Circle: entity.Circle, Name: watcher}, holdOf("", pr))
+		return d.Store.WatchAs(entity, astral.Ref{Circle: entity.Circle, Name: watcher}, holdOf("", d.localPrincipal(pr), pr))
 	}
 	_, err = d.remote(host, request{Op: OpWatch, Circle: entity.Circle, Name: entity.Name, Consumer: watcher, Principal: pr})
 	return err
@@ -262,34 +265,55 @@ func (d *Daemon) monitorLoop() {
 // an error when its authority is gone (revoked, expired, no longer a
 // member). A holder whose peer is not connected right now cannot be
 // re-checked and is left to its own timeout.
+// stillHolds re-verifies one holder for verb on ref ("" = the chain's
+// own validity only, for rights that come from host-side state such as a
+// reply slot). A key holder is checked from the chain stored with the
+// hold, connected or not, without touching presence state; a device
+// holder is checked through the circle service while connected and
+// against member-level revocation when not.
 func (d *Daemon) stillHolds(h astral.Hold, ref astral.Ref, verb string) error {
 	if d.Fabric == nil || d.Fabric.Circle == nil {
 		return nil
 	}
-	p := d.Fabric.Host.ID()
-	if h.Peer != "" {
-		var err error
-		if p, err = peer.Decode(h.Peer); err != nil {
-			return nil
+	if h.Key != "" {
+		if len(h.Chain) == 0 {
+			return errors.New("holder has no chain on record")
 		}
-		if d.Fabric.Host.Network().Connectedness(p) != network.Connected {
-			return nil
+		want := statement.Want{Verb: verb, Now: time.Now()}
+		if verb != "" {
+			want.Res = statement.Resource{Kind: statement.KindSubject, Name: ref.Name}
 		}
+		return d.Fabric.Circle.CheckChain(h.Chain, want)
 	}
-	want := statement.Want{Sub: ref.Circle, Res: statement.Resource{Kind: statement.KindSubject, Name: ref.Name}, Verb: verb, Now: time.Now()}
-	if h.Key == "" {
-		if h.Peer == "" {
-			return nil // the device itself, local trust
-		}
-		ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
-		defer cancel()
-		return d.Fabric.Circle.Verify(ctx, p, want)
+	if h.Peer == "" {
+		return nil // the device itself, local trust
 	}
-	comp, err := d.Fabric.Circle.Present(p, h.Chain)
+	p, err := peer.Decode(h.Peer)
 	if err != nil {
-		return err
+		return nil
 	}
-	return d.Fabric.Circle.VerifyPresented(p, comp.AuthLeafID(), h.Key, want)
+	if d.Fabric.Host.Network().Connectedness(p) != network.Connected {
+		if d.Fabric.Store.IsRevoked(p, time.Now()) {
+			return errors.New("device revoked")
+		}
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
+	defer cancel()
+	want := statement.Want{Sub: ref.Circle, Verb: verb, Now: time.Now(), Res: statement.Resource{Kind: statement.KindSubject, Name: ref.Name}}
+	if verb == "" {
+		want.Res, want.Verb = statement.Resource{Kind: statement.KindRole, Name: statement.VerbMember}, statement.VerbMember
+	}
+	return d.Fabric.Circle.Verify(ctx, p, want)
+}
+
+// verbForHold is the verb a holder must still have on a ref: claim on a
+// subject, nothing beyond liveness on a reply slot.
+func (d *Daemon) verbForHold(ref astral.Ref) string {
+	if m, ok, _ := d.Store.Subject(ref); ok && m.IsReplySlot() {
+		return ""
+	}
+	return statement.VerbClaim
 }
 
 // recheck releases every lease, drops every watch and ends every parked
@@ -302,10 +326,13 @@ func (d *Daemon) recheck() {
 	defer d.end()
 	d.recheckMu.Lock()
 	defer d.recheckMu.Unlock()
+	if d.Fabric != nil && d.Fabric.Circle != nil {
+		d.Fabric.Circle.Sweep()
+	}
 	now := time.Now()
 	if leases, err := d.Store.Leases(now); err == nil {
 		for _, l := range leases {
-			if err := d.stillHolds(l.Hold, l.Ref, statement.VerbClaim); err != nil {
+			if err := d.stillHolds(l.Hold, l.Ref, d.verbForHold(l.Ref)); err != nil {
 				log.Printf("astral: lease on %s by %s released: %v", l.Ref, l.Consumer, err)
 				_ = d.Store.Release(l.Ref, l.EventID)
 			}
@@ -321,7 +348,7 @@ func (d *Daemon) recheck() {
 		}
 	}
 	for _, pw := range d.waits.all() {
-		if err := d.stillHolds(pw.hold, pw.ref, statement.VerbClaim); err != nil {
+		if err := d.stillHolds(pw.hold, pw.ref, d.verbForHold(pw.ref)); err != nil {
 			pw.cancel(errRevoked)
 		}
 	}

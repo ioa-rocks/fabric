@@ -161,7 +161,7 @@ func (c *Client) append(name string, ev astral.Event, reply bool) (id string, fr
 	if c.Signer != nil && ev.CorrelationID != "" && astral.Ephemeral(name) && len(ev.Signature) == 0 {
 		astral.SignReply(c.Signer.Priv, c.Signer.Key, &ev)
 	}
-	if err := c.post("/v0/append", appendBody{Principal: c.sign(OpAppend, name, ev.ID, "", ""), Circle: c.Circle, Name: name, Event: ev, Reply: reply}, &r); err != nil {
+	if err := c.post("/v0/append", appendBody{Principal: c.sign(OpAppend, name, ev.ID, "", appendDigestValue(ev, reply)), Circle: c.Circle, Name: name, Event: ev, Reply: reply}, &r); err != nil {
 		return "", false, "", err
 	}
 	return r.ID, r.Fresh, r.Reply, nil
@@ -187,6 +187,24 @@ func (c *Client) Set(name, value string) error {
 // Get reads a register; ok=false when unset.
 func (c *Client) Get(name string) (astral.Register, bool, error) {
 	var r astral.Register
+	if c.Signer != nil {
+		data, err := json.Marshal(getBody{Principal: c.sign(OpGet, name, "", "", ""), Circle: c.Circle, Name: name})
+		if err != nil {
+			return r, false, err
+		}
+		resp, err := c.http.Post("http://astral/v0/get", "application/json", bytes.NewReader(data))
+		if err != nil {
+			return r, false, fmt.Errorf("is `fabric up` running? %w", err)
+		}
+		defer resp.Body.Close()
+		switch resp.StatusCode {
+		case http.StatusOK:
+			return r, true, json.NewDecoder(resp.Body).Decode(&r)
+		case http.StatusNotFound:
+			return r, false, nil
+		}
+		return r, false, decodeErr(resp)
+	}
 	q := url.Values{"name": {name}}
 	if c.Circle != "" {
 		q.Set("circle", c.Circle)

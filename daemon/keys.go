@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -154,6 +155,11 @@ func (d *Daemon) IssueKey(circleDID string, res []string, verbs []string, validi
 	if validity <= 0 {
 		validity = 30 * 24 * time.Hour
 	}
+	var err error
+	if res, err = cleanSubjects(res); err != nil {
+		return nil, err
+	}
+	verbs = cleanList(verbs)
 	parent, err := d.ownAssert(circleDID)
 	if err != nil {
 		return nil, err
@@ -188,8 +194,10 @@ func (d *Daemon) IssueKey(circleDID string, res []string, verbs []string, validi
 		return nil, fmt.Errorf("sub-key would not verify: %w", err)
 	}
 	for _, v := range verbs {
-		if !comp.Allows(circleDID, statement.Resource{Kind: statement.KindSubject, Name: res[0]}, v) {
-			return nil, fmt.Errorf("sub-key would not verify: this device does not hold %s on %s in that circle", v, res[0])
+		for _, r := range res {
+			if !comp.Allows(circleDID, statement.Resource{Kind: statement.KindSubject, Name: r}, v) {
+				return nil, fmt.Errorf("sub-key would not verify: this device does not hold %s on %s in that circle", v, r)
+			}
 		}
 	}
 	wire, err := s.Bytes()
@@ -300,3 +308,39 @@ func (d *Daemon) DeviceDID() (string, error) {
 	}
 	return did.ForKey(priv.Public().(ed25519.PublicKey)), nil
 }
+
+// cleanSubjects trims and validates subject names for a key or grant:
+// "*" or subject:<name>, nothing else (a bare name would mint a key that
+// fails every check).
+func cleanSubjects(res []string) ([]string, error) {
+	out := make([]string, 0, len(res))
+	for _, r := range res {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			continue
+		}
+		if r != "*" && !strings.HasPrefix(r, "subject:") {
+			return nil, fmt.Errorf("resource %q: use subject:<name> or *", r)
+		}
+		out = append(out, r)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("at least one subject (or *) is required")
+	}
+	return out, nil
+}
+
+// cleanList trims a comma-split list.
+func cleanList(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// CleanSubjects and CleanList are cleanSubjects/cleanList for the CLI.
+func CleanSubjects(res []string) ([]string, error) { return cleanSubjects(res) }
+func CleanList(in []string) []string               { return cleanList(in) }

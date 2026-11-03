@@ -114,11 +114,18 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 
 	gateAddr := fgate.Host.Addrs()[0].String() + "/p2p/" + fgate.Host.ID().String()
 	signer := grantFor(t, root, gateAddr, "claim")
-	w, err := daemon.DialGate(t.Context(), signer)
-	if err != nil {
-		t.Fatalf("dial gate: %v", err)
+	// Each CLI invocation is a fresh connection with a throwaway transport
+	// identity: claim, reply and ack must hang together across three of
+	// them (agy review, 2026-11-03).
+	dial := func() *daemon.Worker {
+		w, err := daemon.DialGate(t.Context(), signer)
+		if err != nil {
+			t.Fatalf("dial gate: %v", err)
+		}
+		t.Cleanup(func() { w.Close() })
+		return w
 	}
-	defer w.Close()
+	w := dial()
 	c, err := w.Claim(t.Context(), "subject:jobs", "worker", 30*time.Second, 1)
 	if err != nil || len(c) != 1 || c[0].Event.ID != reqID {
 		t.Fatalf("grantee claim: %+v err=%v", c, err)
@@ -126,25 +133,42 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	if c[0].Event.ReplyTarget != slot {
 		t.Fatalf("claimed request has no slot: %+v", c[0].Event)
 	}
+	if !fgate.Auth.IsKept(w.ID()) {
+		t.Fatal("the grantee's connection is not kept past the grace")
+	}
+	if _, err := w.Claim(t.Context(), "subject:jobs", "bad@name", 30*time.Second, 1); err == nil || !strings.Contains(err.Error(), "consumer") {
+		t.Fatalf("a consumer with '@' was accepted: %v", err)
+	}
+	w.Close()
 	// Publishing is outside the grant.
-	if _, err := w.Append(t.Context(), "subject:jobs", astral.Event{Kind: "job", Source: "worker", Content: "sneak"}); err == nil || !strings.Contains(err.Error(), "denied") {
+	w2 := dial()
+	if _, err := w2.Append(t.Context(), "subject:jobs", astral.Event{Kind: "job", Source: "worker", Content: "sneak"}); err == nil || !strings.Contains(err.Error(), "denied") {
 		t.Fatalf("grantee published: %v", err)
 	}
-	// The reply: lease-bound, signed by the worker key.
-	if _, err := w.Append(t.Context(), slot, astral.Event{Kind: "result", Source: "worker", Content: "42 pages", CorrelationID: reqID}); err != nil {
+	// The reply: lease-bound, signed by the worker key, from a new connection.
+	if _, err := w2.Append(t.Context(), slot, astral.Event{Kind: "result", Source: "worker", Content: "42 pages", CorrelationID: reqID}); err != nil {
 		t.Fatalf("grantee reply: %v", err)
 	}
 	got := waitClaim(t, clDesk, slot, "team")
 	if got.Event.Content != "42 pages" || got.Event.Signer != signer.Key || got.Event.VerifyReply() != nil {
 		t.Fatalf("reply at the requester: %+v", got.Event)
 	}
-	if err := w.Ack(t.Context(), "subject:jobs", "worker", reqID); err != nil {
-		t.Fatalf("grantee acks its own lease: %v", err)
+	w2.Close()
+	if err := dial().Ack(t.Context(), "subject:jobs", "worker", reqID); err != nil {
+		t.Fatalf("grantee acks its own lease from a third connection: %v", err)
 	}
-	if !fgate.Auth.IsKept(w.Gate()) || fgate.Auth.IsKept(fdesk.Host.ID()) {
-		// The worker's connection is kept past the grace; a member's is
-		// held by membership, not by Keep.
+
+	// A lease held by a worker that is offline is released once its
+	// grant is revoked: the re-check uses the chain stored with the hold.
+	if _, _, err := clDesk.AppendRequest("subject:jobs", astral.Event{Kind: "request", Source: "team", Content: "second"}); err != nil {
+		t.Fatal(err)
 	}
+	w3 := dial()
+	if c, err := w3.Claim(t.Context(), "subject:jobs", "worker", 10*time.Minute, 1); err != nil || len(c) != 1 {
+		t.Fatalf("second claim: %+v err=%v", c, err)
+	}
+	w3.Close()
+	time.Sleep(200 * time.Millisecond)
 
 	// Revoke the grant on the gate (the CLI does this through the circle
 	// service after signing with the root); the next claim is refused.
@@ -155,45 +179,62 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	if err := fgate.Circle.AddRevocation(r); err != nil {
 		t.Fatalf("ingest revocation: %v", err)
 	}
-	if _, _, err := clDesk.AppendRequest("subject:jobs", astral.Event{Kind: "request", Source: "team", Content: "again"}); err != nil {
-		t.Fatal(err)
+	// The offline worker's lease is released: the device reclaims the job.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got, _ := clGate.Claim("subject:jobs", "janitor", 30, 1)
+		if len(got) == 1 && got[0].Event.Content == "second" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("revoked offline worker's lease was not released")
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	w2, err := daemon.DialGate(t.Context(), signer)
+	w4, err := daemon.DialGate(t.Context(), signer)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w2.Close()
-	if _, err := w2.Claim(t.Context(), "subject:jobs", "worker", 30*time.Second, 1); err == nil || !strings.Contains(err.Error(), "denied") {
+	defer w4.Close()
+	if _, err := w4.Claim(t.Context(), "subject:jobs", "worker", 30*time.Second, 1); err == nil || !strings.Contains(err.Error(), "denied") {
 		t.Fatalf("revoked grant still claims: %v", err)
+	}
+	// The gate dropped the stranger once its chain died.
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && len(fgate.Host.Network().ConnsToPeer(w4.ID())) > 0 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if n := len(fgate.Host.Network().ConnsToPeer(w4.ID())); n != 0 {
+		t.Fatalf("gate kept %d connection(s) from a revoked grantee", n)
 	}
 
 	// No grant at all: nothing.
 	nobody := grantFor(t, root, gateAddr, "claim")
 	_, other, _ := ed25519.GenerateKey(rand.Reader)
 	nobody.Priv = other // the chain is for another key: present fails
-	w3, err := daemon.DialGate(t.Context(), nobody)
+	wn, err := daemon.DialGate(t.Context(), nobody)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w3.Close()
-	if _, err := w3.Claim(t.Context(), "subject:jobs", "x", 30*time.Second, 1); err == nil || !strings.Contains(err.Error(), "denied") {
+	defer wn.Close()
+	if _, err := wn.Claim(t.Context(), "subject:jobs", "x", 30*time.Second, 1); err == nil || !strings.Contains(err.Error(), "denied") {
 		t.Fatalf("mismatched key accepted: %v", err)
 	}
 
 	// A dark node refuses the stranger's connection before any protocol:
 	// the dial may complete on the worker's side, but the dark node holds
 	// no connection and no stream ever opens.
-	w4, err := daemon.DialGate(t.Context(), signer, fdesk.Host.Addrs()[0].String()+"/p2p/"+fdesk.Host.ID().String())
+	w5, err := daemon.DialGate(t.Context(), signer, fdesk.Host.Addrs()[0].String()+"/p2p/"+fdesk.Host.ID().String())
 	if err == nil {
-		defer w4.Close()
-		if _, err := w4.Claim(t.Context(), "subject:jobs", "x", 30*time.Second, 1); err == nil {
+		defer w5.Close()
+		if _, err := w5.Claim(t.Context(), "subject:jobs", "x", 30*time.Second, 1); err == nil {
 			t.Fatal("a dark node served a stranger")
 		}
 		deadline := time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) && len(fdesk.Host.Network().ConnsToPeer(w4.ID())) > 0 {
+		for time.Now().Before(deadline) && len(fdesk.Host.Network().ConnsToPeer(w5.ID())) > 0 {
 			time.Sleep(20 * time.Millisecond)
 		}
-		if n := len(fdesk.Host.Network().ConnsToPeer(w4.ID())); n != 0 {
+		if n := len(fdesk.Host.Network().ConnsToPeer(w5.ID())); n != 0 {
 			t.Fatalf("dark node kept %d connection(s) from a stranger", n)
 		}
 	}

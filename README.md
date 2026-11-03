@@ -656,7 +656,7 @@ minutes, and a wait ends when its stream does.
 
 **Request and reply.** `fabric astral append <queue> -reply …` asks the
 host of the queue for a reply slot: the host allocates
-`subject:queues/_reply/<request-id>` in its own circle, owned by itself,
+`subject:queues/_reply/<request-id>` in the queue's circle, owned by itself,
 readable only by the principal that published the request, and points the
 request at it. The worker that holds the request's live lease is the only
 one who may append to the slot, with a reply signed over the request it

@@ -133,8 +133,8 @@ type Subject struct {
 	MaxEvents int   `json:"max_events,omitempty"`
 
 	// A reply slot (memo §12.3): allocated by the host of a request subject
-	// when it accepts a publish that asked for one, owned by the host's
-	// circle. ReplyFor is the request event, ReplyOf its subject,
+	// when it accepts a publish that asked for one, in the request's
+	// circle and owned by the host. ReplyFor is the request event, ReplyOf its subject,
 	// ReplyConsumer the principal that published it (the only one who may
 	// claim, wait on or read the slot); the only appender is the live
 	// claimant of the request, signing its reply.
@@ -297,9 +297,22 @@ type lease struct {
 // revocation or expiry can find and release it: the connection peer and,
 // for a sub-key or grantee, the chain it presented. Empty for a solo node.
 type Hold struct {
-	Peer  string `json:"peer,omitempty"`  // peer ID of the caller's connection ("" = this node)
-	Key   string `json:"key,omitempty"`   // presenting key when not the peer itself
-	Chain []byte `json:"chain,omitempty"` // that key's statement chain, wire bytes
+	Principal string `json:"principal,omitempty"` // did:key of the principal: the device key, or the sub-key/grant key
+	Peer      string `json:"peer,omitempty"`      // peer ID of the caller's connection ("" = this node)
+	Key       string `json:"key,omitempty"`       // presenting key when not the peer itself (= Principal then)
+	Chain     []byte `json:"chain,omitempty"`     // that key's statement chain, wire bytes
+}
+
+// ErrBadConsumer is a consumer string the plane cannot use as a label.
+var ErrBadConsumer = errors.New("astral: consumer must not contain '@'")
+
+// ValidConsumer rejects '@' in a consumer name: the host appends its own
+// `@<principal label>` and identity lives in Hold, never in the string.
+func ValidConsumer(c string) error {
+	if strings.ContainsRune(c, '@') {
+		return ErrBadConsumer
+	}
+	return nil
 }
 
 // MaxLease and MaxHeartbeat bound caller-chosen durations: a revoked
@@ -741,14 +754,15 @@ func (s *Store) Ack(ref Ref, consumer, eventID string) error {
 	return b.Commit(pebble.Sync)
 }
 
-// LeaseHolder reports who holds a live lease on an event, if anyone.
-func (s *Store) LeaseHolder(ref Ref, eventID string, now time.Time) (consumer string, ok bool, err error) {
+// LeaseHolder reports who holds a live lease on an event, if anyone: the
+// consumer string and the Hold it was taken under.
+func (s *Store) LeaseHolder(ref Ref, eventID string, now time.Time) (consumer string, hold Hold, ok bool, err error) {
 	var l lease
 	found, err := s.getJSON(k2("l/", ref, eventID), &l)
 	if err != nil || !found || l.Until <= now.UnixNano() {
-		return "", false, err
+		return "", Hold{}, false, err
 	}
-	return l.Consumer, true, nil
+	return l.Consumer, l.Hold, true, nil
 }
 
 // Pending counts journaled-but-unacked events (leased ones included).

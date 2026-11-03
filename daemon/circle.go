@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -79,11 +81,26 @@ type CircleService struct {
 
 	mu           sync.RWMutex
 	peers        map[peer.ID]circleEntry
-	presented    map[peer.ID]map[presentKey]*statement.Compiled // chains presented on a connection (sub-keys, grantees)
-	extraRevs    map[string]*statement.RevocationSet            // revocations for circles not held here (a gate's home circle)
+	presented    map[peer.ID]map[presentKey]presentedChain // chains presented on a connection (sub-keys, grantees)
+	extraRevs    map[string]*statement.RevocationSet       // revocations for the home circle when not held here (a gate)
 	onInvalidate []func()
 	stop         func()
 }
+
+// presentedChain is one compiled chain with the bytes it came from, so a
+// holder can be re-checked later without the presenter around.
+type presentedChain struct {
+	comp *statement.Compiled
+	raw  []byte
+}
+
+// Caps on what a listed gate keeps for strangers: chains per connection,
+// and kept connections per presenting key (a grantee with one key cannot
+// pin thousands of protected connections; agy review, 2026-11-03).
+var (
+	MaxPresentedPerPeer = 16
+	MaxKeptPerKey       = 4
+)
 
 // OnInvalidate registers a hook run (in its own goroutine) whenever cached
 // authority is dropped — a revocation arrived, a device was forgotten — so
@@ -96,6 +113,7 @@ func (s *CircleService) OnInvalidate(f func()) {
 }
 
 func (s *CircleService) invalidated() {
+	s.Sweep()
 	s.mu.RLock()
 	hooks := append([]func(){}, s.onInvalidate...)
 	s.mu.RUnlock()
@@ -133,7 +151,8 @@ const noCircleTTL = 30 * time.Second
 // NewCircleService attaches the exchange to the host for the circles under
 // root (listed on demand — circles added later need no restart).
 func NewCircleService(h host.Host, auth *fabricnet.AuthService, root string) *CircleService {
-	s := &CircleService{h: h, auth: auth, root: root, peers: map[peer.ID]circleEntry{}, presented: map[peer.ID]map[presentKey]*statement.Compiled{}, extraRevs: map[string]*statement.RevocationSet{}}
+	s := &CircleService{h: h, auth: auth, root: root, peers: map[peer.ID]circleEntry{}, presented: map[peer.ID]map[presentKey]presentedChain{}, extraRevs: map[string]*statement.RevocationSet{}}
+	s.loadExtraRevs()
 	h.SetStreamHandler(CircleProtocolV4ID, auth.RequireMember(s.handleV4))
 	h.SetStreamHandler(CircleProtocolID, auth.RequireMember(s.handleV3))
 	h.SetStreamHandler(CircleProtocolV2ID, auth.RequireMember(s.handleV2))
@@ -432,10 +451,61 @@ func (s *CircleService) revsFor(circleDID string, now time.Time) statement.Revoc
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.revsForLocked(circleDID, now)
+}
+
+func (s *CircleService) revsForLocked(circleDID string, now time.Time) statement.Revocations {
+	if c := s.circleByDID(circleDID); c != nil {
+		if set, err := c.RevocationSet(now); err == nil {
+			return set
+		}
+	}
 	if set := s.extraRevs[circleDID]; set != nil {
 		return set
 	}
 	return nil
+}
+
+func (s *CircleService) rootsForLocked(circleDID string) (statement.Roots, error) {
+	return s.rootsFor(circleDID)
+}
+
+// CheckChain verifies a chain from its bytes alone — roots, window,
+// revocations, and want's verb on want's resource when a verb is given,
+// else the chain's own resource — without touching the presence state.
+// What a data plane uses to re-check a holder whose connection is gone.
+func (s *CircleService) CheckChain(raw []byte, want statement.Want) error {
+	st, err := statement.Decode(raw)
+	if err != nil {
+		return err
+	}
+	roots, err := s.rootsFor(st.Payload.Sub)
+	if err != nil {
+		return err
+	}
+	c, err := statement.Compile(st, nil, st.Payload.Sub, roots)
+	if err != nil {
+		return err
+	}
+	if want.Now.IsZero() {
+		want.Now = time.Now()
+	}
+	want.Sub, want.PresentingKey = c.Sub, c.PresentingKey
+	if want.Verb == "" {
+		want.Res, want.Verb = firstRes(c), firstVerb(c)
+	}
+	return c.Check(roots, s.revsFor(c.Sub, want.Now), want)
+}
+
+// PresentedChain returns the bytes of a chain presented on a connection.
+func (s *CircleService) PresentedChain(p peer.ID, auth [32]byte, key string) ([]byte, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	pc, ok := s.presented[p][presentKey{auth: auth, key: key}]
+	if !ok {
+		return nil, false
+	}
+	return pc.raw, true
 }
 
 // AddRevocation ingests a verified revocation signed for one of this
@@ -488,9 +558,62 @@ func (s *CircleService) forgetDevice(deviceDID string) {
 func (s *CircleService) forgetAll() {
 	s.mu.Lock()
 	s.peers = map[peer.ID]circleEntry{}
-	s.presented = map[peer.ID]map[presentKey]*statement.Compiled{}
 	s.mu.Unlock()
 	s.invalidated()
+}
+
+// Sweep re-checks every presented chain against the current window and
+// revocations, drops the dead ones, and ends a stranger's connection once
+// it has no live chain left (AuthService.Drop). Runs on every
+// invalidation and on the data plane's re-check timer.
+func (s *CircleService) Sweep() {
+	now := time.Now()
+	s.mu.Lock()
+	type dead struct {
+		p    peer.ID
+		keys []presentKey
+	}
+	var deads []dead
+	for p, m := range s.presented {
+		d := dead{p: p}
+		for k, pc := range m {
+			if err := s.validLocked(pc.comp, now); err != nil {
+				d.keys = append(d.keys, k)
+			}
+		}
+		if len(d.keys) > 0 {
+			deads = append(deads, d)
+		}
+	}
+	var drop []peer.ID
+	for _, d := range deads {
+		for _, k := range d.keys {
+			delete(s.presented[d.p], k)
+		}
+		if len(s.presented[d.p]) == 0 {
+			delete(s.presented, d.p)
+			drop = append(drop, d.p)
+		}
+	}
+	s.mu.Unlock()
+	for _, p := range drop {
+		if s.auth != nil && p != s.h.ID() && !s.auth.Allows(p, CircleProtocolID) {
+			log.Printf("circle: stranger %s has no live chain left — dropped", p)
+			s.auth.Drop(p)
+		}
+	}
+}
+
+// validLocked is the window + roots + revocations half of Check for a
+// chain on its own resource (caller holds s.mu at least for reading).
+func (s *CircleService) validLocked(c *statement.Compiled, now time.Time) error {
+	roots, err := s.rootsForLocked(c.Sub)
+	if err != nil {
+		return err
+	}
+	return c.Check(roots, s.revsForLocked(c.Sub, now), statement.Want{
+		Sub: c.Sub, Res: firstRes(c), Verb: firstVerb(c), PresentingKey: c.PresentingKey, Now: now,
+	})
 }
 
 // ErrNotPresented is a verb under a chain this connection never presented.
@@ -534,18 +657,62 @@ func (s *CircleService) Present(p peer.ID, raw []byte) (*statement.Compiled, err
 	}); err != nil {
 		return nil, fmt.Errorf("presented chain: %w", err)
 	}
+	self := p == s.h.ID()
+	if !self && s.h.Network().Connectedness(p) != network.Connected {
+		return nil, errors.New("presented chain: peer is not connected")
+	}
+	key := presentKey{auth: c.AuthLeafID(), key: c.PresentingKey}
 	s.mu.Lock()
 	m := s.presented[p]
 	if m == nil {
-		m = map[presentKey]*statement.Compiled{}
-		s.presented[p] = m
+		m = map[presentKey]presentedChain{}
 	}
-	m[presentKey{auth: c.AuthLeafID(), key: c.PresentingKey}] = c
+	if _, have := m[key]; !have {
+		if len(m) >= MaxPresentedPerPeer {
+			s.mu.Unlock()
+			return nil, fmt.Errorf("presented chain: too many chains on this connection (%d)", MaxPresentedPerPeer)
+		}
+		if !self && s.auth != nil && !s.auth.Allows(p, CircleProtocolID) {
+			n := 0
+			for q, qm := range s.presented {
+				if q == p {
+					continue
+				}
+				for k := range qm {
+					if k.key == c.PresentingKey {
+						n++
+						break
+					}
+				}
+			}
+			if n >= MaxKeptPerKey {
+				s.mu.Unlock()
+				return nil, fmt.Errorf("presented chain: key %s already holds %d connections here", shortDID(c.PresentingKey), n)
+			}
+		}
+	}
+	m[key] = presentedChain{comp: c, raw: raw}
+	s.presented[p] = m
 	s.mu.Unlock()
-	if s.auth != nil && p != s.h.ID() {
+	if s.auth != nil && !self {
 		s.auth.Keep(p)
 	}
 	return c, nil
+}
+
+// VerifyPresentedValid is VerifyPresented without a verb: is the presented
+// chain itself still live (window, roots, revocations)? Used where the
+// right to act comes from host-side state — a claimant acking its own
+// lease, a requester reading its reply slot — but the chain must still
+// be alive (agy review, 2026-11-03).
+func (s *CircleService) VerifyPresentedValid(p peer.ID, auth [32]byte, key string) error {
+	s.mu.RLock()
+	pc, ok := s.presented[p][presentKey{auth: auth, key: key}]
+	s.mu.RUnlock()
+	if !ok {
+		return ErrNotPresented
+	}
+	return s.validLocked(pc.comp, time.Now())
 }
 
 // firstRes is a resource the chain's leaf names, for a Check that asks
@@ -571,11 +738,12 @@ func firstVerb(c *statement.Compiled) string {
 // key, under the authority leaf auth, on this connection.
 func (s *CircleService) VerifyPresented(p peer.ID, auth [32]byte, key string, want statement.Want) error {
 	s.mu.RLock()
-	c := s.presented[p][presentKey{auth: auth, key: key}]
+	pc, ok := s.presented[p][presentKey{auth: auth, key: key}]
 	s.mu.RUnlock()
-	if c == nil {
+	if !ok {
 		return ErrNotPresented
 	}
+	c := pc.comp
 	if want.Sub == "" {
 		want.Sub = c.Sub
 	}
@@ -653,9 +821,10 @@ func versionOf(id protocol.ID) int {
 // online right now instead of waiting for their next connection. Returns
 // how many members were reached.
 func (s *CircleService) Refresh(ctx context.Context) int {
-	s.mu.Lock()
-	s.peers = map[peer.ID]circleEntry{}
-	s.mu.Unlock()
+	// Drop everything cached — presented chains and the data plane's
+	// holders included: the caller just wrote a revocation to disk that no
+	// peer will echo as new (agy review, 2026-11-03).
+	s.forgetAll()
 	n := 0
 	for _, p := range s.h.Network().Peers() {
 		if !s.auth.Allows(p, CircleProtocolID) {
@@ -844,9 +1013,10 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) error {
 		}
 		c := s.circleByDID(r.Circle)
 		if c == nil {
-			// Not held here (a gate and its home circle): keep the
-			// verified revocation in memory for presented chains.
-			if r.Stmt == nil {
+			// Not held here: only the home circle matters (a gate hosts
+			// and verifies for it without a circle directory). Anything
+			// else is noise a member could flood us with.
+			if r.Stmt == nil || s.home == nil || r.Circle != s.home() || r.Spent(now) {
 				continue
 			}
 			s.mu.Lock()
@@ -856,6 +1026,9 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) error {
 				s.extraRevs[r.Circle] = set
 			}
 			fresh, err := set.Add(r.Stmt)
+			if fresh {
+				s.saveExtraRevsLocked()
+			}
 			s.mu.Unlock()
 			if err != nil {
 				return fmt.Errorf("peer revocation: %w", err)
@@ -863,6 +1036,7 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) error {
 			if fresh {
 				log.Printf("circle %s: statement revoked (learned from a peer; circle not held here)", shortDID(r.Circle))
 				s.forgetAll()
+				s.relaySoon()
 			}
 			continue
 		}
@@ -878,6 +1052,9 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) error {
 				log.Printf("circle %q: statement %s revoked (learned from a peer)", c.Config.Name, r.ID()[:8])
 				s.forgetAll()
 			}
+		}
+		if len(added) > 0 {
+			s.relaySoon()
 		}
 	}
 	return nil
@@ -909,4 +1086,76 @@ func ed25519Of(pk crypto.PubKey) (ed25519.PublicKey, error) {
 		return nil, err
 	}
 	return ed25519.PublicKey(raw), nil
+}
+
+// extraRevsPath is where a node without the home circle's directory keeps
+// that circle's revocations across restarts (a redeployed gate must not
+// resurrect a revoked grant until the desk reconnects).
+func (s *CircleService) extraRevsPath() string { return filepath.Join(s.root, "home-revocations.cbor") }
+
+func (s *CircleService) loadExtraRevs() {
+	raw, err := os.ReadFile(s.extraRevsPath())
+	if err != nil {
+		return
+	}
+	var list [][]byte
+	if err := cbor.Unmarshal(raw, &list); err != nil {
+		return
+	}
+	now := time.Now()
+	for _, item := range list {
+		st, err := statement.Decode(item)
+		if err != nil {
+			continue
+		}
+		r, err := circle.RevocationFromStatement(st)
+		if err != nil || r.Verify() != nil || r.Spent(now) {
+			continue
+		}
+		set := s.extraRevs[r.Circle]
+		if set == nil {
+			set = statement.NewRevocationSet()
+			s.extraRevs[r.Circle] = set
+		}
+		_, _ = set.Add(st)
+	}
+}
+
+// saveExtraRevsLocked writes the live extra revocations (caller holds s.mu).
+func (s *CircleService) saveExtraRevsLocked() {
+	now := time.Now()
+	var list [][]byte
+	for _, set := range s.extraRevs {
+		for _, st := range set.All() {
+			if r, err := circle.RevocationFromStatement(st); err != nil || r.Spent(now) {
+				set.Remove(st.ID())
+				continue
+			}
+			if b, err := st.Bytes(); err == nil {
+				list = append(list, b)
+			}
+		}
+	}
+	if err := os.MkdirAll(s.root, 0o700); err != nil {
+		return
+	}
+	raw, err := cbor.Marshal(list)
+	if err != nil {
+		return
+	}
+	tmp := s.extraRevsPath() + ".tmp"
+	if os.WriteFile(tmp, raw, 0o600) == nil {
+		_ = os.Rename(tmp, s.extraRevsPath())
+	}
+}
+
+// relaySoon pushes what this node now holds to every connected member
+// shortly: a revocation learned from one peer reaches the others through
+// this node even when its source goes offline (desk → gate → gate).
+func (s *CircleService) relaySoon() {
+	time.AfterFunc(500*time.Millisecond, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		s.Refresh(ctx)
+	})
 }

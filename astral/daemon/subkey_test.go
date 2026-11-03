@@ -109,6 +109,14 @@ func TestSubKeyActsWithinItsVerbs(t *testing.T) {
 	if _, _, err := asKey.Append("subject:local", astral.Event{Kind: "job", Source: "w"}); err == nil || !strings.Contains(err.Error(), "denied") {
 		t.Fatalf("claim-only key published locally: %v", err)
 	}
+	// Registers follow the subject: a claim-only key cannot read one even
+	// through -key on get (it used to go out unsigned as the device).
+	if err := clNas.Set("register:jobs/status", "busy"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := asKey.Get("register:jobs/status"); err == nil || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("claim-only key read a register: %v", err)
+	}
 	// A forged envelope: another key signing under this key's chain.
 	bogus := *asKey.Signer
 	_, bogusPriv, _ := ed25519.GenerateKey(rand.Reader)

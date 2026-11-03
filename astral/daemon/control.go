@@ -158,6 +158,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/ack", d.ctlAck)
 	mux.HandleFunc("POST /v0/set", d.ctlSet)
 	mux.HandleFunc("GET /v0/get", d.ctlGet)
+	mux.HandleFunc("POST /v0/get", d.ctlGetSigned)
 	mux.HandleFunc("POST /v0/wait", d.ctlWait)
 	mux.HandleFunc("POST /v0/heartbeat", d.ctlHeartbeat)
 	mux.HandleFunc("POST /v0/watch", d.ctlWatch)
@@ -396,6 +397,37 @@ func (d *Daemon) ctlGet(w http.ResponseWriter, r *http.Request) {
 	defer d.end()
 	q := r.URL.Query()
 	reg, ok, err := d.Get(nil, d.Ref(q.Get("circle"), q.Get("name")))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if !ok {
+		http.Error(w, "no such register", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, reg)
+}
+
+type getBody struct {
+	Principal *astral.Principal `json:"principal,omitempty"`
+	Circle    string            `json:"circle,omitempty"`
+	Name      string            `json:"name"`
+}
+
+// ctlGetSigned is Get for a caller acting as a sub-key: the read is
+// checked against that key, not the device.
+func (d *Daemon) ctlGetSigned(w http.ResponseWriter, r *http.Request) {
+	var b getBody
+	if err := decode(w, r, &b); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if !d.begin() {
+		writeErr(w, errors.New("shutting down"))
+		return
+	}
+	defer d.end()
+	reg, ok, err := d.Get(b.Principal, d.Ref(b.Circle, b.Name))
 	if err != nil {
 		writeErr(w, err)
 		return

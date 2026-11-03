@@ -9,10 +9,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 
 	"ioa.rocks/fabric/astral"
 	"ioa.rocks/fabric/cert"
@@ -614,17 +618,27 @@ func cmdCircleGrantNew(args []string) error {
 	if _, err := os.Stat(c.KeyPath()); err != nil {
 		return fmt.Errorf("this device holds no key for circle %q — grant from an owner device", c.Config.Name)
 	}
+	resList, err := daemon.CleanSubjects(strings.Split(*res, ","))
+	if err != nil {
+		return err
+	}
+	verbList := daemon.CleanList(strings.Split(*verbs, ","))
 	if len(gates) == 0 {
+		// Only a listed node's own global addresses make sense as hints:
+		// a dark owner device cannot be dialed by a stranger at all.
 		if dir, err := state.Open(*statePath); err == nil {
 			if st, err := daemon.NewClient(dir).Status(); err == nil {
-				// Verified-reachable addresses first; else everything announced.
-				cands := st.ReachableAddrs
-				if len(cands) == 0 {
-					cands = st.Addrs
-				}
-				for _, a := range cands {
-					if strings.Contains(a, "/p2p/") && !strings.Contains(a, "127.0.0.1") && !strings.Contains(a, "/ip6/::1") && !strings.Contains(a, "192.168.") && !strings.Contains(a, "p2p-circuit") {
-						gates = append(gates, a)
+				if st.Posture != "listed" {
+					fmt.Fprintln(os.Stderr, "note: this node is not listed — pass -gate with the listed gate that hosts the subject")
+				} else {
+					cands := st.ReachableAddrs
+					if len(cands) == 0 {
+						cands = st.Addrs
+					}
+					for _, a := range cands {
+						if globalDialable(a) {
+							gates = append(gates, a)
+						}
 					}
 				}
 			}
@@ -644,11 +658,9 @@ func cmdCircleGrantNew(args []string) error {
 	}
 	now := time.Now()
 	var rs []statement.Resource
-	resList := strings.Split(*res, ",")
 	for _, n := range resList {
-		rs = append(rs, statement.Resource{Kind: statement.KindSubject, Name: strings.TrimSpace(n), Sub: c.Config.DID})
+		rs = append(rs, statement.Resource{Kind: statement.KindSubject, Name: n, Sub: c.Config.DID})
 	}
-	verbList := strings.Split(*verbs, ",")
 	st, err := statement.Sign(priv, statement.Payload{
 		Aud: did.ForKey(pub), Sub: c.Config.DID, Res: rs, Verbs: verbList,
 		Nbf: now.Unix(), Exp: now.Add(*exp).Unix(), Iat: now.Unix(), Del: 0,
@@ -782,6 +794,38 @@ func cmdCircleGrantRevoke(args []string) error {
 	}
 	fmt.Printf("revoked grant %s (stored; members learn it on their next exchange with this node)\n", gs[i].ID[:8])
 	return nil
+}
+
+// globalDialable keeps a multiaddr a stranger on the internet can dial: a
+// /p2p/ component, no relay, and a global unicast IP (no loopback,
+// private, link-local, CGNAT/overlay or ULA ranges).
+func globalDialable(a string) bool {
+	if !strings.Contains(a, "/p2p/") || strings.Contains(a, "p2p-circuit") {
+		return false
+	}
+	m, err := ma.NewMultiaddr(a)
+	if err != nil {
+		return false
+	}
+	if strings.HasPrefix(a, "/dns") {
+		return true
+	}
+	ip, err := manet.ToIP(m)
+	if err != nil {
+		return false
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	if !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLoopback() {
+		return false
+	}
+	if cgnat := netip.MustParsePrefix("100.64.0.0/10"); cgnat.Contains(addr) {
+		return false
+	}
+	return true
 }
 
 // stringList is a repeatable string flag.
