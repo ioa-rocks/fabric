@@ -2,11 +2,16 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+
 	"ioa.rocks/fabric/astral"
+	"ioa.rocks/fabric/statement"
 )
 
 // Wake (contract rule 2): the wake channel may be cheap and lossy because
@@ -58,6 +63,63 @@ func (w *waiters) notify(ref astral.Ref) {
 	}
 }
 
+// waitTable is every parked wait with its holder, so a revocation can end
+// the ones whose authority died.
+type waitTable struct {
+	mu   sync.Mutex
+	next int
+	by   map[int]*parkedWait
+}
+
+type parkedWait struct {
+	ref    astral.Ref
+	hold   astral.Hold
+	cancel context.CancelCauseFunc
+}
+
+func newWaitTable() *waitTable { return &waitTable{by: map[int]*parkedWait{}} }
+
+func (w *waitTable) add(p *parkedWait) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.next++
+	w.by[w.next] = p
+	return w.next
+}
+
+func (w *waitTable) remove(id int) {
+	w.mu.Lock()
+	delete(w.by, id)
+	w.mu.Unlock()
+}
+
+func (w *waitTable) all() []*parkedWait {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make([]*parkedWait, 0, len(w.by))
+	for _, p := range w.by {
+		out = append(out, p)
+	}
+	return out
+}
+
+// errRevoked ends a wait whose holder lost its authority.
+var errRevoked = errors.New("astral: authority revoked while waiting")
+
+// waitHeld is waitLocal registered under a holder: a revocation push can
+// end it early.
+func (d *Daemon) waitHeld(ctx context.Context, ref astral.Ref, timeout time.Duration, hold astral.Hold) (Woke, error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	id := d.waits.add(&parkedWait{ref: ref, hold: hold, cancel: cancel})
+	defer d.waits.remove(id)
+	woke, err := d.waitLocal(ctx, ref, timeout)
+	if err != nil && errors.Is(context.Cause(ctx), errRevoked) {
+		return "", errRevoked
+	}
+	return woke, err
+}
+
 // waitLocal parks until ref (hosted here) has pending mail or timeout.
 // An active wait counts as activity: a parked waiter keeps its ephemeral
 // reply subject from idling out under it.
@@ -99,7 +161,7 @@ func (d *Daemon) Wait(ctx context.Context, pr *astral.Principal, ref astral.Ref,
 		if err := d.localAuthorize(pr, OpWait, ref, "", "", ""); err != nil {
 			return "", err
 		}
-		return d.waitLocal(ctx, ref, timeout)
+		return d.waitHeld(ctx, ref, timeout, holdOf("", pr))
 	}
 	host, ok, err := d.Store.Host(ref)
 	if err != nil || !ok {
@@ -144,7 +206,7 @@ func (d *Daemon) Watch(pr *astral.Principal, entity astral.Ref, watcher string) 
 		if err := d.localAuthorize(pr, OpWatch, entity, "", watcher, ""); err != nil {
 			return err
 		}
-		return d.Store.Watch(entity, astral.Ref{Circle: entity.Circle, Name: watcher})
+		return d.Store.WatchAs(entity, astral.Ref{Circle: entity.Circle, Name: watcher}, holdOf("", pr))
 	}
 	_, err = d.remote(host, request{Op: OpWatch, Circle: entity.Circle, Name: entity.Name, Consumer: watcher, Principal: pr})
 	return err
@@ -167,17 +229,96 @@ func (d *Daemon) entityHost(entity astral.Ref) (host string, remote bool, err er
 // tests can shrink it.
 var TombstoneKeep = 24 * time.Hour
 
+// RecheckInterval is how often held leases, watches and waits are
+// re-checked against their holder's authority regardless of pushes (an
+// expired chain has no push). Variable so tests can shrink it.
+var RecheckInterval = 30 * time.Second
+
 func (d *Daemon) monitorLoop() {
 	t := time.NewTicker(MonitorInterval)
 	defer t.Stop()
+	rc := time.NewTicker(RecheckInterval)
+	defer rc.Stop()
 	for {
 		select {
 		case <-d.ctx.Done():
 			return
 		case <-t.C:
+		case <-rc.C:
+			d.recheck()
+			continue
 		}
 		d.sweepMonitors()
 		d.sweepExpired()
+	}
+}
+
+// stillHolds re-verifies one holder for verb on ref: nil when it still may,
+// an error when its authority is gone (revoked, expired, no longer a
+// member). A holder whose peer is not connected right now cannot be
+// re-checked and is left to its own timeout.
+func (d *Daemon) stillHolds(h astral.Hold, ref astral.Ref, verb string) error {
+	if d.Fabric == nil || d.Fabric.Circle == nil {
+		return nil
+	}
+	p := d.Fabric.Host.ID()
+	if h.Peer != "" {
+		var err error
+		if p, err = peer.Decode(h.Peer); err != nil {
+			return nil
+		}
+		if d.Fabric.Host.Network().Connectedness(p) != network.Connected {
+			return nil
+		}
+	}
+	want := statement.Want{Sub: ref.Circle, Res: statement.Resource{Kind: statement.KindSubject, Name: ref.Name}, Verb: verb, Now: time.Now()}
+	if h.Key == "" {
+		if h.Peer == "" {
+			return nil // the device itself, local trust
+		}
+		ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
+		defer cancel()
+		return d.Fabric.Circle.Verify(ctx, p, want)
+	}
+	comp, err := d.Fabric.Circle.Present(p, h.Chain)
+	if err != nil {
+		return err
+	}
+	return d.Fabric.Circle.VerifyPresented(p, comp.AuthLeafID(), h.Key, want)
+}
+
+// recheck releases every lease, drops every watch and ends every parked
+// wait whose holder no longer verifies (memo §12.24: push-invalidate, so
+// another worker can reclaim at once and a revoked key's wait returns).
+func (d *Daemon) recheck() {
+	if !d.begin() {
+		return
+	}
+	defer d.end()
+	d.recheckMu.Lock()
+	defer d.recheckMu.Unlock()
+	now := time.Now()
+	if leases, err := d.Store.Leases(now); err == nil {
+		for _, l := range leases {
+			if err := d.stillHolds(l.Hold, l.Ref, statement.VerbClaim); err != nil {
+				log.Printf("astral: lease on %s by %s released: %v", l.Ref, l.Consumer, err)
+				_ = d.Store.Release(l.Ref, l.EventID)
+			}
+		}
+	}
+	if ws, err := d.Store.Watches(); err == nil {
+		for _, w := range ws {
+			inbox := astral.Ref{Circle: w.Entity.Circle, Name: "subject:" + w.Entity.Name}
+			if err := d.stillHolds(w.Hold, inbox, statement.VerbRead); err != nil {
+				log.Printf("astral: watch on %s by %s dropped: %v", w.Entity, w.Watcher, err)
+				_ = d.Store.Unwatch(w.Entity, w.Watcher)
+			}
+		}
+	}
+	for _, pw := range d.waits.all() {
+		if err := d.stillHolds(pw.hold, pw.ref, statement.VerbClaim); err != nil {
+			pw.cancel(errRevoked)
+		}
 	}
 }
 

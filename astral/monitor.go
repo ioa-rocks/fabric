@@ -77,6 +77,9 @@ func (s *Store) Heartbeat(entity Ref, ttl time.Duration) (Heartbeat, error) {
 	if ttl <= 0 {
 		ttl = 30 * time.Second
 	}
+	if ttl > MaxHeartbeat {
+		ttl = MaxHeartbeat
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UnixNano()
@@ -98,13 +101,49 @@ func (s *Store) Heartbeat(entity Ref, ttl time.Duration) (Heartbeat, error) {
 
 // Watch subscribes watcher (a subject ref) to entity's death notices.
 func (s *Store) Watch(entity, watcher Ref) error {
+	return s.WatchAs(entity, watcher, Hold{})
+}
+
+// WatchAs is Watch recording who subscribed (see Hold).
+func (s *Store) WatchAs(entity, watcher Ref, hold Hold) error {
 	if err := watcher.Valid(); err != nil {
 		return err
 	}
 	if err := validEntity(entity); err != nil {
 		return err
 	}
-	return s.db.Set([]byte(k2("w/", entity, watcher.key())), nil, pebble.Sync)
+	raw, err := json.Marshal(hold)
+	if err != nil {
+		return err
+	}
+	return s.db.Set([]byte(k2("w/", entity, watcher.key())), raw, pebble.Sync)
+}
+
+// WatchInfo is one subscription with its holder.
+type WatchInfo struct {
+	Entity  Ref
+	Watcher Ref
+	Hold    Hold
+}
+
+// Watches lists every subscription.
+func (s *Store) Watches() ([]WatchInfo, error) {
+	it, err := s.db.NewIter(prefixBounds("w/"))
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var out []WatchInfo
+	for it.First(); it.Valid(); it.Next() {
+		entity, rest := mustParseKey(string(it.Key())[2:])
+		watcher, _ := mustParseKey(strings.TrimPrefix(rest, "/"))
+		var h Hold
+		if len(it.Value()) > 0 {
+			_ = json.Unmarshal(it.Value(), &h)
+		}
+		out = append(out, WatchInfo{Entity: entity, Watcher: watcher, Hold: h})
+	}
+	return out, nil
 }
 
 // Unwatch removes a subscription.

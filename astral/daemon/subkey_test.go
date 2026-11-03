@@ -137,3 +137,95 @@ func TestSubKeyActsWithinItsVerbs(t *testing.T) {
 		t.Fatalf("key records: %+v", ks)
 	}
 }
+
+// TestRevocationPushesLeasesAndWaits: a sub-key holds a long lease and a
+// parked wait on nas; revoking it on desk releases the lease (the device
+// reclaims the job at once) and ends the wait with a revocation error.
+// Lease and heartbeat durations are capped.
+func TestRevocationPushesLeasesAndWaits(t *testing.T) {
+	daemon.OutboxInterval = 300 * time.Millisecond
+	_, root, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nas := newMeshNode(t, root, "nas")
+	desk := newMeshNode(t, root, "desk")
+	roster := []*event.Event{nas.event, desk.event}
+	x, err := circle.Init(nas.circleRoot(), "x", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, _ := x.Export()
+	attestInto(t, nas, x)
+	joinCircle(t, desk, bundle, true)
+	xDID := x.Config.DID
+
+	fnas := nas.fabric(t, root, "nas", nil, roster...)
+	dnas := startDaemon(t, nas.statePath, fnas)
+	clNas := daemon.NewClient(nas.statePath).In(xDID)
+	for _, n := range []string{"subject:jobs", "subject:quiet"} {
+		if err := clNas.Declare(n, astral.DeliveryShared, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fdesk := desk.fabric(t, root, "desk", nil, roster...)
+	startDaemon(t, desk.statePath, fdesk)
+	fdesk.Host.Peerstore().AddAddrs(fnas.Host.ID(), dnas.Fabric.Host.Addrs(), time.Hour)
+	if err := fdesk.Host.Connect(t.Context(), fdesk.Host.Peerstore().PeerInfo(fnas.Host.ID())); err != nil {
+		t.Fatal(err)
+	}
+	clDesk := daemon.NewClient(desk.statePath)
+	waitConnected(t, clDesk, "nas")
+	waitPlaced(t, clDesk.In(xDID), "subject:jobs @ "+xDID)
+	waitPlaced(t, clDesk.In(xDID), "subject:quiet @ "+xDID)
+	if _, _, err := clDesk.In(xDID).Append("subject:jobs", astral.Event{Kind: "job", Source: "cron", Content: "one"}); err != nil {
+		t.Fatal(err)
+	}
+
+	k, err := fdesk.IssueKey(xDID, []string{"*"}, []string{"claim"}, time.Hour, "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	asKey := clDesk.WithKey(signerFor(t, k))
+	c, err := asKey.Claim("subject:jobs", "w", 3600, 1)
+	if err != nil || len(c) != 1 {
+		t.Fatalf("claim: %+v err=%v", c, err)
+	}
+	if until := time.Unix(0, c[0].Until); until.After(time.Now().Add(astral.MaxLease + time.Minute)) {
+		t.Fatalf("lease not capped: until %s", until)
+	}
+	// The device cannot take the job while the key holds it.
+	if got, _ := clDesk.In(xDID).Claim("subject:jobs", "other", 30, 1); len(got) != 0 {
+		t.Fatalf("leased job reclaimed early: %+v", got)
+	}
+	// A parked wait under the key.
+	waitErr := make(chan error, 1)
+	go func() {
+		_, err := asKey.Wait("subject:quiet", 60)
+		waitErr <- err
+	}()
+	time.Sleep(500 * time.Millisecond)
+
+	if err := fdesk.RevokeKey(k.ID[:8]); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got, _ := clDesk.In(xDID).Claim("subject:jobs", "other", 30, 1)
+		if len(got) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("revoked key's lease was not released")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	select {
+	case err := <-waitErr:
+		if err == nil || !strings.Contains(err.Error(), "revoked") {
+			t.Fatalf("wait under a revoked key returned %v, want a revocation error", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("wait under a revoked key did not return")
+	}
+}

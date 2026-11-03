@@ -77,10 +77,30 @@ type CircleService struct {
 	roots  statement.Roots
 	certOf func(peer.ID) (*cert.Cert, bool)
 
-	mu        sync.RWMutex
-	peers     map[peer.ID]circleEntry
-	presented map[peer.ID]map[presentKey]*statement.Compiled // chains presented on a connection (sub-keys, grantees)
-	stop      func()
+	mu           sync.RWMutex
+	peers        map[peer.ID]circleEntry
+	presented    map[peer.ID]map[presentKey]*statement.Compiled // chains presented on a connection (sub-keys, grantees)
+	onInvalidate []func()
+	stop         func()
+}
+
+// OnInvalidate registers a hook run (in its own goroutine) whenever cached
+// authority is dropped — a revocation arrived, a device was forgotten — so
+// a data plane can re-check what it holds under that authority (leases,
+// waits, subscriptions) at once instead of at the next verb.
+func (s *CircleService) OnInvalidate(f func()) {
+	s.mu.Lock()
+	s.onInvalidate = append(s.onInvalidate, f)
+	s.mu.Unlock()
+}
+
+func (s *CircleService) invalidated() {
+	s.mu.RLock()
+	hooks := append([]func(){}, s.onInvalidate...)
+	s.mu.RUnlock()
+	for _, f := range hooks {
+		go f()
+	}
 }
 
 // presentKey identifies a presented chain on one connection: the authority
@@ -418,12 +438,14 @@ func shortDID(d string) string {
 // against the revocation set.
 func (s *CircleService) forgetDevice(deviceDID string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for p := range s.peers {
 		if did, err := deviceDIDOf(p); err == nil && did == deviceDID {
 			delete(s.peers, p)
+			delete(s.presented, p)
 		}
 	}
+	s.mu.Unlock()
+	s.invalidated()
 }
 
 // forgetAll drops every cached result: a by-id revocation names a statement,
@@ -434,6 +456,7 @@ func (s *CircleService) forgetAll() {
 	s.peers = map[peer.ID]circleEntry{}
 	s.presented = map[peer.ID]map[presentKey]*statement.Compiled{}
 	s.mu.Unlock()
+	s.invalidated()
 }
 
 // ErrNotPresented is a verb under a chain this connection never presented.

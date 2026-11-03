@@ -146,6 +146,8 @@ type Daemon struct {
 	done              chan struct{} // outbox loop exited
 	mdone             chan struct{} // monitor loop exited
 	wake              *waiters
+	waits             *waitTable // parked waits, by holder, for revocation push
+	recheckMu         sync.Mutex
 	stopNetworkNotify func()
 
 	ctx    context.Context
@@ -184,8 +186,8 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 	d := &Daemon{
 		Path: statePath, Store: st,
 		kick: make(chan struct{}, 1), done: make(chan struct{}), mdone: make(chan struct{}),
-		wake: newWaiters(),
-		ctx:  ctx, cancel: cancel,
+		wake: newWaiters(), waits: newWaitTable(),
+		ctx: ctx, cancel: cancel,
 	}
 	if fd != nil {
 		d.Fabric = fd
@@ -214,6 +216,12 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		}}
 		fd.Host.Network().Notify(nb)
 		d.stopNetworkNotify = func() { fd.Host.Network().StopNotify(nb) }
+		if fd.Circle != nil {
+			// A revocation or a forgotten device: re-check every lease,
+			// watch and parked wait held under the dropped authority now,
+			// not at its next verb.
+			fd.Circle.OnInvalidate(d.recheck)
+		}
 	}
 	return d, nil
 }
@@ -380,7 +388,7 @@ func (d *Daemon) Claim(pr *astral.Principal, ref astral.Ref, consumer string, le
 		if err := d.localAuthorize(pr, OpClaim, ref, "", consumer, ""); err != nil {
 			return nil, err
 		}
-		c, err := d.Store.Claim(ref, d.localConsumer(pr, consumer), lease, n)
+		c, err := d.Store.ClaimAs(ref, d.localConsumer(pr, consumer), lease, n, holdOf("", pr))
 		d.learnReplyRoutes(ref.Circle, c)
 		return c, err
 	}
@@ -625,10 +633,9 @@ func (d *Daemon) handleStreamV2(s network.Stream) {
 	if req.Circle == "" {
 		req.Circle = d.Home()
 	}
-	if req.Op == OpWait {
-		_ = s.SetDeadline(time.Now().Add(time.Duration(req.LeaseNS) + 15*time.Second))
-	}
-	resp := d.serve(req, s.Conn().RemotePeer())
+	ctx, cancel := d.streamContext(s, req.Op)
+	defer cancel()
+	resp := d.serve(ctx, req, s.Conn().RemotePeer())
 	out, err := cbor.Marshal(resp)
 	if err != nil {
 		return
@@ -653,15 +660,34 @@ func (d *Daemon) handleStreamV1(s network.Stream) {
 		req.Refs = d.homeRefs(req.Names)
 		req.Names = nil
 	}
-	if req.Op == OpWait {
-		_ = s.SetDeadline(time.Now().Add(time.Duration(req.LeaseNS) + 15*time.Second))
-	}
-	resp := d.serve(req, s.Conn().RemotePeer())
+	ctx, cancel := d.streamContext(s, req.Op)
+	defer cancel()
+	resp := d.serve(ctx, req, s.Conn().RemotePeer())
 	if req.Op == OpRegistry {
 		resp.Names = d.bareNames(resp.Refs)
 		resp.Refs = nil
 	}
 	_ = cbor.NewEncoder(s).Encode(resp)
+}
+
+// streamContext is the context a request runs under: the daemon's, and
+// for a wait also the stream's — a peer that goes away (or is cut off by a
+// revocation closing its connection) ends its park at once instead of
+// leaving a goroutine until the timeout (memo §12.24).
+func (d *Daemon) streamContext(s network.Stream, op Op) (context.Context, context.CancelFunc) {
+	if op != OpWait {
+		return context.WithCancel(d.ctx)
+	}
+	_ = s.SetDeadline(time.Now().Add(11*time.Minute + 15*time.Second))
+	ctx, cancel := context.WithCancel(d.ctx)
+	go func() {
+		// The request was fully read; the next read returns only when the
+		// peer closes or resets the stream.
+		var b [1]byte
+		_, _ = s.Read(b[:])
+		cancel()
+	}()
+	return ctx, cancel
 }
 
 func (d *Daemon) homeRefs(names []string) []astral.Ref {
@@ -746,7 +772,17 @@ func entityOf(register string) string {
 	return rest
 }
 
-func (d *Daemon) serve(req request, remote peer.ID) (resp response) {
+// holdOf is the Hold for a call: the connection peer and, for a sub-key or
+// grantee, its chain.
+func holdOf(peer string, pr *astral.Principal) astral.Hold {
+	h := astral.Hold{Peer: peer}
+	if pr != nil {
+		h.Key, h.Chain = pr.Key, pr.Chain
+	}
+	return h
+}
+
+func (d *Daemon) serve(ctx context.Context, req request, remote peer.ID) (resp response) {
 	fail := func(err error) response { return response{Err: err.Error()} }
 	from := d.peerName(remote)
 	ref := req.ref()
@@ -816,7 +852,7 @@ func (d *Daemon) serve(req request, remote peer.ID) (resp response) {
 		if timeout <= 0 || timeout > 10*time.Minute {
 			timeout = 30 * time.Second
 		}
-		woke, err := d.waitLocal(d.ctx, ref, timeout)
+		woke, err := d.waitHeld(ctx, ref, timeout, holdOf(remote.String(), req.Principal))
 		if err != nil {
 			return fail(err)
 		}
@@ -825,9 +861,9 @@ func (d *Daemon) serve(req request, remote peer.ID) (resp response) {
 		_, err := d.Store.Heartbeat(ref, time.Duration(req.LeaseNS))
 		return fail0(err)
 	case OpWatch:
-		return fail0(d.Store.Watch(ref, astral.Ref{Circle: ref.Circle, Name: req.Consumer}))
+		return fail0(d.Store.WatchAs(ref, astral.Ref{Circle: ref.Circle, Name: req.Consumer}, holdOf(remote.String(), req.Principal)))
 	case OpClaim:
-		c, err := d.Store.Claim(ref, req.Consumer+"@"+from, time.Duration(req.LeaseNS), req.N)
+		c, err := d.Store.ClaimAs(ref, req.Consumer+"@"+from, time.Duration(req.LeaseNS), req.N, holdOf(remote.String(), req.Principal))
 		if err != nil {
 			return fail(err)
 		}

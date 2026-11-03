@@ -645,6 +645,15 @@ publish even on its own node. Leases and sources name the key
 (`<consumer>@<key8>@<member>`). Foreign grantees present their chain the
 same way (next slices, `tasks/open/astral-per-circle.md`).
 
+**Revocation reaches live state at once.** Every lease, watch and parked
+wait records who holds it (connection peer, and the chain for a sub-key).
+When a revocation lands — or a device is forgotten — the host re-checks
+each holder: a lease whose authority died is released so another worker
+reclaims the job immediately, its watches are dropped, and its parked
+waits return a revocation error. The same re-check runs on a timer for
+chains that merely expire. Leases and heartbeat TTLs are capped at ten
+minutes, and a wait ends when its stream does.
+
 ```sh
 fabric astral subject subject:queues/agents/concierge/inbox -delivery exclusive -accepts user,system
 fabric astral append subject:queues/agents/concierge/inbox -kind user "translate this"

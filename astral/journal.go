@@ -143,6 +143,7 @@ type LeaseInfo struct {
 	EventID  string `json:"event_id"`
 	Consumer string `json:"consumer"`
 	Until    int64  `json:"until"`
+	Hold     Hold   `json:"hold,omitempty"`
 }
 
 // Placement is one learned registry entry: who hosts a remote ref.
@@ -211,7 +212,25 @@ type ack struct {
 type lease struct {
 	Consumer string `json:"consumer"`
 	Until    int64  `json:"until"`
+	Hold     Hold   `json:"hold,omitempty"`
 }
+
+// Hold records under which authority a lease (or a watch) was taken, so a
+// revocation or expiry can find and release it: the connection peer and,
+// for a sub-key or grantee, the chain it presented. Empty for a solo node.
+type Hold struct {
+	Peer  string `json:"peer,omitempty"`  // peer ID of the caller's connection ("" = this node)
+	Key   string `json:"key,omitempty"`   // presenting key when not the peer itself
+	Chain []byte `json:"chain,omitempty"` // that key's statement chain, wire bytes
+}
+
+// MaxLease and MaxHeartbeat bound caller-chosen durations: a revoked
+// claimant's lease, or a dead runner's lease, ends within these even if
+// the push never reaches the host.
+var (
+	MaxLease     = 10 * time.Minute
+	MaxHeartbeat = 10 * time.Minute
+)
 
 // Open opens (or creates) a journal directory.
 func Open(dir string) (*Store, error) {
@@ -532,6 +551,11 @@ func (s *Store) nextSeq(ref Ref) (uint64, error) {
 // A lapsed lease is re-claimable (by anyone holding the drain capability —
 // for a queue that is how a crashed worker's event reaches another).
 func (s *Store) Claim(ref Ref, consumer string, d time.Duration, n int) ([]Claimed, error) {
+	return s.ClaimAs(ref, consumer, d, n, Hold{})
+}
+
+// ClaimAs is Claim recording who holds the lease (see Hold).
+func (s *Store) ClaimAs(ref Ref, consumer string, d time.Duration, n int, hold Hold) ([]Claimed, error) {
 	subject, ok, err := s.Subject(ref)
 	if err != nil {
 		return nil, err
@@ -546,6 +570,9 @@ func (s *Store) Claim(ref Ref, consumer string, d time.Duration, n int) ([]Claim
 	}
 	if d <= 0 {
 		d = 30 * time.Second
+	}
+	if d > MaxLease {
+		d = MaxLease
 	}
 	now := time.Now()
 	until := now.Add(d).UnixNano()
@@ -599,7 +626,7 @@ func (s *Store) Claim(ref Ref, consumer string, d time.Duration, n int) ([]Claim
 		} else if ok && l.Until > now.UnixNano() && l.Consumer != consumer {
 			continue
 		}
-		if err := s.setJSON(b, k2("l/", ref, ev.ID), lease{Consumer: consumer, Until: until}); err != nil {
+		if err := s.setJSON(b, k2("l/", ref, ev.ID), lease{Consumer: consumer, Until: until, Hold: hold}); err != nil {
 			return nil, err
 		}
 		out = append(out, Claimed{Event: ev, Consumer: consumer, Until: until})
@@ -685,9 +712,17 @@ func (s *Store) Leases(now time.Time) ([]LeaseInfo, error) {
 			continue
 		}
 		ref, rest := mustParseKey(string(it.Key())[2:])
-		out = append(out, LeaseInfo{Ref: ref, EventID: strings.TrimPrefix(rest, "/"), Consumer: l.Consumer, Until: l.Until})
+		out = append(out, LeaseInfo{Ref: ref, EventID: strings.TrimPrefix(rest, "/"), Consumer: l.Consumer, Until: l.Until, Hold: l.Hold})
 	}
 	return out, nil
+}
+
+// Release ends a lease early (the holder's authority died): the event is
+// claimable again at once. Unknown or lapsed leases are a no-op.
+func (s *Store) Release(ref Ref, eventID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.Delete([]byte(k2("l/", ref, eventID)), pebble.Sync)
 }
 
 // Set writes a register (latest value wins; intermediate values are lost
