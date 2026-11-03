@@ -261,16 +261,13 @@ func (d *Daemon) monitorLoop() {
 	}
 }
 
-// stillHolds re-verifies one holder for verb on ref: nil when it still may,
-// an error when its authority is gone (revoked, expired, no longer a
-// member). A holder whose peer is not connected right now cannot be
-// re-checked and is left to its own timeout.
 // stillHolds re-verifies one holder for verb on ref ("" = the chain's
 // own validity only, for rights that come from host-side state such as a
 // reply slot). A key holder is checked from the chain stored with the
 // hold, connected or not, without touching presence state; a device
-// holder is checked through the circle service while connected and
-// against member-level revocation when not.
+// holder is checked through the circle service while connected and, when
+// not, against member-level revocation and the attestation stored with
+// the hold.
 func (d *Daemon) stillHolds(h astral.Hold, ref astral.Ref, verb string) error {
 	if d.Fabric == nil || d.Fabric.Circle == nil {
 		return nil
@@ -295,6 +292,16 @@ func (d *Daemon) stillHolds(h astral.Hold, ref astral.Ref, verb string) error {
 	if d.Fabric.Host.Network().Connectedness(p) != network.Connected {
 		if d.Fabric.Store.IsRevoked(p, time.Now()) {
 			return errors.New("device revoked")
+		}
+		if len(h.Chain) > 0 {
+			// Its attestation in the ref's circle, as it stood when the
+			// hold was taken: window and circle revocations still apply
+			// while the device is away (Codex review, 2026-11-03).
+			want := statement.Want{Verb: verb, Now: time.Now()}
+			if verb != "" {
+				want.Res = statement.Resource{Kind: statement.KindSubject, Name: ref.Name}
+			}
+			return d.Fabric.Circle.CheckChain(h.Chain, want)
 		}
 		return nil
 	}

@@ -11,6 +11,7 @@ import (
 	"ioa.rocks/fabric/astral"
 	"ioa.rocks/fabric/astral/daemon"
 	"ioa.rocks/fabric/circle"
+	fabricdaemon "ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/event"
 )
 
@@ -59,7 +60,8 @@ func TestVerbsCheckedAgainstCircle(t *testing.T) {
 	nas := newMeshNode(t, root, "nas")
 	desk := newMeshNode(t, root, "desk")
 	carbon := newMeshNode(t, root, "carbon")
-	roster := []*event.Event{nas.event, desk.event, carbon.event}
+	guest := newMeshNode(t, root, "guest")
+	roster := []*event.Event{nas.event, desk.event, carbon.event, guest.event}
 
 	// Circle X is minted on nas; desk joins and attests; carbon holds no X.
 	x, err := circle.Init(nas.circleRoot(), "x", "pw")
@@ -72,10 +74,11 @@ func TestVerbsCheckedAgainstCircle(t *testing.T) {
 	}
 	attestInto(t, nas, x) // the minting node is a device of its circle too
 	joinCircle(t, desk, bundle, true)
+	joinCircle(t, guest, bundle, false) // holds X's bundle, is no device of X
 	xDID := x.Config.DID
 
 	fnas := nas.fabric(t, root, "nas", nil, roster...)
-	dnas := startDaemon(t, nas.statePath, fnas)
+	startDaemon(t, nas.statePath, fnas)
 	clNas := daemon.NewClient(nas.statePath).In(xDID)
 	if err := clNas.Declare("subject:jobs", astral.DeliveryShared, nil); err != nil {
 		t.Fatal(err)
@@ -85,19 +88,34 @@ func TestVerbsCheckedAgainstCircle(t *testing.T) {
 		t.Fatal("declared a subject in a circle the node does not hold")
 	}
 
+	// Every node connects to every earlier one: the test is about verbs,
+	// not about how fast the reconnect loop finds a peer under load.
+	up := []*fabricdaemon.Daemon{fnas}
 	connect := func(n *meshNode) *daemon.Client {
 		fd := n.fabric(t, root, n.cert.Payload.Meta.Name, nil, roster...)
 		startDaemon(t, n.statePath, fd)
-		fd.Host.Peerstore().AddAddrs(fnas.Host.ID(), dnas.Fabric.Host.Addrs(), time.Hour)
-		if err := fd.Host.Connect(t.Context(), fd.Host.Peerstore().PeerInfo(fnas.Host.ID())); err != nil {
-			t.Fatalf("connect: %v", err)
+		for _, other := range up {
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				fd.Host.Peerstore().AddAddrs(other.Host.ID(), other.Host.Addrs(), time.Hour)
+				err := fd.Host.Connect(t.Context(), fd.Host.Peerstore().PeerInfo(other.Host.ID()))
+				if err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("connect: %v", err)
+				}
+				time.Sleep(100 * time.Millisecond) // the other host may still be binding its listener
+			}
 		}
+		up = append(up, fd)
 		cl := daemon.NewClient(n.statePath)
 		waitConnected(t, cl, "nas")
 		return cl
 	}
 	clDesk := connect(desk)
 	clCarbon := connect(carbon)
+	clGuest := connect(guest)
 	waitPlaced(t, clDesk.In(xDID), "subject:jobs @ "+xDID)
 
 	// desk, a device of X: publish, claim, own-lease ack all pass.
@@ -140,6 +158,17 @@ func TestVerbsCheckedAgainstCircle(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitPlaced(t, clDesk, "subject:home")
+	// The registry tells a peer only about the circles it is a device of:
+	// guest could verify nas's announcement (it holds X's bundle) but is
+	// no device of X, so nas never named X's subject to it; the home
+	// circle's it learns (Codex review, 2026-11-03).
+	if err := daemon.NewClient(nas.statePath).Declare("subject:lobby", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	waitPlaced(t, clGuest, "subject:lobby")
+	if s, _ := clGuest.Status(); s.Placed["subject:jobs @ "+xDID] != "" {
+		t.Fatalf("a non-device of X learned X's subject: %v", s.Placed)
+	}
 	if _, fresh, err := clDesk.Append("subject:home", astral.Event{Kind: "note", Source: "t"}); err != nil || !fresh {
 		t.Fatalf("home-circle publish: fresh=%v err=%v", fresh, err)
 	}

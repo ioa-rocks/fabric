@@ -395,6 +395,12 @@ func (d *Daemon) append(pr *astral.Principal, ref astral.Ref, ev astral.Event, w
 		if wantReply {
 			return false, "", fmt.Errorf("astral: host %s unreachable; a request with a reply slot is not parked: %w", d.hostLabel(host), err)
 		}
+		if pr != nil {
+			// A signed operation cannot be replayed later: the outbox
+			// retries as the device, which would publish under its
+			// broader rights (Codex review, 2026-11-03).
+			return false, "", fmt.Errorf("astral: host %s unreachable; a sub-key's publish is not parked: %w", d.hostLabel(host), err)
+		}
 		// Park it; the outbox loop retries when the host is reachable.
 		if qerr := d.Store.Enqueue(ref, ev); qerr != nil {
 			return false, "", qerr
@@ -728,7 +734,7 @@ func (d *Daemon) presentOnly(p peer.ID, pr *astral.Principal) error {
 		}
 	}
 	if err := d.Fabric.Circle.VerifyPresentedValid(p, pr.AuthID(), pr.Key); err != nil {
-		return fmt.Errorf("%w: %s: %v", ErrDenied, keyLabel(pr.Key), err)
+		return fmt.Errorf("%w: %s: %w", ErrDenied, keyLabel(pr.Key), err)
 	}
 	return nil
 }
@@ -758,21 +764,33 @@ func (d *Daemon) authorizePrincipal(p peer.ID, pr *astral.Principal, op Op, ref 
 		}
 	}
 	if err := pr.Verify(string(op), ref, eventID, consumer, value, time.Now()); err != nil {
+		d.dropStranger(p)
 		return fmt.Errorf("%w: %v", ErrDenied, err)
 	}
 	verb, res := verbFor(op, ref)
+	var err error
 	if verb == "" || ownLease {
 		// The right comes from host-side state; the chain must still be
 		// presented and alive all the same.
-		return d.presentOnly(p, pr)
-	}
-	err := d.Fabric.Circle.VerifyPresented(p, pr.AuthID(), pr.Key, statement.Want{
+		err = d.presentOnly(p, pr)
+	} else if verr := d.Fabric.Circle.VerifyPresented(p, pr.AuthID(), pr.Key, statement.Want{
 		Sub: res.Circle, Res: statement.Resource{Kind: statement.KindSubject, Name: res.Name},
 		Verb: verb, Now: time.Now(),
-	})
-	if err != nil {
-		return fmt.Errorf("%w: %s on %s as %s: %v", ErrDenied, verb, res, keyLabel(pr.Key), err)
+	}); verr != nil {
+		err = fmt.Errorf("%w: %s on %s as %s: %w", ErrDenied, verb, res, keyLabel(pr.Key), verr)
 	}
+	if errors.Is(err, fabricdaemon.ErrNotPresented) {
+		// Signed by a key no presented chain names: a stranger with
+		// nothing behind it.
+		d.dropStranger(p)
+	}
+	if err != nil {
+		return err
+	}
+	// A chain is public bytes; only a signature by the key it names
+	// proves the caller holds it, and only then is its connection pinned
+	// past the grace disconnect (Codex review, 2026-11-03).
+	d.Fabric.Circle.Keep(p)
 	return nil
 }
 
@@ -1078,9 +1096,9 @@ func (d *Daemon) serve(ctx context.Context, req request, remote peer.ID) (resp r
 		if req.Principal == nil || len(req.Principal.Chain) == 0 {
 			return fail(fmt.Errorf("%w: present carries no chain", ErrDenied))
 		}
-		if _, err := d.Fabric.Circle.Present(remote, req.Principal.Chain); err != nil {
-			d.dropStranger(remote)
-			return fail(fmt.Errorf("%w: %v", ErrDenied, err))
+		eventID, consumer, value := req.digestFields()
+		if err := d.authorizePrincipal(remote, req.Principal, OpPresent, ref, eventID, consumer, value, true); err != nil {
+			return fail(err)
 		}
 		return response{}
 	}
@@ -1140,13 +1158,23 @@ func (d *Daemon) serve(ctx context.Context, req request, remote peer.ID) (resp r
 		// The chain was presented earlier on this connection: keep its
 		// bytes with the hold so a re-check never depends on the peer.
 		hold.Chain, _ = d.Fabric.Circle.PresentedChain(remote, req.Principal.AuthID(), req.Principal.Key)
+	} else if req.Principal == nil && d.Fabric != nil && d.Fabric.Circle != nil {
+		// Likewise the device's own attestation in the ref's circle: a
+		// holder that goes offline is still checked against its circle's
+		// window and revocations (Codex review, 2026-11-03).
+		hold.Chain, _ = d.Fabric.Circle.DeviceChain(remote, ref.Circle)
 	}
 	switch req.Op {
 	case OpRegistry:
+		if !d.isMember(remote) || req.Principal != nil {
+			// The registry is the devices' business; a grantee learns
+			// its routes from the responses to its own calls.
+			return fail(fmt.Errorf("%w: registry exchange is for member devices", ErrDenied))
+		}
 		if err := d.learnRegistry(remote, d.hostable(remote, req.Refs)); err != nil && !errors.As(err, new(*astral.ConflictError)) {
 			return fail(err)
 		}
-		return response{Refs: d.hostedRefs()}
+		return response{Refs: d.sharedRefs(remote, d.hostedRefs())}
 	case OpAppend:
 		ev := req.Event
 		ev.Source = stampSource(ev.Source, from)
@@ -1251,8 +1279,35 @@ func (d *Daemon) hostable(p peer.ID, refs []astral.Ref) []astral.Ref {
 	return out
 }
 
+// sharedRefs keeps the refs whose circle the peer is a live device of:
+// what this node tells it about, and what it is told. A subject's name is
+// the circle's business, not every member's (Codex review, 2026-11-03).
+func (d *Daemon) sharedRefs(p peer.ID, refs []astral.Ref) []astral.Ref {
+	if d.Fabric == nil {
+		return refs
+	}
+	seen := map[string]bool{}
+	out := make([]astral.Ref, 0, len(refs))
+	for _, r := range refs {
+		ok, done := seen[r.Circle]
+		if !done {
+			ok = d.authorizeMember(p, r.Circle) == nil
+			seen[r.Circle] = ok
+		}
+		if ok {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 func (d *Daemon) refreshRegistry(p peer.ID) {
-	resp, err := d.remoteWithin(p.String(), request{Op: OpRegistry, Refs: d.hostedRefs()}, 15*time.Second)
+	// A peer may connect while the daemon shuts down; the store is gone.
+	if !d.begin() {
+		return
+	}
+	defer d.end()
+	resp, err := d.remoteWithin(p.String(), request{Op: OpRegistry, Refs: d.sharedRefs(p, d.hostedRefs())}, 15*time.Second)
 	if err != nil {
 		log.Printf("astral: registry refresh from %s: %v", d.peerName(p), err)
 		return

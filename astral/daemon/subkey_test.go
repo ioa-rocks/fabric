@@ -10,6 +10,7 @@ import (
 
 	"ioa.rocks/fabric/astral"
 	"ioa.rocks/fabric/astral/daemon"
+	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
 	fabricdaemon "ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/event"
@@ -43,7 +44,8 @@ func TestSubKeyActsWithinItsVerbs(t *testing.T) {
 	}
 	nas := newMeshNode(t, root, "nas")
 	desk := newMeshNode(t, root, "desk")
-	roster := []*event.Event{nas.event, desk.event}
+	ghost := newMeshNode(t, root, "ghost") // on the roster, never started
+	roster := []*event.Event{nas.event, desk.event, ghost.event}
 	x, err := circle.Init(nas.circleRoot(), "x", "pw")
 	if err != nil {
 		t.Fatal(err)
@@ -101,6 +103,18 @@ func TestSubKeyActsWithinItsVerbs(t *testing.T) {
 	}
 	if _, _, err := asKey.Append("subject:jobs", astral.Event{Kind: "job", Source: "w", Content: "sneak"}); err == nil || !strings.Contains(err.Error(), "denied") {
 		t.Fatalf("claim-only key published: %v", err)
+	}
+	// A sub-key's publish to an unreachable host is refused, never parked:
+	// the outbox retries as the device, under its broader rights (Codex
+	// review, 2026-11-03). The device's own cast still parks.
+	if err := clDesk.In(xDID).SetHost("subject:far", "ghost"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := asKey.Append("subject:far", astral.Event{Kind: "job", Source: "w", Content: "later"}); err == nil || !strings.Contains(err.Error(), "not parked") {
+		t.Fatalf("sub-key publish to an unreachable host: %v, want a refusal to park", err)
+	}
+	if _, _, err := clDesk.In(xDID).Append("subject:far", astral.Event{Kind: "job", Source: "cron", Content: "later"}); err != nil {
+		t.Fatalf("the device's cast to an unreachable host must park: %v", err)
 	}
 	// Local path: a subject hosted on desk itself is checked the same way.
 	if err := clDesk.In(xDID).Declare("subject:local", astral.DeliveryShared, nil); err != nil {
@@ -235,5 +249,102 @@ func TestRevocationPushesLeasesAndWaits(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("wait under a revoked key did not return")
+	}
+}
+
+// TestOfflineDeviceHoldRecheckedAgainstCircle: desk, a device of X, holds a
+// long lease on nas and goes away; revoking desk's attestation in X on nas
+// releases the lease while desk is offline. The re-check runs from the
+// attestation stored with the hold, not from presence (Codex review,
+// 2026-11-03).
+func TestOfflineDeviceHoldRecheckedAgainstCircle(t *testing.T) {
+	daemon.OutboxInterval = 300 * time.Millisecond
+	prev := daemon.RecheckInterval
+	daemon.RecheckInterval = 500 * time.Millisecond
+	t.Cleanup(func() { daemon.RecheckInterval = prev })
+	_, root, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nas := newMeshNode(t, root, "nas")
+	desk := newMeshNode(t, root, "desk")
+	roster := []*event.Event{nas.event, desk.event}
+	x, err := circle.Init(nas.circleRoot(), "x", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, _ := x.Export()
+	attestInto(t, nas, x)
+	joinCircle(t, desk, bundle, true)
+	xDID := x.Config.DID
+
+	fnas := nas.fabric(t, root, "nas", nil, roster...)
+	dnas := startDaemon(t, nas.statePath, fnas)
+	clNas := daemon.NewClient(nas.statePath)
+	if err := clNas.In(xDID).Declare("subject:jobs", astral.DeliveryShared, nil); err != nil {
+		t.Fatal(err)
+	}
+	fdesk := desk.fabric(t, root, "desk", nil, roster...)
+	ddesk := startDaemon(t, desk.statePath, fdesk)
+	fdesk.Host.Peerstore().AddAddrs(fnas.Host.ID(), dnas.Fabric.Host.Addrs(), time.Hour)
+	if err := fdesk.Host.Connect(t.Context(), fdesk.Host.Peerstore().PeerInfo(fnas.Host.ID())); err != nil {
+		t.Fatal(err)
+	}
+	clDesk := daemon.NewClient(desk.statePath)
+	waitConnected(t, clDesk, "nas")
+	waitPlaced(t, clDesk.In(xDID), "subject:jobs @ "+xDID)
+	if _, _, err := clDesk.In(xDID).Append("subject:jobs", astral.Event{Kind: "job", Source: "cron", Content: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := clDesk.In(xDID).Claim("subject:jobs", "w", 600, 1); err != nil || len(c) != 1 {
+		t.Fatalf("claim: %+v err=%v", c, err)
+	}
+
+	// desk goes dark.
+	ddesk.Stop()
+	fdesk.Stop()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		s, _ := clNas.Status()
+		if s != nil && len(s.Connected) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("nas still sees desk connected")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Still leased while desk is merely away.
+	if got, _ := clNas.In(xDID).Claim("subject:jobs", "other", 30, 1); len(got) != 0 {
+		t.Fatalf("lease of an absent device dropped early: %+v", got)
+	}
+
+	// X revokes desk's device; nas learns it (the CLI goes through the
+	// circle service too).
+	xPriv, err := x.Unlock("pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deskPub, err := desk.cert.DeviceKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := circle.Revoke(xPriv, cert.DIDForKey(deskPub), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fnas.Circle.AddRevocation(r); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		got, _ := clNas.In(xDID).Claim("subject:jobs", "other", 30, 1)
+		if len(got) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("revoked offline device's lease was not released")
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

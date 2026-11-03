@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/network"
+
 	"ioa.rocks/fabric/astral"
 	"ioa.rocks/fabric/astral/daemon"
 	"ioa.rocks/fabric/cert"
@@ -136,6 +138,29 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	if !fgate.Auth.IsKept(w.ID()) {
 		t.Fatal("the grantee's connection is not kept past the grace")
 	}
+	// The chain is public bytes: a caller signing with another key is
+	// refused, never kept, and dropped (Codex review, 2026-11-03).
+	impostor := *signer
+	ipub, ipriv, _ := ed25519.GenerateKey(rand.Reader)
+	impostor.Priv, impostor.Key = ipriv, did.ForKey(ipub)
+	wi, err := daemon.DialGate(t.Context(), &impostor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wi.Claim(t.Context(), "subject:jobs", "worker", 30*time.Second, 1); err == nil || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("impostor with a public chain claimed: %v", err)
+	}
+	if fgate.Auth.IsKept(wi.ID()) {
+		t.Fatal("impostor's connection kept on the strength of a chain alone")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for fgate.Host.Network().Connectedness(wi.ID()) == network.Connected {
+		if time.Now().After(deadline) {
+			t.Fatal("impostor's connection not dropped")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	wi.Close()
 	if _, err := w.Claim(t.Context(), "subject:jobs", "bad@name", 30*time.Second, 1); err == nil || !strings.Contains(err.Error(), "consumer") {
 		t.Fatalf("a consumer with '@' was accepted: %v", err)
 	}
@@ -180,7 +205,7 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 		t.Fatalf("ingest revocation: %v", err)
 	}
 	// The offline worker's lease is released: the device reclaims the job.
-	deadline := time.Now().Add(10 * time.Second)
+	deadline = time.Now().Add(10 * time.Second)
 	for {
 		got, _ := clGate.Claim("subject:jobs", "janitor", 30, 1)
 		if len(got) == 1 && got[0].Event.Content == "second" {

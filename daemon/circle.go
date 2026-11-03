@@ -694,10 +694,38 @@ func (s *CircleService) Present(p peer.ID, raw []byte) (*statement.Compiled, err
 	m[key] = presentedChain{comp: c, raw: raw}
 	s.presented[p] = m
 	s.mu.Unlock()
-	if s.auth != nil && !self {
+	return c, nil
+}
+
+// Keep pins a stranger's connection past the grace disconnect. Called
+// once the caller has proven it holds a presented chain's key — a chain
+// alone is public bytes (Codex review, 2026-11-03).
+func (s *CircleService) Keep(p peer.ID) {
+	if s.auth != nil && p != s.h.ID() {
 		s.auth.Keep(p)
 	}
-	return c, nil
+}
+
+// DeviceChain returns the wire bytes of a connected device's attestation
+// in a circle (its membership cert for the home circle), for a data plane
+// that must re-check a holder after it has gone: a chain in statement form
+// re-verifies from its bytes alone (CheckChain). Legacy attestations have
+// no such form.
+func (s *CircleService) DeviceChain(p peer.ID, circleDID string) ([]byte, bool) {
+	if s.home != nil && circleDID == s.home() && s.certOf != nil {
+		c, ok := s.certOf(p)
+		if !ok || c.Stmt == nil {
+			return nil, false
+		}
+		b, err := c.Stmt.Bytes()
+		return b, err == nil
+	}
+	chain, ok := s.chainFor(p, circleDID)
+	if !ok || chain == nil || len(chain.Auth) == 0 {
+		return nil, false
+	}
+	b, err := chain.Auth[len(chain.Auth)-1].Stmt.Bytes()
+	return b, err == nil
 }
 
 // VerifyPresentedValid is VerifyPresented without a verb: is the presented

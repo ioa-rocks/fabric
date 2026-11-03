@@ -619,8 +619,11 @@ memo §17: honoured *up to the verbs on the device assert*). `append` needs
 `publish`; `claim`, `wait` and `heartbeat` need `claim`; `ack` needs `ack`
 unless the caller acks its own live lease; `get`/`watch` need `read`;
 registers follow their entity's subject; a registry announcement is kept
-only for refs the announcer may `host`. A member outside the circle is
-refused, not parked. Pre-statement certs and attestations carry no verbs
+only for refs the announcer may `host`, and a node tells a peer only about
+the subjects of circles that peer is a live device of (a subject's name is
+the circle's business). A member outside the circle is refused, not
+parked; so is a sub-key's publish to a host that is unreachable — the
+outbox retries as the device, so a signed operation is never parked. Pre-statement certs and attestations carry no verbs
 and count as the full device set. Consumer-name strings are still not
 authorization.
 
@@ -646,12 +649,14 @@ publish even on its own node. Leases and sources name the key
 same way (next slices, `tasks/open/astral-per-circle.md`).
 
 **Revocation reaches live state at once.** Every lease, watch and parked
-wait records who holds it (connection peer, and the chain for a sub-key).
-When a revocation lands — or a device is forgotten — the host re-checks
-each holder: a lease whose authority died is released so another worker
-reclaims the job immediately, its watches are dropped, and its parked
-waits return a revocation error. The same re-check runs on a timer for
-chains that merely expire. Leases and heartbeat TTLs are capped at ten
+wait records who holds it (principal key, connection peer, and the chain
+it acted under — a sub-key's or grantee's presented chain, or the
+device's own attestation in that circle). When a revocation lands — or a
+device is forgotten — the host re-checks each holder from that stored
+chain, connected or not: a lease whose authority died is released so
+another worker reclaims the job immediately, its watches are dropped, and
+its parked waits return a revocation error. The same re-check runs on a
+timer for chains that merely expire. Leases and heartbeat TTLs are capped at ten
 minutes, and a wait ends when its stream does.
 
 **Request and reply.** `fabric astral append <queue> -reply …` asks the
