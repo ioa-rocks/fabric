@@ -218,7 +218,7 @@ func cmdRootMerge(args []string) error {
 		if err != nil {
 			return fmt.Errorf("roster cert for %q: %w", m.Name, err)
 		}
-		fresh, err := cert.IssueAs(newRoot, nil, c.Config.DID, ed25519.PublicKey(m.DevicePub), old.Payload.Cmd, old.Payload.Meta, now, certValidity)
+		fresh, err := cert.IssueAs(newRoot, nil, c.Config.DID, ed25519.PublicKey(m.DevicePub), cert.CmdMember, old.Payload.Meta, now, certValidity)
 		if err != nil {
 			return fmt.Errorf("re-issuing %q: %w", m.Name, err)
 		}

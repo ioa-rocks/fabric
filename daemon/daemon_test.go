@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"ioa.rocks/fabric/admission"
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/state"
@@ -20,6 +21,13 @@ import (
 // newTestDaemon fabricates a member's state dir — cert, device key, and an
 // event log holding exactly the given events — and assembles a daemon on it.
 func newTestDaemon(t *testing.T, nsPriv ed25519.PrivateKey, name string, events []*event.Event) *Daemon {
+	t.Helper()
+	return newTestDaemonCfg(t, nsPriv, name, events, nil)
+}
+
+// newTestDaemonCfg is newTestDaemon with a hook over the saved config (queue
+// host, listed, …).
+func newTestDaemonCfg(t *testing.T, nsPriv ed25519.PrivateKey, name string, events []*event.Event, tweak func(*state.Config)) *Daemon {
 	t.Helper()
 	dir, err := state.Open(t.TempDir())
 	if err != nil {
@@ -43,11 +51,15 @@ func newTestDaemon(t *testing.T, nsPriv ed25519.PrivateKey, name string, events 
 	if err := dir.SaveEvents(events); err != nil {
 		t.Fatal(err)
 	}
-	if err := dir.SaveConfig(state.Config{
+	cfg := state.Config{
 		Name:         name,
 		ListenAddrs:  []string{"/ip4/127.0.0.1/udp/0/quic-v1", "/ip4/127.0.0.1/tcp/0"},
 		NamespaceDID: cert.DIDForKey(nsPriv.Public().(ed25519.PublicKey)),
-	}); err != nil {
+	}
+	if tweak != nil {
+		tweak(&cfg)
+	}
+	if err := dir.SaveConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
 	d, err := New(dir)
@@ -377,5 +389,55 @@ func TestRootMoveAndRetire(t *testing.T) {
 		if !found {
 			t.Fatalf("%s did not persist root-retired", d.Config.Name)
 		}
+	}
+}
+
+// TestRemoteQueueDrivenByMasterDevice: a queue host serves list/approve/deny
+// to the master's device — the one the root admitted first — and to nobody
+// else, with no admin role on any cert (step 4 decision 1: the master's hot
+// cert is a plain member cert so it can sign sub-keys).
+func TestRemoteQueueDrivenByMasterDevice(t *testing.T) {
+	_, nsPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	master := newTestDaemon(t, nsPriv, "desk", nil)
+	other := newTestDaemon(t, nsPriv, "nas", nil)
+	t0 := time.Now().Add(-2 * time.Second)
+	masterAdded, err := event.NewAdded(nsPriv, master.OwnCert(), t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherAdded, err := event.NewAdded(nsPriv, other.OwnCert(), t0.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := newTestDaemonCfg(t, nsPriv, "gate", []*event.Event{otherAdded, masterAdded}, func(c *state.Config) { c.QueueHost = true })
+	if gate.Queue == nil {
+		t.Fatal("precondition: the gate runs the queue")
+	}
+	if m, ok := gate.masterDevice(); !ok || m != master.Host.ID() {
+		t.Fatalf("gate's idea of the master: %v %v, want %s", m, ok, master.Host.ID())
+	}
+	if master.OwnCert().Payload.Cmd != cert.CmdMember {
+		t.Fatal("precondition: the master holds a plain member cert")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, d := range []*Daemon{master, other} {
+		if err := d.Host.Connect(ctx, peer.AddrInfo{ID: gate.Host.ID(), Addrs: gate.Host.Addrs()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !(gate.Store.IsMember(master.Host.ID(), time.Now()) && gate.Store.IsMember(other.Host.ID(), time.Now())) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := admission.RemoteList(ctx, master.Host, gate.Host.ID()); err != nil {
+		t.Fatalf("master device refused by the queue host: %v", err)
+	}
+	if _, err := admission.RemoteList(ctx, other.Host, gate.Host.ID()); err == nil {
+		t.Fatal("a plain member listed the pending queue")
 	}
 }

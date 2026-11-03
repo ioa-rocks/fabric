@@ -274,7 +274,10 @@ func cmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	own, err := cert.Issue(rootPriv, ed25519.PublicKey(devicePubRaw), cert.CmdAdmin, cert.Meta{Name: *name, IP: masterIP}, time.Now(), certValidity)
+	// The master's device gets an ordinary member cert: queue hosts
+	// recognise the master by this first admission, not by a role on the
+	// hot key, so it can sign sub-keys like every other device.
+	own, err := cert.Issue(rootPriv, ed25519.PublicKey(devicePubRaw), cert.CmdMember, cert.Meta{Name: *name, IP: masterIP}, time.Now(), certValidity)
 	if err != nil {
 		return err
 	}
@@ -1073,6 +1076,15 @@ func memberMatches(m daemon.MemberInfo, target string) bool {
 // IP — so renewal never renumbers a node. The re-signed cert travels as a
 // MemberAdded event; stores keep the later expiry and the renewed node
 // adopts its own cert live.
+// mustDeviceKey is the device key of a roster cert that already verified.
+func mustDeviceKey(c *cert.Cert) ed25519.PublicKey {
+	k, err := c.DeviceKey()
+	if err != nil {
+		panic(err)
+	}
+	return k
+}
+
 func cmdRenew(args []string) error {
 	fs := flag.NewFlagSet("renew", flag.ExitOnError)
 	statePath := stateFlag(fs)
@@ -1198,7 +1210,14 @@ func cmdRenew(args []string) error {
 			}
 			fmt.Printf("scope %s -> %s\n", cert.ScopeString(old.Payload.Meta.Scope), cert.ScopeString(newScope))
 		}
-		renewed, err := cert.RenewMeta(rootPriv, old, meta, now, cert.DefaultValidity)
+		if old.Payload.Cmd == cert.CmdAdmin {
+			// The admin role on a hot device cert is retired (queue hosts
+			// know the master by identity): a renewal issues a member cert,
+			// which can delegate sub-keys. Deploy queue hosts first — an
+			// older gate still looks for the role.
+			fmt.Printf("%q: admin-role cert renewed as a member cert (the role is no longer needed on a device key)\n", m.Name)
+		}
+		renewed, err := cert.IssueAs(rootPriv, nil, old.Payload.Sub, mustDeviceKey(old), cert.CmdMember, meta, now, cert.DefaultValidity)
 		if err != nil {
 			return fmt.Errorf("renewing %q: %w", m.Name, err)
 		}

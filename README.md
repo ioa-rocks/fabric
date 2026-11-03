@@ -93,7 +93,7 @@ circuit relay, and the autonat service that tells NAT'd members they
 are private. Joiners bootstrap against the lighthouse's address. The pending
 queue lives there, but it holds no signing material: `fabric pending`,
 `fabric approve`, `fabric deny`, and the web UI on the master
-transparently pull the queue over a member- and admin-gated protocol
+transparently pull the queue over a members-only protocol that answers the master's device alone
 (`/fabric/queue/1`), sign locally, and send the cert back through the
 lighthouse for delivery. This is what makes a CGNAT'd / v6-only master
 workable: the master only ever dials out.
@@ -267,7 +267,7 @@ hijacked name must not be able to usher your device into an impostor
 namespace.
 
 The request waits in cloud-a's queue; `fabric pending` / the UI on the
-master shows it (pulled remotely over the admin-gated queue protocol),
+master shows it (pulled remotely over the queue protocol, which answers only the master's device),
 approval signs on the master and delivers through the lighthouse. The
 master can be asleep when joiners knock — they wait in the queue.
 

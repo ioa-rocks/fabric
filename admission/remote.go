@@ -19,7 +19,8 @@ import (
 // queue host is the always-on, reachable node, but it holds no signing
 // material — the master pulls the pending queue over this protocol, signs
 // locally, and sends the cert (and its MemberAdded event) back for
-// delivery. Members only, and among members admins only: the pending queue
+// delivery. Members only, and among members the master's device only (the one
+// the root admitted first — identity, not a role on its cert): the pending queue
 // (names, fingerprints) is admission-sensitive.
 const QueueProtocolID = protocol.ID("/fabric/queue/1")
 

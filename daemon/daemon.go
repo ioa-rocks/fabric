@@ -315,7 +315,7 @@ func New(dir state.Dir) (*Daemon, error) {
 			log.Printf("join request pending: %q fingerprint=%s (fabric approve %s)", p.Name, p.Fingerprint, p.Fingerprint)
 		})
 		admission.Attach(h, d.Queue, d.NamespaceDID)
-		admission.AttachQueue(h, d.Queue, d.Auth.RequireMember, d.isAdmin, func(eventBytes []byte) error {
+		admission.AttachQueue(h, d.Queue, d.Auth.RequireMember, d.isMasterDevice, func(eventBytes []byte) error {
 			e, err := event.Unmarshal(eventBytes)
 			if err != nil {
 				return err
@@ -329,10 +329,37 @@ func New(dir state.Dir) (*Daemon, error) {
 	return d, nil
 }
 
-// isAdmin reports whether a peer holds an admin-role membership cert.
-func (d *Daemon) isAdmin(p peer.ID) bool {
-	c, ok := d.Store.Cert(p)
-	return ok && c.Payload.Cmd == cert.CmdAdmin
+// isMasterDevice reports whether a peer is the master's device: the one the
+// root admitted first, at `fabric init`, whose MemberAdded event every node
+// carries. The remote queue (list/approve/deny) is driven by that device
+// alone. This is a local identity check, not a verb on the peer's cert: an
+// `admin` verb on a hot device key was the only reason the master's cert
+// differed from a member's, and it stopped the master from signing sub-keys
+// (step 4 decision 1). Approvals are root-signed events verified at ingest
+// regardless; this guards the pending list and denials.
+func (d *Daemon) isMasterDevice(p peer.ID) bool {
+	m, ok := d.masterDevice()
+	return ok && m == p
+}
+
+// masterDevice derives the master's peer ID from the event log: the
+// earliest MemberAdded (apply order: time, then ID).
+func (d *Daemon) masterDevice() (peer.ID, bool) {
+	for _, e := range d.Log.All() {
+		if e.Payload.Kind != event.KindAdded {
+			continue
+		}
+		devKey, err := e.DeviceKey()
+		if err != nil {
+			continue
+		}
+		p, err := fabricnet.PeerIDForKey(devKey)
+		if err != nil {
+			continue
+		}
+		return p, true
+	}
+	return "", false
 }
 
 // queueHosts returns the connected members that serve the remote queue
