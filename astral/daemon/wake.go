@@ -155,10 +155,14 @@ func (d *Daemon) Wait(ctx context.Context, pr *astral.Principal, ref astral.Ref,
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	if _, ok, err := d.Store.Subject(ref); err != nil {
+	if m, ok, err := d.Store.Subject(ref); err != nil {
 		return "", err
 	} else if ok {
-		if err := d.localAuthorize(pr, OpWait, ref, "", "", ""); err != nil {
+		if m.IsReplySlot() {
+			if err := d.replyAccess(m, d.principalLabel(pr)); err != nil {
+				return "", err
+			}
+		} else if err := d.localAuthorize(pr, OpWait, ref, "", "", ""); err != nil {
 			return "", err
 		}
 		return d.waitHeld(ctx, ref, timeout, holdOf("", pr))
@@ -169,6 +173,7 @@ func (d *Daemon) Wait(ctx context.Context, pr *astral.Principal, ref astral.Ref,
 	}
 	resp, err := d.remoteWithin(host, request{Op: OpWait, Circle: ref.Circle, Name: ref.Name, LeaseNS: int64(timeout), Principal: pr}, timeout+5*time.Second)
 	if err != nil {
+		d.dropDeadRoute(ref, resp)
 		return "", err
 	}
 	return Woke(resp.Woke), nil

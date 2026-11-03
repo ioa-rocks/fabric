@@ -282,3 +282,21 @@ func (d *Daemon) RevokeKey(idHex string) error {
 func contextWithTimeout(d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), d)
 }
+
+// DeviceSign signs msg with the hot device key and names the signer.
+func (d *Daemon) DeviceSign(msg []byte) (sig []byte, signer string, err error) {
+	priv, err := d.devicePriv()
+	if err != nil {
+		return nil, "", err
+	}
+	return ed25519.Sign(priv, msg), did.ForKey(priv.Public().(ed25519.PublicKey)), nil
+}
+
+// DeviceDID is this device's key as a did:key.
+func (d *Daemon) DeviceDID() (string, error) {
+	priv, err := d.devicePriv()
+	if err != nil {
+		return "", err
+	}
+	return did.ForKey(priv.Public().(ed25519.PublicKey)), nil
+}

@@ -22,6 +22,7 @@
 package astral
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -32,6 +33,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+
+	"ioa.rocks/fabric/did"
 )
 
 // Event is the envelope that travels on the plane. Payloads enter by
@@ -45,6 +48,49 @@ type Event struct {
 	ReplyTarget   string `json:"reply_target,omitempty"`   // subject (same circle) for a correlated reply
 	CorrelationID string `json:"correlation_id,omitempty"` // spawn/request this answers
 	At            int64  `json:"at"`                       // source clock, Unix nanoseconds
+
+	// A reply is signed by the worker that answered: Signer is its key
+	// (did:key), Signature covers ReplyDigest. The host of the reply slot
+	// checks it against the claimant; the requester may check it against
+	// the provider's chain (memo §12.3, §12.8).
+	Signer    string `json:"signer,omitempty"`
+	Signature []byte `json:"signature,omitempty"`
+}
+
+// ReplyDigest is what a worker signs on a reply: the request it answers
+// (CorrelationID), and the answer.
+func ReplyDigest(e Event) [32]byte {
+	h := sha256.New()
+	for _, s := range []string{"astral-reply-v1", e.CorrelationID, e.Kind, e.Content, e.PayloadRef} {
+		h.Write([]byte(s))
+		h.Write([]byte{0})
+	}
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// SignReply signs a reply with the worker's key.
+func SignReply(priv ed25519.PrivateKey, signer string, e *Event) {
+	d := ReplyDigest(*e)
+	e.Signer = signer
+	e.Signature = ed25519.Sign(priv, d[:])
+}
+
+// VerifyReply checks a reply's signature against its Signer.
+func (e Event) VerifyReply() error {
+	if e.Signer == "" || len(e.Signature) == 0 {
+		return errors.New("astral: reply is not signed")
+	}
+	pub, err := did.KeyFor(e.Signer)
+	if err != nil {
+		return fmt.Errorf("astral: reply signer: %w", err)
+	}
+	d := ReplyDigest(e)
+	if !ed25519.Verify(pub, d[:], e.Signature) {
+		return errors.New("astral: reply signature does not verify")
+	}
+	return nil
 }
 
 // DeriveID fills ID deterministically from the envelope when the source did
@@ -85,10 +131,42 @@ type Subject struct {
 	// Declare (coordination-plane contract: Ephemeral subjects).
 	IdleTTLNS int64 `json:"idle_ttl_ns,omitempty"`
 	MaxEvents int   `json:"max_events,omitempty"`
+
+	// A reply slot (memo §12.3): allocated by the host of a request subject
+	// when it accepts a publish that asked for one, owned by the host's
+	// circle. ReplyFor is the request event, ReplyOf its subject,
+	// ReplyConsumer the principal that published it (the only one who may
+	// claim, wait on or read the slot); the only appender is the live
+	// claimant of the request, signing its reply.
+	ReplyFor      string `json:"reply_for,omitempty"`
+	ReplyOf       string `json:"reply_of,omitempty"`
+	ReplyConsumer string `json:"reply_consumer,omitempty"`
 }
 
 // Ref is the subject's identity.
 func (m Subject) Ref() Ref { return Ref{Circle: m.Circle, Name: m.Name} }
+
+// IsReplySlot reports whether the subject is a host-allocated reply slot.
+func (m Subject) IsReplySlot() bool { return m.ReplyFor != "" }
+
+// ReplyQuota is how many live reply slots one principal may hold on a
+// host at once.
+var ReplyQuota = 100
+
+// ReplySlotsOf counts the live reply slots a principal holds in a circle.
+func (s *Store) ReplySlotsOf(circle, consumer string) (int, error) {
+	boxes, err := s.Subjects()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, m := range boxes {
+		if m.Circle == circle && m.ReplyConsumer == consumer {
+			n++
+		}
+	}
+	return n, nil
+}
 
 // EphemeralPrefix marks SDK-created temporary reply subjects. They are
 // unlisted — never announced through the registry (their route travels in

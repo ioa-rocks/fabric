@@ -141,14 +141,30 @@ func (c *Client) SetHost(name, host string) error {
 // Append casts an event. Returns the (possibly derived) event ID and
 // whether it was new.
 func (c *Client) Append(name string, ev astral.Event) (id string, fresh bool, err error) {
+	id, fresh, _, err = c.append(name, ev, false)
+	return id, fresh, err
+}
+
+// AppendRequest casts a request and returns the reply slot the host
+// allocated for it; claim or wait on that slot for the answer.
+func (c *Client) AppendRequest(name string, ev astral.Event) (id, slot string, err error) {
+	id, _, slot, err = c.append(name, ev, true)
+	return id, slot, err
+}
+
+func (c *Client) append(name string, ev astral.Event, reply bool) (id string, fresh bool, slot string, err error) {
 	var r appendReply
 	if c.Signer != nil && ev.ID == "" {
 		ev.ID = NewEventID()
 	}
-	if err := c.post("/v0/append", appendBody{Principal: c.sign(OpAppend, name, ev.ID, "", ""), Circle: c.Circle, Name: name, Event: ev}, &r); err != nil {
-		return "", false, err
+	// A sub-key signs its replies itself; the device's are signed by the daemon.
+	if c.Signer != nil && ev.CorrelationID != "" && astral.Ephemeral(name) && len(ev.Signature) == 0 {
+		astral.SignReply(c.Signer.Priv, c.Signer.Key, &ev)
 	}
-	return r.ID, r.Fresh, nil
+	if err := c.post("/v0/append", appendBody{Principal: c.sign(OpAppend, name, ev.ID, "", ""), Circle: c.Circle, Name: name, Event: ev, Reply: reply}, &r); err != nil {
+		return "", false, "", err
+	}
+	return r.ID, r.Fresh, r.Reply, nil
 }
 
 // Claim leases up to n events for lease seconds.

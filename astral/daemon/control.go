@@ -81,11 +81,13 @@ type appendBody struct {
 	Circle    string            `json:"circle,omitempty"`
 	Name      string            `json:"name"`
 	Event     astral.Event      `json:"event"`
+	Reply     bool              `json:"reply,omitempty"` // allocate a reply slot at the host
 }
 
 type appendReply struct {
 	ID    string `json:"id"`
 	Fresh bool   `json:"fresh"`
+	Reply string `json:"reply,omitempty"` // the reply slot's name
 }
 
 type claimBody struct {
@@ -320,12 +322,12 @@ func (d *Daemon) ctlAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ev.DeriveID()
-	fresh, err := d.Append(b.Principal, d.Ref(b.Circle, b.Name), ev)
+	fresh, slot, err := d.append(b.Principal, d.Ref(b.Circle, b.Name), ev, b.Reply)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, appendReply{ID: ev.ID, Fresh: fresh})
+	writeJSON(w, appendReply{ID: ev.ID, Fresh: fresh, Reply: slot})
 }
 
 func (d *Daemon) ctlClaim(w http.ResponseWriter, r *http.Request) {

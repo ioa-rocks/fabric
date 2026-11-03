@@ -654,6 +654,19 @@ waits return a revocation error. The same re-check runs on a timer for
 chains that merely expire. Leases and heartbeat TTLs are capped at ten
 minutes, and a wait ends when its stream does.
 
+**Request and reply.** `fabric astral append <queue> -reply …` asks the
+host of the queue for a reply slot: the host allocates
+`subject:queues/_reply/<request-id>` in its own circle, owned by itself,
+readable only by the principal that published the request, and points the
+request at it. The worker that holds the request's live lease is the only
+one who may append to the slot, with a reply signed over the request it
+answers (`-corr <request-id>`; the device key signs for a device, the
+sub-key for a `-key` caller), so a host can drop a reply but neither forge
+nor replay one. Slots are never announced; the requester's node routes to
+the host it published through, the worker's to the host it claimed from.
+A slot idles out after ten minutes and a late reply is refused loudly, not
+parked. Quota: 100 live slots per principal per host.
+
 ```sh
 fabric astral subject subject:queues/agents/concierge/inbox -delivery exclusive -accepts user,system
 fabric astral append subject:queues/agents/concierge/inbox -kind user "translate this"

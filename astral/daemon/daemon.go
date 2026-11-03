@@ -38,6 +38,7 @@ import (
 
 	"ioa.rocks/fabric/astral"
 	fabricdaemon "ioa.rocks/fabric/daemon"
+	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/internal/wire"
 	"ioa.rocks/fabric/statement"
 )
@@ -104,6 +105,8 @@ type request struct {
 	// grantee): the host verifies the envelope and checks that chain, not
 	// the peer's own assert.
 	Principal *astral.Principal `cbor:"principal,omitempty"`
+	// Reply asks the host to allocate a reply slot for this append.
+	Reply bool `cbor:"reply,omitempty"`
 }
 
 // digestFields are the request fields the principal's signature covers.
@@ -125,6 +128,7 @@ func (r request) ref() astral.Ref { return astral.Ref{Circle: r.Circle, Name: r.
 type response struct {
 	Err     string           `cbor:"err,omitempty"`
 	Fresh   bool             `cbor:"fresh,omitempty"`
+	Reply   string           `cbor:"reply,omitempty"` // the allocated reply slot's name
 	Claimed []astral.Claimed `cbor:"claimed,omitempty"`
 	Reg     *astral.Register `cbor:"reg,omitempty"`
 	Woke    string           `cbor:"woke,omitempty"`
@@ -317,38 +321,70 @@ func (d *Daemon) MemberName() string {
 // node's member name; a remote host re-stamps it from the authenticated
 // peer, so a client cannot impersonate another member.
 func (d *Daemon) Append(pr *astral.Principal, ref astral.Ref, ev astral.Event) (fresh bool, err error) {
+	fresh, _, err = d.append(pr, ref, ev, false)
+	return fresh, err
+}
+
+// AppendRequest is Append for a request: the host allocates a reply slot
+// (memo §12.3) and returns its name; the caller claims or waits on it.
+func (d *Daemon) AppendRequest(pr *astral.Principal, ref astral.Ref, ev astral.Event) (fresh bool, slot string, err error) {
+	return d.append(pr, ref, ev, true)
+}
+
+func (d *Daemon) append(pr *astral.Principal, ref astral.Ref, ev astral.Event, wantReply bool) (fresh bool, slot string, err error) {
 	if err := ref.Valid(); err != nil {
-		return false, err
+		return false, "", err
 	}
-	ev.Source = stampSource(ev.Source, d.principalLabel(pr))
+	by := d.principalLabel(pr)
+	ev.Source = stampSource(ev.Source, by)
 	if ev.At == 0 {
 		ev.At = time.Now().UnixNano()
 	}
 	ev.DeriveID()
 	if err := astral.ValidID(ev.ID); err != nil {
-		return false, err
+		return false, "", err
 	}
-	if _, ok, err := d.Store.Subject(ref); err != nil {
-		return false, err
-	} else if ok {
-		if err := d.localAuthorize(pr, OpAppend, ref, ev.ID, "", ""); err != nil {
-			return false, err
+	// A reply from this device is signed with the device key; a sub-key
+	// signs its own on the client side.
+	if ref.Ephemeral() && ev.CorrelationID != "" && pr == nil && len(ev.Signature) == 0 && d.Fabric != nil {
+		dg := astral.ReplyDigest(ev)
+		sig, signer, err := d.Fabric.DeviceSign(dg[:])
+		if err != nil {
+			return false, "", err
 		}
-		return d.appendLocal(ref, ev)
+		ev.Signer, ev.Signature = signer, sig
+	}
+	if m, ok, err := d.Store.Subject(ref); err != nil {
+		return false, "", err
+	} else if ok {
+		if m.IsReplySlot() {
+			signer := ""
+			if pr != nil {
+				signer = pr.Key
+			} else if d.Fabric != nil {
+				signer, _ = d.Fabric.DeviceDID()
+			}
+			if err := d.checkReplyAppend(m, ev, by, signer); err != nil {
+				return false, "", err
+			}
+		} else if err := d.localAuthorize(pr, OpAppend, ref, ev.ID, "", ""); err != nil {
+			return false, "", err
+		}
+		return d.appendLocal(ref, ev, by, wantReply)
 	}
 	host, ok, err := d.Store.Host(ref)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	if !ok {
 		if exp, err := d.Store.Expired(ref); err != nil {
-			return false, err
+			return false, "", err
 		} else if exp {
-			return false, fmt.Errorf("%w: %s", astral.ErrSubjectExpired, ref)
+			return false, "", fmt.Errorf("%w: %s", astral.ErrSubjectExpired, ref)
 		}
-		return false, astral.ErrUnknownSubject
+		return false, "", astral.ErrUnknownSubject
 	}
-	resp, err := d.remote(host, request{Op: OpAppend, Circle: ref.Circle, Name: ref.Name, Event: ev, Principal: pr})
+	resp, err := d.remote(host, request{Op: OpAppend, Circle: ref.Circle, Name: ref.Name, Event: ev, Principal: pr, Reply: wantReply})
 	if err != nil {
 		// The host answered and refused (expired, kind rejected, full):
 		// that is a loud semantic outcome, never parked — the outbox is
@@ -356,41 +392,123 @@ func (d *Daemon) Append(pr *astral.Principal, ref astral.Ref, ev astral.Event) (
 		// on retry. A dead reply route is also dropped here, so learned
 		// ephemeral placements do not outlive their subject.
 		if resp.Err != "" {
-			if ref.Ephemeral() && strings.Contains(resp.Err, "expired") {
-				_ = d.Store.SetHost(ref, "")
-			}
-			return false, err
+			d.dropDeadRoute(ref, resp)
+			return false, "", err
+		}
+		if wantReply {
+			return false, "", fmt.Errorf("astral: host %s unreachable; a request with a reply slot is not parked: %w", d.hostLabel(host), err)
 		}
 		// Park it; the outbox loop retries when the host is reachable.
 		if qerr := d.Store.Enqueue(ref, ev); qerr != nil {
-			return false, qerr
+			return false, "", qerr
 		}
 		log.Printf("astral: %s unreachable (%v); parked %s in outbox", d.hostLabel(host), err, ev.ID)
-		return true, nil
+		return true, "", nil
 	}
-	return resp.Fresh, nil
+	if resp.Reply != "" {
+		// The slot lives where the request does.
+		_ = d.Store.SetHost(astral.Ref{Circle: ref.Circle, Name: resp.Reply}, host)
+	}
+	return resp.Fresh, resp.Reply, nil
 }
 
-// appendLocal journals and wakes parked waiters.
-func (d *Daemon) appendLocal(ref astral.Ref, ev astral.Event) (bool, error) {
+// dropDeadRoute forgets a learned reply-slot route once its host says the
+// slot expired: learned ephemeral placements do not outlive their subject.
+func (d *Daemon) dropDeadRoute(ref astral.Ref, resp response) {
+	if ref.Ephemeral() && strings.Contains(resp.Err, "expired") {
+		_ = d.Store.SetHost(ref, "")
+	}
+}
+
+// appendLocal journals and wakes parked waiters; with wantReply it first
+// allocates the reply slot for the request (owned by this host's circle,
+// consumer = by, idle TTL and cap from the ephemeral defaults, quota per
+// principal) and points the event at it.
+func (d *Daemon) appendLocal(ref astral.Ref, ev astral.Event, by string, wantReply bool) (bool, string, error) {
+	slot := ""
+	if wantReply {
+		slot = astral.EphemeralPrefix + ev.ID
+		slotRef := astral.Ref{Circle: ref.Circle, Name: slot}
+		if _, exists, _ := d.Store.Subject(slotRef); !exists {
+			n, err := d.Store.ReplySlotsOf(ref.Circle, by)
+			if err != nil {
+				return false, "", err
+			}
+			if n >= astral.ReplyQuota {
+				return false, "", fmt.Errorf("astral: %s holds %d reply slots here (quota)", by, n)
+			}
+			if err := d.Store.Declare(astral.Subject{
+				Circle: ref.Circle, Name: slot, Delivery: astral.DeliveryExclusive,
+				ReplyFor: ev.ID, ReplyOf: ref.Name, ReplyConsumer: by,
+			}); err != nil {
+				return false, "", err
+			}
+		}
+		ev.ReplyTarget = slot
+	}
 	fresh, err := d.Store.Append(ref, ev)
 	if err == nil && fresh {
 		d.wake.notify(ref)
 	}
-	return fresh, err
+	return fresh, slot, err
+}
+
+// checkReplyAppend is the reply slot's append rule: the appender is the
+// live claimant of the correlated request (host-side state, no token), the
+// reply answers that request, and it is signed by the appender's key.
+func (d *Daemon) checkReplyAppend(m astral.Subject, ev astral.Event, by, signer string) error {
+	if ev.CorrelationID != m.ReplyFor {
+		return fmt.Errorf("%w: reply does not answer request %s", ErrDenied, m.ReplyFor)
+	}
+	holder, live, err := d.Store.LeaseHolder(astral.Ref{Circle: m.Circle, Name: m.ReplyOf}, m.ReplyFor, time.Now())
+	if err != nil {
+		return err
+	}
+	if !live || d.holderPrincipal(holder) != by {
+		return fmt.Errorf("%w: only the live claimant of request %s may reply (%s is not)", ErrDenied, m.ReplyFor, by)
+	}
+	if err := ev.VerifyReply(); err != nil {
+		return fmt.Errorf("%w: %v", ErrDenied, err)
+	}
+	if signer == "" || ev.Signer != signer {
+		return fmt.Errorf("%w: reply signed by %s, appended by %s", ErrDenied, keyLabel(ev.Signer), keyLabel(signer))
+	}
+	return nil
+}
+
+// holderPrincipal is the principal part of a lease's consumer string:
+// what follows the consumer's own name. A bare consumer (a local claim by
+// the device itself) is this device.
+func (d *Daemon) holderPrincipal(holder string) string {
+	_, principal, ok := strings.Cut(holder, "@")
+	if !ok {
+		return d.MemberName()
+	}
+	return principal
+}
+
+// replyAccess is the reply slot's read side: only the principal that
+// published the request may claim, wait on or read it.
+func (d *Daemon) replyAccess(m astral.Subject, by string) error {
+	if m.ReplyConsumer != by {
+		return fmt.Errorf("%w: reply slot %s belongs to %s", ErrDenied, m.Name, m.ReplyConsumer)
+	}
+	return nil
 }
 
 // Claim leases events from a ref, wherever it is hosted.
 func (d *Daemon) Claim(pr *astral.Principal, ref astral.Ref, consumer string, lease time.Duration, n int) ([]astral.Claimed, error) {
-	if _, ok, err := d.Store.Subject(ref); err != nil {
+	if m, ok, err := d.Store.Subject(ref); err != nil {
 		return nil, err
 	} else if ok {
-		if err := d.localAuthorize(pr, OpClaim, ref, "", consumer, ""); err != nil {
+		if m.IsReplySlot() {
+			if err := d.replyAccess(m, d.principalLabel(pr)); err != nil {
+				return nil, err
+			}
+		} else if err := d.localAuthorize(pr, OpClaim, ref, "", consumer, ""); err != nil {
 			return nil, err
 		}
-		c, err := d.Store.ClaimAs(ref, d.localConsumer(pr, consumer), lease, n, holdOf("", pr))
-		d.learnReplyRoutes(ref.Circle, c)
-		return c, err
+		return d.Store.ClaimAs(ref, d.localConsumer(pr, consumer), lease, n, holdOf("", pr))
 	}
 	host, ok, err := d.Store.Host(ref)
 	if err != nil || !ok {
@@ -398,38 +516,29 @@ func (d *Daemon) Claim(pr *astral.Principal, ref astral.Ref, consumer string, le
 	}
 	resp, err := d.remote(host, request{Op: OpClaim, Circle: ref.Circle, Name: ref.Name, Consumer: consumer, LeaseNS: int64(lease), N: n, Principal: pr})
 	if err != nil {
+		d.dropDeadRoute(ref, resp)
 		return nil, err
 	}
-	d.learnReplyRoutes(ref.Circle, resp.Claimed)
+	d.learnReplyRoutes(ref.Circle, resp.Claimed, host)
 	return resp.Claimed, nil
 }
 
-// learnReplyRoutes records placements for ephemeral reply subjects named
-// in claimed requests. Reply subjects are never announced through the
-// registry — possession of the claimed request *is* the route (and, once
-// grants harden, the capability): its authoritative Source names the
-// member whose node declared the reply subject. A reply subject lives in
-// the request's circle.
-func (d *Daemon) learnReplyRoutes(circle string, claimed []astral.Claimed) {
+// learnReplyRoutes records placements for the reply slots named in claimed
+// requests: a slot lives on the host of the request (memo §12.3), which is
+// exactly the node the claim came from. Slots are never announced through
+// the registry.
+func (d *Daemon) learnReplyRoutes(circle string, claimed []astral.Claimed, host string) {
 	for _, c := range claimed {
 		target := c.Event.ReplyTarget
 		if target == "" || !astral.Ephemeral(target) {
-			continue
-		}
-		_, member, ok := strings.Cut(c.Event.Source, "@")
-		if !ok || member == "" || member == d.MemberName() {
 			continue
 		}
 		ref := astral.Ref{Circle: circle, Name: target}
 		if _, hosted, err := d.Store.Subject(ref); err != nil || hosted {
 			continue
 		}
-		p, ok := d.peerByName(member)
-		if !ok {
-			continue
-		}
-		if err := d.Store.SetHost(ref, p.String()); err != nil {
-			log.Printf("astral: learning reply route %s → %s: %v", ref, member, err)
+		if err := d.Store.SetHost(ref, host); err != nil {
+			log.Printf("astral: learning reply route %s → %s: %v", ref, d.hostLabel(host), err)
 		}
 	}
 }
@@ -553,7 +662,21 @@ func (d *Daemon) localConsumer(pr *astral.Principal, consumer string) string {
 	if pr == nil {
 		return consumer
 	}
-	return consumer + "@" + keyLabel(pr.Key)
+	return consumer + "@" + d.principalLabel(pr)
+}
+
+// deviceDIDOf derives a peer's device key as did:key (ed25519 peer IDs
+// embed the key).
+func deviceDIDOf(p peer.ID) (string, error) {
+	pk, err := p.ExtractPublicKey()
+	if err != nil {
+		return "", err
+	}
+	raw, err := pk.Raw()
+	if err != nil {
+		return "", err
+	}
+	return did.ForKey(raw), nil
 }
 
 // keyLabel is a short handle for a did:key in labels and logs.
@@ -804,9 +927,41 @@ func (d *Daemon) serve(ctx context.Context, req request, remote peer.ID) (resp r
 		}
 		return response{}
 	}
-	// A sub-key (or grantee) acting through the connection peer: its own
-	// chain and signature decide, and it is named in Source and consumer.
-	if req.Principal != nil {
+	// Reply slots have their own rules (memo §12.3): the consumer that
+	// published the request reads it, the request's live claimant appends
+	// to it with a signed reply; verbs do not apply. A sub-key's envelope
+	// is still verified so the key is who it says.
+	if m, hosted, _ := d.Store.Subject(ref); hosted && m.IsReplySlot() {
+		by := from
+		signer, _ := deviceDIDOf(remote)
+		if req.Principal != nil {
+			eventID, consumer, value := req.digestFields()
+			if err := d.authorizePrincipal(remote, req.Principal, req.Op, ref, eventID, consumer, value, true); err != nil {
+				return fail(err)
+			}
+			by, signer = keyLabel(req.Principal.Key)+"@"+from, req.Principal.Key
+		}
+		switch req.Op {
+		case OpAppend:
+			ev := req.Event
+			ev.Source = stampSource(ev.Source, by)
+			if err := d.checkReplyAppend(m, ev, by, signer); err != nil {
+				return fail(err)
+			}
+			fresh, _, err := d.appendLocal(ref, ev, by, false)
+			if err != nil {
+				return fail(err)
+			}
+			return response{Fresh: fresh}
+		case OpClaim, OpWait, OpGet:
+			if err := d.replyAccess(m, by); err != nil {
+				return fail(err)
+			}
+			from = by
+		default:
+			return fail(fmt.Errorf("%w: %s on a reply slot", ErrDenied, req.Op))
+		}
+	} else if req.Principal != nil {
 		eventID, consumer, value := req.digestFields()
 		asKey := keyLabel(req.Principal.Key) + "@" + from
 		ownLease := false
@@ -842,11 +997,11 @@ func (d *Daemon) serve(ctx context.Context, req request, remote peer.ID) (resp r
 	case OpAppend:
 		ev := req.Event
 		ev.Source = stampSource(ev.Source, from)
-		fresh, err := d.appendLocal(ref, ev)
+		fresh, slot, err := d.appendLocal(ref, ev, from, req.Reply)
 		if err != nil {
 			return fail(err)
 		}
-		return response{Fresh: fresh}
+		return response{Fresh: fresh, Reply: slot}
 	case OpWait:
 		timeout := time.Duration(req.LeaseNS)
 		if timeout <= 0 || timeout > 10*time.Minute {

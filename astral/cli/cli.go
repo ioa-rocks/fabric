@@ -27,7 +27,8 @@ const usage = `usage: fabric astral <command> [flags] [args]
                                        -idle self-destructs after inactivity; -max caps appends
   rm <name>                            remove a hosted subject and its journal
   host <name> <member|peer-id>         record that a node hosts <name> ("" clears)
-  append <name> [-kind user] [-source tool] [-id id] [-ref artifact] [-reply target] [-corr id] <content|->
+  append <name> [-kind user] [-source tool] [-id id] [-ref artifact] [-reply] [-corr id] <content|->
+                                       -reply asks the host for a reply slot (printed); -corr answers a request
   claim <name> [-consumer me] [-lease 30] [-n 1] [-wait 0]
                                        -wait N parks up to N seconds for mail first
   heartbeat <entity> [-ttl 30]         extend <entity>'s liveness lease
@@ -311,8 +312,8 @@ func cmdAppend(args []string) error {
 	source := fs.String("source", "cli", "source tool (member label is stamped by the daemon)")
 	id := fs.String("id", "", "event id (derived when empty)")
 	ref := fs.String("ref", "", "payload artifact reference")
-	reply := fs.String("reply", "", "reply target")
-	corr := fs.String("corr", "", "correlation id")
+	reply := fs.Bool("reply", false, "ask the host to allocate a reply slot for this request")
+	corr := fs.String("corr", "", "correlation id: the request event this answers (replies are signed)")
 	pos := parse(fs, args)
 	if len(pos) != 2 {
 		return fmt.Errorf("usage: append <name> [flags] <content|->")
@@ -325,10 +326,17 @@ func cmdAppend(args []string) error {
 		}
 		content = strings.TrimRight(string(b), "\n")
 	}
-	eid, fresh, err := client(fs, st).Append(pos[0], astral.Event{
-		ID: *id, Kind: *kind, Source: *source, Content: content,
-		PayloadRef: *ref, ReplyTarget: *reply, CorrelationID: *corr,
-	})
+	ev := astral.Event{ID: *id, Kind: *kind, Source: *source, Content: content, PayloadRef: *ref, CorrelationID: *corr}
+	cl := client(fs, st)
+	if *reply {
+		eid, slot, err := cl.AppendRequest(pos[0], ev)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s\nreply slot %s\n", eid, slot)
+		return nil
+	}
+	eid, fresh, err := cl.Append(pos[0], ev)
 	if err != nil {
 		return err
 	}
