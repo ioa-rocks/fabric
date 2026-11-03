@@ -594,22 +594,33 @@ leases and acknowledgements, wait/timer wake, and heartbeat monitors. The local 
 mode-0600 Unix socket; `fabric astral` exposes the same verbs for development
 and inspection.
 
-Subject placement is discovered between authenticated Fabric members. A node
-announces the names it hosts on connect and whenever it declares another one;
-peers atomically refresh placements and remove stale names. Conflicting claims
-are rejected loudly. `fabric astral host` remains as a manual/debug override,
-not normal mesh configuration.
+**Subjects belong to circles.** A subject is `(circle DID, name)`
+(overlapping-circles memo §12.4, §17): two circles may both have a
+`subject:jobs`, and a node hosting for several keeps them apart. Every
+`fabric astral` command takes `-circle <did>`; without it a name is in this
+node's *home circle* (the namespace DID), which is also what a journal
+written before this change migrates into on first start.
 
-The stream protocol is member-gated, but fine-grained delegated capabilities
-are not implemented yet: every namespace member can currently invoke every
-Astral verb. Subject ACLs and optional daemon-issued client keys are the next
-security slice; consumer-name strings are not authorization.
+Subject placement is discovered between authenticated Fabric members. A node
+announces the refs it hosts on connect and whenever it declares another one;
+peers atomically refresh placements (keyed by peer ID) and remove stale
+refs. Conflicts are per ref: a ref another node already holds is refused
+and logged, the rest of the announcement lands. `fabric astral host` remains
+as a manual/debug override, not normal mesh configuration. The stream
+protocol is `/astral/subject/2` (framed, circle on the wire); v1 is still
+served and dialed for one release, with bare names meaning the home circle.
+
+The stream protocol is member-gated, but per-verb checks against the
+caller's statement chain are the next slice of the Astral-per-circle step
+(`tasks/open/astral-per-circle.md`): every member can currently invoke every
+Astral verb, and consumer-name strings are not authorization.
 
 ```sh
 fabric astral subject subject:queues/agents/concierge/inbox -delivery exclusive -accepts user,system
 fabric astral append subject:queues/agents/concierge/inbox -kind user "translate this"
 fabric astral claim subject:queues/agents/concierge/inbox -consumer concierge -wait 30
 fabric astral status
+fabric astral subject subject:jobs -circle did:key:z6Mk…team -delivery shared   # a team-circle queue
 ```
 
 `subject:` is currently implementation vocabulary. The resource UX is

@@ -15,6 +15,10 @@
 //     alternative placement modes possible later);
 //   - there is no silent dump subject: a name must be declared before it
 //     accepts mail, and an undeclared kind is rejected loudly.
+//
+// Every resource is a Ref — (circle DID, name) — since the Astral-per-circle
+// step (overlapping-circles memo §17): a subject belongs to a circle, and
+// the store keys by the pair.
 package astral
 
 import (
@@ -38,7 +42,7 @@ type Event struct {
 	Source        string `json:"source"`                   // principal: "<tool>@<member>"
 	Content       string `json:"content,omitempty"`        // short text
 	PayloadRef    string `json:"payload_ref,omitempty"`    // artifact reference
-	ReplyTarget   string `json:"reply_target,omitempty"`   // subject for a correlated reply
+	ReplyTarget   string `json:"reply_target,omitempty"`   // subject (same circle) for a correlated reply
 	CorrelationID string `json:"correlation_id,omitempty"` // spawn/request this answers
 	At            int64  `json:"at"`                       // source clock, Unix nanoseconds
 }
@@ -68,6 +72,7 @@ const (
 // Subject is a placed durable publication journal. Inbox and work queue are
 // subscription policies, not different resource types.
 type Subject struct {
+	Circle   string   `json:"circle"`
 	Name     string   `json:"name"`
 	Delivery Delivery `json:"delivery"`
 	Accepts  []string `json:"accepts,omitempty"`
@@ -81,6 +86,9 @@ type Subject struct {
 	IdleTTLNS int64 `json:"idle_ttl_ns,omitempty"`
 	MaxEvents int   `json:"max_events,omitempty"`
 }
+
+// Ref is the subject's identity.
+func (m Subject) Ref() Ref { return Ref{Circle: m.Circle, Name: m.Name} }
 
 // EphemeralPrefix marks SDK-created temporary reply subjects. They are
 // unlisted — never announced through the registry (their route travels in
@@ -109,13 +117,17 @@ func (m Subject) accepts(kind string) bool {
 	return false
 }
 
-// Register is a latest-value cell: `register:<entity>/<key>`.
+// Register is a latest-value cell: `register:<entity>/<key>` in a circle.
 type Register struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
-	By    string `json:"by,omitempty"`
-	At    int64  `json:"at"`
+	Circle string `json:"circle"`
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	By     string `json:"by,omitempty"`
+	At     int64  `json:"at"`
 }
+
+// Ref is the register's identity.
+func (r Register) Ref() Ref { return Ref{Circle: r.Circle, Name: r.Name} }
 
 // Claimed is one leased event.
 type Claimed struct {
@@ -127,10 +139,16 @@ type Claimed struct {
 // LeaseInfo is an active claim lease surfaced to operators. It deliberately
 // contains no journal sequence: ordering cursors never leave the store.
 type LeaseInfo struct {
-	Name     string `json:"name"`
+	Ref
 	EventID  string `json:"event_id"`
 	Consumer string `json:"consumer"`
 	Until    int64  `json:"until"`
+}
+
+// Placement is one learned registry entry: who hosts a remote ref.
+type Placement struct {
+	Ref
+	Host string `json:"host"` // peer ID of the hosting node
 }
 
 // ErrUnknownSubject and ErrKindRejected are loud ingress failures by design.
@@ -139,7 +157,7 @@ var (
 	ErrKindRejected      = errors.New("astral: kind not accepted by subject")
 	ErrExclusiveConsumer = errors.New("astral: exclusive subject already has an active consumer")
 	ErrBadName           = errors.New("astral: name must be subject:<name> or register:<entity>/<key>")
-	ErrNameConflict      = errors.New("astral: name is already hosted by another member")
+	ErrNameConflict      = errors.New("astral: name is already hosted by another node")
 
 	// ErrSubjectExpired is a normal outcome, not a fault: the temporary
 	// subject reached its idle TTL and self-destructed — its declarer is
@@ -166,18 +184,20 @@ func ValidRegister(name string) error {
 	return nil
 }
 
-// Store is the journal. Key layout (all values JSON):
+// Store is the journal. Key layout (all values JSON; <ref> is Ref.key, i.e.
+// `<circle>/<len>:<name>`, which is prefix-safe):
 //
-//	m/<name>            Subject
-//	e/<name>/<seq>      Event, arrival order (internal cursor)
-//	i/<name>/<id>       seq, for idempotent append
-//	a/<name>/<id>       ack {consumer, at}
-//	l/<name>/<id>       lease {consumer, until}
-//	r/<name>            Register
-//	o/<name>/<id>       outbox: Event waiting for a remote host
-//	p/<name>            placement: member name hosting a remote subject
-//	t/<name>            last-activity clock, Unix nanoseconds
-//	x/<name>            expiry tombstone: when an idle subject self-destructed
+//	m/<ref>            Subject
+//	e/<ref>/<seq>      Event, arrival order (internal cursor)
+//	i/<ref>/<id>       seq, for idempotent append
+//	a/<ref>/<id>       ack {consumer, at}
+//	l/<ref>/<id>       lease {consumer, until}
+//	r/<ref>            Register
+//	o/<ref>/<id>       outbox: Event waiting for a remote host
+//	p/<ref>            placement: peer ID hosting a remote ref
+//	t/<ref>            last-activity clock, Unix nanoseconds
+//	x/<ref>            expiry tombstone: when an idle subject self-destructed
+//	v/layout           store layout version (see Migrate)
 type Store struct {
 	db *pebble.DB
 	mu sync.Mutex // serializes claim (read-modify-write over leases) and seq allocation
@@ -239,9 +259,14 @@ func (s *Store) setJSON(b *pebble.Batch, key string, v any) error {
 	return b.Set([]byte(key), raw, nil)
 }
 
+func k1(prefix string, r Ref) string { return prefix + r.key() }
+
+func k2(prefix string, r Ref, tail string) string { return prefix + r.key() + "/" + tail }
+
 // Declare creates a subject or updates its policy metadata.
 func (s *Store) Declare(m Subject) error {
-	if err := ValidName(m.Name); err != nil {
+	ref := m.Ref()
+	if err := ref.Valid(); err != nil {
 		return err
 	}
 	if m.Delivery == "" {
@@ -250,7 +275,7 @@ func (s *Store) Declare(m Subject) error {
 	if m.Delivery != DeliveryExclusive && m.Delivery != DeliveryShared {
 		return fmt.Errorf("astral: invalid delivery %q", m.Delivery)
 	}
-	if Ephemeral(m.Name) {
+	if ref.Ephemeral() {
 		if m.IdleTTLNS == 0 {
 			m.IdleTTLNS = int64(ReplyIdleTTL)
 		}
@@ -259,7 +284,7 @@ func (s *Store) Declare(m Subject) error {
 		}
 	}
 	var prev Subject
-	if ok, err := s.getJSON("m/"+m.Name, &prev); err != nil {
+	if ok, err := s.getJSON(k1("m/", ref), &prev); err != nil {
 		return err
 	} else if ok {
 		m.Created = prev.Created
@@ -272,55 +297,55 @@ func (s *Store) Declare(m Subject) error {
 	}
 	b := s.db.NewBatch()
 	defer b.Close()
-	if err := b.Set([]byte("m/"+m.Name), raw, nil); err != nil {
+	if err := b.Set([]byte(k1("m/", ref)), raw, nil); err != nil {
 		return err
 	}
 	// A redeclared name is a new incarnation: clear any expiry tombstone
 	// and start its activity clock.
-	if err := b.Delete([]byte("x/"+m.Name), nil); err != nil {
+	if err := b.Delete([]byte(k1("x/", ref)), nil); err != nil {
 		return err
 	}
-	if err := s.setJSON(b, "t/"+m.Name, time.Now().UnixNano()); err != nil {
+	if err := s.setJSON(b, k1("t/", ref), time.Now().UnixNano()); err != nil {
 		return err
 	}
 	return b.Commit(pebble.Sync)
 }
 
-// Expired reports whether a name self-destructed after its idle TTL.
-func (s *Store) Expired(name string) (bool, error) {
+// Expired reports whether a subject self-destructed after its idle TTL.
+func (s *Store) Expired(ref Ref) (bool, error) {
 	var at int64
-	return s.getJSON("x/"+name, &at)
+	return s.getJSON(k1("x/", ref), &at)
 }
 
 // unknownOrExpired distinguishes "never declared" from "declared and
 // gone" — the latter is a normal outcome a replier must not retry.
-func (s *Store) unknownOrExpired(name string) error {
-	if exp, err := s.Expired(name); err != nil {
+func (s *Store) unknownOrExpired(ref Ref) error {
+	if exp, err := s.Expired(ref); err != nil {
 		return err
 	} else if exp {
-		return fmt.Errorf("%w: %s", ErrSubjectExpired, name)
+		return fmt.Errorf("%w: %s", ErrSubjectExpired, ref)
 	}
 	return ErrUnknownSubject
 }
 
-// Touch records activity on a hosted name (an active wait counts: a
+// Touch records activity on a hosted subject (an active wait counts: a
 // parked waiter keeps its reply subject alive).
-func (s *Store) Touch(name string) error {
+func (s *Store) Touch(ref Ref) error {
 	raw, err := json.Marshal(time.Now().UnixNano())
 	if err != nil {
 		return err
 	}
-	return s.db.Set([]byte("t/"+name), raw, pebble.NoSync)
+	return s.db.Set([]byte(k1("t/", ref)), raw, pebble.NoSync)
 }
 
 // Subject looks a declared subject up.
-func (s *Store) Subject(name string) (Subject, bool, error) {
+func (s *Store) Subject(ref Ref) (Subject, bool, error) {
 	var m Subject
-	ok, err := s.getJSON("m/"+name, &m)
+	ok, err := s.getJSON(k1("m/", ref), &m)
 	return m, ok, err
 }
 
-// Subjects lists declared names.
+// Subjects lists declared subjects, every circle.
 func (s *Store) Subjects() ([]Subject, error) {
 	it, err := s.db.NewIter(prefixBounds("m/"))
 	if err != nil {
@@ -339,44 +364,42 @@ func (s *Store) Subjects() ([]Subject, error) {
 }
 
 // Remove deletes a declared subject and every event, index, ack, lease,
-// and parked outbox entry under it. Name validation is deliberately
-// skipped so operators can remove entries that predate the current
-// naming rules.
-func (s *Store) Remove(name string) error {
-	return s.remove(name, false)
+// and parked outbox entry under it.
+func (s *Store) Remove(ref Ref) error {
+	return s.remove(ref, false)
 }
 
 // Expire removes an idle subject and leaves a tombstone, so a late
 // publish gets "expired" — the replier learns the declarer is gone —
 // instead of "unknown".
-func (s *Store) Expire(name string) error {
-	return s.remove(name, true)
+func (s *Store) Expire(ref Ref) error {
+	return s.remove(ref, true)
 }
 
-func (s *Store) remove(name string, tombstone bool) error {
+func (s *Store) remove(ref Ref, tombstone bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var m Subject
-	if ok, err := s.getJSON("m/"+name, &m); err != nil {
+	if ok, err := s.getJSON(k1("m/", ref), &m); err != nil {
 		return err
 	} else if !ok {
 		return ErrUnknownSubject
 	}
 	b := s.db.NewBatch()
 	defer b.Close()
-	for _, key := range []string{"m/" + name, "t/" + name} {
+	for _, key := range []string{k1("m/", ref), k1("t/", ref)} {
 		if err := b.Delete([]byte(key), nil); err != nil {
 			return err
 		}
 	}
 	for _, prefix := range []string{"e/", "i/", "a/", "l/", "o/"} {
-		bounds := prefixBounds(prefix + name + "/")
+		bounds := prefixBounds(k1(prefix, ref) + "/")
 		if err := b.DeleteRange(bounds.LowerBound, bounds.UpperBound, nil); err != nil {
 			return err
 		}
 	}
 	if tombstone {
-		if err := s.setJSON(b, "x/"+name, time.Now().UnixNano()); err != nil {
+		if err := s.setJSON(b, k1("x/", ref), time.Now().UnixNano()); err != nil {
 			return err
 		}
 	}
@@ -385,25 +408,25 @@ func (s *Store) remove(name string, tombstone bool) error {
 
 // IdleExpired lists subjects whose idle TTL has elapsed with no appends,
 // claims, acks, or active waits.
-func (s *Store) IdleExpired(now time.Time) ([]string, error) {
+func (s *Store) IdleExpired(now time.Time) ([]Ref, error) {
 	boxes, err := s.Subjects()
 	if err != nil {
 		return nil, err
 	}
-	var out []string
+	var out []Ref
 	for _, m := range boxes {
 		if m.IdleTTLNS <= 0 {
 			continue
 		}
 		last := m.Created
 		var t int64
-		if ok, err := s.getJSON("t/"+m.Name, &t); err != nil {
+		if ok, err := s.getJSON(k1("t/", m.Ref()), &t); err != nil {
 			return nil, err
 		} else if ok {
 			last = t
 		}
 		if now.UnixNano()-last > m.IdleTTLNS {
-			out = append(out, m.Name)
+			out = append(out, m.Ref())
 		}
 	}
 	return out, nil
@@ -433,62 +456,66 @@ func (s *Store) SweepTombstones(now time.Time, keep time.Duration) error {
 // Append journals an event. Returns fresh=false when the ID was already
 // present (the idempotent retry case). The event's own ID is honoured;
 // an empty ID is derived.
-func (s *Store) Append(name string, ev Event) (fresh bool, err error) {
-	m, ok, err := s.Subject(name)
+func (s *Store) Append(ref Ref, ev Event) (fresh bool, err error) {
+	m, ok, err := s.Subject(ref)
 	if err != nil {
 		return false, err
 	}
 	if !ok {
-		return false, s.unknownOrExpired(name)
+		return false, s.unknownOrExpired(ref)
 	}
 	if ev.Kind == "" {
 		return false, fmt.Errorf("astral: event kind required")
 	}
 	if !m.accepts(ev.Kind) {
-		return false, fmt.Errorf("%w: %q rejects kind %q", ErrKindRejected, name, ev.Kind)
+		return false, fmt.Errorf("%w: %s rejects kind %q", ErrKindRejected, ref, ev.Kind)
 	}
 	if ev.At == 0 {
 		ev.At = time.Now().UnixNano()
 	}
 	ev.DeriveID()
+	if err := ValidID(ev.ID); err != nil {
+		return false, err
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var seq uint64
-	if ok, err := s.getJSON("i/"+name+"/"+ev.ID, &seq); err != nil {
+	if ok, err := s.getJSON(k2("i/", ref, ev.ID), &seq); err != nil {
 		return false, err
 	} else if ok {
 		return false, nil
 	}
-	seq, err = s.nextSeq(name)
+	seq, err = s.nextSeq(ref)
 	if err != nil {
 		return false, err
 	}
 	// Sequences are never reused, so seq counts total appends over the
 	// subject's lifetime — exactly what the cap bounds.
 	if m.MaxEvents > 0 && seq > uint64(m.MaxEvents) {
-		return false, fmt.Errorf("%w: %s capped at %d events", ErrSubjectFull, name, m.MaxEvents)
+		return false, fmt.Errorf("%w: %s capped at %d events", ErrSubjectFull, ref, m.MaxEvents)
 	}
 	b := s.db.NewBatch()
 	defer b.Close()
-	if err := s.setJSON(b, eventKey(name, seq), ev); err != nil {
+	if err := s.setJSON(b, eventKey(ref, seq), ev); err != nil {
 		return false, err
 	}
-	if err := s.setJSON(b, "i/"+name+"/"+ev.ID, seq); err != nil {
+	if err := s.setJSON(b, k2("i/", ref, ev.ID), seq); err != nil {
 		return false, err
 	}
-	if err := s.setJSON(b, "t/"+name, time.Now().UnixNano()); err != nil {
+	if err := s.setJSON(b, k1("t/", ref), time.Now().UnixNano()); err != nil {
 		return false, err
 	}
 	return true, b.Commit(pebble.Sync)
 }
 
-func eventKey(name string, seq uint64) string { return fmt.Sprintf("e/%s/%020d", name, seq) }
+func eventKey(ref Ref, seq uint64) string { return k2("e/", ref, fmt.Sprintf("%020d", seq)) }
 
-// nextSeq reads the highest journaled sequence for a name and returns +1.
+// nextSeq reads the highest journaled sequence for a subject and returns +1.
 // Caller holds s.mu.
-func (s *Store) nextSeq(name string) (uint64, error) {
-	it, err := s.db.NewIter(prefixBounds("e/" + name + "/"))
+func (s *Store) nextSeq(ref Ref) (uint64, error) {
+	prefix := k1("e/", ref) + "/"
+	it, err := s.db.NewIter(prefixBounds(prefix))
 	if err != nil {
 		return 0, err
 	}
@@ -497,22 +524,21 @@ func (s *Store) nextSeq(name string) (uint64, error) {
 		return 1, nil
 	}
 	var seq uint64
-	key := string(it.Key())
-	_, err = fmt.Sscanf(key[len("e/"+name+"/"):], "%d", &seq)
+	_, err = fmt.Sscanf(string(it.Key())[len(prefix):], "%d", &seq)
 	return seq + 1, err
 }
 
 // Claim leases up to n unacked, unleased events to consumer, oldest first.
 // A lapsed lease is re-claimable (by anyone holding the drain capability —
 // for a queue that is how a crashed worker's event reaches another).
-func (s *Store) Claim(name, consumer string, d time.Duration, n int) ([]Claimed, error) {
-	subject, ok, err := s.Subject(name)
+func (s *Store) Claim(ref Ref, consumer string, d time.Duration, n int) ([]Claimed, error) {
+	subject, ok, err := s.Subject(ref)
 	if err != nil {
 		return nil, err
 	} else if !ok {
-		return nil, s.unknownOrExpired(name)
+		return nil, s.unknownOrExpired(ref)
 	}
-	if err := s.Touch(name); err != nil {
+	if err := s.Touch(ref); err != nil {
 		return nil, err
 	}
 	if n <= 0 {
@@ -530,7 +556,7 @@ func (s *Store) Claim(name, consumer string, d time.Duration, n int) ([]Claimed,
 		subject.Delivery = DeliveryExclusive // zero value defaults like Declare
 	}
 	if subject.Delivery == DeliveryExclusive {
-		leases, err := s.db.NewIter(prefixBounds("l/" + name + "/"))
+		leases, err := s.db.NewIter(prefixBounds(k1("l/", ref) + "/"))
 		if err != nil {
 			return nil, err
 		}
@@ -542,14 +568,14 @@ func (s *Store) Claim(name, consumer string, d time.Duration, n int) ([]Claimed,
 			}
 			if active.Until > now.UnixNano() && active.Consumer != consumer {
 				leases.Close()
-				return nil, fmt.Errorf("%w: %s is held by %s", ErrExclusiveConsumer, name, active.Consumer)
+				return nil, fmt.Errorf("%w: %s is held by %s", ErrExclusiveConsumer, ref, active.Consumer)
 			}
 		}
 		if err := leases.Close(); err != nil {
 			return nil, err
 		}
 	}
-	it, err := s.db.NewIter(prefixBounds("e/" + name + "/"))
+	it, err := s.db.NewIter(prefixBounds(k1("e/", ref) + "/"))
 	if err != nil {
 		return nil, err
 	}
@@ -562,18 +588,18 @@ func (s *Store) Claim(name, consumer string, d time.Duration, n int) ([]Claimed,
 		if err := json.Unmarshal(it.Value(), &ev); err != nil {
 			return nil, err
 		}
-		if ok, err := s.getJSON("a/"+name+"/"+ev.ID, &ack{}); err != nil {
+		if ok, err := s.getJSON(k2("a/", ref, ev.ID), &ack{}); err != nil {
 			return nil, err
 		} else if ok {
 			continue
 		}
 		var l lease
-		if ok, err := s.getJSON("l/"+name+"/"+ev.ID, &l); err != nil {
+		if ok, err := s.getJSON(k2("l/", ref, ev.ID), &l); err != nil {
 			return nil, err
 		} else if ok && l.Until > now.UnixNano() && l.Consumer != consumer {
 			continue
 		}
-		if err := s.setJSON(b, "l/"+name+"/"+ev.ID, lease{Consumer: consumer, Until: until}); err != nil {
+		if err := s.setJSON(b, k2("l/", ref, ev.ID), lease{Consumer: consumer, Until: until}); err != nil {
 			return nil, err
 		}
 		out = append(out, Claimed{Event: ev, Consumer: consumer, Until: until})
@@ -587,32 +613,32 @@ func (s *Store) Claim(name, consumer string, d time.Duration, n int) ([]Claimed,
 // Ack marks an event incorporated by consumer. It is a force-ack: no lease
 // is required, because the consumer's own durable commit is the proof.
 // Acking twice is harmless; acking an unknown event is an error.
-func (s *Store) Ack(name, consumer, eventID string) error {
+func (s *Store) Ack(ref Ref, consumer, eventID string) error {
 	var seq uint64
-	if ok, err := s.getJSON("i/"+name+"/"+eventID, &seq); err != nil {
+	if ok, err := s.getJSON(k2("i/", ref, eventID), &seq); err != nil {
 		return err
 	} else if !ok {
-		return fmt.Errorf("astral: no event %s in %s", eventID, name)
+		return fmt.Errorf("astral: no event %s in %s", eventID, ref)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b := s.db.NewBatch()
 	defer b.Close()
-	if err := s.setJSON(b, "a/"+name+"/"+eventID, ack{Consumer: consumer, At: time.Now().UnixNano()}); err != nil {
+	if err := s.setJSON(b, k2("a/", ref, eventID), ack{Consumer: consumer, At: time.Now().UnixNano()}); err != nil {
 		return err
 	}
-	if err := b.Delete([]byte("l/"+name+"/"+eventID), nil); err != nil {
+	if err := b.Delete([]byte(k2("l/", ref, eventID)), nil); err != nil {
 		return err
 	}
-	if err := s.setJSON(b, "t/"+name, time.Now().UnixNano()); err != nil {
+	if err := s.setJSON(b, k1("t/", ref), time.Now().UnixNano()); err != nil {
 		return err
 	}
 	return b.Commit(pebble.Sync)
 }
 
 // Pending counts journaled-but-unacked events (leased ones included).
-func (s *Store) Pending(name string) (int, error) {
-	it, err := s.db.NewIter(prefixBounds("e/" + name + "/"))
+func (s *Store) Pending(ref Ref) (int, error) {
+	it, err := s.db.NewIter(prefixBounds(k1("e/", ref) + "/"))
 	if err != nil {
 		return 0, err
 	}
@@ -623,7 +649,7 @@ func (s *Store) Pending(name string) (int, error) {
 		if err := json.Unmarshal(it.Value(), &ev); err != nil {
 			return 0, err
 		}
-		if ok, err := s.getJSON("a/"+name+"/"+ev.ID, &ack{}); err != nil {
+		if ok, err := s.getJSON(k2("a/", ref, ev.ID), &ack{}); err != nil {
 			return 0, err
 		} else if !ok {
 			n++
@@ -648,12 +674,8 @@ func (s *Store) Leases(now time.Time) ([]LeaseInfo, error) {
 		if l.Until <= now.UnixNano() {
 			continue
 		}
-		key := strings.TrimPrefix(string(it.Key()), "l/")
-		i := strings.LastIndex(key, "/")
-		if i < 0 {
-			continue
-		}
-		out = append(out, LeaseInfo{Name: key[:i], EventID: key[i+1:], Consumer: l.Consumer, Until: l.Until})
+		ref, rest := mustParseKey(string(it.Key())[2:])
+		out = append(out, LeaseInfo{Ref: ref, EventID: strings.TrimPrefix(rest, "/"), Consumer: l.Consumer, Until: l.Until})
 	}
 	return out, nil
 }
@@ -661,6 +683,9 @@ func (s *Store) Leases(now time.Time) ([]LeaseInfo, error) {
 // Set writes a register (latest value wins; intermediate values are lost
 // by design).
 func (s *Store) Set(r Register) error {
+	if err := validCircle(r.Circle); err != nil {
+		return err
+	}
 	if err := ValidRegister(r.Name); err != nil {
 		return err
 	}
@@ -671,29 +696,29 @@ func (s *Store) Set(r Register) error {
 	if err != nil {
 		return err
 	}
-	return s.db.Set([]byte("r/"+r.Name), raw, pebble.Sync)
+	return s.db.Set([]byte(k1("r/", r.Ref())), raw, pebble.Sync)
 }
 
 // Get reads a register.
-func (s *Store) Get(name string) (Register, bool, error) {
+func (s *Store) Get(ref Ref) (Register, bool, error) {
 	var r Register
-	ok, err := s.getJSON("r/"+name, &r)
+	ok, err := s.getJSON(k1("r/", ref), &r)
 	return r, ok, err
 }
 
 // --- placement (learned registry cache; namespace-engine authority later) ---
 
-// SetHost records which member hosts a remote name; "" clears it.
-func (s *Store) SetHost(name, member string) error {
-	if member == "" {
-		return s.db.Delete([]byte("p/"+name), pebble.Sync)
+// SetHost records which node (peer ID) hosts a remote ref; "" clears it.
+func (s *Store) SetHost(ref Ref, host string) error {
+	if host == "" {
+		return s.db.Delete([]byte(k1("p/", ref)), pebble.Sync)
 	}
-	return s.db.Set([]byte("p/"+name), []byte(member), pebble.Sync)
+	return s.db.Set([]byte(k1("p/", ref)), []byte(host), pebble.Sync)
 }
 
-// Host returns the member hosting a remote name.
-func (s *Store) Host(name string) (string, bool, error) {
-	raw, closer, err := s.db.Get([]byte("p/" + name))
+// Host returns the node hosting a remote ref.
+func (s *Store) Host(ref Ref) (string, bool, error) {
+	raw, closer, err := s.db.Get([]byte(k1("p/", ref)))
 	if errors.Is(err, pebble.ErrNotFound) {
 		return "", false, nil
 	}
@@ -705,44 +730,70 @@ func (s *Store) Host(name string) (string, bool, error) {
 }
 
 // Hosts lists every placement record.
-func (s *Store) Hosts() (map[string]string, error) {
+func (s *Store) Hosts() ([]Placement, error) {
 	it, err := s.db.NewIter(prefixBounds("p/"))
 	if err != nil {
 		return nil, err
 	}
 	defer it.Close()
-	out := map[string]string{}
+	var out []Placement
 	for it.First(); it.Valid(); it.Next() {
-		out[string(it.Key())[2:]] = string(it.Value())
+		ref, _ := mustParseKey(string(it.Key())[2:])
+		out = append(out, Placement{Ref: ref, Host: string(it.Value())})
 	}
 	return out, nil
 }
 
-// ReplaceHost atomically replaces every placement learned from member with
-// names. Registry refreshes use replacement rather than additive updates so a
-// subject that a member stopped hosting does not remain routable forever.
-func (s *Store) ReplaceHost(member string, names []string) error {
-	if member == "" {
+// ConflictError lists the refs an announcement could not place because
+// another node already holds them. The rest of the announcement landed.
+type ConflictError struct {
+	Refs []Ref
+}
+
+func (e *ConflictError) Error() string {
+	names := make([]string, len(e.Refs))
+	for i, r := range e.Refs {
+		names[i] = r.String()
+	}
+	return fmt.Sprintf("%v: %s", ErrNameConflict, strings.Join(names, ", "))
+}
+
+func (e *ConflictError) Unwrap() error { return ErrNameConflict }
+
+// ReplaceHost atomically replaces every placement learned from host with
+// refs. Registry refreshes use replacement rather than additive updates so
+// a subject that a node stopped hosting does not remain routable forever.
+// Conflicts are per ref (memo §12.4): a ref another host holds is refused
+// and reported in a *ConflictError, the rest land. An invalid ref fails the
+// whole call — that is a malformed announcement, not a contest.
+func (s *Store) ReplaceHost(host string, refs []Ref) error {
+	if host == "" {
 		return errors.New("astral: registry host required")
+	}
+	for _, ref := range refs {
+		if err := ref.Valid(); err != nil {
+			return err
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b := s.db.NewBatch()
 	defer b.Close()
-	for _, name := range names {
-		if err := ValidName(name); err != nil {
-			return err
-		}
-		raw, closer, err := s.db.Get([]byte("p/" + name))
+	var conflicts []Ref
+	var accepted []Ref
+	for _, ref := range refs {
+		raw, closer, err := s.db.Get([]byte(k1("p/", ref)))
 		if err == nil {
 			existing := string(raw)
 			closer.Close()
-			if existing != member {
-				return fmt.Errorf("%w: %s is on %s, not %s", ErrNameConflict, name, existing, member)
+			if existing != host {
+				conflicts = append(conflicts, ref)
+				continue
 			}
 		} else if !errors.Is(err, pebble.ErrNotFound) {
 			return err
 		}
+		accepted = append(accepted, ref)
 	}
 	it, err := s.db.NewIter(prefixBounds("p/"))
 	if err != nil {
@@ -751,10 +802,11 @@ func (s *Store) ReplaceHost(member string, names []string) error {
 	for it.First(); it.Valid(); it.Next() {
 		// Ephemeral reply routes are learned from claimed requests, not
 		// from announcements — a registry refresh must not wipe them.
-		if Ephemeral(strings.TrimPrefix(string(it.Key()), "p/")) {
+		ref, _ := mustParseKey(string(it.Key())[2:])
+		if ref.Ephemeral() {
 			continue
 		}
-		if string(it.Value()) == member {
+		if string(it.Value()) == host {
 			if err := b.Delete(append([]byte(nil), it.Key()...), nil); err != nil {
 				it.Close()
 				return err
@@ -764,48 +816,55 @@ func (s *Store) ReplaceHost(member string, names []string) error {
 	if err := it.Close(); err != nil {
 		return err
 	}
-	for _, name := range names {
-		if err := b.Set([]byte("p/"+name), []byte(member), nil); err != nil {
+	for _, ref := range accepted {
+		if err := b.Set([]byte(k1("p/", ref)), []byte(host), nil); err != nil {
 			return err
 		}
 	}
-	return b.Commit(pebble.Sync)
+	if err := b.Commit(pebble.Sync); err != nil {
+		return err
+	}
+	if len(conflicts) > 0 {
+		return &ConflictError{Refs: conflicts}
+	}
+	return nil
 }
 
 // --- client outbox: a cast that could not reach its host yet ---
 
-// Enqueue parks an event for a remote name. Idempotent by event ID.
-func (s *Store) Enqueue(name string, ev Event) error {
+// Enqueue parks an event for a remote ref. Idempotent by event ID.
+func (s *Store) Enqueue(ref Ref, ev Event) error {
 	ev.DeriveID()
+	if err := ValidID(ev.ID); err != nil {
+		return err
+	}
 	raw, err := json.Marshal(ev)
 	if err != nil {
 		return err
 	}
-	return s.db.Set([]byte("o/"+name+"/"+ev.ID), raw, pebble.Sync)
+	return s.db.Set([]byte(k2("o/", ref, ev.ID)), raw, pebble.Sync)
 }
 
 // Dequeue removes a delivered outbox entry.
-func (s *Store) Dequeue(name, id string) error {
-	return s.db.Delete([]byte("o/"+name+"/"+id), pebble.Sync)
+func (s *Store) Dequeue(ref Ref, id string) error {
+	return s.db.Delete([]byte(k2("o/", ref, id)), pebble.Sync)
 }
 
-// Outbox lists parked events grouped by name.
-func (s *Store) Outbox() (map[string][]Event, error) {
+// Outbox lists parked events grouped by ref.
+func (s *Store) Outbox() (map[Ref][]Event, error) {
 	it, err := s.db.NewIter(prefixBounds("o/"))
 	if err != nil {
 		return nil, err
 	}
 	defer it.Close()
-	out := map[string][]Event{}
+	out := map[Ref][]Event{}
 	for it.First(); it.Valid(); it.Next() {
-		key := string(it.Key())[2:]
-		i := strings.LastIndex(key, "/")
-		name := key[:i]
+		ref, _ := mustParseKey(string(it.Key())[2:])
 		var ev Event
 		if err := json.Unmarshal(it.Value(), &ev); err != nil {
 			return nil, err
 		}
-		out[name] = append(out[name], ev)
+		out[ref] = append(out[ref], ev)
 	}
 	return out, nil
 }

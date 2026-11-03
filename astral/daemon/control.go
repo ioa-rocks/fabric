@@ -1,7 +1,8 @@
 // The control API is HTTP over a unix socket, mirroring fabric's and
 // vault's: local-trust (socket mode 0600), JSON in and out. The CLI and
 // any local process (a screenshot tool, an Entourage adapter) are plane
-// clients through this surface.
+// clients through this surface. Every body may name a circle; an empty
+// circle is the node's home circle.
 package daemon
 
 import (
@@ -38,41 +39,47 @@ type StatusReply struct {
 	Path    string `json:"path"`
 	Mesh    bool   `json:"mesh"`
 	Member  string `json:"member,omitempty"`
+	Home    string `json:"home"` // the circle a bare name belongs to here
 
-	Hosted    []HostedInfo       `json:"hosted,omitempty"`    // names journaled here
-	Placed    map[string]string  `json:"placed,omitempty"`    // remote name → host member
-	Outbox    int                `json:"outbox"`              // parked casts
-	Monitors  []astral.Heartbeat `json:"monitors,omitempty"`  // leases held here
-	Claims    []astral.LeaseInfo `json:"claims,omitempty"`    // active event claim leases
-	Connected []string           `json:"connected,omitempty"` // member labels reachable now
+	Hosted     []HostedInfo       `json:"hosted,omitempty"`     // subjects journaled here
+	Placed     map[string]string  `json:"placed,omitempty"`     // display: name (+ " @ circle" outside home) → host label
+	Placements []astral.Placement `json:"placements,omitempty"` // the same, structured (host = peer ID)
+	Outbox     int                `json:"outbox"`               // parked casts
+	Monitors   []astral.Heartbeat `json:"monitors,omitempty"`   // leases held here
+	Claims     []astral.LeaseInfo `json:"claims,omitempty"`     // active event claim leases
+	Connected  []string           `json:"connected,omitempty"`  // member labels reachable now
 }
 
-// HostedInfo is one locally hosted name with its backlog.
+// HostedInfo is one locally hosted subject with its backlog.
 type HostedInfo struct {
 	astral.Subject
 	Pending int `json:"pending"`
 }
 
 type declareBody struct {
+	Circle   string          `json:"circle,omitempty"`
 	Name     string          `json:"name"`
 	Delivery astral.Delivery `json:"delivery,omitempty"`
 	Accepts  []string        `json:"accepts,omitempty"`
-	IdleS    int             `json:"idle_s,omitempty"`      // idle TTL seconds; 0 = never (ephemeral names default)
-	MaxEv    int             `json:"max_events,omitempty"`  // total-append cap; 0 = unlimited (ephemeral names default)
+	IdleS    int             `json:"idle_s,omitempty"`     // idle TTL seconds; 0 = never (ephemeral names default)
+	MaxEv    int             `json:"max_events,omitempty"` // total-append cap; 0 = unlimited (ephemeral names default)
 }
 
 type removeBody struct {
-	Name string `json:"name"`
+	Circle string `json:"circle,omitempty"`
+	Name   string `json:"name"`
 }
 
 type hostBody struct {
-	Name string `json:"name"`
-	Host string `json:"host"` // "" clears
+	Circle string `json:"circle,omitempty"`
+	Name   string `json:"name"`
+	Host   string `json:"host"` // peer ID or connected member label; "" clears
 }
 
 type appendBody struct {
-	Name  string       `json:"name"`
-	Event astral.Event `json:"event"`
+	Circle string       `json:"circle,omitempty"`
+	Name   string       `json:"name"`
+	Event  astral.Event `json:"event"`
 }
 
 type appendReply struct {
@@ -81,6 +88,7 @@ type appendReply struct {
 }
 
 type claimBody struct {
+	Circle   string `json:"circle,omitempty"`
 	Name     string `json:"name"`
 	Consumer string `json:"consumer"`
 	LeaseS   int    `json:"lease_s,omitempty"`
@@ -88,12 +96,14 @@ type claimBody struct {
 }
 
 type ackBody struct {
+	Circle   string `json:"circle,omitempty"`
 	Name     string `json:"name"`
 	Consumer string `json:"consumer"`
 	EventID  string `json:"event_id"`
 }
 
 type waitBody struct {
+	Circle   string `json:"circle,omitempty"`
 	Name     string `json:"name"`
 	TimeoutS int    `json:"timeout_s,omitempty"`
 }
@@ -103,18 +113,21 @@ type waitReply struct {
 }
 
 type heartbeatBody struct {
+	Circle string `json:"circle,omitempty"`
 	Entity string `json:"entity"`
 	TTLS   int    `json:"ttl_s,omitempty"`
 }
 
 type watchBody struct {
+	Circle  string `json:"circle,omitempty"`
 	Entity  string `json:"entity"`
 	Watcher string `json:"watcher"`
 }
 
 type setBody struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
+	Circle string `json:"circle,omitempty"`
+	Name   string `json:"name"`
+	Value  string `json:"value"`
 }
 
 func (d *Daemon) serveControl() (func(), error) {
@@ -161,7 +174,7 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, astral.ErrUnknownSubject):
 		code = http.StatusNotFound
 	case errors.Is(err, astral.ErrKindRejected), errors.Is(err, astral.ErrBadName),
-		errors.Is(err, astral.ErrSubjectFull):
+		errors.Is(err, astral.ErrBadCircle), errors.Is(err, astral.ErrSubjectFull):
 		code = http.StatusBadRequest
 	}
 	http.Error(w, err.Error(), code)
@@ -171,23 +184,37 @@ func decode(w http.ResponseWriter, r *http.Request, v any) error {
 	return json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(v)
 }
 
+// display renders a ref for the Placed map: bare inside the home circle.
+func (d *Daemon) display(ref astral.Ref) string {
+	if ref.Circle == d.Home() {
+		return ref.Name
+	}
+	return ref.String()
+}
+
 func (d *Daemon) ctlStatus(w http.ResponseWriter, r *http.Request) {
 	if !d.begin() {
 		writeErr(w, errors.New("shutting down"))
 		return
 	}
 	defer d.end()
-	reply := StatusReply{Version: Version, Path: d.Path, Mesh: d.Fabric != nil, Member: d.MemberName()}
+	reply := StatusReply{Version: Version, Path: d.Path, Mesh: d.Fabric != nil, Member: d.MemberName(), Home: d.Home()}
 	boxes, err := d.Store.Subjects()
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	for _, m := range boxes {
-		n, _ := d.Store.Pending(m.Name)
+		n, _ := d.Store.Pending(m.Ref())
 		reply.Hosted = append(reply.Hosted, HostedInfo{Subject: m, Pending: n})
 	}
-	reply.Placed, _ = d.Store.Hosts()
+	reply.Placements, _ = d.Store.Hosts()
+	if len(reply.Placements) > 0 {
+		reply.Placed = make(map[string]string, len(reply.Placements))
+		for _, p := range reply.Placements {
+			reply.Placed[d.display(p.Ref)] = d.hostLabel(p.Host)
+		}
+	}
 	reply.Monitors, _ = d.Store.Heartbeats()
 	reply.Claims, _ = d.Store.Leases(time.Now())
 	ob, _ := d.Store.Outbox()
@@ -211,14 +238,15 @@ func (d *Daemon) ctlDeclare(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	ref := d.Ref(b.Circle, b.Name)
 	if err := d.Declare(astral.Subject{
-		Name: b.Name, Delivery: b.Delivery, Accepts: b.Accepts,
+		Circle: ref.Circle, Name: ref.Name, Delivery: b.Delivery, Accepts: b.Accepts,
 		IdleTTLNS: int64(b.IdleS) * int64(time.Second), MaxEvents: b.MaxEv,
 	}); err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, map[string]string{"name": b.Name})
+	writeJSON(w, ref)
 }
 
 func (d *Daemon) ctlRemove(w http.ResponseWriter, r *http.Request) {
@@ -227,11 +255,12 @@ func (d *Daemon) ctlRemove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if err := d.Remove(b.Name); err != nil {
+	ref := d.Ref(b.Circle, b.Name)
+	if err := d.Remove(ref); err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, map[string]string{"name": b.Name})
+	writeJSON(w, ref)
 }
 
 func (d *Daemon) ctlHost(w http.ResponseWriter, r *http.Request) {
@@ -240,15 +269,25 @@ func (d *Daemon) ctlHost(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if err := astral.ValidName(b.Name); err != nil {
+	ref := d.Ref(b.Circle, b.Name)
+	if err := ref.Valid(); err != nil {
 		writeErr(w, err)
 		return
 	}
-	if err := d.Store.SetHost(b.Name, b.Host); err != nil {
+	host := ""
+	if b.Host != "" {
+		p, err := d.resolveHost(b.Host)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		host = p.String()
+	}
+	if err := d.Store.SetHost(ref, host); err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, b)
+	writeJSON(w, hostBody{Circle: ref.Circle, Name: ref.Name, Host: host})
 }
 
 func (d *Daemon) ctlAppend(w http.ResponseWriter, r *http.Request) {
@@ -268,7 +307,7 @@ func (d *Daemon) ctlAppend(w http.ResponseWriter, r *http.Request) {
 		ev.At = time.Now().UnixNano()
 	}
 	ev.DeriveID()
-	fresh, err := d.Append(b.Name, ev)
+	fresh, err := d.Append(d.Ref(b.Circle, b.Name), ev)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -287,7 +326,7 @@ func (d *Daemon) ctlClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	c, err := d.Claim(b.Name, b.Consumer, time.Duration(b.LeaseS)*time.Second, b.N)
+	c, err := d.Claim(d.Ref(b.Circle, b.Name), b.Consumer, time.Duration(b.LeaseS)*time.Second, b.N)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -309,7 +348,7 @@ func (d *Daemon) ctlAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	if err := d.Ack(b.Name, b.Consumer, b.EventID); err != nil {
+	if err := d.Ack(d.Ref(b.Circle, b.Name), b.Consumer, b.EventID); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -327,7 +366,7 @@ func (d *Daemon) ctlSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	if err := d.Set(b.Name, b.Value); err != nil {
+	if err := d.Set(d.Ref(b.Circle, b.Name), b.Value); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -340,7 +379,8 @@ func (d *Daemon) ctlGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	reg, ok, err := d.Get(r.URL.Query().Get("name"))
+	q := r.URL.Query()
+	reg, ok, err := d.Get(d.Ref(q.Get("circle"), q.Get("name")))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -363,7 +403,7 @@ func (d *Daemon) ctlWait(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	woke, err := d.Wait(r.Context(), b.Name, time.Duration(b.TimeoutS)*time.Second)
+	woke, err := d.Wait(r.Context(), d.Ref(b.Circle, b.Name), time.Duration(b.TimeoutS)*time.Second)
 	if err != nil && woke == "" {
 		writeErr(w, err)
 		return
@@ -382,7 +422,7 @@ func (d *Daemon) ctlHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	if err := d.Heartbeat(b.Entity, time.Duration(b.TTLS)*time.Second); err != nil {
+	if err := d.Heartbeat(d.Ref(b.Circle, b.Entity), time.Duration(b.TTLS)*time.Second); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -400,7 +440,7 @@ func (d *Daemon) ctlWatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.end()
-	if err := d.Watch(b.Entity, b.Watcher); err != nil {
+	if err := d.Watch(d.Ref(b.Circle, b.Entity), b.Watcher); err != nil {
 		writeErr(w, err)
 		return
 	}

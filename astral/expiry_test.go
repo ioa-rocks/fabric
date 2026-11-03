@@ -21,10 +21,10 @@ func TestEphemeralDefaults(t *testing.T) {
 	if !Ephemeral("subject:queues/_reply/abc") || Ephemeral("subject:queues/fortune") {
 		t.Fatal("Ephemeral prefix detection wrong")
 	}
-	if err := s.Declare(Subject{Name: "subject:queues/_reply/abc"}); err != nil {
+	if err := s.Declare(Subject{Circle: LocalCircle, Name: "subject:queues/_reply/abc"}); err != nil {
 		t.Fatal(err)
 	}
-	m, ok, err := s.Subject("subject:queues/_reply/abc")
+	m, ok, err := s.Subject(R("subject:queues/_reply/abc"))
 	if err != nil || !ok {
 		t.Fatalf("lookup: ok=%v err=%v", ok, err)
 	}
@@ -32,18 +32,18 @@ func TestEphemeralDefaults(t *testing.T) {
 		t.Fatalf("defaults not applied: %+v", m)
 	}
 	// Explicit policy wins over defaults.
-	if err := s.Declare(Subject{Name: "subject:queues/_reply/xyz", IdleTTLNS: int64(time.Hour), MaxEvents: 7}); err != nil {
+	if err := s.Declare(Subject{Circle: LocalCircle, Name: "subject:queues/_reply/xyz", IdleTTLNS: int64(time.Hour), MaxEvents: 7}); err != nil {
 		t.Fatal(err)
 	}
-	m, _, _ = s.Subject("subject:queues/_reply/xyz")
+	m, _, _ = s.Subject(R("subject:queues/_reply/xyz"))
 	if m.IdleTTLNS != int64(time.Hour) || m.MaxEvents != 7 {
 		t.Fatalf("explicit policy overridden: %+v", m)
 	}
 	// Ordinary subjects stay unlimited unless asked.
-	if err := s.Declare(Subject{Name: "subject:queues/fortune"}); err != nil {
+	if err := s.Declare(Subject{Circle: LocalCircle, Name: "subject:queues/fortune"}); err != nil {
 		t.Fatal(err)
 	}
-	m, _, _ = s.Subject("subject:queues/fortune")
+	m, _, _ = s.Subject(R("subject:queues/fortune"))
 	if m.IdleTTLNS != 0 || m.MaxEvents != 0 {
 		t.Fatalf("ordinary subject got limits: %+v", m)
 	}
@@ -51,8 +51,8 @@ func TestEphemeralDefaults(t *testing.T) {
 
 func TestSubjectFull(t *testing.T) {
 	s := openStore(t)
-	name := "subject:queues/capped"
-	if err := s.Declare(Subject{Name: name, MaxEvents: 2}); err != nil {
+	name := R("subject:queues/capped")
+	if err := s.Declare(Subject{Circle: LocalCircle, Name: name.Name, MaxEvents: 2}); err != nil {
 		t.Fatal(err)
 	}
 	for _, ev := range []Event{{ID: "e1", Kind: "user"}, {ID: "e2", Kind: "user"}} {
@@ -71,8 +71,8 @@ func TestSubjectFull(t *testing.T) {
 
 func TestExpireTombstoneAndRedeclare(t *testing.T) {
 	s := openStore(t)
-	name := "subject:queues/_reply/gone"
-	if err := s.Declare(Subject{Name: name}); err != nil {
+	name := R("subject:queues/_reply/gone")
+	if err := s.Declare(Subject{Circle: LocalCircle, Name: name.Name}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Expire(name); err != nil {
@@ -85,7 +85,7 @@ func TestExpireTombstoneAndRedeclare(t *testing.T) {
 		t.Fatalf("claim after expiry = %v, want ErrSubjectExpired", err)
 	}
 	// Redeclaring is a new incarnation: the tombstone clears.
-	if err := s.Declare(Subject{Name: name}); err != nil {
+	if err := s.Declare(Subject{Circle: LocalCircle, Name: name.Name}); err != nil {
 		t.Fatal(err)
 	}
 	if fresh, err := s.Append(name, Event{Kind: "result", Content: "reborn"}); err != nil || !fresh {
@@ -105,13 +105,13 @@ func TestExpireTombstoneAndRedeclare(t *testing.T) {
 
 func TestIdleExpiredAndTouch(t *testing.T) {
 	s := openStore(t)
-	idle := "subject:queues/_reply/idle"
-	busy := "subject:queues/_reply/busy"
-	forever := "subject:queues/fortune"
+	idle := R("subject:queues/_reply/idle")
+	busy := R("subject:queues/_reply/busy")
+	forever := R("subject:queues/fortune")
 	for _, decl := range []Subject{
-		{Name: idle, IdleTTLNS: int64(50 * time.Millisecond)},
-		{Name: busy, IdleTTLNS: int64(50 * time.Millisecond)},
-		{Name: forever},
+		{Circle: LocalCircle, Name: idle.Name, IdleTTLNS: int64(50 * time.Millisecond)},
+		{Circle: LocalCircle, Name: busy.Name, IdleTTLNS: int64(50 * time.Millisecond)},
+		{Circle: LocalCircle, Name: forever.Name},
 	} {
 		if err := s.Declare(decl); err != nil {
 			t.Fatal(err)
@@ -132,13 +132,13 @@ func TestIdleExpiredAndTouch(t *testing.T) {
 
 func TestReplaceHostPreservesEphemeralRoutes(t *testing.T) {
 	s := openStore(t)
-	reply := "subject:queues/_reply/r1"
+	reply := R("subject:queues/_reply/r1")
 	if err := s.SetHost(reply, "desk"); err != nil {
 		t.Fatal(err)
 	}
 	// A registry refresh from desk announces only durable names; the
 	// learned reply route must survive the replacement.
-	if err := s.ReplaceHost("desk", []string{"subject:queues/desk-things"}); err != nil {
+	if err := s.ReplaceHost("desk", []Ref{R("subject:queues/desk-things")}); err != nil {
 		t.Fatal(err)
 	}
 	host, ok, err := s.Host(reply)

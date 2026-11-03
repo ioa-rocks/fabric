@@ -31,45 +31,45 @@ const (
 
 type waiters struct {
 	mu   sync.Mutex
-	gens map[string]chan struct{} // name → closed-and-replaced on every append
+	gens map[astral.Ref]chan struct{} // ref → closed-and-replaced on every append
 }
 
-func newWaiters() *waiters { return &waiters{gens: map[string]chan struct{}{}} }
+func newWaiters() *waiters { return &waiters{gens: map[astral.Ref]chan struct{}{}} }
 
-// chanFor returns the current generation channel for name.
-func (w *waiters) chanFor(name string) chan struct{} {
+// chanFor returns the current generation channel for ref.
+func (w *waiters) chanFor(ref astral.Ref) chan struct{} {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	ch, ok := w.gens[name]
+	ch, ok := w.gens[ref]
 	if !ok {
 		ch = make(chan struct{})
-		w.gens[name] = ch
+		w.gens[ref] = ch
 	}
 	return ch
 }
 
-// notify releases everyone parked on name.
-func (w *waiters) notify(name string) {
+// notify releases everyone parked on ref.
+func (w *waiters) notify(ref astral.Ref) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if ch, ok := w.gens[name]; ok {
+	if ch, ok := w.gens[ref]; ok {
 		close(ch)
-		delete(w.gens, name)
+		delete(w.gens, ref)
 	}
 }
 
-// waitLocal parks until name (hosted here) has pending mail or timeout.
+// waitLocal parks until ref (hosted here) has pending mail or timeout.
 // An active wait counts as activity: a parked waiter keeps its ephemeral
 // reply subject from idling out under it.
-func (d *Daemon) waitLocal(ctx context.Context, name string, timeout time.Duration) (Woke, error) {
-	_ = d.Store.Touch(name)
+func (d *Daemon) waitLocal(ctx context.Context, ref astral.Ref, timeout time.Duration) (Woke, error) {
+	_ = d.Store.Touch(ref)
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
 		// Take the generation *before* checking, so an append between the
 		// check and the park cannot be missed.
-		ch := d.wake.chanFor(name)
-		n, err := d.Store.Pending(name)
+		ch := d.wake.chanFor(ref)
+		n, err := d.Store.Pending(ref)
 		if err != nil {
 			return "", err
 		}
@@ -86,23 +86,23 @@ func (d *Daemon) waitLocal(ctx context.Context, name string, timeout time.Durati
 	}
 }
 
-// Wait parks until name has pending mail (wherever it is hosted) or
+// Wait parks until ref has pending mail (wherever it is hosted) or
 // timeout. Remote waits ride one stream per wait; the host's deadline is
 // timeout plus slack.
-func (d *Daemon) Wait(ctx context.Context, name string, timeout time.Duration) (Woke, error) {
+func (d *Daemon) Wait(ctx context.Context, ref astral.Ref, timeout time.Duration) (Woke, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	if _, ok, err := d.Store.Subject(name); err != nil {
+	if _, ok, err := d.Store.Subject(ref); err != nil {
 		return "", err
 	} else if ok {
-		return d.waitLocal(ctx, name, timeout)
+		return d.waitLocal(ctx, ref, timeout)
 	}
-	host, ok, err := d.Store.Host(name)
+	host, ok, err := d.Store.Host(ref)
 	if err != nil || !ok {
 		return "", orUnknown(err)
 	}
-	resp, err := d.remoteWithin(host, request{Op: OpWait, Name: name, LeaseNS: int64(timeout)}, timeout+5*time.Second)
+	resp, err := d.remoteWithin(host, request{Op: OpWait, Circle: ref.Circle, Name: ref.Name, LeaseNS: int64(timeout)}, timeout+5*time.Second)
 	if err != nil {
 		return "", err
 	}
@@ -112,8 +112,9 @@ func (d *Daemon) Wait(ctx context.Context, name string, timeout time.Duration) (
 // --- monitors ---
 
 // Heartbeat extends an entity's liveness lease on the host of
-// subject:<entity> (an entity with no placed inbox is monitored here).
-func (d *Daemon) Heartbeat(entity string, ttl time.Duration) error {
+// subject:<entity> in the entity's circle (an entity with no placed inbox
+// is monitored here).
+func (d *Daemon) Heartbeat(entity astral.Ref, ttl time.Duration) error {
 	host, remote, err := d.entityHost(entity)
 	if err != nil {
 		return err
@@ -122,25 +123,26 @@ func (d *Daemon) Heartbeat(entity string, ttl time.Duration) error {
 		_, err := d.Store.Heartbeat(entity, ttl)
 		return err
 	}
-	_, err = d.remote(host, request{Op: OpHeartbeat, Name: entity, LeaseNS: int64(ttl)})
+	_, err = d.remote(host, request{Op: OpHeartbeat, Circle: entity.Circle, Name: entity.Name, LeaseNS: int64(ttl)})
 	return err
 }
 
-// Watch subscribes a watcher subject to entity's death notices.
-func (d *Daemon) Watch(entity, watcher string) error {
+// Watch subscribes a watcher subject (same circle) to entity's death
+// notices.
+func (d *Daemon) Watch(entity astral.Ref, watcher string) error {
 	host, remote, err := d.entityHost(entity)
 	if err != nil {
 		return err
 	}
 	if !remote {
-		return d.Store.Watch(entity, watcher)
+		return d.Store.Watch(entity, astral.Ref{Circle: entity.Circle, Name: watcher})
 	}
-	_, err = d.remote(host, request{Op: OpWatch, Name: entity, Consumer: watcher})
+	_, err = d.remote(host, request{Op: OpWatch, Circle: entity.Circle, Name: entity.Name, Consumer: watcher})
 	return err
 }
 
-func (d *Daemon) entityHost(entity string) (host string, remote bool, err error) {
-	inbox := "subject:" + entity
+func (d *Daemon) entityHost(entity astral.Ref) (host string, remote bool, err error) {
+	inbox := astral.Ref{Circle: entity.Circle, Name: "subject:" + entity.Name}
 	if _, ok, err := d.Store.Subject(inbox); err != nil || ok {
 		return "", false, err
 	}
@@ -178,17 +180,17 @@ func (d *Daemon) sweepExpired() {
 	}
 	defer d.end()
 	now := time.Now()
-	names, err := d.Store.IdleExpired(now)
+	refs, err := d.Store.IdleExpired(now)
 	if err != nil {
 		log.Printf("astral: expiry sweep: %v", err)
 		return
 	}
-	for _, name := range names {
-		if err := d.Store.Expire(name); err != nil {
-			log.Printf("astral: expiring %s: %v", name, err)
+	for _, ref := range refs {
+		if err := d.Store.Expire(ref); err != nil {
+			log.Printf("astral: expiring %s: %v", ref, err)
 			continue
 		}
-		log.Printf("astral: subject %s expired (idle)", name)
+		log.Printf("astral: subject %s expired (idle)", ref)
 	}
 	if err := d.Store.SweepTombstones(now, TombstoneKeep); err != nil {
 		log.Printf("astral: tombstone sweep: %v", err)
@@ -210,7 +212,7 @@ func (d *Daemon) sweepMonitors() {
 		return
 	}
 	for _, l := range lapses {
-		notice := astral.DeathNotice(l.Entity, l.Gen, time.Now().UnixNano())
+		notice := astral.DeathNotice(l.Entity.Name, l.Gen, time.Now().UnixNano())
 		ok := true
 		for _, w := range l.Watchers {
 			if _, err := d.Append(w, notice); err != nil {

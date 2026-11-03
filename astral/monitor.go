@@ -19,24 +19,31 @@ import (
 // runner that resumes heartbeating after its lease lapsed starts a new
 // generation — the watchers already got the death notice for the old one.
 //
+// An entity lives in a circle like everything else: the entity ref is
+// (circle, entity) and watchers are subject refs of the same circle.
+//
 // Key layout:
 //
-//	h/<entity>            Heartbeat {until, gen, notified}
-//	w/<entity>/<watcher>  "" (watcher = subject name)
+//	h/<entity ref>                Heartbeat {until, gen, notified}
+//	w/<entity ref>/<watcher ref>  "" (watcher = subject ref)
 
 // Heartbeat is an entity's liveness lease.
 type Heartbeat struct {
+	Circle   string `json:"circle"`
 	Entity   string `json:"entity"`
 	Until    int64  `json:"until"` // Unix nanoseconds
 	Gen      uint64 `json:"gen"`
 	Notified bool   `json:"notified"` // death notice for Gen already cast
 }
 
+// Ref is the entity's identity.
+func (h Heartbeat) Ref() Ref { return Ref{Circle: h.Circle, Name: h.Entity} }
+
 // Lapse is one lapsed lease with the subjects to notify.
 type Lapse struct {
-	Entity   string
+	Entity   Ref
 	Gen      uint64
-	Watchers []string
+	Watchers []Ref
 }
 
 // DeathNotice is the event cast to a watcher when entity's lease lapses.
@@ -51,11 +58,21 @@ func DeathNotice(entity string, gen uint64, at int64) Event {
 	}
 }
 
+func validEntity(entity Ref) error {
+	if err := validCircle(entity.Circle); err != nil {
+		return err
+	}
+	if entity.Name == "" || strings.ContainsAny(entity.Name, "/ ") {
+		return fmt.Errorf("astral: bad entity %q", entity.Name)
+	}
+	return nil
+}
+
 // Heartbeat extends entity's lease by ttl. A lapsed or notified lease
 // starts a new generation.
-func (s *Store) Heartbeat(entity string, ttl time.Duration) (Heartbeat, error) {
-	if entity == "" || strings.ContainsAny(entity, "/ ") {
-		return Heartbeat{}, fmt.Errorf("astral: bad entity %q", entity)
+func (s *Store) Heartbeat(entity Ref, ttl time.Duration) (Heartbeat, error) {
+	if err := validEntity(entity); err != nil {
+		return Heartbeat{}, err
 	}
 	if ttl <= 0 {
 		ttl = 30 * time.Second
@@ -64,47 +81,49 @@ func (s *Store) Heartbeat(entity string, ttl time.Duration) (Heartbeat, error) {
 	defer s.mu.Unlock()
 	now := time.Now().UnixNano()
 	var h Heartbeat
-	ok, err := s.getJSON("h/"+entity, &h)
+	ok, err := s.getJSON(k1("h/", entity), &h)
 	if err != nil {
 		return h, err
 	}
 	if !ok || h.Notified || h.Until < now {
-		h = Heartbeat{Entity: entity, Gen: h.Gen + 1}
+		h = Heartbeat{Circle: entity.Circle, Entity: entity.Name, Gen: h.Gen + 1}
 	}
 	h.Until = now + int64(ttl)
 	raw, err := json.Marshal(h)
 	if err != nil {
 		return h, err
 	}
-	return h, s.db.Set([]byte("h/"+entity), raw, pebble.Sync)
+	return h, s.db.Set([]byte(k1("h/", entity)), raw, pebble.Sync)
 }
 
-// Watch subscribes watcher (a subject name) to entity's death notices.
-func (s *Store) Watch(entity, watcher string) error {
-	if err := ValidName(watcher); err != nil {
+// Watch subscribes watcher (a subject ref) to entity's death notices.
+func (s *Store) Watch(entity, watcher Ref) error {
+	if err := watcher.Valid(); err != nil {
 		return err
 	}
-	if entity == "" || strings.ContainsAny(entity, "/ ") {
-		return fmt.Errorf("astral: bad entity %q", entity)
+	if err := validEntity(entity); err != nil {
+		return err
 	}
-	return s.db.Set([]byte("w/"+entity+"/"+watcher), nil, pebble.Sync)
+	return s.db.Set([]byte(k2("w/", entity, watcher.key())), nil, pebble.Sync)
 }
 
 // Unwatch removes a subscription.
-func (s *Store) Unwatch(entity, watcher string) error {
-	return s.db.Delete([]byte("w/"+entity+"/"+watcher), pebble.Sync)
+func (s *Store) Unwatch(entity, watcher Ref) error {
+	return s.db.Delete([]byte(k2("w/", entity, watcher.key())), pebble.Sync)
 }
 
 // Watchers lists the subjects watching entity.
-func (s *Store) Watchers(entity string) ([]string, error) {
-	it, err := s.db.NewIter(prefixBounds("w/" + entity + "/"))
+func (s *Store) Watchers(entity Ref) ([]Ref, error) {
+	prefix := k1("w/", entity) + "/"
+	it, err := s.db.NewIter(prefixBounds(prefix))
 	if err != nil {
 		return nil, err
 	}
 	defer it.Close()
-	var out []string
+	var out []Ref
 	for it.First(); it.Valid(); it.Next() {
-		out = append(out, string(it.Key())[len("w/"+entity+"/"):])
+		w, _ := mustParseKey(string(it.Key())[len(prefix):])
+		out = append(out, w)
 	}
 	return out, nil
 }
@@ -139,22 +158,22 @@ func (s *Store) Lapsed(now time.Time) ([]Lapse, error) {
 		if h.Notified || h.Until >= now.UnixNano() {
 			continue
 		}
-		w, err := s.Watchers(h.Entity)
+		w, err := s.Watchers(h.Ref())
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, Lapse{Entity: h.Entity, Gen: h.Gen, Watchers: w})
+		out = append(out, Lapse{Entity: h.Ref(), Gen: h.Gen, Watchers: w})
 	}
 	return out, nil
 }
 
 // MarkNotified records that gen's death notice was cast. A newer
 // generation (the runner came back meanwhile) is left alone.
-func (s *Store) MarkNotified(entity string, gen uint64) error {
+func (s *Store) MarkNotified(entity Ref, gen uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var h Heartbeat
-	ok, err := s.getJSON("h/"+entity, &h)
+	ok, err := s.getJSON(k1("h/", entity), &h)
 	if err != nil || !ok || h.Gen != gen {
 		return err
 	}
@@ -163,5 +182,5 @@ func (s *Store) MarkNotified(entity string, gen uint64) error {
 	if err != nil {
 		return err
 	}
-	return s.db.Set([]byte("h/"+entity), raw, pebble.Sync)
+	return s.db.Set([]byte(k1("h/", entity)), raw, pebble.Sync)
 }

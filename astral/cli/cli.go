@@ -18,11 +18,11 @@ import (
 
 const usage = `usage: fabric astral <command> [flags] [args]
 
-  status                               hosted names, placements, outbox, connected members
+  status                               hosted subjects, placements, outbox, connected members
   subject <subject:name> [-delivery exclusive|shared] [-accepts k1,k2] [-idle 10m] [-max 100]
                                        -idle self-destructs after inactivity; -max caps appends
   rm <name>                            remove a hosted subject and its journal
-  host <name> <member>                 record that <member> hosts <name> ("" clears)
+  host <name> <member|peer-id>         record that a node hosts <name> ("" clears)
   append <name> [-kind user] [-source tool] [-id id] [-ref artifact] [-reply target] [-corr id] <content|->
   claim <name> [-consumer me] [-lease 30] [-n 1] [-wait 0]
                                        -wait N parks up to N seconds for mail first
@@ -32,7 +32,8 @@ const usage = `usage: fabric astral <command> [flags] [args]
   set <register:entity/key> <value>
   get <register:entity/key>
 
-Every command accepts -state <dir> (default ` + "`" + `%s` + "`" + `).
+Every command accepts -state <dir> (default ` + "`" + `%s` + "`" + `) and
+-circle <did> — the circle the name belongs to (default: this node's home circle).
 `
 
 // Main runs the CLI and returns the process exit code.
@@ -82,12 +83,18 @@ func Main(args []string) int {
 	return 0
 }
 
-// flags builds a flag set with -state and interleaved parsing: flags are
-// valid before and after positionals.
+// flags builds a flag set with -state and -circle and interleaved parsing:
+// flags are valid before and after positionals.
 func flags(name string) (*flag.FlagSet, *string) {
 	fs := flag.NewFlagSet("astral "+name, flag.ExitOnError)
 	st := fs.String("state", daemon.DefaultPath(), "astral state directory")
+	fs.String("circle", "", "circle DID the name belongs to (default: this node's home circle)")
 	return fs, st
+}
+
+// client builds the control-socket client for the parsed flags.
+func client(fs *flag.FlagSet, st *string) *daemon.Client {
+	return daemon.NewClient(*st).In(fs.Lookup("circle").Value.String())
 }
 
 func parse(fs *flag.FlagSet, args []string) []string {
@@ -109,7 +116,7 @@ func parse(fs *flag.FlagSet, args []string) []string {
 func cmdStatus(args []string) error {
 	fs, st := flags("status")
 	parse(fs, args)
-	s, err := daemon.NewClient(*st).Status()
+	s, err := client(fs, st).Status()
 	if err != nil {
 		return err
 	}
@@ -119,6 +126,7 @@ func cmdStatus(args []string) error {
 	} else {
 		fmt.Println("solo (no mesh attached)")
 	}
+	fmt.Printf("home circle %s\n", s.Home)
 	if len(s.Hosted) > 0 {
 		fmt.Println("hosted here:")
 		for _, h := range s.Hosted {
@@ -126,7 +134,11 @@ func cmdStatus(args []string) error {
 			if len(h.Accepts) > 0 {
 				acc = strings.Join(h.Accepts, ",")
 			}
-			fmt.Printf("  %-32s pending %-4d accepts %s\n", h.Name, h.Pending, acc)
+			name := h.Name
+			if h.Circle != s.Home {
+				name = h.Name + " @ " + h.Circle
+			}
+			fmt.Printf("  %-32s pending %-4d accepts %s\n", name, h.Pending, acc)
 		}
 	}
 	if len(s.Placed) > 0 {
@@ -155,7 +167,7 @@ func cmdSubject(args []string) error {
 	if *accepts != "" {
 		kinds = strings.Split(*accepts, ",")
 	}
-	cl := daemon.NewClient(*st)
+	cl := client(fs, st)
 	if *idle > 0 || *maxEvents > 0 {
 		return cl.DeclareExpiring(pos[0], astral.Delivery(*delivery), kinds, *idle, *maxEvents)
 	}
@@ -168,16 +180,16 @@ func cmdRm(args []string) error {
 	if len(pos) != 1 {
 		return fmt.Errorf("usage: rm <name>")
 	}
-	return daemon.NewClient(*st).Remove(pos[0])
+	return client(fs, st).Remove(pos[0])
 }
 
 func cmdHost(args []string) error {
 	fs, st := flags("host")
 	pos := parse(fs, args)
 	if len(pos) != 2 {
-		return fmt.Errorf("usage: host <name> <member>")
+		return fmt.Errorf("usage: host <name> <member|peer-id>")
 	}
-	return daemon.NewClient(*st).SetHost(pos[0], pos[1])
+	return client(fs, st).SetHost(pos[0], pos[1])
 }
 
 func cmdAppend(args []string) error {
@@ -200,7 +212,7 @@ func cmdAppend(args []string) error {
 		}
 		content = strings.TrimRight(string(b), "\n")
 	}
-	eid, fresh, err := daemon.NewClient(*st).Append(pos[0], astral.Event{
+	eid, fresh, err := client(fs, st).Append(pos[0], astral.Event{
 		ID: *id, Kind: *kind, Source: *source, Content: content,
 		PayloadRef: *ref, ReplyTarget: *reply, CorrelationID: *corr,
 	})
@@ -225,7 +237,7 @@ func cmdClaim(args []string) error {
 	if len(pos) != 1 {
 		return fmt.Errorf("usage: claim <name> [-consumer me] [-lease 30] [-n 1] [-wait 0]")
 	}
-	cl := daemon.NewClient(*st)
+	cl := client(fs, st)
 	if *wait > 0 {
 		if _, err := cl.Wait(pos[0], *wait); err != nil {
 			return err
@@ -251,7 +263,7 @@ func cmdAck(args []string) error {
 	if len(pos) != 2 {
 		return fmt.Errorf("usage: ack <name> <event-id> [-consumer me]")
 	}
-	return daemon.NewClient(*st).Ack(pos[0], *consumer, pos[1])
+	return client(fs, st).Ack(pos[0], *consumer, pos[1])
 }
 
 func cmdSet(args []string) error {
@@ -260,7 +272,7 @@ func cmdSet(args []string) error {
 	if len(pos) != 2 {
 		return fmt.Errorf("usage: set <register:entity/key> <value>")
 	}
-	return daemon.NewClient(*st).Set(pos[0], pos[1])
+	return client(fs, st).Set(pos[0], pos[1])
 }
 
 func cmdGet(args []string) error {
@@ -269,7 +281,7 @@ func cmdGet(args []string) error {
 	if len(pos) != 1 {
 		return fmt.Errorf("usage: get <register:entity/key>")
 	}
-	r, ok, err := daemon.NewClient(*st).Get(pos[0])
+	r, ok, err := client(fs, st).Get(pos[0])
 	if err != nil {
 		return err
 	}
@@ -287,7 +299,7 @@ func cmdHeartbeat(args []string) error {
 	if len(pos) != 1 {
 		return fmt.Errorf("usage: heartbeat <entity> [-ttl 30]")
 	}
-	return daemon.NewClient(*st).Heartbeat(pos[0], *ttl)
+	return client(fs, st).Heartbeat(pos[0], *ttl)
 }
 
 func cmdWatch(args []string) error {
@@ -296,5 +308,5 @@ func cmdWatch(args []string) error {
 	if len(pos) != 2 {
 		return fmt.Errorf("usage: watch <entity> <watcher-subject>")
 	}
-	return daemon.NewClient(*st).Watch(pos[0], pos[1])
+	return client(fs, st).Watch(pos[0], pos[1])
 }

@@ -135,7 +135,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
 	if ast, err := astraldaemon.NewClient(s.astralPath).Status(); err == nil {
 		o.Astral = &AstralOverview{
 			Status:     ast,
-			Capability: "member-wide (delegated capabilities not yet implemented)",
+			Capability: "per circle: subjects are (circle, name); any member may still call any verb until the verb checks land",
 		}
 	}
 	if st.Master {

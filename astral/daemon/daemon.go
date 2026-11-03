@@ -1,17 +1,20 @@
 // Package daemon is the astral subsystem of the node process (ADR 0013 +
-// ADR 0015): a journal host behind `/astral/subject/1` and a local control
+// ADR 0015): a journal host behind `/astral/subject/2` and a local control
 // socket, attached to the fabric daemon that owns the machine's
 // connectivity. `fabric up` activates it on every node — the plane exists
-// wherever fabric runs; what differs per node is which names it *hosts*.
+// wherever fabric runs; what differs per node is which refs it *hosts*.
 //
-// Every verb resolves a name first: hosted here → local journal; placed on
-// another member → a stream to that member (a cast that cannot reach its
-// host is parked in the outbox and retried); unknown → loud error. The
-// placement table is refreshed directly between authenticated members; the
-// namespace engine can later become its signed source of truth.
+// Every verb resolves a ref — (circle DID, name) — first: hosted here →
+// local journal; placed on another node → a stream to that node (a cast
+// that cannot reach its host is parked in the outbox and retried); unknown
+// → loud error. The placement table is refreshed directly between
+// authenticated members and keyed by peer ID.
 //
-// With no fabric attached (nil) the subsystem serves local names only —
-// the solo mode the unit tests exercise.
+// Protocol v1 (bare names) is still served and dialed for one release: a
+// bare name is the same resource in the node's home circle on both ends.
+//
+// With no fabric attached (nil) the subsystem serves local refs only — the
+// solo mode the unit tests exercise; its circle is astral.LocalCircle.
 package daemon
 
 import (
@@ -28,18 +31,27 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 
 	"ioa.rocks/fabric/astral"
 	fabricdaemon "ioa.rocks/fabric/daemon"
+	"ioa.rocks/fabric/internal/wire"
 )
 
 // Version travels in status replies so mismatched nodes are visible.
-const Version = "0.2-dev"
+const Version = "0.3-dev"
 
-// Protocol is the host protocol: one CBOR request, one CBOR reply per
-// stream, member-gated. `call` in its degenerate form — framing is
-// per-protocol (ADR 0015).
-const Protocol = "/astral/subject/1"
+// Protocol is the host protocol: one framed CBOR request, one framed CBOR
+// reply per stream, member-gated, every request naming its circle.
+// ProtocolV1 is the bare-name predecessor, served and dialed during the
+// rollout. `call` in its degenerate form — framing is per-protocol (ADR
+// 0015).
+const (
+	Protocol   = "/astral/subject/2"
+	ProtocolV1 = "/astral/subject/1"
+)
+
+const maxWireSize = 256 * 1024
 
 // OutboxInterval is the outbox retry timer; auth of a new peer also
 // triggers a flush. Variable so tests can shrink it.
@@ -67,11 +79,12 @@ const (
 	OpWait      Op = "wait"      // park until mail or LeaseNS timeout
 	OpHeartbeat Op = "heartbeat" // Name = entity, LeaseNS = ttl
 	OpWatch     Op = "watch"     // Name = entity, Consumer = watcher subject
-	OpRegistry  Op = "registry"  // exchange names hosted by each endpoint
+	OpRegistry  Op = "registry"  // exchange refs hosted by each endpoint
 )
 
 type request struct {
 	Op       Op           `cbor:"op"`
+	Circle   string       `cbor:"circle,omitempty"` // v2; absent on v1 = home circle
 	Name     string       `cbor:"name"`
 	Event    astral.Event `cbor:"event,omitempty"`
 	Consumer string       `cbor:"consumer,omitempty"`
@@ -79,8 +92,11 @@ type request struct {
 	N        int          `cbor:"n,omitempty"`
 	EventID  string       `cbor:"event_id,omitempty"`
 	Value    string       `cbor:"value,omitempty"`
-	Names    []string     `cbor:"names,omitempty"`
+	Names    []string     `cbor:"names,omitempty"` // v1 registry: bare names
+	Refs     []astral.Ref `cbor:"refs,omitempty"`  // v2 registry
 }
+
+func (r request) ref() astral.Ref { return astral.Ref{Circle: r.Circle, Name: r.Name} }
 
 type response struct {
 	Err     string           `cbor:"err,omitempty"`
@@ -89,6 +105,7 @@ type response struct {
 	Reg     *astral.Register `cbor:"reg,omitempty"`
 	Woke    string           `cbor:"woke,omitempty"`
 	Names   []string         `cbor:"names,omitempty"`
+	Refs    []astral.Ref     `cbor:"refs,omitempty"`
 }
 
 // Daemon hosts a journal and routes verbs.
@@ -125,13 +142,18 @@ func (d *Daemon) end() { d.wg.Done() }
 
 // New opens the journal under statePath and attaches to fd's host. Attach
 // before fd.Run(): the handler and the auth hook must be in place when the
-// first peer authenticates.
+// first peer authenticates. A layout-1 journal is migrated into the home
+// circle on open.
 func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 	if err := os.MkdirAll(statePath, 0o700); err != nil {
 		return nil, err
 	}
 	st, err := astral.Open(filepath.Join(statePath, "journal"))
 	if err != nil {
+		return nil, err
+	}
+	if err := st.CheckLayout(); err != nil {
+		st.Close()
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -142,7 +164,18 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		ctx:  ctx, cancel: cancel,
 	}
 	if fd != nil {
-		fd.Host.SetStreamHandler(Protocol, fd.Auth.RequireMember(d.handleStream))
+		d.Fabric = fd
+	}
+	if n, err := st.Migrate(d.Home()); err != nil {
+		cancel()
+		st.Close()
+		return nil, fmt.Errorf("astral: migrating the journal into circle %s: %w", d.Home(), err)
+	} else if n > 0 {
+		log.Printf("astral: %d journal key(s) moved into circle %s (layout %d)", n, d.Home(), astral.Layout)
+	}
+	if fd != nil {
+		fd.Host.SetStreamHandler(Protocol, fd.Auth.RequireMember(d.handleStreamV2))
+		fd.Host.SetStreamHandler(ProtocolV1, fd.Auth.RequireMember(d.handleStreamV1))
 		// Chain onto whatever on-auth hook is already installed (fabric's
 		// own anti-entropy, vault's sync) rather than replacing it.
 		prev := fd.Auth.OnAuthenticated()
@@ -152,7 +185,6 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 			}
 			go d.refreshRegistry(p)
 		})
-		d.Fabric = fd
 		nb := &network.NotifyBundle{ConnectedF: func(_ network.Network, c network.Conn) {
 			go d.refreshRegistry(c.RemotePeer())
 		}}
@@ -162,9 +194,29 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 	return d, nil
 }
 
-// Declare hosts a name on this node and announces the refreshed local
+// Home is the circle a bare name belongs to on this node: the namespace
+// (home circle) DID when on a mesh, astral.LocalCircle when solo.
+func (d *Daemon) Home() string {
+	if d.Fabric == nil {
+		return astral.LocalCircle
+	}
+	return d.Fabric.Config.NamespaceDID
+}
+
+// Ref resolves (circle, name) with the home circle as default.
+func (d *Daemon) Ref(circle, name string) astral.Ref {
+	if circle == "" {
+		circle = d.Home()
+	}
+	return astral.Ref{Circle: circle, Name: name}
+}
+
+// Declare hosts a subject on this node and announces the refreshed local
 // registry view to every connected member.
 func (d *Daemon) Declare(m astral.Subject) error {
+	if m.Circle == "" {
+		m.Circle = d.Home()
+	}
 	if err := d.Store.Declare(m); err != nil {
 		return err
 	}
@@ -174,8 +226,8 @@ func (d *Daemon) Declare(m astral.Subject) error {
 
 // Remove drops a subject hosted here (journal included) and announces the
 // refreshed local registry so peers forget the placement.
-func (d *Daemon) Remove(name string) error {
-	if err := d.Store.Remove(name); err != nil {
+func (d *Daemon) Remove(ref astral.Ref) error {
+	if err := d.Store.Remove(ref); err != nil {
 		return err
 	}
 	go d.announceRegistry()
@@ -192,7 +244,7 @@ func (d *Daemon) Run() error {
 		return err
 	}
 	defer stopControl()
-	log.Printf("astral subsystem up: %s", d.Path)
+	log.Printf("astral subsystem up: %s (home circle %s)", d.Path, d.Home())
 
 	if d.Fabric != nil {
 		go func() { defer close(d.done); d.outboxLoop() }()
@@ -225,12 +277,12 @@ func (d *Daemon) MemberName() string {
 
 // --- verb routing ---
 
-// Append casts an event to a name: locally hosted → journal; placed
+// Append casts an event to a ref: locally hosted → journal; placed
 // elsewhere → stream, outbox on failure. Source is stamped with this
 // node's member name; a remote host re-stamps it from the authenticated
 // peer, so a client cannot impersonate another member.
-func (d *Daemon) Append(name string, ev astral.Event) (fresh bool, err error) {
-	if err := astral.ValidName(name); err != nil {
+func (d *Daemon) Append(ref astral.Ref, ev astral.Event) (fresh bool, err error) {
+	if err := ref.Valid(); err != nil {
 		return false, err
 	}
 	ev.Source = stampSource(ev.Source, d.MemberName())
@@ -238,24 +290,27 @@ func (d *Daemon) Append(name string, ev astral.Event) (fresh bool, err error) {
 		ev.At = time.Now().UnixNano()
 	}
 	ev.DeriveID()
-	if _, ok, err := d.Store.Subject(name); err != nil {
+	if err := astral.ValidID(ev.ID); err != nil {
+		return false, err
+	}
+	if _, ok, err := d.Store.Subject(ref); err != nil {
 		return false, err
 	} else if ok {
-		return d.appendLocal(name, ev)
+		return d.appendLocal(ref, ev)
 	}
-	host, ok, err := d.Store.Host(name)
+	host, ok, err := d.Store.Host(ref)
 	if err != nil {
 		return false, err
 	}
 	if !ok {
-		if exp, err := d.Store.Expired(name); err != nil {
+		if exp, err := d.Store.Expired(ref); err != nil {
 			return false, err
 		} else if exp {
-			return false, fmt.Errorf("%w: %s", astral.ErrSubjectExpired, name)
+			return false, fmt.Errorf("%w: %s", astral.ErrSubjectExpired, ref)
 		}
 		return false, astral.ErrUnknownSubject
 	}
-	resp, err := d.remote(host, request{Op: OpAppend, Name: name, Event: ev})
+	resp, err := d.remote(host, request{Op: OpAppend, Circle: ref.Circle, Name: ref.Name, Event: ev})
 	if err != nil {
 		// The host answered and refused (expired, kind rejected, full):
 		// that is a loud semantic outcome, never parked — the outbox is
@@ -263,48 +318,48 @@ func (d *Daemon) Append(name string, ev astral.Event) (fresh bool, err error) {
 		// on retry. A dead reply route is also dropped here, so learned
 		// ephemeral placements do not outlive their subject.
 		if resp.Err != "" {
-			if astral.Ephemeral(name) && strings.Contains(resp.Err, "expired") {
-				_ = d.Store.SetHost(name, "")
+			if ref.Ephemeral() && strings.Contains(resp.Err, "expired") {
+				_ = d.Store.SetHost(ref, "")
 			}
 			return false, err
 		}
 		// Park it; the outbox loop retries when the host is reachable.
-		if qerr := d.Store.Enqueue(name, ev); qerr != nil {
+		if qerr := d.Store.Enqueue(ref, ev); qerr != nil {
 			return false, qerr
 		}
-		log.Printf("astral: %s unreachable (%v); parked %s in outbox", host, err, ev.ID)
+		log.Printf("astral: %s unreachable (%v); parked %s in outbox", d.hostLabel(host), err, ev.ID)
 		return true, nil
 	}
 	return resp.Fresh, nil
 }
 
 // appendLocal journals and wakes parked waiters.
-func (d *Daemon) appendLocal(name string, ev astral.Event) (bool, error) {
-	fresh, err := d.Store.Append(name, ev)
+func (d *Daemon) appendLocal(ref astral.Ref, ev astral.Event) (bool, error) {
+	fresh, err := d.Store.Append(ref, ev)
 	if err == nil && fresh {
-		d.wake.notify(name)
+		d.wake.notify(ref)
 	}
 	return fresh, err
 }
 
-// Claim leases events from a name, wherever it is hosted.
-func (d *Daemon) Claim(name, consumer string, lease time.Duration, n int) ([]astral.Claimed, error) {
-	if _, ok, err := d.Store.Subject(name); err != nil {
+// Claim leases events from a ref, wherever it is hosted.
+func (d *Daemon) Claim(ref astral.Ref, consumer string, lease time.Duration, n int) ([]astral.Claimed, error) {
+	if _, ok, err := d.Store.Subject(ref); err != nil {
 		return nil, err
 	} else if ok {
-		c, err := d.Store.Claim(name, consumer, lease, n)
-		d.learnReplyRoutes(c)
+		c, err := d.Store.Claim(ref, consumer, lease, n)
+		d.learnReplyRoutes(ref.Circle, c)
 		return c, err
 	}
-	host, ok, err := d.Store.Host(name)
+	host, ok, err := d.Store.Host(ref)
 	if err != nil || !ok {
 		return nil, orUnknown(err)
 	}
-	resp, err := d.remote(host, request{Op: OpClaim, Name: name, Consumer: consumer, LeaseNS: int64(lease), N: n})
+	resp, err := d.remote(host, request{Op: OpClaim, Circle: ref.Circle, Name: ref.Name, Consumer: consumer, LeaseNS: int64(lease), N: n})
 	if err != nil {
 		return nil, err
 	}
-	d.learnReplyRoutes(resp.Claimed)
+	d.learnReplyRoutes(ref.Circle, resp.Claimed)
 	return resp.Claimed, nil
 }
 
@@ -312,8 +367,9 @@ func (d *Daemon) Claim(name, consumer string, lease time.Duration, n int) ([]ast
 // in claimed requests. Reply subjects are never announced through the
 // registry — possession of the claimed request *is* the route (and, once
 // grants harden, the capability): its authoritative Source names the
-// member whose node declared the reply subject.
-func (d *Daemon) learnReplyRoutes(claimed []astral.Claimed) {
+// member whose node declared the reply subject. A reply subject lives in
+// the request's circle.
+func (d *Daemon) learnReplyRoutes(circle string, claimed []astral.Claimed) {
 	for _, c := range claimed {
 		target := c.Event.ReplyTarget
 		if target == "" || !astral.Ephemeral(target) {
@@ -323,72 +379,77 @@ func (d *Daemon) learnReplyRoutes(claimed []astral.Claimed) {
 		if !ok || member == "" || member == d.MemberName() {
 			continue
 		}
-		if _, hosted, err := d.Store.Subject(target); err != nil || hosted {
+		ref := astral.Ref{Circle: circle, Name: target}
+		if _, hosted, err := d.Store.Subject(ref); err != nil || hosted {
 			continue
 		}
-		if err := d.Store.SetHost(target, member); err != nil {
-			log.Printf("astral: learning reply route %s → %s: %v", target, member, err)
+		p, ok := d.peerByName(member)
+		if !ok {
+			continue
+		}
+		if err := d.Store.SetHost(ref, p.String()); err != nil {
+			log.Printf("astral: learning reply route %s → %s: %v", ref, member, err)
 		}
 	}
 }
 
-// Ack force-acks an event, wherever the name is hosted.
-func (d *Daemon) Ack(name, consumer, eventID string) error {
-	if _, ok, err := d.Store.Subject(name); err != nil {
+// Ack force-acks an event, wherever the ref is hosted.
+func (d *Daemon) Ack(ref astral.Ref, consumer, eventID string) error {
+	if _, ok, err := d.Store.Subject(ref); err != nil {
 		return err
 	} else if ok {
-		return d.Store.Ack(name, consumer, eventID)
+		return d.Store.Ack(ref, consumer, eventID)
 	}
-	host, ok, err := d.Store.Host(name)
+	host, ok, err := d.Store.Host(ref)
 	if err != nil || !ok {
 		return orUnknown(err)
 	}
-	_, err = d.remote(host, request{Op: OpAck, Name: name, Consumer: consumer, EventID: eventID})
+	_, err = d.remote(host, request{Op: OpAck, Circle: ref.Circle, Name: ref.Name, Consumer: consumer, EventID: eventID})
 	return err
 }
 
 // Set writes a register. Registers are hosted beside the inbox subject of the
 // entity they describe: `register:<entity>/<key>` follows the placement of
-// `subject:<entity>`; an entity with no placed inbox keeps its registers
-// locally.
-func (d *Daemon) Set(name, value string) error {
-	if err := astral.ValidRegister(name); err != nil {
+// `subject:<entity>` in the same circle; an entity with no placed inbox
+// keeps its registers locally.
+func (d *Daemon) Set(ref astral.Ref, value string) error {
+	if err := astral.ValidRegister(ref.Name); err != nil {
 		return err
 	}
-	host, remote, err := d.registerHost(name)
+	host, remote, err := d.registerHost(ref)
 	if err != nil {
 		return err
 	}
 	if !remote {
-		return d.Store.Set(astral.Register{Name: name, Value: value, By: d.MemberName()})
+		return d.Store.Set(astral.Register{Circle: ref.Circle, Name: ref.Name, Value: value, By: d.MemberName()})
 	}
-	_, err = d.remote(host, request{Op: OpSet, Name: name, Value: value})
+	_, err = d.remote(host, request{Op: OpSet, Circle: ref.Circle, Name: ref.Name, Value: value})
 	return err
 }
 
 // Get reads a register.
-func (d *Daemon) Get(name string) (astral.Register, bool, error) {
-	if err := astral.ValidRegister(name); err != nil {
+func (d *Daemon) Get(ref astral.Ref) (astral.Register, bool, error) {
+	if err := astral.ValidRegister(ref.Name); err != nil {
 		return astral.Register{}, false, err
 	}
-	host, remote, err := d.registerHost(name)
+	host, remote, err := d.registerHost(ref)
 	if err != nil {
 		return astral.Register{}, false, err
 	}
 	if !remote {
-		return d.Store.Get(name)
+		return d.Store.Get(ref)
 	}
-	resp, err := d.remote(host, request{Op: OpGet, Name: name})
+	resp, err := d.remote(host, request{Op: OpGet, Circle: ref.Circle, Name: ref.Name})
 	if err != nil || resp.Reg == nil {
 		return astral.Register{}, false, err
 	}
 	return *resp.Reg, true, nil
 }
 
-func (d *Daemon) registerHost(name string) (host string, remote bool, err error) {
-	entity := strings.TrimPrefix(name, "register:")
+func (d *Daemon) registerHost(ref astral.Ref) (host string, remote bool, err error) {
+	entity := strings.TrimPrefix(ref.Name, "register:")
 	entity = entity[:strings.Index(entity, "/")]
-	inbox := "subject:" + entity
+	inbox := astral.Ref{Circle: ref.Circle, Name: "subject:" + entity}
 	if _, ok, err := d.Store.Subject(inbox); err != nil || ok {
 		return "", false, err
 	}
@@ -421,7 +482,38 @@ func stampSource(src, member string) string {
 
 // --- stream side ---
 
-func (d *Daemon) handleStream(s network.Stream) {
+// handleStreamV2: framed CBOR, circle on the wire.
+func (d *Daemon) handleStreamV2(s network.Stream) {
+	defer s.Close()
+	if !d.begin() {
+		return
+	}
+	defer d.end()
+	_ = s.SetDeadline(time.Now().Add(15 * time.Second))
+	data, err := wire.ReadFrame(s, maxWireSize)
+	if err != nil {
+		return
+	}
+	var req request
+	if err := cbor.Unmarshal(data, &req); err != nil {
+		return
+	}
+	if req.Circle == "" {
+		req.Circle = d.Home()
+	}
+	if req.Op == OpWait {
+		_ = s.SetDeadline(time.Now().Add(time.Duration(req.LeaseNS) + 15*time.Second))
+	}
+	resp := d.serve(req, s.Conn().RemotePeer())
+	out, err := cbor.Marshal(resp)
+	if err != nil {
+		return
+	}
+	_ = wire.WriteFrame(s, out)
+}
+
+// handleStreamV1: raw CBOR, bare names = home circle, registry by name.
+func (d *Daemon) handleStreamV1(s network.Stream) {
 	defer s.Close()
 	if !d.begin() {
 		return
@@ -432,35 +524,64 @@ func (d *Daemon) handleStream(s network.Stream) {
 	if err := cbor.NewDecoder(s).Decode(&req); err != nil {
 		return
 	}
+	req.Circle = d.Home()
+	if req.Op == OpRegistry {
+		req.Refs = d.homeRefs(req.Names)
+		req.Names = nil
+	}
 	if req.Op == OpWait {
 		_ = s.SetDeadline(time.Now().Add(time.Duration(req.LeaseNS) + 15*time.Second))
 	}
-	from := d.peerName(s.Conn().RemotePeer())
-	resp := d.serve(req, from)
+	resp := d.serve(req, s.Conn().RemotePeer())
+	if req.Op == OpRegistry {
+		resp.Names = d.bareNames(resp.Refs)
+		resp.Refs = nil
+	}
 	_ = cbor.NewEncoder(s).Encode(resp)
 }
 
-func (d *Daemon) serve(req request, from string) (resp response) {
+func (d *Daemon) homeRefs(names []string) []astral.Ref {
+	out := make([]astral.Ref, 0, len(names))
+	for _, n := range names {
+		out = append(out, astral.Ref{Circle: d.Home(), Name: n})
+	}
+	return out
+}
+
+// bareNames projects refs onto v1: home-circle names only.
+func (d *Daemon) bareNames(refs []astral.Ref) []string {
+	var out []string
+	for _, r := range refs {
+		if r.Circle == d.Home() {
+			out = append(out, r.Name)
+		}
+	}
+	return out
+}
+
+func (d *Daemon) serve(req request, remote peer.ID) (resp response) {
 	fail := func(err error) response { return response{Err: err.Error()} }
-	// Remote verbs act on names hosted here only — no forwarding chains.
-	if _, ok, err := d.Store.Subject(req.Name); err != nil {
+	from := d.peerName(remote)
+	ref := req.ref()
+	// Remote verbs act on refs hosted here only — no forwarding chains.
+	if _, ok, err := d.Store.Subject(ref); err != nil {
 		return fail(err)
 	} else if !ok && req.Op != OpGet && req.Op != OpSet && req.Op != OpHeartbeat && req.Op != OpWatch && req.Op != OpRegistry {
-		if exp, _ := d.Store.Expired(req.Name); exp {
-			return fail(fmt.Errorf("%w: %s", astral.ErrSubjectExpired, req.Name))
+		if exp, _ := d.Store.Expired(ref); exp {
+			return fail(fmt.Errorf("%w: %s", astral.ErrSubjectExpired, ref))
 		}
-		return fail(fmt.Errorf("%w: %s not hosted on %s", astral.ErrUnknownSubject, req.Name, d.MemberName()))
+		return fail(fmt.Errorf("%w: %s not hosted on %s", astral.ErrUnknownSubject, ref, d.MemberName()))
 	}
 	switch req.Op {
 	case OpRegistry:
-		if err := d.learnRegistry(from, req.Names); err != nil {
+		if err := d.learnRegistry(remote, req.Refs); err != nil && !errors.As(err, new(*astral.ConflictError)) {
 			return fail(err)
 		}
-		return response{Names: d.hostedNames()}
+		return response{Refs: d.hostedRefs()}
 	case OpAppend:
 		ev := req.Event
 		ev.Source = stampSource(ev.Source, from)
-		fresh, err := d.appendLocal(req.Name, ev)
+		fresh, err := d.appendLocal(ref, ev)
 		if err != nil {
 			return fail(err)
 		}
@@ -470,28 +591,28 @@ func (d *Daemon) serve(req request, from string) (resp response) {
 		if timeout <= 0 || timeout > 10*time.Minute {
 			timeout = 30 * time.Second
 		}
-		woke, err := d.waitLocal(d.ctx, req.Name, timeout)
+		woke, err := d.waitLocal(d.ctx, ref, timeout)
 		if err != nil {
 			return fail(err)
 		}
 		return response{Woke: string(woke)}
 	case OpHeartbeat:
-		_, err := d.Store.Heartbeat(req.Name, time.Duration(req.LeaseNS))
+		_, err := d.Store.Heartbeat(ref, time.Duration(req.LeaseNS))
 		return fail0(err)
 	case OpWatch:
-		return fail0(d.Store.Watch(req.Name, req.Consumer))
+		return fail0(d.Store.Watch(ref, astral.Ref{Circle: ref.Circle, Name: req.Consumer}))
 	case OpClaim:
-		c, err := d.Store.Claim(req.Name, req.Consumer+"@"+from, time.Duration(req.LeaseNS), req.N)
+		c, err := d.Store.Claim(ref, req.Consumer+"@"+from, time.Duration(req.LeaseNS), req.N)
 		if err != nil {
 			return fail(err)
 		}
 		return response{Claimed: c}
 	case OpAck:
-		return fail0(d.Store.Ack(req.Name, req.Consumer+"@"+from, req.EventID))
+		return fail0(d.Store.Ack(ref, req.Consumer+"@"+from, req.EventID))
 	case OpSet:
-		return fail0(d.Store.Set(astral.Register{Name: req.Name, Value: req.Value, By: from}))
+		return fail0(d.Store.Set(astral.Register{Circle: ref.Circle, Name: ref.Name, Value: req.Value, By: from}))
 	case OpGet:
-		r, ok, err := d.Store.Get(req.Name)
+		r, ok, err := d.Store.Get(ref)
 		if err != nil {
 			return fail(err)
 		}
@@ -503,48 +624,57 @@ func (d *Daemon) serve(req request, from string) (resp response) {
 	return fail(fmt.Errorf("astral: unknown op %q", req.Op))
 }
 
-// hostedNames lists the names this node announces. Ephemeral reply
-// subjects are deliberately absent: they are unlisted, and their route
-// travels inside the claimed request (learnReplyRoutes).
-func (d *Daemon) hostedNames() []string {
+// hostedRefs lists the refs this node announces. Ephemeral reply subjects
+// are deliberately absent: they are unlisted, and their route travels
+// inside the claimed request (learnReplyRoutes).
+func (d *Daemon) hostedRefs() []astral.Ref {
 	boxes, err := d.Store.Subjects()
 	if err != nil {
 		return nil
 	}
-	names := make([]string, 0, len(boxes))
+	refs := make([]astral.Ref, 0, len(boxes))
 	for _, box := range boxes {
 		if astral.Ephemeral(box.Name) {
 			continue
 		}
-		names = append(names, box.Name)
+		refs = append(refs, box.Ref())
 	}
-	return names
+	return refs
 }
 
-func (d *Daemon) learnRegistry(member string, names []string) error {
-	local := make(map[string]bool)
-	for _, name := range d.hostedNames() {
-		local[name] = true
+// learnRegistry records what a peer hosts. A ref hosted here is kept
+// local and the contest logged; an ephemeral ref is dropped; a ref another
+// peer already holds is refused per ref (ConflictError, the rest land).
+func (d *Daemon) learnRegistry(from peer.ID, refs []astral.Ref) error {
+	local := make(map[astral.Ref]bool)
+	for _, r := range d.hostedRefs() {
+		local[r] = true
 	}
-	filtered := names[:0]
-	for _, name := range names {
-		// Drop ephemeral names a peer running older code still announces.
-		if !local[name] && !astral.Ephemeral(name) {
-			filtered = append(filtered, name)
+	filtered := make([]astral.Ref, 0, len(refs))
+	for _, r := range refs {
+		switch {
+		case local[r]:
+			log.Printf("astral: %s announces %s, which this node hosts too — keeping the local one", d.peerName(from), r)
+		case r.Ephemeral():
+		default:
+			filtered = append(filtered, r)
 		}
 	}
-	return d.Store.ReplaceHost(member, filtered)
+	err := d.Store.ReplaceHost(from.String(), filtered)
+	if ce := new(*astral.ConflictError); errors.As(err, ce) {
+		log.Printf("astral: registry from %s: %v", d.peerName(from), err)
+	}
+	return err
 }
 
 func (d *Daemon) refreshRegistry(p peer.ID) {
-	member := d.peerName(p)
-	resp, err := d.remoteWithin(member, request{Op: OpRegistry, Names: d.hostedNames()}, 15*time.Second)
+	resp, err := d.remoteWithin(p.String(), request{Op: OpRegistry, Refs: d.hostedRefs()}, 15*time.Second)
 	if err != nil {
-		log.Printf("astral: registry refresh from %s: %v", member, err)
+		log.Printf("astral: registry refresh from %s: %v", d.peerName(p), err)
 		return
 	}
-	if err := d.learnRegistry(member, resp.Names); err != nil {
-		log.Printf("astral: registry apply from %s: %v", member, err)
+	if err := d.learnRegistry(p, resp.Refs); err != nil && !errors.As(err, new(*astral.ConflictError)) {
+		log.Printf("astral: registry apply from %s: %v", d.peerName(p), err)
 		return
 	}
 	d.kickOutbox()
@@ -579,6 +709,15 @@ func (d *Daemon) peerName(p peer.ID) string {
 	return p.String()
 }
 
+// hostLabel renders a placement host (peer ID) for logs and status.
+func (d *Daemon) hostLabel(host string) string {
+	p, err := peer.Decode(host)
+	if err != nil {
+		return host
+	}
+	return d.peerName(p)
+}
+
 // peerByName finds a connected member by cert label.
 func (d *Daemon) peerByName(name string) (peer.ID, bool) {
 	if d.Fabric == nil {
@@ -593,37 +732,95 @@ func (d *Daemon) peerByName(name string) (peer.ID, bool) {
 	return "", false
 }
 
-var errNoMesh = errors.New("astral: name is hosted elsewhere but this node is not on a mesh")
+// resolveHost accepts a peer ID or a known member's label (connected or
+// not: a placement may be recorded before the host is reachable, the
+// outbox covers the gap).
+func (d *Daemon) resolveHost(host string) (peer.ID, error) {
+	if p, err := peer.Decode(host); err == nil {
+		return p, nil
+	}
+	if d.Fabric != nil {
+		members, _ := d.Fabric.Store.Snapshot()
+		for p, c := range members {
+			if c.Payload.Meta.Name == host {
+				return p, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("astral: host %q is neither a peer ID nor a known member", host)
+}
+
+var errNoMesh = errors.New("astral: ref is hosted elsewhere but this node is not on a mesh")
 
 func (d *Daemon) remote(host string, req request) (response, error) {
 	return d.remoteWithin(host, req, 15*time.Second)
 }
 
+// remoteWithin calls host (a peer ID) with req. It negotiates v2 first;
+// a v1 peer is addressed with bare names, which only the home circle has.
 func (d *Daemon) remoteWithin(host string, req request, within time.Duration) (response, error) {
 	if d.Fabric == nil {
 		return response{}, errNoMesh
 	}
-	p, ok := d.peerByName(host)
-	if !ok {
-		return response{}, fmt.Errorf("astral: host %q not connected", host)
+	p, err := peer.Decode(host)
+	if err != nil {
+		return response{}, fmt.Errorf("astral: placement host %q is not a peer ID", host)
+	}
+	if d.Fabric.Host.Network().Connectedness(p) != network.Connected {
+		return response{}, fmt.Errorf("astral: host %s not connected", d.peerName(p))
 	}
 	if !d.Fabric.Auth.Allows(p, Protocol) {
-		return response{}, fmt.Errorf("astral: host %q is outside the astral scope of its membership cert", host)
+		return response{}, fmt.Errorf("astral: host %s is outside the astral scope of its membership cert", d.peerName(p))
 	}
 	ctx, cancel := context.WithTimeout(d.ctx, within)
 	defer cancel()
-	s, err := d.Fabric.Host.NewStream(ctx, p, Protocol)
+	s, err := d.Fabric.Host.NewStream(ctx, p, protocol.ID(Protocol), protocol.ID(ProtocolV1))
 	if err != nil {
 		return response{}, err
 	}
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(within))
-	if err := cbor.NewEncoder(s).Encode(req); err != nil {
-		return response{}, err
-	}
 	var resp response
-	if err := cbor.NewDecoder(s).Decode(&resp); err != nil {
-		return response{}, err
+	if s.Protocol() == protocol.ID(ProtocolV1) {
+		if req.Circle != "" && req.Circle != d.Home() {
+			// A refusal, not an outage: parking it would wait for an
+			// upgrade that may never come.
+			msg := fmt.Sprintf("astral: host %s runs protocol v1 and cannot address circle %s", d.peerName(p), req.Circle)
+			return response{Err: msg}, errors.New(msg)
+		}
+		req.Circle = ""
+		if req.Op == OpRegistry {
+			req.Names = d.bareNames(req.Refs)
+			req.Refs = nil
+		}
+		if err := cbor.NewEncoder(s).Encode(req); err != nil {
+			return response{}, err
+		}
+		if err := cbor.NewDecoder(s).Decode(&resp); err != nil {
+			return response{}, err
+		}
+		if req.Op == OpRegistry {
+			resp.Refs = d.homeRefs(resp.Names)
+			resp.Names = nil
+		}
+	} else {
+		if req.Circle == "" {
+			req.Circle = d.Home()
+		}
+		data, err := cbor.Marshal(req)
+		if err != nil {
+			return response{}, err
+		}
+		if err := wire.WriteFrame(s, data); err != nil {
+			return response{}, err
+		}
+		raw, err := wire.ReadFrame(s, maxWireSize)
+		if err != nil {
+			return response{}, err
+		}
+		if err := cbor.Unmarshal(raw, &resp); err != nil {
+			return response{}, err
+		}
 	}
 	if resp.Err != "" {
 		return resp, errors.New(resp.Err)
@@ -667,22 +864,22 @@ func (d *Daemon) flushOutbox() {
 		log.Printf("astral: outbox scan: %v", err)
 		return
 	}
-	for name, evs := range ob {
-		host, ok, err := d.Store.Host(name)
+	for ref, evs := range ob {
+		host, ok, err := d.Store.Host(ref)
 		if err != nil || !ok {
 			continue
 		}
 		for _, ev := range evs {
-			if resp, err := d.remote(host, request{Op: OpAppend, Name: name, Event: ev}); err != nil {
+			if resp, err := d.remote(host, request{Op: OpAppend, Circle: ref.Circle, Name: ref.Name, Event: ev}); err != nil {
 				if resp.Err == "" {
 					break // host still unreachable; keep the rest parked
 				}
 				// The host refused (expired, kind rejected, full): a retry
 				// can never succeed, so drop the cast loudly instead of
 				// parking it forever.
-				log.Printf("astral: outbox cast %s → %s refused, dropped: %v", ev.ID, name, err)
+				log.Printf("astral: outbox cast %s → %s refused, dropped: %v", ev.ID, ref, err)
 			}
-			if err := d.Store.Dequeue(name, ev.ID); err != nil {
+			if err := d.Store.Dequeue(ref, ev.ID); err != nil {
 				log.Printf("astral: outbox dequeue %s: %v", ev.ID, err)
 			}
 		}

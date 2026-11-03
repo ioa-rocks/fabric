@@ -17,7 +17,11 @@ import (
 )
 
 // Client is a plane client over a running subsystem's control socket.
-type Client struct{ http http.Client }
+// Circle selects which circle names refer to; "" is the node's home circle.
+type Client struct {
+	Circle string
+	http   http.Client
+}
 
 // NewClient builds a client for a state dir's control socket.
 func NewClient(statePath string) *Client {
@@ -32,6 +36,13 @@ func NewClient(statePath string) *Client {
 			},
 		},
 	}}
+}
+
+// In returns a client addressing circle.
+func (c *Client) In(circle string) *Client {
+	cc := *c
+	cc.Circle = circle
+	return &cc
 }
 
 func decodeErr(resp *http.Response) error {
@@ -82,7 +93,7 @@ func (c *Client) Status() (*StatusReply, error) {
 // Declare hosts a subject here with explicit delivery policy; an empty
 // delivery defaults to exclusive.
 func (c *Client) Declare(name string, delivery astral.Delivery, accepts []string) error {
-	return c.post("/v0/subjects", declareBody{Name: name, Delivery: delivery, Accepts: accepts}, nil)
+	return c.post("/v0/subjects", declareBody{Circle: c.Circle, Name: name, Delivery: delivery, Accepts: accepts}, nil)
 }
 
 // DeclareExpiring is Declare with an explicit lifecycle: idle self-destruct
@@ -90,26 +101,27 @@ func (c *Client) Declare(name string, delivery astral.Delivery, accepts []string
 // ephemeral `_reply/` names, which default to tight limits either way).
 func (c *Client) DeclareExpiring(name string, delivery astral.Delivery, accepts []string, idle time.Duration, maxEvents int) error {
 	return c.post("/v0/subjects", declareBody{
-		Name: name, Delivery: delivery, Accepts: accepts,
+		Circle: c.Circle, Name: name, Delivery: delivery, Accepts: accepts,
 		IdleS: int(idle / time.Second), MaxEv: maxEvents,
 	}, nil)
 }
 
 // Remove drops a subject hosted on this node, journal included.
 func (c *Client) Remove(name string) error {
-	return c.post("/v0/remove", removeBody{Name: name}, nil)
+	return c.post("/v0/remove", removeBody{Circle: c.Circle, Name: name}, nil)
 }
 
-// SetHost records that member hosts name (registry stub); "" clears.
+// SetHost records that host (peer ID or connected member label) hosts
+// name (registry override); "" clears.
 func (c *Client) SetHost(name, host string) error {
-	return c.post("/v0/hosts", hostBody{Name: name, Host: host}, nil)
+	return c.post("/v0/hosts", hostBody{Circle: c.Circle, Name: name, Host: host}, nil)
 }
 
 // Append casts an event. Returns the (possibly derived) event ID and
 // whether it was new.
 func (c *Client) Append(name string, ev astral.Event) (id string, fresh bool, err error) {
 	var r appendReply
-	if err := c.post("/v0/append", appendBody{Name: name, Event: ev}, &r); err != nil {
+	if err := c.post("/v0/append", appendBody{Circle: c.Circle, Name: name, Event: ev}, &r); err != nil {
 		return "", false, err
 	}
 	return r.ID, r.Fresh, nil
@@ -118,24 +130,28 @@ func (c *Client) Append(name string, ev astral.Event) (id string, fresh bool, er
 // Claim leases up to n events for lease seconds.
 func (c *Client) Claim(name, consumer string, leaseS, n int) ([]astral.Claimed, error) {
 	var out []astral.Claimed
-	err := c.post("/v0/claim", claimBody{Name: name, Consumer: consumer, LeaseS: leaseS, N: n}, &out)
+	err := c.post("/v0/claim", claimBody{Circle: c.Circle, Name: name, Consumer: consumer, LeaseS: leaseS, N: n}, &out)
 	return out, err
 }
 
 // Ack force-acks an event for consumer.
 func (c *Client) Ack(name, consumer, eventID string) error {
-	return c.post("/v0/ack", ackBody{Name: name, Consumer: consumer, EventID: eventID}, nil)
+	return c.post("/v0/ack", ackBody{Circle: c.Circle, Name: name, Consumer: consumer, EventID: eventID}, nil)
 }
 
 // Set writes a register.
 func (c *Client) Set(name, value string) error {
-	return c.post("/v0/set", setBody{Name: name, Value: value}, nil)
+	return c.post("/v0/set", setBody{Circle: c.Circle, Name: name, Value: value}, nil)
 }
 
 // Get reads a register; ok=false when unset.
 func (c *Client) Get(name string) (astral.Register, bool, error) {
 	var r astral.Register
-	resp, err := c.http.Get("http://astral/v0/get?name=" + url.QueryEscape(name))
+	q := url.Values{"name": {name}}
+	if c.Circle != "" {
+		q.Set("circle", c.Circle)
+	}
+	resp, err := c.http.Get("http://astral/v0/get?" + q.Encode())
 	if err != nil {
 		return r, false, fmt.Errorf("is `fabric up` running? %w", err)
 	}
@@ -152,16 +168,16 @@ func (c *Client) Get(name string) (astral.Register, bool, error) {
 // Wait parks until name has mail or timeoutS elapses (the timer wake).
 func (c *Client) Wait(name string, timeoutS int) (Woke, error) {
 	var r waitReply
-	err := c.post("/v0/wait", waitBody{Name: name, TimeoutS: timeoutS}, &r)
+	err := c.post("/v0/wait", waitBody{Circle: c.Circle, Name: name, TimeoutS: timeoutS}, &r)
 	return r.Woke, err
 }
 
 // Heartbeat extends entity's liveness lease by ttlS seconds.
 func (c *Client) Heartbeat(entity string, ttlS int) error {
-	return c.post("/v0/heartbeat", heartbeatBody{Entity: entity, TTLS: ttlS}, nil)
+	return c.post("/v0/heartbeat", heartbeatBody{Circle: c.Circle, Entity: entity, TTLS: ttlS}, nil)
 }
 
 // Watch subscribes watcher (a subject) to entity's death notices.
 func (c *Client) Watch(entity, watcher string) error {
-	return c.post("/v0/watch", watchBody{Entity: entity, Watcher: watcher}, nil)
+	return c.post("/v0/watch", watchBody{Circle: c.Circle, Entity: entity, Watcher: watcher}, nil)
 }
