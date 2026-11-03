@@ -610,10 +610,20 @@ as a manual/debug override, not normal mesh configuration. The stream
 protocol is `/astral/subject/2` (framed, circle on the wire); v1 is still
 served and dialed for one release, with bare names meaning the home circle.
 
-The stream protocol is member-gated, but per-verb checks against the
-caller's statement chain are the next slice of the Astral-per-circle step
-(`tasks/open/astral-per-circle.md`): every member can currently invoke every
-Astral verb, and consumer-name strings are not authorization.
+**Every verb is checked against the caller's chain.** The host asks the
+circle service whether the connection peer may do the verb on that
+`(circle, name)`: its device attestation in that circle (from the circle
+exchange), or its membership cert for the home circle, checked on every
+call for window, scope, honoured roots and revocations (overlapping-circles
+memo §17: honoured *up to the verbs on the device assert*). `append` needs
+`publish`; `claim`, `wait` and `heartbeat` need `claim`; `ack` needs `ack`
+unless the caller acks its own live lease; `get`/`watch` need `read`;
+registers follow their entity's subject; a registry announcement is kept
+only for refs the announcer may `host`. A member outside the circle is
+refused, not parked. Pre-statement certs and attestations carry no verbs
+and count as the full device set. Consumer-name strings are still not
+authorization; sub-keys and foreign grantees presenting their own chain
+are the next slices (`tasks/open/astral-per-circle.md`).
 
 ```sh
 fabric astral subject subject:queues/agents/concierge/inbox -delivery exclusive -accepts user,system

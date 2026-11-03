@@ -36,6 +36,7 @@ import (
 	"ioa.rocks/fabric/astral"
 	fabricdaemon "ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/internal/wire"
+	"ioa.rocks/fabric/statement"
 )
 
 // Version travels in status replies so mismatched nodes are visible.
@@ -216,6 +217,9 @@ func (d *Daemon) Ref(circle, name string) astral.Ref {
 func (d *Daemon) Declare(m astral.Subject) error {
 	if m.Circle == "" {
 		m.Circle = d.Home()
+	}
+	if d.Fabric != nil && m.Circle != d.Home() && (d.Fabric.Circle == nil || !d.Fabric.Circle.Has(m.Circle)) {
+		return fmt.Errorf("astral: this node holds no circle %s (fabric circle status)", m.Circle)
 	}
 	if err := d.Store.Declare(m); err != nil {
 		return err
@@ -559,6 +563,69 @@ func (d *Daemon) bareNames(refs []astral.Ref) []string {
 	return out
 }
 
+// ErrDenied is a verb the caller's chain does not grant (host-side).
+var ErrDenied = errors.New("astral: denied")
+
+// authorize asks the circle service whether the connection peer may do
+// verb on ref: its device attestation in ref's circle (or its membership
+// cert for the home circle), checked at every call — window, scope, roots,
+// revocations (memo §17 item 3: honoured up to the verbs on the assert).
+// Solo nodes have no peers; a mesh node without a circle service fails
+// closed.
+func (d *Daemon) authorize(p peer.ID, ref astral.Ref, verb string) error {
+	if d.Fabric == nil {
+		return nil
+	}
+	if d.Fabric.Circle == nil {
+		return fmt.Errorf("%w: no circle service on this node", ErrDenied)
+	}
+	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
+	defer cancel()
+	err := d.Fabric.Circle.Verify(ctx, p, statement.Want{
+		Sub: ref.Circle, Res: statement.Resource{Kind: statement.KindSubject, Name: ref.Name},
+		Verb: verb, Now: time.Now(),
+	})
+	if err != nil {
+		return fmt.Errorf("%w: %s on %s: %v", ErrDenied, verb, ref, err)
+	}
+	return nil
+}
+
+// verbFor maps an op onto the statement verb it needs and the resource it
+// is checked on (an entity op is checked on the entity's inbox subject).
+func verbFor(op Op, ref astral.Ref) (verb string, res astral.Ref) {
+	switch op {
+	case OpAppend:
+		return statement.VerbPublish, ref
+	case OpClaim, OpWait:
+		return statement.VerbClaim, ref
+	case OpAck:
+		return statement.VerbAck, ref
+	case OpHeartbeat:
+		return statement.VerbClaim, astral.Ref{Circle: ref.Circle, Name: "subject:" + ref.Name}
+	case OpWatch:
+		return statement.VerbRead, astral.Ref{Circle: ref.Circle, Name: "subject:" + ref.Name}
+	case OpSet, OpGet:
+		return verbForRegister(op), astral.Ref{Circle: ref.Circle, Name: "subject:" + entityOf(ref.Name)}
+	}
+	return "", ref
+}
+
+func verbForRegister(op Op) string {
+	if op == OpSet {
+		return statement.VerbPublish
+	}
+	return statement.VerbRead
+}
+
+func entityOf(register string) string {
+	rest := strings.TrimPrefix(register, "register:")
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[:i]
+	}
+	return rest
+}
+
 func (d *Daemon) serve(req request, remote peer.ID) (resp response) {
 	fail := func(err error) response { return response{Err: err.Error()} }
 	from := d.peerName(remote)
@@ -572,9 +639,23 @@ func (d *Daemon) serve(req request, remote peer.ID) (resp response) {
 		}
 		return fail(fmt.Errorf("%w: %s not hosted on %s", astral.ErrUnknownSubject, ref, d.MemberName()))
 	}
+	// Authorization at the verb. A claimant acking its own live lease
+	// needs no ack verb (ack is the janitor's authority over any lease).
+	if verb, res := verbFor(req.Op, ref); verb != "" {
+		ownLease := false
+		if req.Op == OpAck {
+			holder, live, _ := d.Store.LeaseHolder(ref, req.EventID, time.Now())
+			ownLease = live && holder == req.Consumer+"@"+from
+		}
+		if !ownLease {
+			if err := d.authorize(remote, res, verb); err != nil {
+				return fail(err)
+			}
+		}
+	}
 	switch req.Op {
 	case OpRegistry:
-		if err := d.learnRegistry(remote, req.Refs); err != nil && !errors.As(err, new(*astral.ConflictError)) {
+		if err := d.learnRegistry(remote, d.hostable(remote, req.Refs)); err != nil && !errors.As(err, new(*astral.ConflictError)) {
 			return fail(err)
 		}
 		return response{Refs: d.hostedRefs()}
@@ -667,13 +748,28 @@ func (d *Daemon) learnRegistry(from peer.ID, refs []astral.Ref) error {
 	return err
 }
 
+// hostable keeps the announced refs the peer's chain lets it host (memo
+// §12.4: announcements accepted only from attested holders of that
+// circle); the rest are dropped and logged.
+func (d *Daemon) hostable(p peer.ID, refs []astral.Ref) []astral.Ref {
+	out := make([]astral.Ref, 0, len(refs))
+	for _, r := range refs {
+		if err := d.authorize(p, r, statement.VerbHost); err != nil {
+			log.Printf("astral: announcement dropped: %v", err)
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
 func (d *Daemon) refreshRegistry(p peer.ID) {
 	resp, err := d.remoteWithin(p.String(), request{Op: OpRegistry, Refs: d.hostedRefs()}, 15*time.Second)
 	if err != nil {
 		log.Printf("astral: registry refresh from %s: %v", d.peerName(p), err)
 		return
 	}
-	if err := d.learnRegistry(p, resp.Refs); err != nil && !errors.As(err, new(*astral.ConflictError)) {
+	if err := d.learnRegistry(p, d.hostable(p, resp.Refs)); err != nil && !errors.As(err, new(*astral.ConflictError)) {
 		log.Printf("astral: registry apply from %s: %v", d.peerName(p), err)
 		return
 	}

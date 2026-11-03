@@ -174,8 +174,16 @@ func (n *meshNode) fabric(t *testing.T, root ed25519.PrivateKey, name string, bo
 		t.Fatal(err)
 	}
 	fd.DisableTUN = true
+	// The composition root always attaches the circle service: astral
+	// verbs are checked against it (home circle = membership cert).
+	fd.Circle = fabricdaemon.NewCircleService(fd.Host, fd.Auth, filepath.Join(n.statePath, "circles"))
+	fd.Circle.SetOwnCert(fd.OwnCert)
+	fd.Circle.SetHome(fd.NamespaceDID, fd.Roots, fd.Store.Cert)
 	return fd
 }
+
+// circleRoot is where a mesh node keeps its circles.
+func (n *meshNode) circleRoot() string { return filepath.Join(n.statePath, "circles") }
 
 func waitConnected(t *testing.T, cl *daemon.Client, member string) {
 	t.Helper()

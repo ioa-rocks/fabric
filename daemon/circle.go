@@ -20,6 +20,7 @@ import (
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/fabricnet"
 	"ioa.rocks/fabric/internal/wire"
+	"ioa.rocks/fabric/statement"
 )
 
 // Circle-presence exchange: after membership auth, two members show each
@@ -68,6 +69,13 @@ type CircleService struct {
 	// attestation — one assert per device (mesh-root merge) — so a node
 	// needs no separate `circle attest` into its own home circle.
 	ownCert func() *cert.Cert
+	// home is the home circle's DID, roots the honoured roots for it and
+	// certOf the member store: a peer's chain in the home circle is its
+	// membership cert (one assert per device, mesh-root merge), which the
+	// circle exchange never carries.
+	home   func() string
+	roots  statement.Roots
+	certOf func(peer.ID) (*cert.Cert, bool)
 
 	mu    sync.RWMutex
 	peers map[peer.ID]circleEntry
@@ -77,10 +85,17 @@ type CircleService struct {
 // circleEntry is one exchange result. A result with circles holds for the
 // connection; an empty one (the peer presented no attestation) only for
 // noCircleTTL, so a device attested after connecting (`fabric circle
-// attest` needs no restart) is picked up without a reconnect.
+// attest` needs no restart) is picked up without a reconnect. chains holds
+// the compiled attestation per circle (nil for a legacy attestation);
+// homeChain the compiled membership cert, keyed by its ID so a renewal
+// recompiles.
 type circleEntry struct {
-	dids []string
-	at   time.Time
+	dids   []string
+	chains map[string]*statement.Compiled
+	at     time.Time
+
+	homeCertID [32]byte
+	homeChain  *statement.Compiled
 }
 
 const noCircleTTL = 30 * time.Second
@@ -107,6 +122,12 @@ func NewCircleService(h host.Host, auth *fabricnet.AuthService, root string) *Ci
 
 // Root is the circle root this node serves.
 func (s *CircleService) Root() string { return s.root }
+
+// SetHome names the home circle and wires the member store, so Verify can
+// answer for it from membership certs.
+func (s *CircleService) SetHome(home func() string, roots statement.Roots, certOf func(peer.ID) (*cert.Cert, bool)) {
+	s.home, s.roots, s.certOf = home, roots, certOf
+}
 
 // SetOwnCert lets the service present the node's membership cert as its
 // home-circle attestation (see ownCert).
@@ -264,10 +285,122 @@ func (s *CircleService) ownRevocations(now time.Time, statements bool) ([][]byte
 	return out, nil
 }
 
-func (s *CircleService) remember(p peer.ID, dids []string) {
+func (s *CircleService) remember(p peer.ID, dids []string, chains map[string]*statement.Compiled) {
 	s.mu.Lock()
-	s.peers[p] = circleEntry{dids: dids, at: time.Now()}
+	prev := s.peers[p]
+	s.peers[p] = circleEntry{dids: dids, chains: chains, at: time.Now(), homeCertID: prev.homeCertID, homeChain: prev.homeChain}
 	s.mu.Unlock()
+}
+
+// chainFor returns a peer's compiled attestation in a circle from the
+// current exchange result (nil chain = legacy attestation).
+func (s *CircleService) chainFor(p peer.ID, did string) (chain *statement.Compiled, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, known := s.peers[p]
+	if !known {
+		return nil, false
+	}
+	chain, ok = e.chains[did]
+	return chain, ok
+}
+
+// Verify answers one authorization question about a connected member: may
+// the device p do want.Verb on want.Res in circle want.Sub? The chain is
+// the device's attestation in that circle (from the exchange) or, for the
+// home circle, its membership cert; want.PresentingKey is set here from
+// the transport-authenticated peer key. Check runs on every call (window,
+// scope, roots still honoured, revocations); only the crypto is cached. A
+// legacy attestation or cert carries no verbs and counts as the full
+// device set.
+func (s *CircleService) Verify(ctx context.Context, p peer.ID, want statement.Want) error {
+	if want.Sub == "" {
+		return errors.New("verify: circle required")
+	}
+	presenter, err := deviceDIDOf(p)
+	if err != nil {
+		return err
+	}
+	want.PresentingKey = presenter
+	if want.Now.IsZero() {
+		want.Now = time.Now()
+	}
+	if s.home != nil && want.Sub == s.home() && s.certOf != nil {
+		return s.verifyHome(p, want)
+	}
+	c := s.circleByDID(want.Sub)
+	if c == nil {
+		return fmt.Errorf("circle %s is not held by this node", shortDID(want.Sub))
+	}
+	if _, err := s.Ensure(ctx, p); err != nil {
+		return fmt.Errorf("circle exchange with %s: %w", p, err)
+	}
+	chain, ok := s.chainFor(p, want.Sub)
+	if !ok {
+		return fmt.Errorf("%s is not a device of circle %s", shortDID(presenter), shortDID(want.Sub))
+	}
+	if chain == nil {
+		return legacyAllows(circle.DeviceVerbs, want)
+	}
+	revs, err := c.RevocationSet(want.Now)
+	if err != nil {
+		return err
+	}
+	return chain.Check(statement.NewDIDRoots(c.Config.DID), revs, want)
+}
+
+// verifyHome is Verify for the home circle: the chain is the membership
+// cert the member store holds for the peer.
+func (s *CircleService) verifyHome(p peer.ID, want statement.Want) error {
+	c, ok := s.certOf(p)
+	if !ok {
+		return fmt.Errorf("%s is not a member", p)
+	}
+	if c.Stmt == nil {
+		return legacyAllows(cert.VerbsForScope(c.Payload.Cmd, c.Payload.Meta.Scope), want)
+	}
+	id := c.Stmt.ID()
+	s.mu.RLock()
+	e := s.peers[p]
+	chain := e.homeChain
+	s.mu.RUnlock()
+	if chain == nil || e.homeCertID != id {
+		var err error
+		chain, err = statement.Compile(c.Stmt, nil, want.Sub, s.roots)
+		if err != nil {
+			return fmt.Errorf("membership cert: %w", err)
+		}
+		s.mu.Lock()
+		e = s.peers[p]
+		e.homeCertID, e.homeChain = id, chain
+		s.peers[p] = e
+		s.mu.Unlock()
+	}
+	var revs statement.Revocations
+	if hc := s.circleByDID(want.Sub); hc != nil {
+		if set, err := hc.RevocationSet(want.Now); err == nil {
+			revs = set
+		}
+	}
+	return chain.Check(s.roots, revs, want)
+}
+
+// legacyAllows is the verb check for a pre-statement cert or attestation:
+// no resources were ever narrowed, so it is the verb list alone.
+func legacyAllows(verbs []string, want statement.Want) error {
+	for _, v := range verbs {
+		if v == want.Verb {
+			return nil
+		}
+	}
+	return fmt.Errorf("legacy chain does not grant %s", want.Verb)
+}
+
+func shortDID(d string) string {
+	if len(d) > 16 {
+		return d[:16] + "…"
+	}
+	return d
 }
 
 // forgetDevice drops cached results for every connected peer whose key is
@@ -329,12 +462,12 @@ func (s *CircleService) Ensure(ctx context.Context, p peer.ID) ([]string, error)
 		st.Reset()
 		return nil, err
 	}
-	dids, err := s.readHello(st, pub, v)
+	dids, chains, err := s.readHello(st, pub, v)
 	if err != nil {
 		st.Reset()
 		return nil, err
 	}
-	s.remember(p, dids)
+	s.remember(p, dids, chains)
 	return dids, nil
 }
 
@@ -429,12 +562,12 @@ func (s *CircleService) handle(st network.Stream, v int) {
 		st.Reset()
 		return
 	}
-	dids, err := s.readHello(st, pub, v)
+	dids, chains, err := s.readHello(st, pub, v)
 	if err != nil {
 		st.Reset()
 		return
 	}
-	s.remember(st.Conn().RemotePeer(), dids)
+	s.remember(st.Conn().RemotePeer(), dids, chains)
 	if err := s.writeOwn(st, v); err != nil {
 		st.Reset()
 	}
@@ -467,10 +600,10 @@ func (s *CircleService) writeOwn(st network.Stream, v int) error {
 // readHello reads one frame, ingests any revocations in it, and verifies
 // every attestation against the peer key the transport authenticated.
 // Returns the circle DIDs the peer is a live device of.
-func (s *CircleService) readHello(st network.Stream, devicePub ed25519.PublicKey, v int) ([]string, error) {
+func (s *CircleService) readHello(st network.Stream, devicePub ed25519.PublicKey, v int) ([]string, map[string]*statement.Compiled, error) {
 	raw, err := wire.ReadFrame(st, maxAttestationsWireSize)
 	if err != nil {
-		return nil, fmt.Errorf("reading attestations: %w", err)
+		return nil, nil, fmt.Errorf("reading attestations: %w", err)
 	}
 	var hello circleHello
 	if len(raw) > 0 {
@@ -480,7 +613,7 @@ func (s *CircleService) readHello(st network.Stream, devicePub ed25519.PublicKey
 			err = cbor.Unmarshal(raw, &hello.Attestations)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("decoding attestations: %w", err)
+			return nil, nil, fmt.Errorf("decoding attestations: %w", err)
 		}
 	}
 	now := time.Now()
@@ -489,7 +622,7 @@ func (s *CircleService) readHello(st network.Stream, devicePub ed25519.PublicKey
 	// case; a revoked device dutifully gossiping its own revocation is the
 	// rare one), and its attestations must be judged against them.
 	if err := s.ingestRevocations(hello.Revocations, now); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	return s.verifyAttestations(hello.Attestations, devicePub, now)
 }
@@ -500,18 +633,25 @@ func (s *CircleService) readHello(st network.Stream, devicePub ed25519.PublicKey
 // list either); a merely dead one — expired, or revoked by a circle we
 // hold — is skipped, since an honest device can lag a renewal or a
 // revocation.
-func (s *CircleService) verifyAttestations(list [][]byte, devicePub ed25519.PublicKey, now time.Time) ([]string, error) {
+func (s *CircleService) verifyAttestations(list [][]byte, devicePub ed25519.PublicKey, now time.Time) ([]string, map[string]*statement.Compiled, error) {
 	dids := make([]string, 0, len(list))
+	chains := make(map[string]*statement.Compiled, len(list))
 	for _, item := range list {
 		a, err := circle.UnmarshalAttestation(item)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if a.Device != cert.DIDForKey(devicePub) {
-			return nil, errors.New("peer attestation: attestation names a different device")
+			return nil, nil, errors.New("peer attestation: attestation names a different device")
 		}
-		if err := a.VerifySignature(); err != nil {
-			return nil, fmt.Errorf("peer attestation: %w", err)
+		chain, err := a.Compile()
+		if err != nil && !errors.Is(err, circle.ErrLegacy) {
+			return nil, nil, fmt.Errorf("peer attestation: %w", err)
+		}
+		if chain == nil {
+			if err := a.VerifySignature(); err != nil {
+				return nil, nil, fmt.Errorf("peer attestation: %w", err)
+			}
 		}
 		if a.Valid(now) != nil {
 			continue
@@ -520,8 +660,9 @@ func (s *CircleService) verifyAttestations(list [][]byte, devicePub ed25519.Publ
 			continue
 		}
 		dids = append(dids, a.Circle)
+		chains[a.Circle] = chain
 	}
-	return dids, nil
+	return dids, chains, nil
 }
 
 // ingestRevocations stores the revocations that concern circles this node

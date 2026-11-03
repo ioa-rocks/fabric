@@ -636,6 +636,16 @@ func (s *Store) Ack(ref Ref, consumer, eventID string) error {
 	return b.Commit(pebble.Sync)
 }
 
+// LeaseHolder reports who holds a live lease on an event, if anyone.
+func (s *Store) LeaseHolder(ref Ref, eventID string, now time.Time) (consumer string, ok bool, err error) {
+	var l lease
+	found, err := s.getJSON(k2("l/", ref, eventID), &l)
+	if err != nil || !found || l.Until <= now.UnixNano() {
+		return "", false, err
+	}
+	return l.Consumer, true, nil
+}
+
 // Pending counts journaled-but-unacked events (leased ones included).
 func (s *Store) Pending(ref Ref) (int, error) {
 	it, err := s.db.NewIter(prefixBounds(k1("e/", ref) + "/"))

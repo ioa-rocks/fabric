@@ -353,16 +353,19 @@ func cmdUp(args []string) error {
 				log.Printf("circle adopted from %s into %s (the old copy is left in place, unused)", legacy, root)
 			}
 		}
+		// The circle instance of the namespace engine: which of our
+		// circles a mesh member is a device of, and what its chain lets it
+		// do. Vault and astral gate on it; the home circle is answered
+		// from membership certs, so a node with no circle directory (a
+		// gate) still verifies.
+		d.Circle = daemon.NewCircleService(d.Host, d.Auth, root)
+		d.Circle.SetOwnCert(d.OwnCert)
+		d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.Cert)
 		if circle.Any(root) {
 			st, err := vaultstore.Open(*vaultState, root)
 			if err != nil {
 				return fmt.Errorf("vault subsystem: %w", err)
 			}
-			// The circle instance of the namespace engine: which of our
-			// circles a mesh member is a device of. Vault gates on it;
-			// astral will.
-			d.Circle = daemon.NewCircleService(d.Host, d.Auth, root)
-			d.Circle.SetOwnCert(d.OwnCert)
 			vd, err = vaultdaemon.New(st, d)
 			if err != nil {
 				return fmt.Errorf("vault subsystem: %w", err)

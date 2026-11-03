@@ -235,6 +235,20 @@ func (a *Attestation) VerifySignature() error {
 	return nil
 }
 
+// Compile runs the structural verifier over a statement attestation and
+// returns the compiled chain for per-verb checks (statement.Compiled.Check);
+// a legacy attestation has no chain and returns ErrLegacy.
+func (a *Attestation) Compile() (*statement.Compiled, error) {
+	if a.Stmt == nil {
+		return nil, ErrLegacy
+	}
+	return a.compile()
+}
+
+// ErrLegacy marks an attestation that predates statements: it carries no
+// verbs, and holders treat it as a full device attestation (DeviceVerbs).
+var ErrLegacy = errors.New("legacy attestation (no statement)")
+
 // compile runs the structural verifier over a statement attestation, with
 // the circle DID resolved to its root key.
 func (a *Attestation) compile() (*statement.Compiled, error) {
