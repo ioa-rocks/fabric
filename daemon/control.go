@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"sort"
 	"time"
 
@@ -253,7 +254,15 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		sp.KnownAddrs = d.knownAddrs(p)
 		switch {
 		case sp.Member:
-			sp.Circles = append([]string{d.NamespaceDID()}, d.sharedKnown(p)...)
+			// The circles the peer table verified the peer in (handshake,
+			// gossip), plus what the legacy exchange learned from a peer
+			// on the old binary.
+			sp.Circles = d.Store.Circles(p, now)
+			for _, did := range d.sharedKnown(p) {
+				if !slices.Contains(sp.Circles, did) {
+					sp.Circles = append(sp.Circles, did)
+				}
+			}
 		case !sp.Revoked && d.Auth.IsKept(p):
 			sp.Grantee = true
 			if d.Circle != nil {

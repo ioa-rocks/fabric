@@ -94,8 +94,25 @@ aside { display: flex; flex-direction: column; gap: 14px; }
 .card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 8px; }
 .card h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-2); margin: 0; }
 
+/* circle tabs: filter, not pagination — "All" plus one per circle this node
+   holds; a circle's colour derives from its DID and is the same on every
+   node of the fleet. */
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.tabs button {
+  border: 1px solid var(--line); border-radius: 999px; padding: 3px 11px;
+  background: var(--card); color: var(--ink-2); font-size: 12.5px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.tabs button .dot { width: 9px; height: 9px; border-radius: 50%; }
+.tabs button[aria-selected="true"] { color: var(--ink); border-color: var(--ink-3); background: var(--surface); font-weight: 600; }
+.tabs .tab-role { color: var(--ink-3); font-size: 11px; }
+
 /* graph */
 #graph { width: 100%; height: auto; display: block; }
+#graph .node.dim { opacity: 0.28; }
+#graph .node circle.ring { fill: none; stroke-width: 2; }
+#graph .node .circle-dot { stroke: var(--card); stroke-width: 1.5; }
+#graph .node.grantee circle.body { stroke: var(--ink-3); stroke-dasharray: 2 3; }
 #graph text { font: 12px system-ui, sans-serif; fill: var(--ink); }
 #graph .sub { font-size: 10.5px; fill: var(--ink-2); }
 #graph .edge { stroke: var(--ink-3); stroke-width: 2; fill: none; }
@@ -137,6 +154,12 @@ dl.kv dd { margin: 0; font-size: 12.5px; overflow-wrap: anywhere; }
 .badge.expired  { background: color-mix(in srgb, var(--warn) 16%, var(--card));     border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
 .badge.revoked  { background: color-mix(in srgb, var(--critical) 13%, var(--card)); border-color: color-mix(in srgb, var(--critical) 38%, var(--line)); }
 .badge.offline  { background: var(--surface); border-color: var(--line); color: var(--ink-2); }
+.badge.grantee  { background: var(--surface); border-color: var(--line); color: var(--ink-2); }
+.circle-chip {
+  display: inline-flex; align-items: center; gap: 5px; margin: 0 6px 4px 0;
+  border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; font-size: 11.5px;
+}
+.circle-chip .dot { width: 8px; height: 8px; border-radius: 50%; }
 .badge.warn-soft { background: color-mix(in srgb, var(--warn) 16%, var(--card)); border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
 .badge.warn      { background: color-mix(in srgb, var(--critical) 15%, var(--card)); border-color: color-mix(in srgb, var(--critical) 45%, var(--line)); }
 

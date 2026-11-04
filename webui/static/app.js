@@ -8,6 +8,7 @@ const SVG = "http://www.w3.org/2000/svg";
 
 const state = {
   data: null,       // last /api/overview payload
+  circle: (() => { try { return localStorage.getItem("fabric-circle") || null; } catch { return null; } })(), // circle DID the tabs filter on; null = all
   selected: null,   // selected node id ('self' or peer id)
   form: null,       // {kind:'approve'|'deny'|'revoke', fp, error, busy}
   failing: false,
@@ -75,6 +76,9 @@ function nodes() {
 function classify(p, pendingByID) {
   if (p.revoked) return "revoked";
   if (p.member) return p.connected ? "member" : "offline";
+  /* A bare worker kept on a listed gate by a verified grant chain: in no
+     circle's roster, yet legitimately connected (memo §17 item 1). */
+  if (p.grantee) return "grantee";
   const pend = pendingByID.get(p.id);
   if (pend && pend.status === "pending") return "pending";
   /* A lapsed member: cert ran out unrenewed. Not a member, but known by
@@ -84,10 +88,71 @@ function classify(p, pendingByID) {
 }
 
 const KIND_LABEL = {
-  self: "this node", member: "member", offline: "member (offline)",
+  self: "this node", member: "device", offline: "device (offline)",
   pending: "pending approval", stranger: "stranger", revoked: "revoked",
-  expired: "expired — re-join needed",
+  expired: "expired — re-join needed", grantee: "grantee (no circle)",
 };
+
+/* ---------- circles ----------
+   A circle's colour derives from its DID, so every node of the fleet paints
+   the same circle the same way; its name is this node's own label for it
+   (status.circles), the short DID when this node holds no such circle. A
+   peer carries exactly the circles it verifiably shares with this node —
+   nothing else is known here, by construction. */
+
+function circleColor(did) {
+  let h = 0;
+  for (let i = 0; i < did.length; i++) h = (h * 31 + did.charCodeAt(i)) >>> 0;
+  return `hsl(${h % 360} 62% 46%)`;
+}
+function heldCircles(d) { return (d.status && d.status.circles) || []; }
+function circleName(d, did) {
+  const c = heldCircles(d).find(c => c.did === did);
+  return c ? c.name : short(did);
+}
+/* Circles a peer shares with this node; self holds everything listed. */
+function circlesOf(d, n) {
+  if (n.kind === "self") return heldCircles(d).map(c => c.did);
+  return n.circles || [];
+}
+function inSelected(d, n) {
+  return !state.circle || circlesOf(d, n).includes(state.circle);
+}
+function sharedBetween(d, a, b) {
+  const ca = circlesOf(d, a), cb = new Set(circlesOf(d, b));
+  return ca.filter(c => cb.has(c));
+}
+
+function renderTabs(d) {
+  const box = document.getElementById("circle-tabs");
+  box.innerHTML = "";
+  const circles = heldCircles(d);
+  if (!circles.length) { box.hidden = true; return; }
+  box.hidden = false;
+  if (state.circle && !circles.some(c => c.did === state.circle)) state.circle = null;
+  const mk = (label, did, role, color) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-selected", String((did || null) === state.circle));
+    if (color) b.append(dot(color));
+    b.append(label);
+    if (role) { const r = document.createElement("span"); r.className = "tab-role"; r.textContent = role; b.append(r); }
+    b.onclick = () => {
+      state.circle = did || null;
+      try { did ? localStorage.setItem("fabric-circle", did) : localStorage.removeItem("fabric-circle"); } catch {}
+      render();
+    };
+    return b;
+  };
+  box.append(mk("All", null));
+  for (const c of circles) {
+    const title = `${c.did}${c.prefix ? " · overlay " + c.prefix : ""} · ${c.devices || 0} other device${c.devices === 1 ? "" : "s"} known`;
+    const b = mk(c.name, c.did, c.role, circleColor(c.did));
+    b.title = title;
+    box.append(b);
+  }
+}
 
 /* ---------- render ---------- */
 
@@ -109,11 +174,12 @@ function render() {
   }
   const ns = nodes();
   if (!state.form || state.form.host !== "expiry") renderExpiryBanner(d);
+  renderTabs(d);
   // Revoked peers never connect again — they are tombstones, not topology.
   // The graph shows the live mesh; they get their own list until they GC.
   const live = ns.filter(n => n.kind !== "revoked");
   renderGraph(d, live);
-  renderLegend(live);
+  renderLegend(d, live);
   renderRevoked(ns.filter(n => n.kind === "revoked"));
   if (!state.form) {         // don't repaint under an open passphrase form
     renderDetails(d, ns);
@@ -182,9 +248,13 @@ function renderAstral(d) {
   if (card.hidden) return;
 
   const a = d.astral.status || {};
-  const hosted = a.hosted || [];
-  const placed = Object.entries(a.placed || {}).sort((x, y) => x[0].localeCompare(y[0]));
-  const claims = a.claims || [];
+  const inCircle = ref => !state.circle || !ref || !ref.circle || ref.circle === state.circle;
+  const hosted = (a.hosted || []).filter(inCircle);
+  const placedAll = (a.placements || []).filter(inCircle);
+  const placed = state.circle
+    ? placedAll.map(p => [p.name, hostLabel(d, p.host)]).sort((x, y) => x[0].localeCompare(y[0]))
+    : Object.entries(a.placed || {}).sort((x, y) => x[0].localeCompare(y[0]));
+  const claims = (a.claims || []).filter(inCircle);
   const monitors = a.monitors || [];
   const pending = hosted.reduce((n, h) => n + (h.pending || 0), 0);
   document.getElementById("astral-summary").textContent =
@@ -231,9 +301,18 @@ function operatorTable(headers, rows, empty) {
 }
 
 function hostedTable(hosted) {
-  return operatorTable(["name", "delivery", "pending", "accepts"], hosted.map(h => [
-    mono(h.name), h.delivery || "exclusive", String(h.pending || 0), (h.accepts || []).join(", ") || "any kind",
-  ]), "No subjects are hosted on this node.");
+  const d = state.data;
+  return operatorTable(["name", "circle", "delivery", "pending", "accepts"], hosted.map(h => {
+    const c = document.createElement("span");
+    if (h.circle) c.append(dot(circleColor(h.circle)), " ", circleName(d, h.circle));
+    return [mono(h.name), c, h.delivery || "exclusive", String(h.pending || 0), (h.accepts || []).join(", ") || "any kind"];
+  }), state.circle ? `No subjects of ${circleName(d, state.circle)} are hosted on this node.` : "No subjects are hosted on this node.");
+}
+
+/* A placement host is a peer ID; name it from the roster when known. */
+function hostLabel(d, host) {
+  const p = (d.status.peers || []).find(p => p.id === host);
+  return p && p.name ? p.name : short(host);
 }
 
 function placedTable(placed) {
@@ -302,7 +381,12 @@ function renderVault(d) {
   const table = document.createElement("table");
   table.className = "buckets";
   table.innerHTML = `<tr><th>bucket</th><th>circle</th><th>objects</th><th>held</th><th>placement</th></tr>`;
-  for (const b of buckets) {
+  const visible = state.circle ? buckets.filter(b => b.owner === state.circle) : buckets;
+  if (!visible.length) {
+    box.append(note(`No buckets owned by ${circleName(d, state.circle)}.`));
+    return;
+  }
+  for (const b of visible) {
     const tr = document.createElement("tr");
     tr.className = "bucket-row";
     const held = document.createElement("td");
@@ -318,9 +402,12 @@ function renderVault(d) {
     link.href = "/buckets/" + encodeURIComponent(b.id);
     link.className = "bucket-link";
     link.textContent = b.name;
+    const circleCell = document.createElement("td");
+    if (b.owner) circleCell.append(dot(circleColor(b.owner)), " ");
+    circleCell.append((vs.circles || []).find(c => c.did === b.owner)?.name || circleName(d, b.owner || "") || "Unknown");
     tr.append(
       td(link),
-      td((vs.circles || []).find(c => c.did === b.owner)?.name || b.owner || "Unknown"),
+      circleCell,
       td(String(b.objects)),
       held,
       td(b.folder ? "folder" : (b.sub || "none")),
@@ -492,8 +579,10 @@ async function loadObjects(view, after, history) {
 
 function renderHeader(d) {
   const nsChip = document.getElementById("ns-chip");
-  nsChip.textContent = d.status.namespace_did;
-  nsChip.onclick = () => copy(d.status.namespace_did, nsChip);
+  const held = heldCircles(d);
+  nsChip.textContent = held.length ? held.map(c => c.name).join(" · ") : d.status.namespace_did;
+  nsChip.title = held.length ? "circles this node holds (click to copy the first circle's DID)" : "namespace DID (click to copy)";
+  nsChip.onclick = () => copy(held.length ? held[0].did : d.status.namespace_did, nsChip);
 
   const selfChip = document.getElementById("self-chip");
   selfChip.innerHTML = "";
@@ -535,8 +624,17 @@ function renderGraph(d, ns) {
     }));
   }
 
+  // The circle tab filters: nodes outside the chosen circle are dimmed,
+  // edges with an end outside it are not drawn (an edge is one connection;
+  // the circles belong to its endpoints).
+  const byID = Object.fromEntries(all.map(n => [n.id, n]));
+  const shown = n => inSelected(d, n);
+  if (state.circle) links = links.filter(l => shown(byID[l.a]) && shown(byID[l.b]));
+
   const summary = document.getElementById("graph-summary");
-  summary.textContent = `${ns.filter(n => n.kind.startsWith("member") || n.kind === "offline").length + 1} members · ${links.length} link${links.length === 1 ? "" : "s"} up`;
+  const devices = ns.filter(n => (n.kind === "member" || n.kind === "offline") && shown(n)).length + 1;
+  summary.textContent = (state.circle ? `${circleName(d, state.circle)}: ` : "") +
+    `${devices} device${devices === 1 ? "" : "s"} · ${links.length} link${links.length === 1 ? "" : "s"} up`;
 
   // edges first, under the nodes; trimmed to node boundaries so lines and
   // labels never run under a node's own caption
@@ -550,6 +648,10 @@ function renderGraph(d, ns) {
     const parts = [];
     if (l.rtt_ms) parts.push(l.rtt_ms < 1 ? l.rtt_ms.toFixed(2) + " ms" : l.rtt_ms.toFixed(1) + " ms");
     if (l.transport) parts.push(l.transport + (l.relayed ? " · relay" : ""));
+    // Shared circles on the label, not the line: two peers often share
+    // several, and only what this node knows of each end is shown.
+    const shared = byID[l.a] && byID[l.b] ? sharedBetween(d, byID[l.a], byID[l.b]) : [];
+    if (shared.length) parts.push(shared.map(c => circleName(d, c)).join("+"));
     if (parts.length) {
       // near-vertical edges get the label fully beside the line; otherwise
       // it sits above the midpoint, pushed out along the perpendicular
@@ -562,7 +664,7 @@ function renderGraph(d, ns) {
 
   for (const n of all) {
     const [x, y, rad] = pos[n.id];
-    drawNode(svg, x, y, n.kind === "self" ? { ...n, id: "self" } : n, rad);
+    drawNode(svg, x, y, n.kind === "self" ? { ...n, id: "self" } : n, rad, d, shown(n));
   }
 }
 
@@ -571,8 +673,8 @@ function ringPos(i, n, cx, cy, r) {
   return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
 }
 
-function drawNode(svg, x, y, n, radius) {
-  const g = el("g", { class: `node ${n.kind}` + (state.selected === n.id ? " selected" : "") });
+function drawNode(svg, x, y, n, radius, d, shown = true) {
+  const g = el("g", { class: `node ${n.kind}` + (state.selected === n.id ? " selected" : "") + (shown ? "" : " dim") });
   g.append(el("circle", { class: "halo", cx: x, cy: y, r: radius + 6 }));
   const body = el("circle", { class: "body", cx: x, cy: y, r: radius });
   if (n.kind === "offline") body.setAttribute("stroke-dasharray", "4 4");
@@ -583,6 +685,19 @@ function drawNode(svg, x, y, n, radius) {
     g.append(el("line", { class: "cross", x1: x - o, y1: y - o, x2: x + o, y2: y + o }));
     g.append(el("line", { class: "cross", x1: x - o, y1: y + o, x2: x + o, y2: y - o }));
   }
+  // Circle badges: one dot per circle this node shares with the peer (all
+  // held circles on self), along the upper arc, coloured by DID.
+  const circles = d ? circlesOf(d, n).slice().sort() : [];
+  circles.forEach((did, i) => {
+    const a = -Math.PI / 2 + (i - (circles.length - 1) / 2) * 0.55;
+    const dotEl = el("circle", {
+      class: "circle-dot", cx: x + Math.cos(a) * (radius + 1), cy: y + Math.sin(a) * (radius + 1), r: 4.5,
+      fill: circleColor(did),
+    });
+    const title = el("title", {}, `${circleName(d, did)} — ${did}`);
+    dotEl.append(title);
+    g.append(dotEl);
+  });
   g.append(el("text", { x, y: y + radius + 16, "text-anchor": "middle" }, n.name || short(n.id)));
   const sub = n.ip ? `${n.ip.split("/")[0]} · ${KIND_LABEL[n.kind]}` : KIND_LABEL[n.kind];
   g.append(el("text", { x, y: y + radius + 30, "text-anchor": "middle", class: "sub" }, sub));
@@ -596,8 +711,8 @@ function drawNode(svg, x, y, n, radius) {
   svg.append(g);
 }
 
-function renderLegend(ns) {
-  const kinds = ["member", "pending", "offline", "expired", "revoked", "stranger"];
+function renderLegend(d, ns) {
+  const kinds = ["member", "pending", "offline", "expired", "revoked", "stranger", "grantee"];
   const present = new Set(ns.map(n => n.kind));
   const lg = document.getElementById("legend");
   lg.innerHTML = "";
@@ -608,7 +723,14 @@ function renderLegend(ns) {
     sw.className = "swatch";
     sw.style.borderColor = kindColor(k);
     if (k === "offline") sw.style.borderStyle = "dashed";
+    if (k === "grantee") sw.style.borderStyle = "dotted";
     s.append(sw, KIND_LABEL[k]);
+    lg.append(s);
+  }
+  for (const c of heldCircles(d)) {
+    const s = document.createElement("span");
+    s.append(dot(circleColor(c.did)), ` ${c.name}`);
+    s.title = "dots on a node: the circles it shares with this node";
     lg.append(s);
   }
   const direct = document.createElement("span");
@@ -622,7 +744,20 @@ function renderLegend(ns) {
 }
 
 function kindColor(k) {
-  return { member: "var(--good)", pending: "var(--warn)", expired: "var(--warn)", stranger: "var(--serious)", revoked: "var(--critical)" }[k] || "var(--ink-3)";
+  return { member: "var(--good)", pending: "var(--warn)", expired: "var(--warn)", stranger: "var(--serious)", revoked: "var(--critical)", grantee: "var(--ink-3)" }[k] || "var(--ink-3)";
+}
+
+/* A row of circle chips (name, colour) for the details panels. */
+function circleChips(d, dids) {
+  const wrap = document.createElement("span");
+  for (const did of dids.slice().sort()) {
+    const chip = document.createElement("span");
+    chip.className = "circle-chip";
+    chip.title = did;
+    chip.append(dot(circleColor(did)), circleName(d, did));
+    wrap.append(chip);
+  }
+  return wrap;
 }
 
 /* ---------- details panel ---------- */
@@ -638,6 +773,7 @@ function renderDetails(d, ns) {
   const kv = document.createElement("dl");
   kv.className = "kv";
   add(kv, "name", n.name || "—");
+  if ((n.circles || []).length) add(kv, n.kind === "grantee" ? "granted in" : "shares", circleChips(d, n.circles));
   if (n.ip) add(kv, "overlay IP", mono(n.ip.split("/")[0]));
   if (n.scope) add(kv, "scope", `mesh + ${n.scope.filter(f => f !== "mesh").join(" + ") || "nothing else"}`);
   add(kv, "peer ID", mono(n.id));
@@ -733,6 +869,10 @@ function renderSelf(d, box) {
   const overlayIP = (d.status.overlay_ip || "").split("/")[0];
   add(kv, "name", d.status.name);
   add(kv, "role", d.status.master ? "master (holds the root key)" : "member");
+  for (const c of heldCircles(d)) {
+    const dd = add(kv, c === heldCircles(d)[0] ? "circles" : "", circleChips(d, [c.did]));
+    dd.append(` ${c.role || "device"}${c.prefix ? " · overlay " + c.prefix : ""}${c.attested === false ? " · NOT attested" : ""}`);
+  }
   if (d.status.overlay_ip) {
     add(kv, "overlay IP", mono(overlayIP));
     add(kv, "TUN bridge", d.status.tun_active ? "up (fabric0)" : "down — other transports still work");
