@@ -207,6 +207,7 @@ func New(dir state.Dir) (*Daemon, error) {
 
 	opts := []libp2p.Option{
 		libp2p.Identity(priv),
+		libp2p.UserAgent(Agent()),
 		// Share libp2p's observation tracker, including disconnect cleanup.
 		libp2p.WithFxOption(fx.Populate(&d.observedAddrs)),
 		libp2p.ListenAddrStrings(cfg.ListenAddrs...),

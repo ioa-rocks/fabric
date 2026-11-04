@@ -63,6 +63,9 @@ type StatusPeer struct {
 	Transport string  `json:"transport,omitempty"` // tcp / quic / …
 	Relayed   bool    `json:"relayed,omitempty"`   // via a circuit relay, not direct
 	RTTMillis float64 `json:"rtt_ms,omitempty"`
+	// Agent is the software the peer announced on identify (release and
+	// git revision for a fabric from 2026-11-04 on); only while connected.
+	Agent string `json:"agent,omitempty"`
 
 	IP           string     `json:"ip,omitempty"` // overlay address from the cert
 	CertExpiry   *time.Time `json:"cert_expiry,omitempty"`
@@ -123,6 +126,7 @@ type StatusReply struct {
 	UnverifiedAddrs  []string     `json:"unverified_addrs,omitempty"`
 	OverlayIP        string       `json:"overlay_ip,omitempty"`
 	CertExpiry       *time.Time   `json:"cert_expiry,omitempty"` // this node's own cert
+	Agent            string       `json:"agent"`                 // this node's software (release, git revision)
 	TUNActive        bool         `json:"tun_active"`
 	DNSActive        bool         `json:"dns_active"`
 	Addrs            []string     `json:"addrs"`
@@ -208,6 +212,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		QueueHost:    d.Queue != nil,
 		Posture:      d.Gater.Posture(),
 		Reachability: d.Reachability(),
+		Agent:        Agent(),
 		OverlayIP:    d.OwnCert().Payload.Meta.IP,
 		TUNActive:    d.Bridge != nil,
 		DNSActive:    d.DNS != nil,
@@ -252,6 +257,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			sp.RTTMillis = float64(rtt.Microseconds()) / 1000
 		}
 		sp.KnownAddrs = d.knownAddrs(p)
+		sp.Agent = d.agentOf(p.String())
 		switch {
 		case sp.Member:
 			// The circles the peer table verified the peer in (handshake,

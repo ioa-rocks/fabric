@@ -777,6 +777,7 @@ function renderDetails(d, ns) {
   if (n.ip) add(kv, "overlay IP", mono(n.ip.split("/")[0]));
   if (n.scope) add(kv, "scope", `mesh + ${n.scope.filter(f => f !== "mesh").join(" + ") || "nothing else"}`);
   add(kv, "peer ID", mono(n.id));
+  if (n.agent) add(kv, "software", n.agent);
   if (n.connected) {
     add(kv, "link", `${n.relayed ? "RELAYED" : "direct"} · ${n.transport || "?"} · ${n.direction === "inbound" ? "they dialed us" : "we dialed them"}`);
     add(kv, "address", mono(n.addr || "—"));
@@ -879,6 +880,7 @@ function renderSelf(d, box) {
     if (d.status.tun_active) add(kv, ".fabric DNS", d.status.dns_active ? "serving" : "not running");
   }
   add(kv, "peer ID", mono(d.status.peer_id));
+  if (d.status.agent) add(kv, "software", d.status.agent);
   add(kv, "NAT", (d.status.reachability || "unknown").toLowerCase());
   /* Per-address verdicts (autonat v2) — on dual-stack NAT'd lines the
      single word above hides the real story (e.g. v4 reachable through a

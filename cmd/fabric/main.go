@@ -45,8 +45,10 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
+// version is the release label the daemon also announces on identify.
+var version = daemon.Version
+
 const (
-	version      = "0.0.1"
 	certValidity = cert.DefaultValidity // spec §5
 
 	// Dual-stack, QUIC + TCP. QUIC gives a UDP underlay (no TCP-over-TCP
@@ -464,7 +466,7 @@ func cmdStatus(args []string) error {
 	if s.Posture != "" {
 		role += ", " + s.Posture
 	}
-	fmt.Printf("%s (%s)  peer %s\n", s.Name, role, s.PeerID)
+	fmt.Printf("%s (%s)  peer %s  %s\n", s.Name, role, s.PeerID, s.Agent)
 	if s.RefusedInbound > 0 {
 		fmt.Printf("dark: refused %d inbound connection(s) from peers not in the member store since start\n", s.RefusedInbound)
 	}
@@ -527,7 +529,11 @@ func cmdStatus(args []string) error {
 		if p.Scope != nil {
 			scope = "  scope:" + cert.ScopeString(p.Scope)
 		}
-		fmt.Printf("  %-16s %-9s %-8s %-18s %s%s\n", name, conn, member, ip, p.ID, scope)
+		agent := ""
+		if p.Agent != "" {
+			agent = "  " + p.Agent
+		}
+		fmt.Printf("  %-16s %-9s %-8s %-18s %s%s%s\n", name, conn, member, ip, p.ID, scope, agent)
 	}
 	return nil
 }
