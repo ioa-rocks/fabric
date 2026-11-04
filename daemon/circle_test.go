@@ -130,6 +130,11 @@ func TestCircleServiceVerifiesDevicesPerCircle(t *testing.T) {
 	if got := desk.svc.Shared(ctx, hers.h.ID()); !slices.Equal(got, []string{familyDID}) {
 		t.Fatalf("desk∩hers = %v, want [family]", got)
 	}
+	// The cached view a status poll reads agrees with Shared once an
+	// exchange has run, and never lists a circle the peer is not in.
+	if got := desk.svc.SharedKnown(hers.h.ID()); !slices.Equal(got, []string{familyDID}) {
+		t.Fatalf("desk SharedKnown hers = %v, want [family]", got)
+	}
 	if !desk.svc.InCircle(ctx, hers.h.ID(), familyDID) || desk.svc.InCircle(ctx, hers.h.ID(), alexDID) {
 		t.Fatal("her device must be in family only, from the desk's point of view")
 	}

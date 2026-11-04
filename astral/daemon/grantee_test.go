@@ -138,6 +138,24 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	if !fgate.Auth.IsKept(w.ID()) {
 		t.Fatal("the grantee's connection is not kept past the grace")
 	}
+	// The gate's status shows it as a grantee of the home circle, and a
+	// member with the home circle shared — what the UI draws per circle.
+	if st, err := fabricdaemon.NewClient(gdir).Status(); err != nil {
+		t.Fatal(err)
+	} else {
+		var worker, member bool
+		for _, p := range st.Peers {
+			switch p.ID {
+			case w.ID().String():
+				worker = p.Grantee && len(p.Circles) == 1 && p.Circles[0] == signer.Circle
+			case fdesk.Host.ID().String():
+				member = p.Member && len(p.Circles) == 1 && p.Circles[0] == st.NamespaceDID
+			}
+		}
+		if !worker || !member {
+			t.Fatalf("status peers do not show grantee/member circles: %+v", st.Peers)
+		}
+	}
 	// The chain is public bytes: a caller signing with another key is
 	// refused, never kept, and dropped (Codex review, 2026-11-03).
 	impostor := *signer

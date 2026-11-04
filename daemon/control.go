@@ -45,6 +45,15 @@ type StatusPeer struct {
 	// Scope is the cert-borne protocol scope (fabric ADR 0005); absent means
 	// unrestricted.
 	Scope []string `json:"scope,omitempty"`
+	// Circles this node verifiably shares with the peer, as DIDs: the home
+	// circle for every member, plus every held circle the peer's last
+	// exchange attested it into. Only shared circles are ever listed — a
+	// peer's other circles are not this node's business (memo §17). For a
+	// grantee, the circle(s) of the chain(s) it presented.
+	Circles []string `json:"circles,omitempty"`
+	// Grantee marks a non-member kept past the grace because it presented
+	// a verified chain on a listed node (a bare worker; memo §17 item 1).
+	Grantee bool `json:"grantee,omitempty"`
 
 	// Link telemetry — how traffic actually reaches this peer (only set
 	// while connected).
@@ -241,6 +250,15 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			sp.RTTMillis = float64(rtt.Microseconds()) / 1000
 		}
 		sp.KnownAddrs = d.knownAddrs(p)
+		switch {
+		case sp.Member:
+			sp.Circles = append([]string{d.NamespaceDID()}, d.sharedKnown(p)...)
+		case !sp.Revoked && d.Auth.IsKept(p):
+			sp.Grantee = true
+			if d.Circle != nil {
+				sp.Circles = d.Circle.PresentedCircles(p)
+			}
+		}
 		reply.Peers = append(reply.Peers, sp)
 		seen[sp.ID] = true
 	}
@@ -279,6 +297,22 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	writeJSON(w, reply)
+}
+
+// sharedKnown is the circle service's cached view of the circles shared
+// with a member, minus the home circle (listed by the caller for every
+// member) — nil without a circle service.
+func (d *Daemon) sharedKnown(p peer.ID) []string {
+	if d.Circle == nil {
+		return nil
+	}
+	var out []string
+	for _, did := range d.Circle.SharedKnown(p) {
+		if did != d.NamespaceDID() {
+			out = append(out, did)
+		}
+	}
+	return out
 }
 
 // handleGraph returns the aggregated mesh link state — every live link any

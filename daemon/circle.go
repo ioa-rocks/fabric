@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -863,6 +864,41 @@ func (s *CircleService) Refresh(ctx context.Context) int {
 		}
 	}
 	return n
+}
+
+// SharedKnown is Shared from the cache alone — the circles this node
+// holds that the member's last exchange verified it into — never running
+// an exchange. For status views that must not block on the network.
+func (s *CircleService) SharedKnown(p peer.ID) []string {
+	theirs, ok := s.CirclesOf(p)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, c := range s.Circles() {
+		for _, d := range theirs {
+			if d == c.Config.DID {
+				out = append(out, d)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// PresentedCircles lists the circles of the chains a connection has
+// presented (a grantee's grant, a sub-key's circle), for status views.
+func (s *CircleService) PresentedCircles(p peer.ID) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []string
+	for _, pc := range s.presented[p] {
+		if !slices.Contains(out, pc.comp.Sub) {
+			out = append(out, pc.comp.Sub)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // Shared returns the circles this node and the member verifiably share.
