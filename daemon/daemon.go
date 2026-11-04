@@ -149,6 +149,12 @@ func New(dir state.Dir) (*Daemon, error) {
 	// Dirs whose DID the log-fed roster already honours are that roster.
 	for _, c := range circles {
 		if roots.Honours(c.Config.DID) {
+			// The first circle's directory: the log-fed roster persists
+			// there too, so an assert the log never carries (a `circle
+			// admit` into this circle) survives a restart.
+			if err := store.Rosters()[0].Attach(c, time.Now()); err != nil {
+				log.Printf("circle %q: devices.cbor unreadable: %v", c.Config.Name, err)
+			}
 			continue
 		}
 		roster, err := circle.OpenRoster(c, time.Now())

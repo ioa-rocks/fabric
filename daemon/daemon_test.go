@@ -628,3 +628,43 @@ func mustDevicePub(t *testing.T, d *Daemon) ed25519.PublicKey {
 	}
 	return k
 }
+
+// A `circle admit` into the first circle — the one the membership-event
+// log feeds — must survive a restart: the roster persists to the circle
+// directory's devices.cbor, so a dark node still knows the device before
+// it presents itself (Codex review, 2026-11-04).
+func TestFirstCircleAdmissionSurvivesRestart(t *testing.T) {
+	_, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
+	desk := newTestDaemon(t, nsPriv, "desk", nil)
+	if _, err := circle.InitFromSeed(circle.Root(desk.Dir.Path), "main", nsPriv.Seed(), "pw"); err != nil {
+		t.Fatal(err)
+	}
+	// Re-open so the first roster is attached to the new directory.
+	desk.Host.Close()
+	desk.Stop()
+	d, err := New(desk.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachCircles(d)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	att, _ := circle.AttestWith(nsPriv, nil, cert.DIDForKey(nsPriv.Public().(ed25519.PublicKey)), devPub, time.Now(), time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "nas"})
+	raw, _ := att.Marshal()
+	if fresh, err := d.Circle.Admit(raw); err != nil || !fresh {
+		t.Fatalf("Admit: %v %v", fresh, err)
+	}
+	p, _ := fabricnet.PeerIDForKey(devPub)
+	if !d.Store.IsMember(p, time.Now()) {
+		t.Fatal("admitted device not a member")
+	}
+	d.Host.Close()
+	d.Stop()
+	again, err := New(desk.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { again.Host.Close(); again.Stop() })
+	if !again.Store.IsMember(p, time.Now()) {
+		t.Fatal("admission into the first circle was lost on restart")
+	}
+}

@@ -94,7 +94,8 @@ type AuthService struct {
 	shook     map[peer.ID]Handshake
 	presenter Presenter
 	sink      RevocationSink
-	v2        bool // dial v2 (tests turn it off to exercise the v1 path)
+	ownAllows func(family string) bool // any own assert admits the family; nil = the own cert alone
+	v2        bool                     // dial v2 (tests turn it off to exercise the v1 path)
 }
 
 // NewAuthService wires the handshake handlers and the grace-period watchdog
@@ -175,6 +176,26 @@ func (a *AuthService) SetRevocationSink(f RevocationSink) {
 	a.mu.Lock()
 	a.sink = f
 	a.mu.Unlock()
+}
+
+// SetOwnAllows installs the own-scope view over every circle this node is
+// a device of: a protocol family is served when *any* own assert carries
+// its verbs, not only the first circle's cert (a gate in one circle can be
+// a full device in another; Codex review, 2026-11-04).
+func (a *AuthService) SetOwnAllows(f func(family string) bool) {
+	a.mu.Lock()
+	a.ownAllows = f
+	a.mu.Unlock()
+}
+
+func (a *AuthService) ownScopeAllows(family string) bool {
+	a.mu.RLock()
+	f, own := a.ownAllows, a.own
+	a.mu.RUnlock()
+	if f != nil {
+		return f(family)
+	}
+	return own == nil || own.Allows(family)
 }
 
 // DisableV2 makes this node dial v1 only (tests: a peer on the old binary).
@@ -303,6 +324,12 @@ func (a *AuthService) authenticateV1(s network.Stream, p peer.ID) error {
 		s.Reset()
 		return errors.New("this node holds no membership certificate yet")
 	}
+	// v1 speaks for the own cert's circle alone: a peer this node knows
+	// only from other circles must not be shown that cert.
+	if known := a.store.Circles(p, time.Now()); len(known) > 0 && !a.store.In(p, own.Payload.Sub, time.Now()) {
+		s.Reset()
+		return fmt.Errorf("peer %s is in none of the circles the v1 handshake speaks for", p)
+	}
 	if err := writeCert(s, own); err != nil {
 		return err
 	}
@@ -362,11 +389,17 @@ func (a *AuthService) handleInbound(s network.Stream) {
 		s.Reset()
 		return
 	}
-	if own := a.ownCert(); own != nil {
-		if err := writeCert(s, own); err != nil {
-			s.Reset()
-			return
-		}
+	// Answer with the own cert only to a peer of its circle: a device of
+	// another circle presenting on v1 would otherwise learn this node's
+	// first circle, DID and all (Codex review, 2026-11-04).
+	own := a.ownCert()
+	if own == nil || theirs.Payload.Sub != own.Payload.Sub && !a.store.In(p, own.Payload.Sub, time.Now()) {
+		s.Reset()
+		return
+	}
+	if err := writeCert(s, own); err != nil {
+		s.Reset()
+		return
 	}
 	a.noteMember(p, theirs, known, Handshake{Version: 1, Circles: []string{theirs.Payload.Sub}, At: time.Now()})
 }
@@ -510,7 +543,7 @@ func (a *AuthService) RequireMember(next network.StreamHandler) network.StreamHa
 			s.Reset()
 			return
 		}
-		if own := a.ownCert(); own != nil && !own.Allows(cert.ScopeFamily(proto)) {
+		if !a.ownScopeAllows(cert.ScopeFamily(proto)) {
 			s.Reset()
 			return
 		}

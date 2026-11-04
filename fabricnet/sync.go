@@ -395,14 +395,28 @@ func (s *EventSync) pushRecordsExcept(recs [][]byte, except peer.ID) {
 		return
 	}
 	now := time.Now()
+	subjects := make([]peer.ID, len(recs))
+	for i, data := range recs {
+		subjects[i], _ = recordSubject(data)
+	}
 	for _, p := range s.h.Network().Peers() {
 		if p == except || !s.store.IsMember(p, now) {
 			continue
 		}
-		go func(p peer.ID) {
+		// A record goes only to peers that share a circle with its subject.
+		var mine [][]byte
+		for i, data := range recs {
+			if subjects[i] == "" || subjects[i] == s.h.ID() || s.sharesCircle(subjects[i], p) {
+				mine = append(mine, data)
+			}
+		}
+		if len(mine) == 0 {
+			continue
+		}
+		go func(p peer.ID, recs [][]byte) {
 			ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout)
 			defer cancel()
-			str, err := s.h.NewStream(ctx, p, SyncProtocolID)
+			str, err := s.h.NewStream(ctx, p, SyncProtocolV2ID, SyncProtocolID)
 			if err != nil {
 				return
 			}
@@ -410,10 +424,16 @@ func (s *EventSync) pushRecordsExcept(recs [][]byte, except peer.ID) {
 			if deadline, ok := ctx.Deadline(); ok {
 				_ = str.SetDeadline(deadline)
 			}
+			if str.Protocol() == SyncProtocolV2ID {
+				if writeSyncV2(str, syncPayloadV2{Records: recs}) == nil {
+					_, _ = readSyncV2(str)
+				}
+				return
+			}
 			if writeSync(str, syncPayload{Records: recs}) == nil {
 				_, _ = readSync(str) // drain so the responder isn't left hanging
 			}
-		}(p)
+		}(p, mine)
 	}
 }
 
@@ -432,6 +452,9 @@ func (s *EventSync) exchange(ctx context.Context, p peer.ID, evs []*event.Event,
 		_ = str.SetDeadline(deadline)
 	}
 	if str.Protocol() == SyncProtocolV2ID {
+		if full {
+			recs = s.knownRecordsFor(p)
+		}
 		if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(p, evs, full), Records: recs}); err != nil {
 			return err
 		}
@@ -442,6 +465,12 @@ func (s *EventSync) exchange(ctx context.Context, p peer.ID, evs []*event.Event,
 		}
 		s.applyV2(theirs, p)
 		return nil
+	}
+	if !s.inFirstCircle(p) {
+		// An old-binary peer outside the first circle: nothing the legacy
+		// payloads carry is its business.
+		str.Reset()
+		return fmt.Errorf("peer %s is in none of the circles the legacy sync speaks for", p)
 	}
 	if str.Protocol() == EventsProtocolID {
 		if err := writeEventsV1(str, evs); err != nil {
@@ -454,6 +483,9 @@ func (s *EventSync) exchange(ctx context.Context, p peer.ID, evs []*event.Event,
 		}
 		s.applyPayload(syncPayload{Events: theirs}, p)
 		return nil
+	}
+	if recs != nil {
+		recs = s.knownRecordsFor(p)
 	}
 	if err := writeSync(str, syncPayload{Events: evs, Records: recs}); err != nil {
 		return err
@@ -482,7 +514,7 @@ func (s *EventSync) handleSyncV2(str network.Stream) {
 		str.Reset()
 		return
 	}
-	if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(p, s.log.All(), true), Records: s.knownRecords()}); err != nil {
+	if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(p, s.log.All(), true), Records: s.knownRecordsFor(p)}); err != nil {
 		str.Reset()
 		return
 	}
@@ -562,13 +594,23 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 	s.pushRecordsExcept(freshRecords, from)
 }
 
+// inFirstCircle reports whether the peer is a live device of the first
+// circle — the only one the legacy protocols know how to talk about. A
+// device of another circle is a member of this node but must not be served
+// /fabric/sync/1 or /fabric/events/1: they would hand it the first circle's
+// whole event log (Codex review, 2026-11-04).
+func (s *EventSync) inFirstCircle(p peer.ID) bool {
+	rosters := s.store.Rosters()
+	return len(rosters) > 0 && s.store.In(p, rosters[0].Primary(), time.Now())
+}
+
 // handleSync is the responder side of /fabric/sync/1: apply theirs, answer
 // with our full state.
 func (s *EventSync) handleSync(str network.Stream) {
 	defer str.Close()
 	_ = str.SetDeadline(time.Now().Add(exchangeTimeout))
 	p := str.Conn().RemotePeer()
-	if !s.store.IsMember(p, time.Now()) {
+	if !s.inFirstCircle(p) {
 		str.Reset()
 		return
 	}
@@ -577,7 +619,7 @@ func (s *EventSync) handleSync(str network.Stream) {
 		str.Reset()
 		return
 	}
-	if err := writeSync(str, syncPayload{Events: s.log.All(), Records: s.knownRecords()}); err != nil {
+	if err := writeSync(str, syncPayload{Events: s.log.All(), Records: s.knownRecordsFor(p)}); err != nil {
 		str.Reset()
 		return
 	}
@@ -589,7 +631,7 @@ func (s *EventSync) handleV1(str network.Stream) {
 	defer str.Close()
 	_ = str.SetDeadline(time.Now().Add(exchangeTimeout))
 	p := str.Conn().RemotePeer()
-	if !s.store.IsMember(p, time.Now()) {
+	if !s.inFirstCircle(p) {
 		str.Reset()
 		return
 	}
@@ -728,8 +770,15 @@ func (s *EventSync) SeedRecords(recs [][]byte) {
 func (s *EventSync) KnownRecords() [][]byte { return s.knownRecords() }
 
 // knownRecords returns our own signed address record plus the freshest
-// record we hold for every current member.
-func (s *EventSync) knownRecords() [][]byte {
+// record we hold for every current member (what is worth persisting).
+func (s *EventSync) knownRecords() [][]byte { return s.recordsFor(nil) }
+
+// knownRecordsFor is knownRecords narrowed to what one peer may learn:
+// our own record and the records of members that share a circle with it.
+// Where a device lives is its circle's business (Codex review, 2026-11-04).
+func (s *EventSync) knownRecordsFor(p peer.ID) [][]byte { return s.recordsFor(&p) }
+
+func (s *EventSync) recordsFor(to *peer.ID) [][]byte {
 	var out [][]byte
 	s.mu.Lock()
 	if s.ownRec != nil {
@@ -741,7 +790,7 @@ func (s *EventSync) knownRecords() [][]byte {
 	}
 	members, _ := s.store.Snapshot()
 	for p := range members {
-		if p == s.h.ID() {
+		if p == s.h.ID() || (to != nil && !s.sharesCircle(p, *to)) {
 			continue
 		}
 		if env := s.cab.GetPeerRecord(p); env != nil {
@@ -751,6 +800,37 @@ func (s *EventSync) knownRecords() [][]byte {
 		}
 	}
 	return out
+}
+
+// sharesCircle reports whether two members are live devices of a common
+// circle held here.
+func (s *EventSync) sharesCircle(a, b peer.ID) bool {
+	if a == b {
+		return true
+	}
+	now := time.Now()
+	in := s.store.Circles(b, now)
+	for _, c := range s.store.Circles(a, now) {
+		for _, d := range in {
+			if c == d {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// recordSubject is the peer a signed address record is about.
+func recordSubject(data []byte) (peer.ID, bool) {
+	_, untyped, err := record.ConsumeEnvelope(data, peer.PeerRecordEnvelopeDomain)
+	if err != nil {
+		return "", false
+	}
+	rec, ok := untyped.(*peer.PeerRecord)
+	if !ok {
+		return "", false
+	}
+	return rec.PeerID, true
 }
 
 func writeSync(str network.Stream, pl syncPayload) error {

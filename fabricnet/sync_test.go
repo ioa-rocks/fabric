@@ -12,6 +12,8 @@ import (
 	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/statement"
 
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
@@ -397,5 +399,93 @@ func TestVerifyRejectsAssertForAnotherDevice(t *testing.T) {
 	}
 	if s.IsMember(other, time.Now()) {
 		t.Fatal("presenting peer became a member on a forged assert")
+	}
+}
+
+// The legacy protocols speak for the first circle alone: a device of
+// another circle is a member here, but /fabric/sync/1 and /fabric/auth/1
+// must not hand it the first circle's event log or cert (Codex review,
+// 2026-11-04).
+func TestLegacyProtocolsServeFirstCircleOnly(t *testing.T) {
+	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
+	a := newSyncNode(t, nsPub, nsPriv, "desk")
+	fam, _ := circle.Init(t.TempDir(), "family", "pw")
+	famPriv, _ := fam.Unlock("pw")
+	famDID := fam.Config.DID
+	aPub, _ := a.host.Peerstore().PubKey(a.host.ID()).Raw()
+	attA, _ := circle.Attest(famPriv, aPub, time.Now())
+	rawA, _ := attA.Stmt.Bytes()
+	a.store.AddRoster(circle.NewRoster(statement.NewDIDRoots(famDID)))
+	a.auth.SetPresenter(func(_ peer.ID, verified []string) Hello {
+		for _, c := range verified {
+			if c == famDID {
+				return Hello{Asserts: [][]byte{rawA}}
+			}
+		}
+		return Hello{}
+	})
+
+	// B is a device of family only: no main roster, its own assert is its
+	// family attestation.
+	bPriv, _, _ := crypto.GenerateEd25519Key(rand.Reader)
+	bStore := NewPeerTable()
+	bStore.AddRoster(circle.NewRoster(statement.NewDIDRoots(famDID)))
+	bGater := NewGater(bStore)
+	bGater.SetListed(true)
+	bHost, err := libp2p.New(libp2p.Identity(bPriv), libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"), libp2p.ConnectionGater(bGater))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { bHost.Close() })
+	bPub, _ := bPriv.GetPublic().Raw()
+	attB, _ := circle.Attest(famPriv, bPub, time.Now())
+	bOwn, _ := cert.FromStatement(attB.Stmt)
+	bAuth := NewAuthService(bHost, bStore, bOwn, 5*time.Second, nil)
+	// Both know each other in family (admitted / gossiped).
+	ra, _ := a.store.RosterFor(famDID)
+	ra.Add(attB.Stmt, time.Now())
+	rb, _ := bStore.RosterFor(famDID)
+	rb.Add(attA.Stmt, time.Now())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := bHost.Connect(ctx, peer.AddrInfo{ID: a.host.ID(), Addrs: a.host.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bAuth.Authenticate(ctx, a.host.ID()); err != nil {
+		t.Fatalf("v2 handshake in family: %v", err)
+	}
+	if !a.store.IsMember(bHost.ID(), time.Now()) || a.store.In(bHost.ID(), cert.DIDForKey(nsPub), time.Now()) {
+		t.Fatal("B should be a member of A through family only")
+	}
+	// /fabric/sync/1 from B: reset, no log.
+	str, err := bHost.NewStream(ctx, a.host.ID(), SyncProtocolID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = str.SetDeadline(time.Now().Add(3 * time.Second))
+	_ = writeSync(str, syncPayload{})
+	if pl, err := readSync(str); err == nil {
+		t.Fatalf("a family-only device was served the first circle's sync: %d events", len(pl.Events))
+	}
+	str.Close()
+	// /fabric/auth/1 from B: A must not answer with its main cert.
+	bAuth.DisableV2()
+	if err := bAuth.Authenticate(ctx, a.host.ID()); err == nil {
+		t.Fatal("v1 handshake from a family-only device succeeded — A showed its first-circle cert")
+	}
+	if _, ok := bStore.RosterFor(cert.DIDForKey(nsPub)); ok {
+		t.Fatal("B grew a main roster")
+	}
+	// And A's address records for a main-only member never reach B.
+	m := newSyncNode(t, nsPub, nsPriv, "main-only")
+	a.store.AddMember(m.host.ID(), m.own)
+	if a.sync.sharesCircle(m.host.ID(), bHost.ID()) {
+		t.Fatal("a main-only member and a family-only device share a circle")
+	}
+	// (This node's own record always goes out; sharesCircle is asked about
+	// other members' records only.)
+	if !a.sync.sharesCircle(m.host.ID(), m.host.ID()) {
+		t.Fatal("sharesCircle: a member shares with itself")
 	}
 }

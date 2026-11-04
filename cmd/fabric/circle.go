@@ -767,16 +767,46 @@ func cmdCircleAdmit(args []string) error {
 		if *role == circle.RoleGate {
 			return errors.New("a gate never holds tun (memo §17: a public hop reads nothing and is no overlay endpoint)")
 		}
-		if c.Config.Prefix == "" {
+		prefix := c.Config.Prefix
+		cfg, _ := dir.LoadConfig()
+		if prefix == "" && cfg.NamespaceDID == c.Config.DID {
+			prefix = cfg.Subnet // the first circle minted before prefixes lived with the circle
+		}
+		if prefix == "" {
 			return fmt.Errorf("circle %q has no overlay range — 'fabric circle init -subnet' set one at minting; this circle was minted without", c.Config.Name)
 		}
+		// Every address anyone holds in this circle: the roster file, this
+		// device's own assert (attestation or cert) and, when the daemon
+		// runs, its union view including lapsed devices (the first circle's
+		// addresses live in certs and the event log, not in devices.cbor;
+		// Codex review, 2026-11-04).
 		taken := roster.UsedIPs()
 		if own, err := c.LoadAttestation(); err == nil && own.IP != "" {
 			taken = append(taken, own.IP)
 		}
+		if own, err := dir.LoadCert(); err == nil && own != nil && own.Payload.Sub == c.Config.DID && own.Payload.Meta.IP != "" {
+			taken = append(taken, own.Payload.Meta.IP)
+		}
+		var returning string
+		if client != nil {
+			if members, err := client.Members(); err == nil {
+				for _, m := range members {
+					if m.IP == "" {
+						continue
+					}
+					if cert.DIDForKey(ed25519.PublicKey(m.DevicePub)) == deviceDID {
+						returning = m.IP
+						continue
+					}
+					taken = append(taken, m.IP)
+				}
+			}
+		}
 		if dev, ok := roster.Device(deviceDID); ok && dev.Stmt.Payload.Meta != nil && dev.Stmt.Payload.Meta.IP != "" {
 			meta.IP = dev.Stmt.Payload.Meta.IP // a returning device keeps its address
-		} else if meta.IP, err = tunbridge.NextFreeIP(c.Config.Prefix, taken); err != nil {
+		} else if returning != "" {
+			meta.IP = returning
+		} else if meta.IP, err = tunbridge.NextFreeIP(prefix, taken); err != nil {
 			return err
 		}
 		verbs = append(verbs, statement.VerbTun)

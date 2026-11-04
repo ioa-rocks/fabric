@@ -415,3 +415,27 @@ func TestHandshakeFallsBackToV1(t *testing.T) {
 		t.Fatalf("responder's handshake = %+v, want v2 in the one circle", hs)
 	}
 }
+
+// The own-scope half of RequireMember spans every circle this node is a
+// device of: a node whose first cert is control-plane only (a gate) still
+// serves Vault to a circle it is a full device of (Codex review,
+// 2026-11-04).
+func TestOwnScopeSpansCircles(t *testing.T) {
+	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
+	a := newNode(t, nsPub, nsPriv, "full", true, 5*time.Second)
+	b := newScopedNode(t, nsPub, nsPriv, "gate", true, []string{cert.ScopeMesh}, 5*time.Second)
+	connect(t, a, b)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.auth.Authenticate(ctx, b.host.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := echoOn(a, b.host.ID(), vaultEchoProtocol, "x"); err == nil {
+		t.Fatal("a mesh-only own cert served a vault protocol with no other assert")
+	}
+	// Another circle attested b as a full device: its view spans both.
+	b.auth.SetOwnAllows(func(family string) bool { return true })
+	if got, err := echoOn(a, b.host.ID(), vaultEchoProtocol, "x"); err != nil || got != "x" {
+		t.Fatalf("vault echo with a full assert in another circle: %v %q", err, got)
+	}
+}

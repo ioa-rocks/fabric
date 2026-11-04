@@ -120,6 +120,21 @@ func OpenRoster(c *Circle, now time.Time) (*Roster, error) {
 	return r, nil
 }
 
+// Attach gives a memory-only roster a devices.cbor to persist to and loads
+// what is already there: how the circle the membership-event log feeds
+// also keeps the asserts the log never carries (a `circle admit` into it)
+// across a restart (Codex review, 2026-11-04).
+func (r *Roster) Attach(c *Circle, now time.Time) error {
+	path := filepath.Join(c.Path, devicesFile)
+	if err := r.load(path, now); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.path = path
+	r.mu.Unlock()
+	return nil
+}
+
 // Roots is the roster's honoured-roots store.
 func (r *Roster) Roots() *statement.DIDRoots { return r.roots }
 
@@ -484,10 +499,11 @@ func (r *Roster) GC(now time.Time) {
 
 // save writes every assert (lapsed included) as statement bytes, atomically.
 func (r *Roster) save() {
+	r.mu.RLock()
 	if r.path == "" {
+		r.mu.RUnlock()
 		return
 	}
-	r.mu.RLock()
 	list := make([][]byte, 0, len(r.devices))
 	for _, dev := range r.sortedLocked() {
 		if raw, err := dev.Stmt.Bytes(); err == nil {

@@ -198,6 +198,7 @@ func (s *CircleService) SetPeerTable(t *fabricnet.PeerTable) {
 	s.table = t
 	s.Circles() // rosters for every circle directory
 	if s.auth != nil {
+		s.auth.SetOwnAllows(s.ownAllows)
 		s.auth.SetPresenter(s.hello)
 		s.auth.SetRevocationSink(func(_ peer.ID, revs [][]byte) error {
 			_, err := s.ingestRevocations(revs, time.Now())
@@ -219,6 +220,27 @@ func (s *CircleService) AttachSync(sync *fabricnet.EventSync) {
 			return s.ingestRevocations(revs, time.Now())
 		},
 	})
+}
+
+// ownAllows reports whether any of this node's own asserts carries a verb
+// of the protocol family: the own-scope half of RequireMember over every
+// circle, not only the first.
+func (s *CircleService) ownAllows(family string) bool {
+	if family == "" {
+		return true
+	}
+	for _, o := range s.ownAsserts(time.Now()) {
+		if c, err := cert.FromStatement(o.stmt); err == nil && c.Allows(family) {
+			return true
+		}
+	}
+	// No statement asserts at all (a legacy cert): the cert decides.
+	if s.auth != nil {
+		if own := s.auth.Own(); own != nil && own.Stmt == nil {
+			return own.Allows(family)
+		}
+	}
+	return false
 }
 
 // ownAssertsFor is this node's device asserts in one circle, wire bytes.
