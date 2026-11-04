@@ -823,6 +823,13 @@ go test -race ./...
 An end-to-end verification recipe (two live daemons, full admission
 flow) is in `.claude/skills/verify/SKILL.md`.
 
+**Code conventions.** Names say what a thing is: `peer`, `circleDID`,
+`chain`, `hold`, `request` — not `p`, `c`, `h`, `r`. One-letter names are
+fine only for receivers, loop indices and a two-line closure; anything
+that lives past a screenful, crosses a function boundary or shadows a
+package name (`d` for a daemon next to `did`) gets a word. Existing code
+is renamed as it is touched, not in sweeps (operator, 2026-11-04).
+
 License: MPL-2.0.
 
 [Aethera]: ../../  <!-- vision docs; not yet published -->
