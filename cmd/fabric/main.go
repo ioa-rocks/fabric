@@ -354,6 +354,7 @@ func cmdUp(args []string) error {
 		d.Circle = daemon.NewCircleService(d.Host, d.Auth, circlesRoot)
 		d.Circle.SetOwnCert(d.OwnCert)
 		d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.Cert)
+		d.Circle.SetPeerTable(d.Store)
 	}
 	if !*noVault {
 		root := circle.Root(*statePath)

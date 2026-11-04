@@ -162,7 +162,12 @@ func (a *AuthService) Authenticate(ctx context.Context, p peer.ID) error {
 		s.Reset()
 		return err
 	}
-	a.noteMember(p, theirs)
+	_, known := a.store.Cert(p)
+	if err := a.store.Admit(p, theirs); err != nil {
+		s.Reset()
+		return fmt.Errorf("peer %s: %w", p, err)
+	}
+	a.noteMember(p, theirs, known)
 	return nil
 }
 
@@ -176,19 +181,27 @@ func (a *AuthService) handleInbound(s network.Stream) {
 		s.Reset()
 		return
 	}
+	// The peer table has the last word: a chain that verifies but is
+	// revoked along its lineage — or whose device the circle swept — is
+	// refused here, before this node shows its own cert.
+	_, known := a.store.Cert(p)
+	if err := a.store.Admit(p, theirs); err != nil {
+		s.Reset()
+		return
+	}
 	if own := a.ownCert(); own != nil {
 		if err := writeCert(s, own); err != nil {
 			s.Reset()
 			return
 		}
 	}
-	a.noteMember(p, theirs)
+	a.noteMember(p, theirs, known)
 }
 
-func (a *AuthService) noteMember(p peer.ID, c *cert.Cert) {
-	_, known := a.store.Cert(p)
+// noteMember records a handshake the peer table has already admitted:
+// handshake memory, connection protection, and the hooks.
+func (a *AuthService) noteMember(p peer.ID, c *cert.Cert, known bool) {
 	a.store.NotePresented(p, c)
-	a.store.AddMember(p, c)
 	a.h.ConnManager().Protect(p, "fabric-member")
 	if !known && a.onJoin != nil {
 		a.onJoin(p, c)
@@ -202,6 +215,18 @@ func (a *AuthService) noteMember(p peer.ID, c *cert.Cert) {
 // connections: the gater only stops *new* connections (spec §4).
 func (a *AuthService) Revoke(p peer.ID) {
 	a.store.Revoke(p, time.Now())
+	a.h.ConnManager().Unprotect(p, "fabric-member")
+	_ = a.h.Network().ClosePeer(p)
+}
+
+// RevokeIn revokes a peer's membership in one circle; its connections are
+// closed only when no other circle held here still admits it.
+func (a *AuthService) RevokeIn(circleDID string, p peer.ID) {
+	now := time.Now()
+	a.store.RevokeIn(circleDID, p, now)
+	if a.store.IsMember(p, now) {
+		return
+	}
 	a.h.ConnManager().Unprotect(p, "fabric-member")
 	_ = a.h.Network().ClosePeer(p)
 }
@@ -239,7 +264,9 @@ func (a *AuthService) Allows(p peer.ID, protocolID string) bool {
 
 // readAndValidateCert reads one cert frame and checks both chain validity
 // against the honoured roots and the binding to the remote peer's identity
-// key.
+// key. Delegated certs (issued under an admin assert) pass: since step 5
+// the peer table re-checks revocations along the whole chain, so revoking
+// the issuer reaches what it issued.
 func readAndValidateCert(r io.Reader, roots statement.Roots, remote peer.ID) (*cert.Cert, error) {
 	data, err := wire.ReadFrame(r, maxCertWireSize)
 	if err != nil {
@@ -251,13 +278,6 @@ func readAndValidateCert(r io.Reader, roots statement.Roots, remote peer.ID) (*c
 	}
 	if err := cert.VerifyRoots(c, roots, time.Now()); err != nil {
 		return nil, fmt.Errorf("invalid membership cert: %w", err)
-	}
-	// Until the member store indexes revocations by chain ancestor (build
-	// step 5, with keystore-backed desk signing), a cert issued under
-	// another cert is not accepted on transport: revoking the issuer would
-	// not reach what it issued (agy review, 2026-11-02).
-	if c.Stmt != nil && c.Stmt.Parent() != nil {
-		return nil, errors.New("delegated membership certs are not accepted on transport yet")
 	}
 	devKey, err := c.DeviceKey()
 	if err != nil {

@@ -203,40 +203,68 @@ func TestStrangerIsRejectedAndDisconnected(t *testing.T) {
 	t.Fatal("stranger still connected after grace period")
 }
 
-// A cert issued under another cert verifies as a statement but is not
-// accepted on transport until revocations cascade along the chain (build
-// step 5): the member store indexes revocations by the leaf's peer only.
-func TestDelegatedCertRefusedOnTransport(t *testing.T) {
+// A cert issued under another cert (an admin desk's assert) is accepted on
+// transport since step 5: the peer table re-checks revocations along the
+// whole chain, so the root revoking the desk's assert kills what the desk
+// issued — the cascade that used to be the reason for refusing delegation.
+func TestDelegatedCertAcceptedAndCascades(t *testing.T) {
 	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
 	deskPub, deskPriv, _ := ed25519.GenerateKey(rand.Reader)
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	now := time.Now()
-	desk, err := cert.IssueAsDel(nsPriv, nil, cert.DIDForKey(nsPub), deskPub, cert.CmdAdmin, cert.Meta{Name: "desk"}, now, time.Hour, 3)
+	circleDID := cert.DIDForKey(nsPub)
+	desk, err := cert.IssueAsDel(nsPriv, nil, circleDID, deskPub, cert.CmdAdmin, cert.Meta{Name: "desk"}, now, time.Hour, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	delegated, err := cert.IssueAs(deskPriv, desk.Stmt, cert.DIDForKey(nsPub), devPub, cert.CmdMember, cert.Meta{Name: "nas"}, now, time.Hour)
+	delegated, err := cert.IssueAs(deskPriv, desk.Stmt, circleDID, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, now, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	roots := statement.NewDIDRoots(cert.DIDForKey(nsPub))
-	if err := cert.VerifyRoots(delegated, roots, now.Add(time.Minute)); err != nil {
-		t.Fatalf("premise: the delegated cert verifies as a statement: %v", err)
-	}
+	store := NewMemberStore(statement.NewDIDRoots(circleDID))
 	p, _ := PeerIDForKey(devPub)
 	var buf bytes.Buffer
 	if err := writeCert(&buf, delegated); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readAndValidateCert(&buf, roots, p); err == nil || !strings.Contains(err.Error(), "delegated") {
-		t.Fatalf("delegated cert on transport: %v, want refusal", err)
+	got, err := readAndValidateCert(&buf, store.Roots(), p)
+	if err != nil {
+		t.Fatalf("delegated cert on transport: %v", err)
 	}
-	// A root-issued cert passes the same reader.
-	direct, _ := cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, now, time.Hour)
-	buf.Reset()
-	_ = writeCert(&buf, direct)
-	if _, err := readAndValidateCert(&buf, roots, p); err != nil {
-		t.Fatalf("root-issued cert on transport: %v", err)
+	if err := store.Admit(p, got); err != nil {
+		t.Fatalf("admitting the delegated cert: %v", err)
+	}
+	if !store.IsMember(p, time.Now()) {
+		t.Fatal("device under a delegated cert is not a member")
+	}
+
+	// The root revokes the desk's assert by ID: everything the desk issued
+	// dies with it, and the device cannot re-present the same cert.
+	deskID := desk.Stmt.ID()
+	revoke, err := statement.Revoke(nsPriv, circleDID, nil, statement.Target{ID: deskID[:]}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roster, _ := store.RosterFor(circleDID)
+	if fresh, err := roster.AddRevocation(revoke); err != nil || !fresh {
+		t.Fatalf("AddRevocation: fresh=%v err=%v", fresh, err)
+	}
+	if store.IsMember(p, time.Now()) {
+		t.Fatal("device survived the revocation of its issuer")
+	}
+	if !store.IsRevoked(p, time.Now()) {
+		t.Fatal("device not reported revoked after its issuer's revocation")
+	}
+	if err := store.Admit(p, got); err == nil || !strings.Contains(err.Error(), "revoked") {
+		t.Fatalf("re-presenting a cert under a revoked issuer: %v, want refusal", err)
+	}
+	// A root-issued cert for the same device is a re-admission and stands.
+	direct, _ := cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, time.Now(), time.Hour)
+	if err := store.Admit(p, direct); err != nil {
+		t.Fatalf("root-issued cert after the cascade: %v", err)
+	}
+	if !store.IsMember(p, time.Now()) {
+		t.Fatal("re-admitted device is not a member")
 	}
 }
 

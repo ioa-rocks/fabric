@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/statement"
 )
 
@@ -179,4 +180,120 @@ func TestExpiredMemberIsLapsedNotMember(t *testing.T) {
 	if _, ok := s.LapsedCert(p); ok || !s.IsRevoked(p, now) {
 		t.Fatal("revoked lapsed device still remembered")
 	}
+}
+
+// Transport is the union of circles (memo §17 item 1): a device attested
+// only into `family` is a member of a node that holds `family`, with the
+// verbs its attestation carries (vault and astral, no tun), and a stranger
+// to a node that holds only `main`. Revoking it in `family` ends that.
+func TestUnionAdmitsDeviceOfAnyHeldCircle(t *testing.T) {
+	mainPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	familyPub, familyPriv, _ := ed25519.GenerateKey(rand.Reader)
+	mainDID, familyDID := cert.DIDForKey(mainPub), cert.DIDForKey(familyPub)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	p, err := PeerIDForKey(devPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	attestation, err := circle.Attest(familyPriv, devPub, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A node in main and family.
+	both := NewMemberStore(statement.NewDIDRoots(mainDID))
+	family := circle.NewRoster(statement.NewDIDRoots(familyDID))
+	both.AddRoster(family)
+	if _, err := family.Add(attestation.Stmt, now); err != nil {
+		t.Fatal(err)
+	}
+	if !both.IsMember(p, now) {
+		t.Fatal("a family-only device is not a member of a node holding family")
+	}
+	if got := both.Circles(p, now); len(got) != 1 || got[0] != familyDID {
+		t.Fatalf("Circles = %v, want [family]", got)
+	}
+	if !both.In(p, familyDID, now) || both.In(p, mainDID, now) {
+		t.Fatal("In: device should be in family and not in main")
+	}
+	if !both.Allows(p, "/vault/sync/1", now) || !both.Allows(p, "/astral/subject/2", now) {
+		t.Fatal("a device attestation carries the vault and astral verbs")
+	}
+	if both.Allows(p, "/fabric/tun/1", now) {
+		t.Fatal("a device attestation never carries tun")
+	}
+	if c, ok := both.Cert(p); !ok || c.Payload.Sub != familyDID {
+		t.Fatalf("Cert view: ok=%v", ok)
+	}
+	if members, _ := both.Snapshot(); members[p] == nil {
+		t.Fatal("family-only device missing from the snapshot")
+	}
+	if in := both.MembersIn(familyDID); len(in) != 1 || in[0] != p {
+		t.Fatalf("MembersIn(family) = %v", in)
+	}
+
+	// A node holding only main: the same device is a stranger.
+	mainOnly := NewMemberStore(statement.NewDIDRoots(mainDID))
+	mainOnly.AddMember(p, mustView(t, attestation.Stmt))
+	if mainOnly.IsMember(p, now) {
+		t.Fatal("a main-only node admitted a family device")
+	}
+	if _, ok := mainOnly.RosterFor(familyDID); ok {
+		t.Fatal("main-only node has a family roster")
+	}
+
+	// The family circle revokes the device: it is gone from transport.
+	revocation, err := circle.Revoke(familyPriv, cert.DIDForKey(devPub), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := family.AddRevocation(revocation.Stmt); err != nil {
+		t.Fatal(err)
+	}
+	if both.IsMember(p, time.Now()) {
+		t.Fatal("revoked family device is still a member")
+	}
+	if !both.IsRevoked(p, time.Now()) {
+		t.Fatal("revoked family device not reported revoked")
+	}
+	if _, revoked := both.Snapshot(); revoked[p].IsZero() {
+		t.Fatal("revoked device missing from the snapshot's tombstones")
+	}
+}
+
+// A legacy member-revoked sweep kills the asserts issued up to it and
+// nothing after: a cert issued later is a deliberate re-admission.
+func TestSweepThenReadmission(t *testing.T) {
+	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	p, _ := PeerIDForKey(devPub)
+	s := NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
+	then := time.Now().Add(-time.Hour)
+	old, _ := cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, then, 2*time.Hour)
+	s.AddMember(p, old)
+	s.Revoke(p, then.Add(time.Minute))
+	if s.IsMember(p, time.Now()) || !s.IsRevoked(p, time.Now()) {
+		t.Fatal("sweep did not revoke the device")
+	}
+	// The same cert, re-presented: still dead.
+	if err := s.Admit(p, old); err == nil {
+		t.Fatal("swept cert re-admitted")
+	}
+	fresh, _ := cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, time.Now(), time.Hour)
+	if err := s.Admit(p, fresh); err != nil {
+		t.Fatalf("re-admission after a sweep: %v", err)
+	}
+	if !s.IsMember(p, time.Now()) || s.IsRevoked(p, time.Now()) {
+		t.Fatal("re-admitted device is not a plain member")
+	}
+}
+
+func mustView(t *testing.T, st *statement.Statement) *cert.Cert {
+	t.Helper()
+	c, err := cert.FromStatement(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
 }

@@ -21,6 +21,7 @@ import (
 
 	"ioa.rocks/fabric/admission"
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/fabricdns"
@@ -131,6 +132,25 @@ func New(dir state.Dir) (*Daemon, error) {
 	roots := statement.NewDIDRoots(append([]string{cfg.NamespaceDID}, cfg.HonouredRoots...)...)
 	store := fabricnet.NewMemberStore(roots)
 	evLog := event.NewLog(roots)
+	// Every other circle this node holds brings its own roster into the
+	// union (memo §17: transport is the union of circles): a device
+	// attested only into `family` is admitted here because `family` is.
+	// Dirs whose DID the log-fed roster already honours are that roster.
+	if circles, err := circle.List(circle.Root(dir.Path)); err != nil {
+		log.Printf("circles unreadable, transport honours the home circle only: %v", err)
+	} else {
+		for _, c := range circles {
+			if roots.Honours(c.Config.DID) {
+				continue
+			}
+			roster, err := circle.OpenRoster(c, time.Now())
+			if err != nil {
+				log.Printf("circle %q: roster unreadable, starting empty: %v", c.Config.Name, err)
+				roster = circle.NewRoster(statement.NewDIDRoots(c.Config.DID))
+			}
+			store.AddRoster(roster)
+		}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Daemon{
@@ -846,7 +866,7 @@ func (d *Daemon) hydrateStore() {
 				}
 			}
 		case event.KindRevoked:
-			d.Store.Revoke(p, now)
+			d.Store.RevokeIn(e.Payload.Ns, p, now)
 		}
 	}
 }
@@ -902,7 +922,7 @@ func (d *Daemon) applyEvent(e *event.Event) {
 		if c, ok := d.Store.Cert(p); ok {
 			name = c.Payload.Meta.Name
 		}
-		d.Auth.Revoke(p)
+		d.Auth.RevokeIn(e.Payload.Ns, p)
 		if p == d.Host.ID() {
 			log.Printf("THIS DEVICE'S MEMBERSHIP WAS REVOKED — the mesh will refuse it from now on")
 		} else {
@@ -969,6 +989,7 @@ func (d *Daemon) applyRootEvent(e *event.Event, live bool) {
 	if changed {
 		d.Config = cfg
 		d.Roots.Set(append([]string{cfg.NamespaceDID}, cfg.HonouredRoots...))
+		d.Store.Recheck()
 		if err := d.Dir.SaveConfig(cfg); err != nil {
 			log.Printf("persisting config after %s: %v", e.Payload.Kind, err)
 		}

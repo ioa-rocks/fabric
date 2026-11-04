@@ -79,6 +79,10 @@ type CircleService struct {
 	home   func() string
 	roots  statement.Roots
 	certOf func(peer.ID) (*cert.Cert, bool)
+	// table, when set, is the union peer table: a revocation learned for a
+	// circle reaches that circle's roster too, so transport membership dies
+	// with the circle attestation (one assert per device).
+	table *fabricnet.PeerTable
 
 	mu           sync.RWMutex
 	peers        map[peer.ID]circleEntry
@@ -183,6 +187,28 @@ func (s *CircleService) SetHome(home func() string, roots statement.Roots, certO
 // SetOwnCert lets the service present the node's membership cert as its
 // home-circle attestation (see ownCert).
 func (s *CircleService) SetOwnCert(f func() *cert.Cert) { s.ownCert = f }
+
+// SetPeerTable wires the union peer table so circle revocations reach the
+// rosters transport goes by.
+func (s *CircleService) SetPeerTable(t *fabricnet.PeerTable) { s.table = t }
+
+// rosterRevoked pushes a revocation into the circle's roster, if the table
+// holds one for it.
+func (s *CircleService) rosterRevoked(r *circle.Revocation) {
+	if s.table == nil {
+		return
+	}
+	roster, ok := s.table.RosterFor(r.Circle)
+	if !ok {
+		return
+	}
+	switch {
+	case r.Stmt != nil:
+		_, _ = roster.AddRevocation(r.Stmt)
+	case r.Device != "":
+		roster.Sweep(r.Device, r.Time())
+	}
+}
 
 // homeAttestation returns the node's cert read as an attestation into c,
 // when c is the node's home circle and the cert is a statement; nil
@@ -1099,6 +1125,7 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) error {
 			}
 			if fresh {
 				log.Printf("circle %s: statement revoked (learned from a peer; circle not held here)", shortDID(r.Circle))
+				s.rosterRevoked(r)
 				s.forgetAll()
 				s.relaySoon()
 			}
@@ -1109,6 +1136,7 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) error {
 			return fmt.Errorf("storing revocation for circle %q: %w", c.Config.Name, err)
 		}
 		for _, r := range added {
+			s.rosterRevoked(r)
 			if r.Device != "" {
 				log.Printf("circle %q: device %s revoked as of %s (learned from a peer)", c.Config.Name, r.Device, r.Time().Format(time.RFC3339))
 				s.forgetDevice(r.Device)
