@@ -295,6 +295,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		log.Printf("member joined: %q (%s)", c.Payload.Meta.Name, p)
 		d.refreshRoutes()
 	})
+	d.Auth.SetV1Dialable(d.isConfiguredBootstrap)
 	d.Sync = fabricnet.NewEventSync(h, evLog, store, d.applyEvent)
 	d.Auth.SetOnAuthenticated(d.Sync.ExchangeAsync)
 

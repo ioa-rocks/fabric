@@ -34,6 +34,7 @@ type Roster struct {
 	roots *statement.DIDRoots // primary DID first; old roots during a move
 	path  string              // devices.cbor; "" = memory only
 
+	saveMu   sync.Mutex // serialises snapshot + write + rename: a save never overtakes a newer one
 	mu       sync.RWMutex
 	devices  map[string]*Device // by device DID (the assert's aud)
 	revs     *statement.RevocationSet
@@ -204,7 +205,9 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (bool, error) {
 	}
 	r.devices[dev.DID] = dev
 	r.mu.Unlock()
-	r.save()
+	if err := r.save(); err != nil {
+		return true, fmt.Errorf("roster: recorded in memory but not on disk: %w", err)
+	}
 	r.notify()
 	return true, nil
 }
@@ -308,7 +311,7 @@ func (r *Roster) Forget(deviceDID string) {
 	delete(r.devices, deviceDID)
 	r.mu.Unlock()
 	if had {
-		r.save()
+		_ = r.save()
 		r.notify()
 	}
 }
@@ -490,19 +493,26 @@ func (r *Roster) GC(now time.Time) {
 	}
 	r.mu.Unlock()
 	if dropped {
-		r.save()
+		_ = r.save()
 	}
 	if changed {
 		r.notify()
 	}
 }
 
-// save writes every assert (lapsed included) as statement bytes, atomically.
-func (r *Roster) save() {
+// save writes every assert (lapsed included) as statement bytes,
+// atomically and in order: saveMu holds from snapshot to rename, so two
+// concurrent saves cannot swap an older snapshot in over a newer one; a
+// failure is returned so an admission is never reported durable when it
+// is not (Codex review, 2026-11-05).
+func (r *Roster) save() error {
+	r.saveMu.Lock()
+	defer r.saveMu.Unlock()
 	r.mu.RLock()
-	if r.path == "" {
+	path := r.path
+	if path == "" {
 		r.mu.RUnlock()
-		return
+		return nil
 	}
 	list := make([][]byte, 0, len(r.devices))
 	for _, dev := range r.sortedLocked() {
@@ -513,13 +523,17 @@ func (r *Roster) save() {
 	r.mu.RUnlock()
 	raw, err := encMode.Marshal(list)
 	if err != nil {
-		return
+		return err
 	}
-	tmp := r.path + ".tmp"
+	tmp := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return
+		return err
 	}
-	_ = os.Rename(tmp, r.path)
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // load reads devices.cbor into a roster that has no path yet (so Add does

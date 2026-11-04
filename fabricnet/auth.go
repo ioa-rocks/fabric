@@ -95,6 +95,7 @@ type AuthService struct {
 	presenter Presenter
 	sink      RevocationSink
 	ownAllows func(family string) bool // any own assert admits the family; nil = the own cert alone
+	v1To      func(peer.ID) bool       // may v1 be dialed toward a peer in no roster (a bootstrap)? nil = yes
 	v2        bool                     // dial v2 (tests turn it off to exercise the v1 path)
 }
 
@@ -188,6 +189,11 @@ func (a *AuthService) SetOwnAllows(f func(family string) bool) {
 	a.mu.Unlock()
 }
 
+// OwnScopeAllows reports whether any of this node's own asserts admits the
+// protocol family (see SetOwnAllows) — for data planes with their own
+// stream gate.
+func (a *AuthService) OwnScopeAllows(family string) bool { return a.ownScopeAllows(family) }
+
 func (a *AuthService) ownScopeAllows(family string) bool {
 	a.mu.RLock()
 	f, own := a.ownAllows, a.own
@@ -196,6 +202,17 @@ func (a *AuthService) ownScopeAllows(family string) bool {
 		return f(family)
 	}
 	return own == nil || own.Allows(family)
+}
+
+// SetV1Dialable narrows whom the v1 handshake may be *dialed* toward when
+// the peer is in no roster here: v1 sends this node's first-circle cert
+// before anything is verified, so only a configured bootstrap qualifies
+// (Codex review, 2026-11-05). Peers known in the own cert's circle always
+// qualify; peers known only in other circles never do.
+func (a *AuthService) SetV1Dialable(f func(peer.ID) bool) {
+	a.mu.Lock()
+	a.v1To = f
+	a.mu.Unlock()
 }
 
 // DisableV2 makes this node dial v1 only (tests: a peer on the old binary).
@@ -329,6 +346,14 @@ func (a *AuthService) authenticateV1(s network.Stream, p peer.ID) error {
 	if known := a.store.Circles(p, time.Now()); len(known) > 0 && !a.store.In(p, own.Payload.Sub, time.Now()) {
 		s.Reset()
 		return fmt.Errorf("peer %s is in none of the circles the v1 handshake speaks for", p)
+	} else if len(known) == 0 {
+		a.mu.RLock()
+		v1To := a.v1To
+		a.mu.RUnlock()
+		if v1To != nil && !v1To(p) {
+			s.Reset()
+			return fmt.Errorf("peer %s is unknown here and not a bootstrap: not showing it the first-circle cert on v1", p)
+		}
 	}
 	if err := writeCert(s, own); err != nil {
 		return err

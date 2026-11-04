@@ -805,7 +805,9 @@ func (d *Daemon) authorizePrincipal(p peer.ID, pr *astral.Principal, op Op, ref 
 func (d *Daemon) gateStream(next network.StreamHandler) network.StreamHandler {
 	return func(s network.Stream) {
 		p := s.Conn().RemotePeer()
-		if own := d.Fabric.OwnCert(); own != nil && !own.Allows("astral") {
+		// Any of this node's own asserts may admit astral, not only the
+		// first circle's cert (Codex review, 2026-11-05).
+		if !d.Fabric.Auth.OwnScopeAllows("astral") {
 			s.Reset()
 			return
 		}

@@ -3,6 +3,7 @@ package circle
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -150,4 +151,18 @@ func must(pub ed25519.PublicKey, _ ed25519.PrivateKey, err error) ed25519.Public
 		panic(err)
 	}
 	return pub
+}
+
+// A roster that cannot persist says so: an admission is never reported
+// durable when the file could not be written (Codex review, 2026-11-05).
+func TestRosterSaveFailureIsReported(t *testing.T) {
+	c, _ := Init(t.TempDir(), "p", "pw")
+	priv, _ := c.Unlock("pw")
+	r := NewRoster(statement.NewDIDRoots(c.Config.DID))
+	r.path = filepath.Join(t.TempDir(), "missing-dir", "devices.cbor")
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	a, _ := Attest(priv, devPub, time.Now())
+	if _, err := r.Add(a.Stmt, time.Now()); err == nil {
+		t.Fatal("Add reported success although devices.cbor could not be written")
+	}
 }

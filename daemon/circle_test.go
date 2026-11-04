@@ -524,3 +524,38 @@ func subOf(t *testing.T, raw []byte) string {
 	}
 	return st.Payload.Sub
 }
+
+// A gate (`member, host`) of family shares family — it is in the roster,
+// it relays and hosts subjects — but Vault must not hand it the circle's
+// state: SharedWith asks the verbs on the device's assert in each circle
+// (Codex review, 2026-11-05).
+func TestGateSharesCircleButNotItsBuckets(t *testing.T) {
+	nsPub, nsRoot, _ := ed25519.GenerateKey(rand.Reader)
+	family, familyDID := mintCircle(t, "family")
+	desk := newCircleTestNode(t, nsPub, nsRoot, "desk", []*circle.Bundle{family}, true)
+	gate := newCircleTestNode(t, nsPub, nsRoot, "gate", nil, false)
+	fc, _ := circle.ByDID(desk.root, familyDID)
+	priv, _ := fc.Unlock("pw")
+	verbs, _ := circle.VerbsForRole(circle.RoleGate)
+	att, err := circle.AttestWith(priv, nil, familyDID, gate.devPub, time.Now(), time.Hour, verbs, &statement.Meta{Name: "gate"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := att.Marshal()
+	if _, err := desk.svc.Admit(raw); err != nil {
+		t.Fatal(err)
+	}
+	meshConnect(t, gate, desk)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	waitShared(t, desk, gate, []string{familyDID})
+	if got := desk.svc.SharedWith(ctx, gate.h.ID(), statement.KindBucket, statement.VerbSync); len(got) != 0 {
+		t.Fatalf("a gate may sync %v", got)
+	}
+	if desk.svc.InCircleWith(ctx, gate.h.ID(), familyDID, statement.KindBucket, statement.VerbBlob) {
+		t.Fatal("a gate may fetch blobs")
+	}
+	if got := desk.svc.SharedWith(ctx, gate.h.ID(), statement.KindSubject, statement.VerbHost); !slices.Equal(got, []string{familyDID}) {
+		t.Fatalf("a gate hosts subjects: %v", got)
+	}
+}

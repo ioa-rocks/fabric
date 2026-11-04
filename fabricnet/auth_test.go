@@ -439,3 +439,24 @@ func TestOwnScopeSpansCircles(t *testing.T) {
 		t.Fatalf("vault echo with a full assert in another circle: %v %q", err, got)
 	}
 }
+
+// v1 is dialed toward an unknown peer only when it is a configured
+// bootstrap: the v1 dialer sends the first-circle cert before anything is
+// verified (Codex review, 2026-11-05).
+func TestV1DialedOnlyTowardBootstraps(t *testing.T) {
+	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
+	a := newNode(t, nsPub, nsPriv, "new", true, 5*time.Second)
+	b := newNode(t, nsPub, nsPriv, "old", true, 5*time.Second)
+	b.auth.DisableV2()
+	a.auth.SetV1Dialable(func(peer.ID) bool { return false })
+	connect(t, a, b)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.auth.Authenticate(ctx, b.host.ID()); err == nil {
+		t.Fatal("v1 dialed toward an unknown non-bootstrap peer")
+	}
+	a.auth.SetV1Dialable(func(p peer.ID) bool { return p == b.host.ID() })
+	if err := a.auth.Authenticate(ctx, b.host.ID()); err != nil {
+		t.Fatalf("v1 toward a bootstrap: %v", err)
+	}
+}

@@ -769,6 +769,12 @@ func cmdCircleAdmit(args []string) error {
 		}
 		prefix := c.Config.Prefix
 		cfg, _ := dir.LoadConfig()
+		if cfg.NamespaceDID != "" && cfg.NamespaceDID != c.Config.DID {
+			// One overlay per device until the per-circle bridge lands
+			// (task slice H): the bridge has one route table and would
+			// route between prefixes (Codex review, 2026-11-05).
+			return fmt.Errorf("circle %q is not this node's first circle — an overlay in a second circle arrives with the per-circle bridge; admit without -tun for now", c.Config.Name)
+		}
 		if prefix == "" && cfg.NamespaceDID == c.Config.DID {
 			prefix = cfg.Subnet // the first circle minted before prefixes lived with the circle
 		}
@@ -802,9 +808,23 @@ func cmdCircleAdmit(args []string) error {
 				}
 			}
 		}
-		if dev, ok := roster.Device(deviceDID); ok && dev.Stmt.Payload.Meta != nil && dev.Stmt.Payload.Meta.IP != "" {
-			meta.IP = dev.Stmt.Payload.Meta.IP // a returning device keeps its address
-		} else if returning != "" {
+		inPrefix := func(ip string) bool {
+			pfx, err := netip.ParsePrefix(prefix)
+			if err != nil {
+				return false
+			}
+			addr, err := netip.ParsePrefix(ip)
+			if err != nil {
+				return false
+			}
+			return pfx.Contains(addr.Addr())
+		}
+		// A returning device keeps its address — when that address is in
+		// this circle's range (the union view also knows its addresses
+		// elsewhere; Codex review, 2026-11-05).
+		if dev, ok := roster.Device(deviceDID); ok && dev.Stmt.Payload.Meta != nil && inPrefix(dev.Stmt.Payload.Meta.IP) {
+			meta.IP = dev.Stmt.Payload.Meta.IP
+		} else if inPrefix(returning) {
 			meta.IP = returning
 		} else if meta.IP, err = tunbridge.NextFreeIP(prefix, taken); err != nil {
 			return err

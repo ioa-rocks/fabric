@@ -525,6 +525,11 @@ fabric deploy kodi
 fabric deploy kodi gate.example.com relay.example.org
 ```
 
+Deploy a gate by its **public** name, never by its `.fabric` name: the restart
+tears down the overlay the SSH session rides, and only systemd's
+`Restart=on-failure` brings the node back (the upload has landed by then, so
+the node does come back on the new binary — but the command reports a timeout).
+
 It installs atomically at `~/.local/bin/fabric`, migrates the supported legacy
 `~/fabric` service path via a compatibility symlink to that binary, restarts the existing system or user
 unit, and waits for `fabric status` to pass. Run it from the freshly built

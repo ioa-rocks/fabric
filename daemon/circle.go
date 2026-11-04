@@ -1279,6 +1279,20 @@ func (s *CircleService) Shared(ctx context.Context, p peer.ID) []string {
 	return out
 }
 
+// SharedWith is Shared narrowed to the circles in which the member's assert
+// carries verb on a resource of kind: what a data plane asks before it
+// hands a peer that circle's state. A gate (`member, host`) of family
+// shares family but may not `sync` or `blob` it (Codex review, 2026-11-05).
+func (s *CircleService) SharedWith(ctx context.Context, p peer.ID, kind, verb string) []string {
+	var out []string
+	for _, did := range s.Shared(ctx, p) {
+		if s.Verify(ctx, p, statement.Want{Sub: did, Res: statement.Resource{Kind: kind, Name: statement.Any}, Verb: verb}) == nil {
+			out = append(out, did)
+		}
+	}
+	return out
+}
+
 // InCircle reports whether the member is a verified device of one of this
 // node's circles, the one named by did.
 func (s *CircleService) InCircle(ctx context.Context, p peer.ID, did string) bool {
@@ -1288,6 +1302,15 @@ func (s *CircleService) InCircle(ctx context.Context, p peer.ID, did string) boo
 		}
 	}
 	return false
+}
+
+// InCircleWith is InCircle with a verb on a resource kind: the device's
+// assert in that circle must carry it.
+func (s *CircleService) InCircleWith(ctx context.Context, p peer.ID, did, kind, verb string) bool {
+	if !s.InCircle(ctx, p, did) {
+		return false
+	}
+	return s.Verify(ctx, p, statement.Want{Sub: did, Res: statement.Resource{Kind: kind, Name: statement.Any}, Verb: verb}) == nil
 }
 
 // RequireAny wraps a stream handler so that only members sharing at least

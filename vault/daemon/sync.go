@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"ioa.rocks/fabric/statement"
 	"log"
 	"os"
 	"time"
@@ -114,7 +115,7 @@ func (d *Daemon) syncPeer(p peer.ID) {
 	defer d.end()
 	ctx, cancel := context.WithTimeout(d.ctx, 60*time.Second)
 	defer cancel()
-	shared := d.Fabric.Circle.Shared(ctx, p)
+	shared := d.Fabric.Circle.SharedWith(ctx, p, statement.KindBucket, statement.VerbSync)
 	if len(shared) == 0 {
 		return // a member, but a device of none of our circles — nothing to exchange
 	}
@@ -154,7 +155,7 @@ func (d *Daemon) handleSync(s network.Stream) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
-	shared := d.Fabric.Circle.Shared(ctx, s.Conn().RemotePeer())
+	shared := d.Fabric.Circle.SharedWith(ctx, s.Conn().RemotePeer(), statement.KindBucket, statement.VerbSync)
 	cancel()
 	if len(shared) == 0 {
 		s.Reset()
@@ -325,7 +326,7 @@ func (d *Daemon) fetchAnywhere(h *store.Handle, hash string) error {
 			continue
 		}
 		cctx, ccancel := context.WithTimeout(d.ctx, 10*time.Second)
-		in := d.Fabric.Circle.InCircle(cctx, p, h.Bucket.Genesis.Owner)
+		in := d.Fabric.Circle.InCircleWith(cctx, p, h.Bucket.Genesis.Owner, statement.KindBucket, statement.VerbBlob)
 		ccancel()
 		if !in {
 			continue
@@ -400,7 +401,7 @@ func (d *Daemon) handleBlob(s network.Stream) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
-	in := d.Fabric.Circle.InCircle(ctx, s.Conn().RemotePeer(), h.Bucket.Genesis.Owner)
+	in := d.Fabric.Circle.InCircleWith(ctx, s.Conn().RemotePeer(), h.Bucket.Genesis.Owner, statement.KindBucket, statement.VerbBlob)
 	cancel()
 	if !in || !d.bucketReferences(h, req.Hash) {
 		_ = enc.Encode(blobResp{Found: false})
