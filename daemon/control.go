@@ -182,6 +182,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/renew", d.handleRenew)
 	mux.HandleFunc("POST /v0/publish", d.handlePublish)
 	mux.HandleFunc("POST /v0/circle/refresh", d.handleCircleRefresh)
+	mux.HandleFunc("POST /v0/circle/admit", d.handleCircleAdmit)
 	mux.HandleFunc("GET /v0/keys", d.handleKeys)
 	mux.HandleFunc("POST /v0/keys/issue", d.handleKeyIssue)
 	mux.HandleFunc("POST /v0/keys/revoke", d.handleKeyRevoke)
@@ -837,6 +838,50 @@ func (d *Daemon) handleCircleRefresh(w http.ResponseWriter, r *http.Request) {
 
 type circleRefreshReply struct {
 	Reached int `json:"reached"` // connected members the exchange reached
+}
+
+type circleAdmitBody struct {
+	AttestationB64 string `json:"attestation_b64"`
+}
+
+type circleAdmitReply struct {
+	Fresh bool `json:"fresh"` // the roster did not hold this assert yet
+}
+
+// handleCircleAdmit records an attestation the owner CLI just signed in
+// the circle's roster (CircleService.Admit): verified against the
+// circle's root, never trusted because it came over the socket.
+func (d *Daemon) handleCircleAdmit(w http.ResponseWriter, r *http.Request) {
+	if d.Circle == nil {
+		http.Error(w, "this node serves no circle", http.StatusNotFound)
+		return
+	}
+	var body circleAdmitBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	raw, err := base64.StdEncoding.DecodeString(body.AttestationB64)
+	if err != nil {
+		http.Error(w, "attestation_b64: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	fresh, err := d.Circle.Admit(raw)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, circleAdmitReply{Fresh: fresh})
+}
+
+// CircleAdmit hands the daemon a device attestation signed here so the
+// roster and the circle's devices learn it at once.
+func (c *Client) CircleAdmit(attestation []byte) (bool, error) {
+	var out circleAdmitReply
+	if err := c.post("/v0/circle/admit", circleAdmitBody{AttestationB64: base64.StdEncoding.EncodeToString(attestation)}, &out); err != nil {
+		return false, err
+	}
+	return out.Fresh, nil
 }
 
 // CircleRefresh asks the daemon to re-exchange circle state with every

@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -26,6 +28,7 @@ import (
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
 	"ioa.rocks/fabric/statement"
+	"ioa.rocks/fabric/tunbridge"
 	vaultcli "ioa.rocks/fabric/vault/cli"
 	vaultdaemon "ioa.rocks/fabric/vault/daemon"
 	vaultstore "ioa.rocks/fabric/vault/store"
@@ -40,12 +43,14 @@ import (
 // owns it — mesh membership alone grants nothing.
 func cmdCircle(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: fabric circle init|join|export|attest|revoke|passphrase|grant|status")
+		return fmt.Errorf("usage: fabric circle init|admit|join|export|attest|revoke|passphrase|grant|status")
 	}
 	rest := args[1:]
 	switch args[0] {
 	case "init":
 		return cmdCircleInit(rest)
+	case "admit":
+		return cmdCircleAdmit(rest)
 	case "join":
 		return cmdCircleJoin(rest)
 	case "export":
@@ -61,7 +66,7 @@ func cmdCircle(args []string) error {
 	case "status":
 		return cmdCircleStatus(rest)
 	default:
-		return fmt.Errorf("usage: fabric circle init|join|export|attest|revoke|passphrase|grant|status")
+		return fmt.Errorf("usage: fabric circle init|admit|join|export|attest|revoke|passphrase|grant|status")
 	}
 }
 
@@ -107,6 +112,7 @@ func cmdCircleInit(args []string) error {
 	fs := flag.NewFlagSet("circle init", flag.ExitOnError)
 	statePath, vaultState := circleFlags(fs)
 	name := fs.String("name", "", "circle name (required; a single word — it names the directory and the -circle flag)")
+	subnet := fs.String("subnet", "auto", "the circle's overlay range (CIDR): devices admitted with -tun get an address in it; 'auto' derives a /24 in 100.64.0.0/10 from the circle DID, 'none' for no overlay")
 	fs.Parse(args)
 	if *name == "" {
 		return fmt.Errorf("circle init: -name is required")
@@ -123,12 +129,22 @@ func cmdCircleInit(args []string) error {
 	if err != nil {
 		return err
 	}
+	prefix, err := circlePrefix(root, c, *subnet)
+	if err != nil {
+		return err
+	}
+	if err := c.SetPrefix(prefix); err != nil {
+		return err
+	}
 	fmt.Printf("circle created: %q  %s\n", c.Config.Name, c.Config.DID)
+	if prefix != "" {
+		fmt.Printf("overlay range %s (devices admitted with -tun get an address in it)\n", prefix)
+	}
 	fmt.Printf("user-key container: %s — back it up\n", c.KeyPath())
 	if err := attestDevice(*statePath, c, pass); err != nil {
 		return err
 	}
-	fmt.Println("another device joins with: fabric circle export -circle " + c.Config.Name + " <file>, then fabric circle join <file> there")
+	fmt.Println("admit a device with: fabric circle admit <member> -circle " + c.Config.Name + " -out <file>, then fabric circle join <file> there (no key copy)")
 	if cl := vaultdaemon.TryClient(*vaultState); cl == nil {
 		fmt.Println("restart the node daemon ('fabric up') if it was running without any circle, so it starts serving buckets")
 	}
@@ -150,6 +166,41 @@ func cmdCircleJoin(args []string) error {
 	if err != nil {
 		return err
 	}
+	if !b.HasKey() {
+		// A device bundle: the attestation must be for this very device.
+		a, err := b.DeviceAttestation()
+		if err != nil {
+			return err
+		}
+		dir, err := state.Open(*statePath)
+		if err != nil {
+			return err
+		}
+		devPriv, err := dir.LoadDeviceKey()
+		if err != nil {
+			return fmt.Errorf("this node has no fabric identity yet (device.key): on a fresh machine run 'fabric join <bundle>' instead")
+		}
+		raw, err := devPriv.GetPublic().Raw()
+		if err != nil {
+			return err
+		}
+		if err := a.Verify(ed25519.PublicKey(raw), time.Now()); err != nil {
+			return fmt.Errorf("the bundle's attestation is not for this device: %w (the owner must admit this device's key: %s)", err, did.ForKey(ed25519.PublicKey(raw)))
+		}
+		c, err := circle.Join(root, b)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("joined circle %q  %s as a %s (no key on this device)\n", c.Config.Name, c.Config.DID, a.Role())
+		fmt.Printf("attested until %s; gate hints: %s\n", a.Expiry().Format("2006-01-02"), strings.Join(c.Config.Gates, " "))
+		if cl := vaultdaemon.TryClient(*vaultState); cl == nil {
+			fmt.Println("start the node daemon ('fabric up') if it is not running; a running one picks the circle up")
+		} else {
+			fmt.Println("the running daemon picks the circle up; its buckets arrive via sync")
+		}
+		return nil
+	}
+	fmt.Fprintln(os.Stderr, "this bundle carries the circle KEY: joining makes this device a co-owner — it can mint buckets, admit and revoke devices, and revoking it later cannot take that back (a one-way door). For a device that should not own the circle, ask an owner for 'fabric circle admit' instead.")
 	fmt.Fprintf(os.Stderr, "joining circle %q — its passphrase is needed to attest this device: ", b.Config.Name)
 	pass, err := vaultcli.Passphrase()
 	if err != nil {
@@ -159,7 +210,7 @@ func cmdCircleJoin(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("joined circle %q  %s\n", c.Config.Name, c.Config.DID)
+	fmt.Printf("joined circle %q  %s as an owner (holds the key)\n", c.Config.Name, c.Config.DID)
 	if err := attestDevice(*statePath, c, pass); err != nil {
 		return err
 	}
@@ -187,6 +238,9 @@ func cmdCircleExport(args []string) error {
 	if err != nil {
 		return err
 	}
+	if !c.HasKey() {
+		return fmt.Errorf("this device holds no key for circle %q — only an owner device can export it (a device bundle comes from 'fabric circle admit' on an owner)", c.Config.Name)
+	}
 	b, err := c.Export()
 	if err != nil {
 		return err
@@ -195,6 +249,7 @@ func cmdCircleExport(args []string) error {
 		return err
 	}
 	fmt.Printf("circle %q exported to %s — it carries the key container (passphrase-protected); move it privately and delete it after joining\n", c.Config.Name, fs.Arg(0))
+	fmt.Println("note: whoever joins this bundle becomes a co-owner for good (a one-way door); for a device that should not own the circle use 'fabric circle admit' instead")
 	return nil
 }
 
@@ -214,6 +269,9 @@ func attestDevice(statePath string, c *circle.Circle, pass string) error {
 	raw, err := devPriv.GetPublic().Raw()
 	if err != nil {
 		return err
+	}
+	if !c.HasKey() {
+		return fmt.Errorf("this device holds no key for circle %q — an owner device renews it with 'fabric circle admit %s -circle %s'", c.Config.Name, did.ForKey(ed25519.PublicKey(raw)), c.Config.Name)
 	}
 	priv, err := c.Unlock(pass)
 	if err != nil {
@@ -277,6 +335,10 @@ func cmdCircleAttest(args []string) error {
 		}
 	}
 	for _, c := range targets {
+		if !c.HasKey() {
+			fmt.Fprintf(os.Stderr, "circle %q: this device holds no key — an owner device renews it with 'fabric circle admit'\n", c.Config.Name)
+			continue
+		}
 		pass, err := passFor(c)
 		if err != nil {
 			return err
@@ -364,22 +426,48 @@ func cmdCircleStatus(args []string) error {
 		return nil
 	}
 	now := time.Now()
+	// The membership cert doubles as the attestation into the circle that
+	// issued it (one assert per device since the mesh-root merge).
+	var ownCert *cert.Cert
+	if dir, err := state.Open(*statePath); err == nil {
+		ownCert, _ = dir.LoadCert()
+	}
 	for _, c := range circles {
 		fmt.Printf("circle %q  %s\n", c.Config.Name, c.Config.DID)
 		fmt.Printf("  %s\n", c.Path)
-		if _, err := os.Stat(c.KeyPath()); err == nil {
-			fmt.Println("  role: owner device (holds the circle key)")
-		} else {
-			fmt.Println("  role: member device (no circle key)")
+		if c.Config.Prefix != "" {
+			fmt.Printf("  overlay: %s\n", c.Config.Prefix)
+		}
+		if len(c.Config.Gates) > 0 {
+			fmt.Printf("  gates: %s\n", strings.Join(c.Config.Gates, " "))
 		}
 		a, err := c.LoadAttestation()
+		if (err != nil || a.Valid(now) != nil) && ownCert != nil && ownCert.Stmt != nil && ownCert.Payload.Sub == c.Config.DID {
+			if raw, merr := ownCert.Marshal(); merr == nil {
+				if fromCert, uerr := circle.UnmarshalAttestation(raw); uerr == nil {
+					a, err = fromCert, nil
+				}
+			}
+		}
+		switch {
+		case c.HasKey():
+			fmt.Println("  role: owner (holds the circle key: mints buckets, admits and revokes devices)")
+		case err == nil:
+			fmt.Printf("  role: %s (no key on this device)\n", a.Role())
+		default:
+			fmt.Println("  role: device (no key on this device)")
+		}
+		renew := fmt.Sprintf("run 'fabric circle attest -circle %s'", c.Config.Name)
+		if !c.HasKey() {
+			renew = "an owner device re-admits it with 'fabric circle admit'"
+		}
 		switch {
 		case err != nil:
-			fmt.Printf("  device: NOT attested — run 'fabric circle attest -circle %s'; until then no peer syncs this circle with this device\n", c.Config.Name)
+			fmt.Printf("  device: NOT attested — %s; until then no peer serves this circle to this device\n", renew)
 		case c.Revoked(a, now):
-			fmt.Printf("  device: REVOKED by the circle (as of its revocation list) — peers refuse this device; an owner device re-attests it to re-admit\n")
+			fmt.Printf("  device: REVOKED by the circle (as of its revocation list) — peers refuse this device; an owner device re-admits it\n")
 		case a.Valid(now) != nil:
-			fmt.Printf("  device: attestation EXPIRED %s — run 'fabric circle attest -circle %s' (needs the circle key)\n", a.Expiry().Format("2006-01-02"), c.Config.Name)
+			fmt.Printf("  device: attestation EXPIRED %s — %s\n", a.Expiry().Format("2006-01-02"), renew)
 		default:
 			left := int(a.Expiry().Sub(now).Hours() / 24)
 			note := ""
@@ -387,7 +475,11 @@ func cmdCircleStatus(args []string) error {
 				note = "; legacy attestation, window implied from issue date"
 			}
 			if a.PastHalfLife(now) {
-				note += "; past half-life — renew with 'fabric circle attest -expiring'"
+				if c.HasKey() {
+					note += "; past half-life — renew with 'fabric circle attest -expiring'"
+				} else {
+					note += "; past half-life — an owner device re-admits it"
+				}
 			}
 			fmt.Printf("  device: attested until %s (%dd left%s)\n", a.Expiry().Format("2006-01-02"), left, note)
 		}
@@ -466,7 +558,7 @@ func cmdCircleRevoke(args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(c.KeyPath()); err != nil {
+	if !c.HasKey() {
 		return fmt.Errorf("this device holds no key for circle %q — revoke from an owner device", c.Config.Name)
 	}
 	dir, err := state.Open(*statePath)
@@ -477,37 +569,9 @@ func cmdCircleRevoke(args []string) error {
 	if _, err := dir.LoadDeviceKey(); err == nil {
 		client = daemon.NewClient(dir)
 	}
-
-	deviceDID, label := target, target
-	if !strings.HasPrefix(target, "did:key:") {
-		if client == nil {
-			return fmt.Errorf("resolving %q needs this node's fabric identity and running daemon; give the device's did:key instead", target)
-		}
-		members, err := client.Members()
-		if err != nil {
-			return fmt.Errorf("resolving %q needs the running node daemon ('fabric up'), or give the device's did:key: %w", target, err)
-		}
-		var matches []daemon.MemberInfo
-		for _, m := range members {
-			if memberMatches(m, target) {
-				matches = append(matches, m)
-			}
-		}
-		switch len(matches) {
-		case 0:
-			return fmt.Errorf("no mesh member matches %q (see 'fabric status'); a device outside the mesh is revoked by its did:key", target)
-		case 1:
-		default:
-			for _, m := range matches {
-				fmt.Fprintf(os.Stderr, "  %s  %-16s %s\n", m.Fingerprint, m.Name, m.ID)
-			}
-			return fmt.Errorf("%q is ambiguous — %d members match", target, len(matches))
-		}
-		m := matches[0]
-		if m.Self {
-			return fmt.Errorf("%q is this device — revoke it from another owner device of the circle", m.Name)
-		}
-		deviceDID, label = cert.DIDForKey(ed25519.PublicKey(m.DevicePub)), m.Name
+	deviceDID, label, err := resolveDevice(client, target)
+	if err != nil {
+		return err
 	}
 
 	pass, err := passFor(c)
@@ -536,6 +600,241 @@ func cmdCircleRevoke(args []string) error {
 		}
 	}
 	fmt.Println("to re-admit the device later, attest it again on an owner device (an attestation issued after the revocation stands)")
+	return nil
+}
+
+// resolveDevice turns a device reference — did:key, or a member's name,
+// peer ID or fingerprint known to the running daemon — into its did:key and
+// a label. A device outside every circle this node holds is named by its
+// did:key (`fabric status` on that device shows it).
+func resolveDevice(client *daemon.Client, target string) (deviceDID, label string, err error) {
+	if strings.HasPrefix(target, "did:key:") {
+		if _, err := did.KeyFor(target); err != nil {
+			return "", "", fmt.Errorf("%q: %w", target, err)
+		}
+		return target, target, nil
+	}
+	if client == nil {
+		return "", "", fmt.Errorf("resolving %q needs this node's fabric identity and running daemon; give the device's did:key instead", target)
+	}
+	members, err := client.Members()
+	if err != nil {
+		return "", "", fmt.Errorf("resolving %q needs the running node daemon ('fabric up'), or give the device's did:key: %w", target, err)
+	}
+	var matches []daemon.MemberInfo
+	for _, m := range members {
+		if memberMatches(m, target) {
+			matches = append(matches, m)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", "", fmt.Errorf("no known device matches %q (see 'fabric status'); a device this node shares no circle with is named by its did:key", target)
+	case 1:
+	default:
+		for _, m := range matches {
+			fmt.Fprintf(os.Stderr, "  %s  %-16s %s\n", m.Fingerprint, m.Name, m.ID)
+		}
+		return "", "", fmt.Errorf("%q is ambiguous — %d devices match", target, len(matches))
+	}
+	m := matches[0]
+	if m.Self {
+		return "", "", fmt.Errorf("%q is this device — admit or revoke it from another owner device of the circle", m.Name)
+	}
+	return cert.DIDForKey(ed25519.PublicKey(m.DevicePub)), m.Name, nil
+}
+
+// circlePrefix resolves `-subnet` for a circle: auto derives from the DID,
+// none is none, anything else must parse and must not be a range another
+// circle on this node already uses.
+func circlePrefix(root string, c *circle.Circle, subnet string) (string, error) {
+	var prefix string
+	switch subnet {
+	case "none", "":
+		return "", nil
+	case "auto":
+		prefix = circle.DefaultPrefix(c.Config.DID)
+	default:
+		p, err := netip.ParsePrefix(subnet)
+		if err != nil {
+			return "", fmt.Errorf("-subnet: %w", err)
+		}
+		prefix = p.Masked().String()
+	}
+	others, _ := circle.List(root)
+	for _, o := range others {
+		if o.Config.DID != c.Config.DID && o.Config.Prefix == prefix {
+			return "", fmt.Errorf("overlay range %s is already circle %q's on this node — pick another with -subnet", prefix, o.Config.Name)
+		}
+	}
+	return prefix, nil
+}
+
+// listedGateHints returns this node's globally dialable addresses when it
+// is a listed node, for a bundle's gate hints; a dark owner device cannot
+// be dialed by a newcomer and offers none.
+func listedGateHints(statePath string) []string {
+	dir, err := state.Open(statePath)
+	if err != nil {
+		return nil
+	}
+	st, err := daemon.NewClient(dir).Status()
+	if err != nil || st.Posture != "listed" {
+		return nil
+	}
+	cands := st.ReachableAddrs
+	if len(cands) == 0 {
+		cands = st.Addrs
+	}
+	var out []string
+	for _, a := range cands {
+		if globalDialable(a) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// cmdCircleAdmit signs a device into a circle without copying the key
+// (task circle-member-devices, slice D): an owner device resolves the
+// device's key, signs a device assert with the role's verbs — `device`
+// (sync, blob, subjects) or `gate` (`member, host` only: a public hop that
+// reads nothing) — plus `tun` and an address in the circle's range when
+// asked, records it in the circle's roster through the running daemon (so
+// the circle learns the device before it connects), and writes a bundle
+// the device installs with `fabric circle join` (or, on a fresh machine,
+// `fabric join <bundle>`). The bundle carries no key.
+func cmdCircleAdmit(args []string) error {
+	fs := flag.NewFlagSet("circle admit", flag.ExitOnError)
+	statePath, vaultState := circleFlags(fs)
+	name := fs.String("circle", "", "which circle (required when the node holds several)")
+	role := fs.String("role", circle.RoleDevice, "device (sync, blob, subjects) or gate (member, host only)")
+	label := fs.String("name", "", "human label signed into the attestation (default: the member's name)")
+	tun := fs.Bool("tun", false, "also sign tun and an address in the circle's overlay range")
+	validity := fs.Duration("validity", circle.DefaultValidity, "attestation lifetime")
+	out := fs.String("out", "", "bundle file to write for the device (required)")
+	var gates stringList
+	fs.Var(&gates, "gate", "gate hint for the device: a listed device of the circle, multiaddr with /p2p/ (repeatable; default: the circle's recorded hints plus this node's own when listed)")
+	fs.Parse(args)
+	if fs.NArg() != 1 || *out == "" {
+		return fmt.Errorf("usage: fabric circle admit [-circle <name>] [-role device|gate] [-name <label>] [-tun] -out <file> <member-name | peer-id | fingerprint | did:key:…>")
+	}
+	target := fs.Arg(0)
+	root, err := circleRoot(*statePath, *vaultState)
+	if err != nil {
+		return err
+	}
+	c, err := pickCircle(root, *name)
+	if err != nil {
+		return err
+	}
+	if !c.HasKey() {
+		return fmt.Errorf("this device holds no key for circle %q — admit from an owner device", c.Config.Name)
+	}
+	verbs, err := circle.VerbsForRole(*role)
+	if err != nil {
+		return err
+	}
+	dir, err := state.Open(*statePath)
+	if err != nil {
+		return err
+	}
+	var client *daemon.Client
+	if _, err := dir.LoadDeviceKey(); err == nil {
+		client = daemon.NewClient(dir)
+	}
+	deviceDID, memberName, err := resolveDevice(client, target)
+	if err != nil {
+		return err
+	}
+	devicePub, err := did.KeyFor(deviceDID)
+	if err != nil {
+		return err
+	}
+	if *label == "" && memberName != deviceDID {
+		*label = memberName
+	}
+	meta := &statement.Meta{Name: *label}
+	now := time.Now()
+
+	// The owner's roster is what the address allocation goes by; the
+	// daemon's copy is authoritative when it runs, the file otherwise.
+	roster, err := circle.OpenRoster(c, now)
+	if err != nil {
+		return err
+	}
+	if *tun {
+		if *role == circle.RoleGate {
+			return errors.New("a gate never holds tun (memo §17: a public hop reads nothing and is no overlay endpoint)")
+		}
+		if c.Config.Prefix == "" {
+			return fmt.Errorf("circle %q has no overlay range — 'fabric circle init -subnet' set one at minting; this circle was minted without", c.Config.Name)
+		}
+		taken := roster.UsedIPs()
+		if own, err := c.LoadAttestation(); err == nil && own.IP != "" {
+			taken = append(taken, own.IP)
+		}
+		if dev, ok := roster.Device(deviceDID); ok && dev.Stmt.Payload.Meta != nil && dev.Stmt.Payload.Meta.IP != "" {
+			meta.IP = dev.Stmt.Payload.Meta.IP // a returning device keeps its address
+		} else if meta.IP, err = tunbridge.NextFreeIP(c.Config.Prefix, taken); err != nil {
+			return err
+		}
+		verbs = append(verbs, statement.VerbTun)
+	}
+	if len(gates) == 0 {
+		gates = append(gates, c.Config.Gates...)
+		for _, g := range listedGateHints(*statePath) {
+			if !slices.Contains(gates, g) {
+				gates = append(gates, g)
+			}
+		}
+	}
+
+	pass, err := passFor(c)
+	if err != nil {
+		return err
+	}
+	priv, err := c.Unlock(pass)
+	if err != nil {
+		return err
+	}
+	a, err := circle.AttestWith(priv, nil, c.Config.DID, devicePub, now, *validity, verbs, meta)
+	if err != nil {
+		return err
+	}
+	bundle, err := circle.NewDeviceBundle(c, a, gates)
+	if err != nil {
+		return err
+	}
+	if err := circle.WriteBundle(*out, bundle); err != nil {
+		return err
+	}
+	fmt.Printf("admitted %s into circle %q as a %s until %s\n", memberName, c.Config.Name, *role, a.Expiry().Format("2006-01-02"))
+	if meta.IP != "" {
+		fmt.Printf("  overlay address %s\n", meta.IP)
+	}
+	if len(gates) > 0 {
+		fmt.Printf("  gates: %s\n", strings.Join(gates, " "))
+	} else {
+		fmt.Println("  no gate hints (this node is not listed and the circle records none): the device can only be dialed by devices that already know it — pass -gate")
+	}
+	raw, err := a.Marshal()
+	if err != nil {
+		return err
+	}
+	if client != nil {
+		if _, err := client.CircleAdmit(raw); err == nil {
+			fmt.Println("  the circle's roster knows the device now; devices online learn it at once, the rest by gossip")
+		} else {
+			if _, err := roster.Add(a.Stmt, now); err != nil {
+				return err
+			}
+			fmt.Println("  recorded in the circle's roster on disk (no running daemon here: 'fabric up' gossips it)")
+		}
+	} else if _, err := roster.Add(a.Stmt, now); err != nil {
+		return err
+	}
+	fmt.Printf("  bundle written to %s — move it privately to the device, then run there: fabric circle join %s (fresh machine: fabric join %s)\n", *out, filepath.Base(*out), filepath.Base(*out))
 	return nil
 }
 

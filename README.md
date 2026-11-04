@@ -399,12 +399,32 @@ expired anyway. Re-admitting a revoked device means a fresh
 
 ### Circle attestations: the same lifecycle, one layer up
 
-A device's *circle attestation* (what makes peers of a circle sync with
-it) lives one year like a cert and renews by re-signing on a device
-that holds the circle key:
+A device's *circle attestation* (what makes peers of a circle serve it)
+lives one year like a cert. An **owner** (a device holding the circle
+key) admits a device without copying the key:
 
 ```sh
-fabric circle attest -expiring            # renew every attestation past half-life
+# on an owner device: sign her PC in as a device (sync, blob, subjects),
+# or a VPS as a gate (member, host only — a public hop that reads nothing)
+fabric circle admit her-pc -circle family -out her.bundle
+fabric circle admit gate-hetz -circle family -role gate -out gate.bundle
+# on the device: install the bundle (no passphrase — there is no key)
+fabric circle join her.bundle
+```
+
+The bundle carries the circle's config, gate hints and the device's
+attestation; the owner's running daemon records the device in the
+circle's roster at once and gossips it to the circle's devices, so the
+device is admitted the moment it connects (`-tun` also signs an address
+in the circle's overlay range). `circle status` names the role: owner /
+device / gate. A device's attestation is renewed by the owner admitting
+it again; an owner's own with `fabric circle attest -expiring`. A key
+copy (`circle export` / `circle join` of a bundle with the key) makes a
+co-owner — a one-way door, since revoking that device's attestation
+later cannot take root authority back.
+
+```sh
+fabric circle attest -expiring            # renew this owner device's attestation past half-life
 fabric circle revoke her-pc -circle family # an owner device signs a device out
 ```
 

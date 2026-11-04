@@ -16,9 +16,11 @@ package circle
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -44,6 +46,11 @@ type Config struct {
 	// (cold start; task circle-member-devices). Written by `circle admit`
 	// bundles and `circle join`; a device learns the rest by gossip.
 	Gates []string `json:"gates,omitempty"`
+	// Prefix is the circle's overlay range (CIDR), when it has one: the
+	// overlay is a circle resource (memo §5, decided 2026-11-04). A device
+	// admitted with `tun` gets an address inside it, signed into its
+	// assert; the owner allocates against the roster.
+	Prefix string `json:"prefix,omitempty"`
 }
 
 // Circle is an opened circle directory.
@@ -240,13 +247,86 @@ func (c *Circle) Rekey(oldPass, newPass string) error {
 	return os.Rename(tmp, keyPath(c.Path))
 }
 
-// Bundle is the portable form of a circle identity: what a second device
-// of the same owner needs to join the circle. Interim until capability
-// grants let a device hold a sub-key instead of the root user key (ADR
-// 0017 phase 1); the key container keeps its passphrase.
+// Bundle is the portable form of a circle for a device joining it. Two
+// kinds, one format: an **owner bundle** carries the key container (a key
+// copy makes the device a co-owner — a one-way door, memo §14: revoking
+// its assert later cannot remove root authority; the passphrase travels
+// separately), a **device bundle** carries the device's attestation signed
+// by an owner (`circle admit`) and no key. Both carry the config with the
+// circle's gate hints, so a device that knows the circle from nowhere else
+// can find a gate and present itself there.
 type Bundle struct {
-	Config Config `json:"config"`
-	Key    []byte `json:"key"` // the age container, verbatim
+	Config      Config `json:"config"`
+	Key         []byte `json:"key,omitempty"`         // the age container, verbatim (owner bundle)
+	Attestation []byte `json:"attestation,omitempty"` // this device's assert, wire bytes (device bundle)
+}
+
+// HasKey reports whether the bundle carries the circle key (co-ownership).
+func (b *Bundle) HasKey() bool { return len(b.Key) > 0 }
+
+// DeviceAttestation decodes the bundle's attestation, if it carries one.
+func (b *Bundle) DeviceAttestation() (*Attestation, error) {
+	if len(b.Attestation) == 0 {
+		return nil, nil
+	}
+	a, err := UnmarshalAttestation(b.Attestation)
+	if err != nil {
+		return nil, fmt.Errorf("bundle attestation: %w", err)
+	}
+	if a.Circle != b.Config.DID {
+		return nil, errors.New("bundle attestation is for a different circle")
+	}
+	return a, nil
+}
+
+// NewDeviceBundle packs what an admitted device needs: the circle's
+// config (name, DID, gate hints, prefix) and its own attestation.
+func NewDeviceBundle(c *Circle, a *Attestation, gates []string) (*Bundle, error) {
+	if a.Circle != c.Config.DID {
+		return nil, errors.New("attestation is for a different circle")
+	}
+	raw, err := a.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	cfg := c.Config
+	cfg.Gates = gates
+	return &Bundle{Config: cfg, Attestation: raw}, nil
+}
+
+// HasKey reports whether this device holds the circle key — whether it is
+// an owner device.
+func (c *Circle) HasKey() bool {
+	_, err := os.Stat(c.KeyPath())
+	return err == nil
+}
+
+// SetPrefix records the circle's overlay range in its config.
+func (c *Circle) SetPrefix(prefix string) error {
+	if prefix != "" {
+		if _, err := netip.ParsePrefix(prefix); err != nil {
+			return fmt.Errorf("overlay prefix: %w", err)
+		}
+	}
+	c.Config.Prefix = prefix
+	return writeConfig(c.Path, c.Config)
+}
+
+// SetGates records the circle's gate hints in its config.
+func (c *Circle) SetGates(gates []string) error {
+	c.Config.Gates = gates
+	return writeConfig(c.Path, c.Config)
+}
+
+// DefaultPrefix derives a circle's overlay range from its DID: one /24 out
+// of 100.64.0.0/10 (the CGNAT range the fleet's overlay already lives in),
+// so independently minted circles do not collide by default. The operator
+// overrides it at `circle init -subnet`.
+func DefaultPrefix(circleDID string) string {
+	sum := sha256.Sum256([]byte(circleDID))
+	slot := int(sum[0])<<8 | int(sum[1]) // 16 bits
+	slot &= (1 << 14) - 1                // 64 second octets × 256 third octets
+	return fmt.Sprintf("100.%d.%d.0/24", 64+slot>>8, slot&255)
 }
 
 // Export packs the circle identity for transfer to another device.
@@ -281,18 +361,27 @@ func ReadBundle(src string) (*Bundle, error) {
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return nil, fmt.Errorf("%s is not a circle bundle: %w", src, err)
 	}
-	if b.Config.DID == "" || len(b.Key) == 0 {
+	if b.Config.DID == "" || (len(b.Key) == 0 && len(b.Attestation) == 0) {
 		return nil, fmt.Errorf("%s is not a circle bundle", src)
 	}
 	return &b, nil
 }
 
-// Join installs a bundle as this node's circle. Refuses to replace an
-// existing circle — a device belongs to one circle today, and swapping
-// identities under live buckets is not a thing to do by accident.
+// Join installs a bundle as a circle this node holds: the key when the
+// bundle carries one (an owner device), the attestation when it carries
+// that (a device without the key), the config with its gate hints either
+// way. Refuses to replace a circle already held — swapping identities
+// under live buckets is not a thing to do by accident.
 func Join(root string, b *Bundle) (*Circle, error) {
 	if err := validName(b.Config.Name); err != nil {
 		return nil, fmt.Errorf("bundle: %w", err)
+	}
+	if !b.HasKey() && len(b.Attestation) == 0 {
+		return nil, errors.New("bundle carries neither a key nor an attestation")
+	}
+	attestation, err := b.DeviceAttestation()
+	if err != nil {
+		return nil, err
 	}
 	if c, err := ByDID(root, b.Config.DID); err == nil {
 		return nil, fmt.Errorf("this node already holds that circle as %q (%s)", c.Config.Name, c.Path)
@@ -304,13 +393,24 @@ func Join(root string, b *Bundle) (*Circle, error) {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(keyPath(path), b.Key, 0o600); err != nil {
-		return nil, err
+	if b.HasKey() {
+		if err := os.WriteFile(keyPath(path), b.Key, 0o600); err != nil {
+			return nil, err
+		}
 	}
 	if err := writeConfig(path, b.Config); err != nil {
 		return nil, err
 	}
-	return Open(path)
+	c, err := Open(path)
+	if err != nil {
+		return nil, err
+	}
+	if attestation != nil {
+		if err := c.SaveAttestation(attestation); err != nil {
+			return nil, err
+		}
+	}
+	return c, nil
 }
 
 // Migrate adopts a pre-hoist circle (its config and key lived in the vault
@@ -355,8 +455,8 @@ func validName(name string) error {
 	return nil
 }
 
-// WriteBundle writes a bundle file (mode 0600 — it carries the key
-// container).
+// WriteBundle writes a bundle file (mode 0600 — an owner bundle carries
+// the key container).
 func WriteBundle(file string, b *Bundle) error {
 	raw, err := json.MarshalIndent(b, "", "  ")
 	if err != nil {

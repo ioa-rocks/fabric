@@ -121,12 +121,12 @@ func admit(t *testing.T, owner, device *circleTestNode, circleDID string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, ok := owner.store.RosterFor(circleDID)
-	if !ok {
-		t.Fatalf("owner holds no roster for %s", circleDID)
-	}
-	if _, err := r.Add(a.Stmt, time.Now()); err != nil {
+	raw, err := a.Marshal()
+	if err != nil {
 		t.Fatal(err)
+	}
+	if fresh, err := owner.svc.Admit(raw); err != nil || !fresh {
+		t.Fatalf("Admit: fresh=%v err=%v", fresh, err)
 	}
 }
 

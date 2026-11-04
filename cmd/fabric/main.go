@@ -171,11 +171,14 @@ func usage() {
            transports, and resolved IPs are derived automatically;
            announce txt — print the DNS TXT record for hostname joins
   deploy   deploy this x86-64 binary to ~/.local/bin on one or more SSH hosts
-  circle   circle init -name <label> — mint this node's circle (the owner's
-           user key: what buckets and, next, subjects belong to)
-           circle export <file> / circle join <file> — a second device of
-           the same owner; circle attest [-expiring] — sign this device into
-           the circle, or renew (attestations live a year, like certs);
+  circle   circle init -name <label> [-subnet] — mint a circle (the owner's
+           user key: what buckets, subjects and an overlay range belong to)
+           circle admit <member> -circle <name> [-role device|gate] [-tun]
+           -out <file> — sign a device in without copying the key (owner);
+           circle join <file> — install the bundle on the device (a bundle
+           with the key makes a co-owner, a one-way door; circle export);
+           circle attest [-expiring] — renew this owner device's own
+           attestation (attestations live a year, like certs);
            circle revoke <member> — sign a device out (owner device);
            circle passphrase [-circle <name>] — re-encrypt the key container
            under a new passphrase (the key is unchanged; per device);

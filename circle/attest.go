@@ -33,6 +33,43 @@ var DeviceVerbs = []string{
 	statement.VerbAck, statement.VerbRead, statement.VerbSync, statement.VerbWrite, statement.VerbBlob,
 }
 
+// Roles a device of a circle can hold (task circle-member-devices,
+// "Naming"): owner is custody (the key file is on the device), the other
+// two are verb sets on the device assert.
+const (
+	RoleOwner  = "owner"  // holds the circle key: mints, admits, revokes, exports
+	RoleDevice = "device" // DeviceVerbs: syncs, serves blobs, uses subjects; no key
+	RoleGate   = "gate"   // GateVerbs only: a public hop that reads nothing
+)
+
+// GateVerbs is a gate's assert: in the roster and hosting the circle's
+// subjects and relaying for it, but no `sync`, `blob` or `tun` — a
+// compromised VPS cannot read a bucket or join the overlay (memo §17 item
+// 3; decided 2026-11-03).
+var GateVerbs = []string{statement.VerbMember, statement.VerbHost}
+
+// VerbsForRole maps an admission role preset to the verbs it signs.
+func VerbsForRole(role string) ([]string, error) {
+	switch role {
+	case RoleDevice, "":
+		return append([]string(nil), DeviceVerbs...), nil
+	case RoleGate:
+		return append([]string(nil), GateVerbs...), nil
+	}
+	return nil, fmt.Errorf("unknown role %q (device or gate)", role)
+}
+
+// RoleOf names the role a verb set amounts to: gate when nothing beyond
+// GateVerbs is carried, else device. Ownership is not a verb (see Circle.HasKey).
+func RoleOf(verbs []string) string {
+	for _, v := range verbs {
+		if !hasVerb(GateVerbs, v) {
+			return RoleDevice
+		}
+	}
+	return RoleGate
+}
+
 // Attestation is the circle's signed statement that a device — a mesh peer
 // identity — is one of its own. It is minted where the circle key is (the
 // CLI, at `circle init`/`join`/`attest`, under the passphrase) and
@@ -55,6 +92,12 @@ type Attestation struct {
 	Sig    []byte
 	Stmt   *statement.Statement // the statement form; nil for legacy bytes
 	raw    []byte               // legacy payload bytes as signed
+
+	// Statement attestations only (a legacy one carries DeviceVerbs and no
+	// attributes).
+	Verbs []string
+	Name  string // human label the admitting owner gave the device
+	IP    string // overlay address in the circle's prefix, when `tun` was signed
 }
 
 type attestPayload struct {
@@ -102,8 +145,23 @@ func AttestFor(circlePriv ed25519.PrivateKey, devicePub ed25519.PublicKey, now t
 // the root (own == nil) or an admin desk presenting its own admin assert
 // (own), in which case the attestation chains through it and dies with it.
 func AttestAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, devicePub ed25519.PublicKey, now time.Time, validity time.Duration) (*Attestation, error) {
+	return AttestWith(priv, own, circleDID, devicePub, now, validity, DeviceVerbs, nil)
+}
+
+// AttestWith is AttestAs with the verbs and attributes chosen: a role
+// preset (VerbsForRole) plus `tun`, and meta carrying the device's label
+// and — when `tun` is signed — its overlay address inside the circle's
+// prefix (rule 7 lets a root-issued link carry any well-formed address;
+// an admin desk's must lie in the desk's own prefix).
+func AttestWith(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, devicePub ed25519.PublicKey, now time.Time, validity time.Duration, verbs []string, meta *statement.Meta) (*Attestation, error) {
 	if validity <= 0 {
 		return nil, errors.New("attestation validity must be positive")
+	}
+	if !hasVerb(verbs, statement.VerbMember) {
+		return nil, errors.New("a device assert must carry member")
+	}
+	if meta != nil && meta.IP != "" && !hasVerb(verbs, statement.VerbTun) {
+		return nil, errors.New("an overlay address needs the tun verb")
 	}
 	s, err := statement.Sign(priv, statement.Payload{
 		Aud: did.ForKey(devicePub),
@@ -111,7 +169,8 @@ func AttestAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID strin
 		// Any resource in any circle, as for certs: lets the device present
 		// grants other circles gave its circle (rule 5); no authority by itself.
 		Res:   []statement.Resource{{Kind: statement.Any, Name: statement.Any, Sub: statement.Any}},
-		Verbs: DeviceVerbs,
+		Verbs: verbs,
+		Meta:  meta,
 		Del:   1, // sub-keys only: rule 8 keeps admission verbs out of them
 		Iat:   now.Unix(),
 		Nbf:   now.Unix(),
@@ -131,7 +190,20 @@ func fromStatement(s *statement.Statement) (*Attestation, error) {
 	if !hasVerb(p.Verbs, statement.VerbMember) {
 		return nil, errors.New("not an attestation: statement does not carry member")
 	}
-	return &Attestation{Circle: p.Sub, Device: p.Aud, Iat: p.Iat, Nbf: p.Nbf, Exp: p.Exp, Sig: s.Sig, Stmt: s}, nil
+	a := &Attestation{Circle: p.Sub, Device: p.Aud, Iat: p.Iat, Nbf: p.Nbf, Exp: p.Exp, Sig: s.Sig, Stmt: s, Verbs: p.Verbs}
+	if p.Meta != nil {
+		a.Name, a.IP = p.Meta.Name, p.Meta.IP
+	}
+	return a, nil
+}
+
+// Role is the role the attestation's verbs amount to (device for a legacy
+// one, which carries the full device set).
+func (a *Attestation) Role() string {
+	if a.Stmt == nil {
+		return RoleDevice
+	}
+	return RoleOf(a.Verbs)
 }
 
 func hasVerb(verbs []string, v string) bool {

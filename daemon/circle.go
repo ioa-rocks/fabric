@@ -368,6 +368,43 @@ func (s *CircleService) tableCircles(p peer.ID) ([]string, bool) {
 	return s.table.Circles(p, time.Now()), true
 }
 
+// Admit records a device attestation an owner signed here (`circle admit`)
+// in the circle's roster and pushes it to the circle's devices online now,
+// so the circle learns the device before it connects. The attestation
+// must verify against the circle's root and name a circle this node
+// holds; the socket carries no authority of its own. Reports whether the
+// roster changed.
+func (s *CircleService) Admit(raw []byte) (bool, error) {
+	a, err := circle.UnmarshalAttestation(raw)
+	if err != nil {
+		return false, err
+	}
+	if a.Stmt == nil {
+		return false, errors.New("attestation is not a statement")
+	}
+	if err := a.VerifySignature(); err != nil {
+		return false, err
+	}
+	if s.table == nil {
+		return false, errors.New("no peer table attached")
+	}
+	if s.circleByDID(a.Circle) == nil {
+		return false, fmt.Errorf("circle %s is not held by this node", shortDID(a.Circle))
+	}
+	roster, ok := s.table.RosterFor(a.Circle)
+	if !ok {
+		return false, fmt.Errorf("no roster for circle %s", shortDID(a.Circle))
+	}
+	fresh, err := roster.Add(a.Stmt, time.Now())
+	if err != nil {
+		return false, err
+	}
+	if fresh && s.sync != nil {
+		s.sync.PublishStatements(a.Circle, [][]byte{raw}, nil)
+	}
+	return fresh, nil
+}
+
 // reloadRevocations feeds every revocation on disk into the rosters: what
 // the CLI wrote beside the circle (and a restart) must reach transport
 // membership without waiting for a peer to echo it.
@@ -484,8 +521,13 @@ func (s *CircleService) Attested(c *circle.Circle) bool {
 // CircleInfo is the lifecycle view of one circle this node holds, for
 // `fabric status` / `fabric circle status`.
 type CircleInfo struct {
-	Name        string     `json:"name"`
-	DID         string     `json:"did"`
+	Name string `json:"name"`
+	DID  string `json:"did"`
+	// Role is this device's role in the circle: owner (holds the key),
+	// device, or gate (`member, host` only) by its attestation's verbs.
+	Role        string     `json:"role,omitempty"`
+	Prefix      string     `json:"prefix,omitempty"`  // the circle's overlay range, when it has one
+	Devices     int        `json:"devices"`           // live devices in the roster (this one excluded)
 	Attested    bool       `json:"attested"`          // holds a currently valid, unrevoked attestation
 	Expiry      *time.Time `json:"expiry,omitempty"`  // of this device's attestation, if any
 	Legacy      bool       `json:"legacy,omitempty"`  // attestation predates validity windows
@@ -497,9 +539,17 @@ type CircleInfo struct {
 func (s *CircleService) Info(now time.Time) []CircleInfo {
 	var out []CircleInfo
 	for _, c := range s.Circles() {
-		ci := CircleInfo{Name: c.Config.Name, DID: c.Config.DID}
+		ci := CircleInfo{Name: c.Config.Name, DID: c.Config.DID, Prefix: c.Config.Prefix, Role: circle.RoleDevice}
+		if c.HasKey() {
+			ci.Role = circle.RoleOwner
+		}
 		if rs, err := c.Revocations(now); err == nil {
 			ci.Revocations = len(rs)
+		}
+		if s.table != nil {
+			if r, ok := s.table.RosterFor(c.Config.DID); ok {
+				ci.Devices = len(r.LiveDevices(now))
+			}
 		}
 		a, err := c.LoadAttestation()
 		if err != nil || a.Valid(now) != nil {
@@ -515,6 +565,9 @@ func (s *CircleService) Info(now time.Time) []CircleInfo {
 			ci.Legacy = a.Legacy()
 			ci.Revoked = c.Revoked(a, now)
 			ci.Attested = a.Valid(now) == nil && !ci.Revoked
+			if !c.HasKey() {
+				ci.Role = a.Role()
+			}
 		}
 		out = append(out, ci)
 	}

@@ -429,6 +429,22 @@ func (r *Roster) LapsedDevices(now time.Time) []*Device {
 	return out
 }
 
+// UsedIPs lists the overlay addresses the roster's asserts carry, live and
+// lapsed alike (a lapsed device keeps its address until it is back or
+// revoked), for the owner's allocation.
+func (r *Roster) UsedIPs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []string
+	for _, dev := range r.devices {
+		if m := dev.Stmt.Payload.Meta; m != nil && m.IP != "" {
+			out = append(out, m.IP)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Len is the number of entries, live or not.
 func (r *Roster) Len() int {
 	r.mu.RLock()
