@@ -188,9 +188,152 @@ func (s *CircleService) SetHome(home func() string, roots statement.Roots, certO
 // home-circle attestation (see ownCert).
 func (s *CircleService) SetOwnCert(f func() *cert.Cert) { s.ownCert = f }
 
-// SetPeerTable wires the union peer table so circle revocations reach the
-// rosters transport goes by.
-func (s *CircleService) SetPeerTable(t *fabricnet.PeerTable) { s.table = t }
+// SetPeerTable wires the union peer table: circle revocations reach the
+// rosters transport goes by, and the v2 handshake presents this node's
+// asserts per shared circle (hello) and ingests the peer's revocations.
+func (s *CircleService) SetPeerTable(t *fabricnet.PeerTable) {
+	s.table = t
+	s.Circles() // rosters for every circle directory
+	if s.auth != nil {
+		s.auth.SetPresenter(s.hello)
+		s.auth.SetRevocationSink(func(_ peer.ID, revs [][]byte) error {
+			return s.ingestRevocations(revs, time.Now())
+		})
+	}
+}
+
+// ownAssert is one of this node's device asserts with the roster it is in.
+type ownAssert struct {
+	roster *circle.Roster
+	circle string // the circle DID the assert names
+	stmt   *statement.Statement
+}
+
+// ownAsserts lists this node's live device asserts in statement form, one
+// per roster: the membership cert for the circle it is in, the stored
+// attestation for every other circle directory. Legacy attestations have
+// no statement form and are not presentable (re-attest to migrate).
+func (s *CircleService) ownAsserts(now time.Time) []ownAssert {
+	if s.table == nil {
+		return nil
+	}
+	var out []ownAssert
+	seen := map[*circle.Roster]bool{}
+	var own *cert.Cert
+	if s.ownCert != nil {
+		own = s.ownCert()
+	}
+	if own == nil && s.auth != nil {
+		own = s.auth.Own()
+	}
+	if own != nil && own.Stmt != nil {
+		if r, ok := s.table.RosterFor(own.Payload.Sub); ok {
+			out = append(out, ownAssert{roster: r, circle: own.Payload.Sub, stmt: own.Stmt})
+			seen[r] = true
+		}
+	}
+	for _, c := range s.Circles() {
+		r, ok := s.table.RosterFor(c.Config.DID)
+		if !ok || seen[r] {
+			continue
+		}
+		a := s.liveAttestation(c, now)
+		if a == nil || a.Stmt == nil {
+			continue
+		}
+		out = append(out, ownAssert{roster: r, circle: c.Config.DID, stmt: a.Stmt})
+		seen[r] = true
+	}
+	return out
+}
+
+// hinted reports whether the circle's gate hints name the peer.
+func (s *CircleService) hinted(circleDID string, p peer.ID) bool {
+	c := s.circleByDID(circleDID)
+	if c == nil {
+		return false
+	}
+	for _, hint := range c.Config.Gates {
+		if info, err := peer.AddrInfoFromString(hint); err == nil && info.ID == p {
+			return true
+		}
+	}
+	return false
+}
+
+// hello is the v2 presenter (fabricnet.Presenter): on the dialer's side
+// the asserts for the circles this node knows the peer in — its rosters,
+// or the gate hints that named the peer — and on the responder's the
+// asserts for exactly the circles the dialer verified in. The revocations
+// of those circles ride along. A circle the peer is not known in is never
+// named; when the dialer knows the peer from nowhere, fabricnet adds the
+// membership cert alone (the device's first circle, as v1 always showed).
+func (s *CircleService) hello(p peer.ID, verified []string) fabricnet.Hello {
+	now := time.Now()
+	var chosen []ownAssert
+	deviceDID, _ := fabricnet.DeviceDID(p)
+	for _, o := range s.ownAsserts(now) {
+		switch {
+		case verified != nil:
+			if slices.Contains(verified, o.roster.Primary()) {
+				chosen = append(chosen, o)
+			}
+		default:
+			if _, known := o.roster.Device(deviceDID); known || s.hinted(o.circle, p) {
+				chosen = append(chosen, o)
+			}
+		}
+	}
+	var hello fabricnet.Hello
+	for _, o := range chosen {
+		if raw, err := o.stmt.Bytes(); err == nil {
+			hello.Asserts = append(hello.Asserts, raw)
+		}
+	}
+	for _, o := range chosen {
+		hello.Revocations = append(hello.Revocations, s.revocationsOf(o.circle, now)...)
+	}
+	return hello
+}
+
+// revocationsOf is every live revocation this node holds for one circle,
+// both forms (a v2 peer decodes both).
+func (s *CircleService) revocationsOf(circleDID string, now time.Time) [][]byte {
+	var out [][]byte
+	if c := s.circleByDID(circleDID); c != nil {
+		if rs, err := c.Revocations(now); err == nil {
+			for _, r := range rs {
+				if raw, err := r.Marshal(); err == nil {
+					out = append(out, raw)
+				}
+			}
+		}
+		return out
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if set := s.extraRevs[circleDID]; set != nil {
+		for _, st := range set.All() {
+			if raw, err := st.Bytes(); err == nil {
+				out = append(out, raw)
+			}
+		}
+	}
+	return out
+}
+
+// tableCircles is what the v2 handshake established: the circles this
+// node holds that the peer is a live device of, from the peer table.
+func (s *CircleService) tableCircles(p peer.ID) ([]string, bool) {
+	if s.table == nil || s.auth == nil {
+		return nil, false
+	}
+	hs, ok := s.auth.Handshake(p)
+	if !ok || hs.Version < 2 {
+		return nil, false
+	}
+	return s.table.Circles(p, time.Now()), true
+}
 
 // rosterRevoked pushes a revocation into the circle's roster, if the table
 // holds one for it.
@@ -244,9 +387,24 @@ func (s *CircleService) liveAttestation(c *circle.Circle, now time.Time) *circle
 	return nil
 }
 
-// Circles lists the circles this node holds right now.
+// Circles lists the circles this node holds right now, and makes sure the
+// peer table has a roster for each (a circle joined while the daemon runs
+// needs no restart to count for transport).
 func (s *CircleService) Circles() []*circle.Circle {
 	cs, _ := circle.List(s.root)
+	if s.table != nil {
+		for _, c := range cs {
+			if _, ok := s.table.RosterFor(c.Config.DID); ok {
+				continue
+			}
+			roster, err := circle.OpenRoster(c, time.Now())
+			if err != nil {
+				log.Printf("circle %q: roster unreadable, starting empty: %v", c.Config.Name, err)
+				roster = circle.NewRoster(statement.NewDIDRoots(c.Config.DID))
+			}
+			s.table.AddRoster(roster)
+		}
+	}
 	return cs
 }
 
@@ -387,6 +545,11 @@ func (s *CircleService) remember(p peer.ID, dids []string, chains map[string]*st
 // chainFor returns a peer's compiled attestation in a circle from the
 // current exchange result (nil chain = legacy attestation).
 func (s *CircleService) chainFor(p peer.ID, did string) (chain *statement.Compiled, ok bool) {
+	if s.table != nil {
+		if chain, ok := s.table.Chain(p, did, time.Now()); ok {
+			return chain, true
+		}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	e, known := s.peers[p]
@@ -817,6 +980,17 @@ func (s *CircleService) VerifyPresented(p peer.ID, auth [32]byte, key string, wa
 // result exists (an empty list means it presented no attestation, within
 // noCircleTTL).
 func (s *CircleService) CirclesOf(p peer.ID) (dids []string, known bool) {
+	fromTable, shook := s.tableCircles(p)
+	exchanged, ok := s.exchanged(p)
+	if !ok && !shook {
+		return nil, false
+	}
+	return union(fromTable, exchanged), true
+}
+
+// exchanged is the cached result of the legacy circle exchange with a
+// peer (an empty one only within noCircleTTL).
+func (s *CircleService) exchanged(p peer.ID) ([]string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	e, ok := s.peers[p]
@@ -826,11 +1000,25 @@ func (s *CircleService) CirclesOf(p peer.ID) (dids []string, known bool) {
 	return e.dids, true
 }
 
-// Ensure returns the member's verified circle DIDs, running the exchange
-// if this connection has not had one yet.
+func union(a, b []string) []string {
+	out := slices.Clone(a)
+	for _, d := range b {
+		if !slices.Contains(out, d) {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// Ensure returns the member's verified circle DIDs: what the v2 handshake
+// established (the peer table) plus the legacy circle exchange, run on
+// this connection if it has not had one yet. The exchange still discovers
+// shared circles the rosters do not know about; it retires when per-circle
+// gossip fills the rosters (slice C).
 func (s *CircleService) Ensure(ctx context.Context, p peer.ID) ([]string, error) {
-	if dids, ok := s.CirclesOf(p); ok {
-		return dids, nil
+	fromTable, _ := s.tableCircles(p)
+	if dids, ok := s.exchanged(p); ok {
+		return union(fromTable, dids), nil
 	}
 	st, err := s.h.NewStream(ctx, p, CircleProtocolV4ID, CircleProtocolID, CircleProtocolV2ID)
 	if err != nil {
@@ -856,7 +1044,7 @@ func (s *CircleService) Ensure(ctx context.Context, p peer.ID) ([]string, error)
 		return nil, err
 	}
 	s.remember(p, dids, chains)
-	return dids, nil
+	return union(fromTable, dids), nil
 }
 
 // versionOf maps a negotiated protocol ID to the exchange version.
@@ -884,6 +1072,11 @@ func (s *CircleService) Refresh(ctx context.Context) int {
 	for _, p := range s.h.Network().Peers() {
 		if !s.auth.Allows(p, CircleProtocolID) {
 			continue
+		}
+		// A v2 peer gets a fresh handshake: it re-presents, and the
+		// revocations of every shared circle ride the hello.
+		if hs, ok := s.auth.Handshake(p); ok && hs.Version >= 2 {
+			_ = s.auth.Authenticate(ctx, p)
 		}
 		if _, err := s.Ensure(ctx, p); err == nil {
 			n++
@@ -1085,6 +1278,13 @@ func (s *CircleService) verifyAttestations(list [][]byte, devicePub ed25519.Publ
 		}
 		dids = append(dids, a.Circle)
 		chains[a.Circle] = chain
+		// A verified attestation for a circle held here is roster
+		// knowledge: the union peer table admits the device by it.
+		if s.table != nil && a.Stmt != nil {
+			if r, ok := s.table.RosterFor(a.Circle); ok {
+				_, _ = r.Add(a.Stmt, now)
+			}
+		}
 	}
 	return dids, chains, nil
 }

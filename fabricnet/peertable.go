@@ -189,6 +189,36 @@ func (t *PeerTable) Admit(p peer.ID, c *cert.Cert) error {
 	return nil
 }
 
+// Verify judges one assert a peer presented on the v2 handshake: it must
+// be a member assert naming the connected peer (else err — a forgery); its
+// circle must be held here (else held = false — skipped, the peer guessed);
+// it enters that circle's roster and live says whether the device is
+// admitted there now (a revoked or expired assert is recorded with its
+// verdict and skipped). circleDID is the roster's primary DID.
+func (t *PeerTable) Verify(p peer.ID, st *statement.Statement) (circleDID string, held, live bool, err error) {
+	c, err := cert.FromStatement(st)
+	if err != nil {
+		return "", false, false, err
+	}
+	deviceDID, err := DeviceDID(p)
+	if err != nil {
+		return "", false, false, err
+	}
+	if c.Payload.Aud != deviceDID {
+		return "", false, false, fmt.Errorf("assert is issued to %s, not to connected peer %s", c.Payload.Aud, p)
+	}
+	roster, ok := t.RosterFor(c.Payload.Sub)
+	if !ok {
+		return "", false, false, nil
+	}
+	now := time.Now()
+	if _, err := roster.Add(st, now); err != nil {
+		return "", true, false, err
+	}
+	_, live = roster.Live(deviceDID, now)
+	return roster.Primary(), true, live, nil
+}
+
 // AddMember records a verified certificate learned from the event log or
 // gossip. A cert that has already expired is kept as roster memory
 // (lapsed), not as membership; one for a circle not held here, or that

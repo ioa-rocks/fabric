@@ -25,7 +25,7 @@ func TestInitOpenUnlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if re.Config != c.Config {
+	if re.Config.Name != c.Config.Name || re.Config.DID != c.Config.DID {
 		t.Fatalf("reopened config %+v != %+v", re.Config, c.Config)
 	}
 	if _, err := re.Unlock("wrong"); err == nil {
@@ -82,7 +82,7 @@ func TestExportJoinAndMigrate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if j.Config != c.Config {
+	if j.Config.Name != c.Config.Name || j.Config.DID != c.Config.DID {
 		t.Fatalf("joined config %+v != %+v", j.Config, c.Config)
 	}
 	if _, err := j.Unlock("pw"); err != nil {
@@ -115,7 +115,7 @@ func TestExportJoinAndMigrate(t *testing.T) {
 		t.Fatalf("migrate: %v %v", did, err)
 	}
 	m, err := ByDID(dst, c.Config.DID)
-	if err != nil || m.Config != c.Config {
+	if err != nil || m.Config.Name != c.Config.Name || m.Config.DID != c.Config.DID {
 		t.Fatalf("migrated: %+v %v", m, err)
 	}
 	if _, err := os.Stat(m.AttestationPath()); err != nil {

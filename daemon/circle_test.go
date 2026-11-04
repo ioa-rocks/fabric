@@ -24,6 +24,8 @@ import (
 type circleTestNode struct {
 	h      host.Host
 	auth   *fabricnet.AuthService
+	store  *fabricnet.PeerTable
+	own    *cert.Cert
 	devPub ed25519.PublicKey
 	root   string
 	svc    *CircleService
@@ -53,7 +55,7 @@ func newCircleTestNode(t *testing.T, nsPub ed25519.PublicKey, nsRoot ed25519.Pri
 	if err != nil {
 		t.Fatal(err)
 	}
-	n := &circleTestNode{h: h, devPub: ed25519.PublicKey(raw), root: t.TempDir()}
+	n := &circleTestNode{h: h, store: store, own: own, devPub: ed25519.PublicKey(raw), root: t.TempDir()}
 	n.auth = fabricnet.NewAuthService(h, store, own, 5*time.Second, nil)
 	for _, b := range circles {
 		c, err := circle.Join(n.root, b)
@@ -370,4 +372,84 @@ func TestCircleRevocationAndExpiry(t *testing.T) {
 	if info := desk.svc.Info(time.Now()); len(info) != 1 || !info[0].Attested || info[0].Revocations != 1 {
 		t.Fatalf("desk Info = %+v", info)
 	}
+}
+
+// The v2 handshake presents one assert per circle the dialer knows the
+// peer in and the responder answers for exactly those (memo §17: one chain
+// per circle, shared circles only). Rosters are what gossip delivers;
+// seeded here. A node outside `family` is shown nothing of it.
+func TestHandshakeV2PresentsOnlySharedCircles(t *testing.T) {
+	nsPub, nsRoot, _ := ed25519.GenerateKey(rand.Reader)
+	mainDID := cert.DIDForKey(nsPub)
+	family, familyDID := mintCircle(t, "family")
+	desk := newCircleTestNode(t, nsPub, nsRoot, "desk", []*circle.Bundle{family}, true)
+	nas := newCircleTestNode(t, nsPub, nsRoot, "nas", []*circle.Bundle{family}, true)
+	gate := newCircleTestNode(t, nsPub, nsRoot, "gate", nil, false)
+	for _, n := range []*circleTestNode{desk, nas, gate} {
+		n.svc.SetPeerTable(n.store)
+	}
+	// Gossip delivered both rosters to desk and nas: each knows the
+	// other's cert (main's event log) and attestation (family).
+	seed := func(into, who *circleTestNode) {
+		t.Helper()
+		into.store.AddMember(who.h.ID(), who.own)
+		c, _ := circle.ByDID(who.root, familyDID)
+		a, err := c.LoadAttestation()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, ok := into.store.RosterFor(familyDID)
+		if !ok {
+			t.Fatal("no family roster")
+		}
+		if _, err := r.Add(a.Stmt, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(desk, nas)
+	seed(nas, desk)
+
+	// nas → desk: both circles in one handshake, no exchange run.
+	meshConnect(t, nas, desk)
+	for _, pair := range [][2]*circleTestNode{{nas, desk}, {desk, nas}} {
+		hs, ok := pair[0].auth.Handshake(pair[1].h.ID())
+		if !ok || hs.Version != 2 {
+			t.Fatalf("handshake %+v", hs)
+		}
+		slices.Sort(hs.Circles)
+		want := []string{familyDID, mainDID}
+		slices.Sort(want)
+		if !slices.Equal(hs.Circles, want) {
+			t.Fatalf("%s verified %s in %v, want main+family", pair[0].h.ID(), pair[1].h.ID(), hs.Circles)
+		}
+		if got := pair[0].svc.SharedKnown(pair[1].h.ID()); !slices.Contains(got, familyDID) {
+			t.Fatalf("SharedKnown = %v, want family from the handshake alone", got)
+		}
+	}
+
+	// gate → desk: the gate is in no family roster, so desk's hello to it
+	// names main only, and the gate verifies desk in main only.
+	if h := desk.svc.hello(gate.h.ID(), nil); len(h.Asserts) != 0 {
+		t.Fatalf("desk's presenter chose %d asserts for a peer known from no roster, want 0 (fabricnet adds the cert)", len(h.Asserts))
+	}
+	meshConnect(t, gate, desk)
+	hs, _ := gate.auth.Handshake(desk.h.ID())
+	if !slices.Equal(hs.Circles, []string{mainDID}) {
+		t.Fatalf("gate verified desk in %v, want main only", hs.Circles)
+	}
+	if h := desk.svc.hello(gate.h.ID(), []string{mainDID}); len(h.Asserts) != 1 || subOf(t, h.Asserts[0]) != mainDID {
+		t.Fatalf("responder presenter chose %d asserts for [main], want the main cert alone", len(h.Asserts))
+	}
+	if h := desk.svc.hello(nas.h.ID(), []string{familyDID}); len(h.Asserts) != 1 {
+		t.Fatalf("responder presenter chose %d asserts for [family], want the family attestation", len(h.Asserts))
+	}
+}
+
+func subOf(t *testing.T, raw []byte) string {
+	t.Helper()
+	st, err := statement.Decode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st.Payload.Sub
 }

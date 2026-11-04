@@ -38,6 +38,12 @@ const (
 type Config struct {
 	Name string `json:"name"` // human label for the circle owner
 	DID  string `json:"did"`  // owner user key, did:key
+	// Gates are the circle's gate hints: multiaddrs (with /p2p/<peer-id>)
+	// of listed devices of the circle a newcomer dials first. They name
+	// the circle a device presents to a peer it knows from no roster yet
+	// (cold start; task circle-member-devices). Written by `circle admit`
+	// bundles and `circle join`; a device learns the rest by gossip.
+	Gates []string `json:"gates,omitempty"`
 }
 
 // Circle is an opened circle directory.

@@ -385,3 +385,33 @@ func TestScopedMemberIsGatedPerProtocolFamily(t *testing.T) {
 		t.Fatal("Allows disagrees with the gate for the vault-only member")
 	}
 }
+
+// A peer on the previous binary speaks /fabric/auth/1 only; a v2 dialer
+// falls back to it and both still record each other as members.
+func TestHandshakeFallsBackToV1(t *testing.T) {
+	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
+	a := newNode(t, nsPub, nsPriv, "new", true, 5*time.Second)
+	b := newNode(t, nsPub, nsPriv, "old", true, 5*time.Second)
+	b.auth.DisableV2()
+	connect(t, a, b)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.auth.Authenticate(ctx, b.host.ID()); err != nil {
+		t.Fatalf("Authenticate against a v1-only peer: %v", err)
+	}
+	if hs, ok := a.auth.Handshake(b.host.ID()); !ok || hs.Version != 1 {
+		t.Fatalf("handshake = %+v, want v1", hs)
+	}
+	if !a.store.IsMember(b.host.ID(), time.Now()) || !b.store.IsMember(a.host.ID(), time.Now()) {
+		t.Fatal("v1 fallback did not settle membership both ways")
+	}
+	// And v2 between two new nodes records the circle verified.
+	c := newNode(t, nsPub, nsPriv, "new-2", true, 5*time.Second)
+	connect(t, a, c)
+	if err := a.auth.Authenticate(ctx, c.host.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if hs, ok := c.auth.Handshake(a.host.ID()); !ok || hs.Version != 2 || len(hs.Circles) != 1 || hs.Circles[0] != cert.DIDForKey(nsPub) {
+		t.Fatalf("responder's handshake = %+v, want v2 in the one circle", hs)
+	}
+}
