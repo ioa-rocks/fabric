@@ -114,7 +114,34 @@ func NewAuthService(h host.Host, store *PeerTable, ownCert *cert.Cert, grace tim
 	}}
 	h.Network().Notify(nb)
 	a.stopWatch = func() { h.Network().StopNotify(nb) }
+	// A roster change can end a membership without any event naming the
+	// peer (a circle revocation learned by gossip, a root retired): the
+	// connections of peers that are no longer members are closed here.
+	store.OnChange(func() { go a.sweep() })
 	return a
+}
+
+// sweep closes the connections of every peer this node once admitted that
+// no circle held here still admits — the gater only stops *new*
+// connections (spec §4).
+func (a *AuthService) sweep() {
+	now := time.Now()
+	var gone []peer.ID
+	a.mu.Lock()
+	for p := range a.shook {
+		if !a.store.IsMember(p, now) {
+			gone = append(gone, p)
+			delete(a.shook, p)
+		}
+	}
+	a.mu.Unlock()
+	for _, p := range gone {
+		if a.IsKept(p) {
+			continue
+		}
+		a.h.ConnManager().Unprotect(p, "fabric-member")
+		_ = a.h.Network().ClosePeer(p)
+	}
 }
 
 // SetOwn swaps the certificate this node presents in handshakes — how a

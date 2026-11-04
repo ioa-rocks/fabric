@@ -355,6 +355,7 @@ func cmdUp(args []string) error {
 		d.Circle.SetOwnCert(d.OwnCert)
 		d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.Cert)
 		d.Circle.SetPeerTable(d.Store)
+		d.Circle.AttachSync(d.Sync)
 	}
 	if !*noVault {
 		root := circle.Root(*statePath)

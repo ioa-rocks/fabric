@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/statement"
 
@@ -303,5 +304,98 @@ func TestNewerAddressRecordReplacesWithdrawnEndpoints(t *testing.T) {
 	}
 	if len(updates) != 2 || updates[0] != 100 || updates[1] != 101 {
 		t.Fatalf("unexpected notifications: %v", updates)
+	}
+}
+
+// /fabric/sync/2 carries one set per circle both peers are verified in: a
+// node outside `family` is sent main's set alone, a device of family
+// learns the circle's roster — including the sender's own assert — by
+// gossip after a handshake that only covered main.
+func TestSyncV2SendsOnlySharedCircleSets(t *testing.T) {
+	nsPub, nsPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainDID := cert.DIDForKey(nsPub)
+	m := newSyncNode(t, nsPub, nsPriv, "master")
+	a := newSyncNode(t, nsPub, nsPriv, "owner")
+	b := newSyncNode(t, nsPub, nsPriv, "device")
+	hydrate(m, a, b)
+
+	fam, err := circle.Init(t.TempDir(), "family", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	famPriv, _ := fam.Unlock("pw")
+	famDID := fam.Config.DID
+	aPub, _ := a.host.Peerstore().PubKey(a.host.ID()).Raw()
+	bPub, _ := b.host.Peerstore().PubKey(b.host.ID()).Raw()
+	attA, _ := circle.Attest(famPriv, aPub, time.Now())
+	attB, _ := circle.Attest(famPriv, bPub, time.Now())
+	rawA, _ := attA.Stmt.Bytes()
+	for _, n := range []*syncNode{a, b} {
+		n.store.AddRoster(circle.NewRoster(statement.NewDIDRoots(famDID)))
+	}
+	// The owner admitted the device: its assert is in the owner's roster.
+	ra, _ := a.store.RosterFor(famDID)
+	if _, err := ra.Add(attB.Stmt, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	a.sync.SetCircleHooks(CircleHooks{OwnAsserts: func(did string) [][]byte {
+		if did == famDID {
+			return [][]byte{rawA}
+		}
+		return nil
+	}})
+
+	// The wire guarantee: what the owner would send each peer.
+	sets := a.sync.setsFor(m.host.ID(), nil, true)
+	if len(sets) != 1 || sets[0].DID != mainDID {
+		t.Fatalf("sets for a main-only node: %d, first %s; want main alone", len(sets), sets[0].DID)
+	}
+	sets = a.sync.setsFor(b.host.ID(), nil, true)
+	var famSet *circleSet
+	for i := range sets {
+		if sets[i].DID == famDID {
+			famSet = &sets[i]
+		}
+	}
+	if famSet == nil || len(famSet.Asserts) != 2 {
+		t.Fatalf("sets for a family device: %+v; want family with the device's and the owner's asserts", sets)
+	}
+
+	// Live: the device dials the owner (main handshake), gossip brings it
+	// the owner's family assert; the master, connected too, has no roster
+	// to receive one and is sent none.
+	authenticate(t, b, a)
+	authenticate(t, m, a)
+	rb, _ := b.store.RosterFor(famDID)
+	ownerDID, _ := DeviceDID(a.host.ID())
+	waitFor(t, "device to learn the owner's family assert by gossip", func() bool {
+		_, live := rb.Live(ownerDID, time.Now())
+		return live
+	})
+	if !b.store.In(a.host.ID(), famDID, time.Now()) {
+		t.Fatal("device does not see the owner in family after gossip")
+	}
+	if _, ok := m.store.RosterFor(famDID); ok {
+		t.Fatal("master grew a family roster")
+	}
+}
+
+// An assert about another device is refused for the presenting peer,
+// whatever the connection it arrives on.
+func TestVerifyRejectsAssertForAnotherDevice(t *testing.T) {
+	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	otherPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	other, _ := PeerIDForKey(otherPub)
+	s := NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
+	c, _ := cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, time.Now(), time.Hour)
+	if _, _, _, err := s.Verify(other, c.Stmt); err == nil {
+		t.Fatal("assert for another device verified for the presenting peer")
+	}
+	if s.IsMember(other, time.Now()) {
+		t.Fatal("presenting peer became a member on a forged assert")
 	}
 }

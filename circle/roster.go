@@ -227,19 +227,27 @@ func (r *Roster) verdictLocked(dev *Device) error {
 	})
 }
 
-func (r *Roster) recheckLocked() {
+// recheckLocked re-derives every verdict, reporting whether any changed.
+func (r *Roster) recheckLocked() bool {
+	changed := false
 	for _, dev := range r.devices {
+		was := dev.dead != nil
 		dev.dead = r.verdictLocked(dev)
+		changed = changed || was != (dev.dead != nil)
 	}
+	return changed
 }
 
 // Recheck re-derives every verdict: after the roots store changed (a root
 // retired) or revocations arrived by a path other than AddRevocation.
+// Hooks run only when a verdict changed.
 func (r *Roster) Recheck() {
 	r.mu.Lock()
-	r.recheckLocked()
+	changed := r.recheckLocked()
 	r.mu.Unlock()
-	r.notify()
+	if changed {
+		r.notify()
+	}
 }
 
 // AddRevocation indexes a statement revocation and re-derives the verdicts
@@ -260,14 +268,20 @@ func (r *Roster) AddRevocation(st *statement.Statement) (bool, error) {
 // sweepTombstone so the gater refuses it meanwhile.
 func (r *Roster) Sweep(deviceDID string, at time.Time) {
 	r.mu.Lock()
+	changed := false
 	if cut := at.Unix(); cut > r.sweeps[deviceDID] {
 		r.sweeps[deviceDID] = cut
+		changed = true
 	}
 	if dev := r.devices[deviceDID]; dev != nil {
+		was := dev.dead != nil
 		dev.dead = r.verdictLocked(dev)
+		changed = changed || was != (dev.dead != nil)
 	}
 	r.mu.Unlock()
-	r.notify()
+	if changed {
+		r.notify()
+	}
 }
 
 // Forget drops a device without revoking it: what a root retirement does
@@ -426,26 +440,30 @@ func (r *Roster) Len() int {
 // their retention, and drops sweeps that can no longer kill anything.
 func (r *Roster) GC(now time.Time) {
 	r.mu.Lock()
-	changed := false
+	changed, dropped := false, false
 	for did, dev := range r.devices {
-		if !now.Before(dev.Exp) {
+		if !now.Before(dev.Exp) && !dev.lapsed {
 			dev.lapsed = true
+			changed = true
 		}
 		if !now.Before(dev.Exp.Add(LapsedRetention)) {
 			delete(r.devices, did)
-			changed = true
+			changed, dropped = true, true
 		}
 	}
 	for did, at := range r.sweeps {
 		if !now.Before(time.Unix(at, 0).Add(statement.MaxValidity)) {
 			delete(r.sweeps, did)
+			changed = true
 		}
 	}
 	r.mu.Unlock()
-	if changed {
+	if dropped {
 		r.save()
 	}
-	r.notify()
+	if changed {
+		r.notify()
+	}
 }
 
 // save writes every assert (lapsed included) as statement bytes, atomically.

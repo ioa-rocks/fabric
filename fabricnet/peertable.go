@@ -39,6 +39,7 @@ type PeerTable struct {
 	mu        sync.RWMutex
 	rosters   []*circle.Roster // insertion order: the log-fed roster first
 	presented map[peer.ID]presented
+	hooks     []func() // run after any roster changed
 }
 
 // MemberStore is the pre-step-5 name of the peer table.
@@ -72,7 +73,25 @@ func NewMemberStore(roots *statement.DIDRoots) *PeerTable {
 func (t *PeerTable) AddRoster(r *circle.Roster) {
 	t.mu.Lock()
 	t.rosters = append(t.rosters, r)
+	hooks := append([]func(){}, t.hooks...)
 	t.mu.Unlock()
+	for _, f := range hooks {
+		r.OnChange(f)
+	}
+}
+
+// OnChange registers a hook run after any roster in the union changed (a
+// device added, a verdict flipped, an entry dropped): what the auth
+// service's connection sweep and the gossip kick hang on. Runs on the
+// mutating goroutine, outside the roster's lock.
+func (t *PeerTable) OnChange(f func()) {
+	t.mu.Lock()
+	t.hooks = append(t.hooks, f)
+	rosters := append([]*circle.Roster(nil), t.rosters...)
+	t.mu.Unlock()
+	for _, r := range rosters {
+		r.OnChange(f)
+	}
 }
 
 // Rosters lists the rosters in the union, insertion order.

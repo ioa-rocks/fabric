@@ -83,6 +83,9 @@ type CircleService struct {
 	// circle reaches that circle's roster too, so transport membership dies
 	// with the circle attestation (one assert per device).
 	table *fabricnet.PeerTable
+	// sync, when attached, is the gossip: a revocation signed here is
+	// pushed to the devices of its circle at once (PublishStatements).
+	sync *fabricnet.EventSync
 
 	mu           sync.RWMutex
 	peers        map[peer.ID]circleEntry
@@ -197,9 +200,39 @@ func (s *CircleService) SetPeerTable(t *fabricnet.PeerTable) {
 	if s.auth != nil {
 		s.auth.SetPresenter(s.hello)
 		s.auth.SetRevocationSink(func(_ peer.ID, revs [][]byte) error {
-			return s.ingestRevocations(revs, time.Now())
+			_, err := s.ingestRevocations(revs, time.Now())
+			return err
 		})
 	}
+}
+
+// AttachSync lends the gossip this node's circle view: own asserts and live
+// revocations per circle to send, and where a peer's revocations go.
+func (s *CircleService) AttachSync(sync *fabricnet.EventSync) {
+	s.sync = sync
+	sync.SetCircleHooks(fabricnet.CircleHooks{
+		OwnAsserts: s.ownAssertsFor,
+		Revocations: func(circleDID string) [][]byte {
+			return s.revocationsOf(circleDID, time.Now())
+		},
+		Ingest: func(_ peer.ID, revs [][]byte) ([][]byte, error) {
+			return s.ingestRevocations(revs, time.Now())
+		},
+	})
+}
+
+// ownAssertsFor is this node's device asserts in one circle, wire bytes.
+func (s *CircleService) ownAssertsFor(circleDID string) [][]byte {
+	var out [][]byte
+	for _, o := range s.ownAsserts(time.Now()) {
+		if !o.roster.Honours(circleDID) {
+			continue
+		}
+		if raw, err := o.stmt.Bytes(); err == nil {
+			out = append(out, raw)
+		}
+	}
+	return out
 }
 
 // ownAssert is one of this node's device asserts with the roster it is in.
@@ -333,6 +366,25 @@ func (s *CircleService) tableCircles(p peer.ID) ([]string, bool) {
 		return nil, false
 	}
 	return s.table.Circles(p, time.Now()), true
+}
+
+// reloadRevocations feeds every revocation on disk into the rosters: what
+// the CLI wrote beside the circle (and a restart) must reach transport
+// membership without waiting for a peer to echo it.
+func (s *CircleService) reloadRevocations() {
+	if s.table == nil {
+		return
+	}
+	now := time.Now()
+	for _, c := range s.Circles() {
+		rs, err := c.Revocations(now)
+		if err != nil {
+			continue
+		}
+		for _, r := range rs {
+			s.rosterRevoked(r)
+		}
+	}
 }
 
 // rosterRevoked pushes a revocation into the circle's roster, if the table
@@ -706,7 +758,14 @@ func (s *CircleService) AddRevocation(r *circle.Revocation) error {
 	if err != nil {
 		return err
 	}
-	return s.ingestRevocations([][]byte{raw}, time.Now())
+	fresh, err := s.ingestRevocations([][]byte{raw}, time.Now())
+	if err != nil {
+		return err
+	}
+	if s.sync != nil {
+		s.sync.PublishStatements(r.Circle, nil, fresh)
+	}
+	return nil
 }
 
 // legacyAllows is the verb check for a pre-statement cert or attestation:
@@ -1010,13 +1069,18 @@ func union(a, b []string) []string {
 	return out
 }
 
-// Ensure returns the member's verified circle DIDs: what the v2 handshake
-// established (the peer table) plus the legacy circle exchange, run on
-// this connection if it has not had one yet. The exchange still discovers
-// shared circles the rosters do not know about; it retires when per-circle
-// gossip fills the rosters (slice C).
+// Ensure returns the member's verified circle DIDs: for a v2 peer what the
+// peer table holds (handshake and per-circle gossip); for a peer on the
+// old binary the legacy circle exchange, run on this connection if it has
+// not had one yet (retired with v1).
 func (s *CircleService) Ensure(ctx context.Context, p peer.ID) ([]string, error) {
-	fromTable, _ := s.tableCircles(p)
+	fromTable, shook := s.tableCircles(p)
+	if shook {
+		// A v2 peer: the rosters are the truth; per-circle gossip fills
+		// them, and the handshake delivered what they lacked. The exchange
+		// would only name circles the peer may not be in.
+		return fromTable, nil
+	}
 	if dids, ok := s.exchanged(p); ok {
 		return union(fromTable, dids), nil
 	}
@@ -1066,7 +1130,9 @@ func versionOf(id protocol.ID) int {
 func (s *CircleService) Refresh(ctx context.Context) int {
 	// Drop everything cached — presented chains and the data plane's
 	// holders included: the caller just wrote a revocation to disk that no
-	// peer will echo as new (agy review, 2026-11-03).
+	// peer will echo as new (agy review, 2026-11-03). The rosters read it
+	// from disk too, so transport membership follows at once.
+	s.reloadRevocations()
 	s.forgetAll()
 	n := 0
 	for _, p := range s.h.Network().Peers() {
@@ -1238,7 +1304,7 @@ func (s *CircleService) readHello(st network.Stream, devicePub ed25519.PublicKey
 	// us (an owner device telling us about a stolen one is the common
 	// case; a revoked device dutifully gossiping its own revocation is the
 	// rare one), and its attestations must be judged against them.
-	if err := s.ingestRevocations(hello.Revocations, now); err != nil {
+	if _, err := s.ingestRevocations(hello.Revocations, now); err != nil {
 		return nil, nil, err
 	}
 	return s.verifyAttestations(hello.Attestations, devicePub, now)
@@ -1291,15 +1357,16 @@ func (s *CircleService) verifyAttestations(list [][]byte, devicePub ed25519.Publ
 
 // ingestRevocations stores the revocations that concern circles this node
 // holds (a forgery fails the exchange; records for other circles are
-// ignored) and drops cached results for any device newly revoked.
-func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) error {
+// ignored) and drops cached results for any device newly revoked. Returns
+// the wire bytes of the ones that were new, for the relay.
+func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) (fresh [][]byte, err error) {
 	for _, item := range list {
 		r, err := circle.UnmarshalRevocation(item)
 		if err != nil {
-			return err
+			return fresh, err
 		}
 		if err := r.Verify(); err != nil {
-			return fmt.Errorf("peer revocation: %w", err)
+			return fresh, fmt.Errorf("peer revocation: %w", err)
 		}
 		c := s.circleByDID(r.Circle)
 		if c == nil {
@@ -1315,16 +1382,17 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) error {
 				set = statement.NewRevocationSet()
 				s.extraRevs[r.Circle] = set
 			}
-			fresh, err := set.Add(r.Stmt)
-			if fresh {
+			isNew, err := set.Add(r.Stmt)
+			if isNew {
 				s.saveExtraRevsLocked()
 			}
 			s.mu.Unlock()
 			if err != nil {
-				return fmt.Errorf("peer revocation: %w", err)
+				return fresh, fmt.Errorf("peer revocation: %w", err)
 			}
-			if fresh {
+			if isNew {
 				log.Printf("circle %s: statement revoked (learned from a peer; circle not held here)", shortDID(r.Circle))
+				fresh = append(fresh, item)
 				s.rosterRevoked(r)
 				s.forgetAll()
 				s.relaySoon()
@@ -1333,9 +1401,12 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) error {
 		}
 		added, err := c.AddRevocations(now, r)
 		if err != nil {
-			return fmt.Errorf("storing revocation for circle %q: %w", c.Config.Name, err)
+			return fresh, fmt.Errorf("storing revocation for circle %q: %w", c.Config.Name, err)
 		}
 		for _, r := range added {
+			if raw, err := r.Marshal(); err == nil {
+				fresh = append(fresh, raw)
+			}
 			s.rosterRevoked(r)
 			if r.Device != "" {
 				log.Printf("circle %q: device %s revoked as of %s (learned from a peer)", c.Config.Name, r.Device, r.Time().Format(time.RFC3339))
@@ -1349,7 +1420,7 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) error {
 			s.relaySoon()
 		}
 	}
-	return nil
+	return fresh, nil
 }
 
 // deviceDIDOf derives the device DID of a peer from its ID (ed25519 keys
