@@ -47,6 +47,11 @@ type JoinRequest struct {
 	DevicePub []byte `cbor:"device_pub"`
 	Name      string `cbor:"name"`
 	Version   string `cbor:"version"`
+	// Circle is the circle the device asks to join (DID); empty means the
+	// queue host's first circle, as every join did before step 5. Shown
+	// to the approver; per-circle approval through the queue is not built
+	// yet (devices of other circles are admitted with `circle admit`).
+	Circle string `cbor:"circle,omitempty"`
 }
 
 // JoinResponse reports the request's state. On approval it carries the
@@ -73,6 +78,7 @@ type PendingInfo struct {
 	DevicePub   []byte    `json:"device_pub"`
 	ReceivedAt  time.Time `json:"received_at"`
 	Status      Status    `json:"status"`
+	Circle      string    `json:"circle,omitempty"` // the circle asked for; empty = the queue host's first
 }
 
 type entry struct {
@@ -109,7 +115,7 @@ func (q *Queue) Submit(req JoinRequest) (Status, []byte) {
 	status, cert := e.status, e.cert
 	q.mu.Unlock()
 	if !ok && q.onNew != nil {
-		q.onNew(PendingInfo{Fingerprint: fp, Name: req.Name, DevicePub: req.DevicePub, ReceivedAt: e.receivedAt, Status: StatusPending})
+		q.onNew(PendingInfo{Fingerprint: fp, Name: req.Name, DevicePub: req.DevicePub, ReceivedAt: e.receivedAt, Status: StatusPending, Circle: req.Circle})
 	}
 	return status, cert
 }
@@ -126,6 +132,7 @@ func (q *Queue) List() []PendingInfo {
 			DevicePub:   e.req.DevicePub,
 			ReceivedAt:  e.receivedAt,
 			Status:      e.status,
+			Circle:      e.req.Circle,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ReceivedAt.Before(out[j].ReceivedAt) })
@@ -147,7 +154,7 @@ func (q *Queue) Find(prefix string) (PendingInfo, error) {
 		return PendingInfo{}, fmt.Errorf("no pending request matches %q", prefix)
 	case 1:
 		e := q.entries[found[0]]
-		return PendingInfo{Fingerprint: found[0], Name: e.req.Name, DevicePub: e.req.DevicePub, ReceivedAt: e.receivedAt, Status: e.status}, nil
+		return PendingInfo{Fingerprint: found[0], Name: e.req.Name, DevicePub: e.req.DevicePub, ReceivedAt: e.receivedAt, Status: e.status, Circle: e.req.Circle}, nil
 	default:
 		return PendingInfo{}, fmt.Errorf("fingerprint prefix %q is ambiguous", prefix)
 	}

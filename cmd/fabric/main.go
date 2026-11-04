@@ -27,6 +27,7 @@ import (
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/daemon"
+	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
@@ -271,8 +272,15 @@ func cmdInit(args []string) error {
 	}
 	// The home circle is the same key: the namespace DID is the circle DID,
 	// the device cert is the home-circle attestation (mesh-root merge).
-	if _, err := circle.InitFromSeed(circle.Root(dir.Path), *circleName, seed, pass); err != nil {
+	home, err := circle.InitFromSeed(circle.Root(dir.Path), *circleName, seed, pass)
+	if err != nil {
 		return fmt.Errorf("minting the home circle: %w", err)
+	}
+	// The overlay is the circle's resource: its range lives with the circle.
+	if *subnet != "" {
+		if err := home.SetPrefix(*subnet); err != nil {
+			return err
+		}
 	}
 
 	devicePubRaw, err := priv.GetPublic().Raw()
@@ -646,19 +654,26 @@ func cmdGraph(args []string) error {
 func cmdJoin(args []string) error {
 	fs := flag.NewFlagSet("join", flag.ExitOnError)
 	statePath := stateFlag(fs)
-	name := fs.String("name", "", "human label for this device (required)")
+	name := fs.String("name", "", "human label for this device (required with a gate; a bundle carries one)")
 	bootstrap := fs.String("bootstrap", "", "queue host: full multiaddr incl. /p2p/<peer-id>, or bare host[:port] resolved via its _fabric TXT record")
 	listen := fs.String("listen", defaultListen, "listen multiaddrs, comma-separated")
+	circleFlag := fs.String("circle", "", "circle DID to ask the queue host for (default: the host's first circle)")
 	fs.Parse(args)
-	if *bootstrap == "" && fs.NArg() == 1 {
-		*bootstrap = fs.Arg(0) // `fabric join -name x gate.example.com`
-	}
-	if *name == "" || *bootstrap == "" {
-		return fmt.Errorf("join: -name and a bootstrap target are required")
-	}
 	listenAddrs, err := parseListen(*listen)
 	if err != nil {
 		return err
+	}
+	if *bootstrap == "" && fs.NArg() == 1 {
+		if _, statErr := os.Stat(fs.Arg(0)); statErr == nil {
+			return joinBundle(*statePath, fs.Arg(0), *name, listenAddrs) // `fabric join her.bundle` — cold start
+		}
+		*bootstrap = fs.Arg(0) // `fabric join -name x gate.example.com`
+	}
+	if *bootstrap == "" && fs.NArg() == 0 {
+		return showDeviceIdentity(*statePath)
+	}
+	if *name == "" || *bootstrap == "" {
+		return fmt.Errorf("join: -name and a bootstrap target are required (or a bundle file from 'fabric circle admit')")
 	}
 
 	bootAddrs, expectNS, err := resolveBootstrap(*bootstrap)
@@ -710,7 +725,7 @@ func cmdJoin(args []string) error {
 	defer h.Close()
 	h.Peerstore().AddAddrs(target.ID, target.Addrs, time.Hour)
 
-	req := admission.JoinRequest{DevicePub: devicePubRaw, Name: *name, Version: version}
+	req := admission.JoinRequest{DevicePub: devicePubRaw, Name: *name, Version: version, Circle: *circleFlag}
 	fmt.Printf("this device: %q, key fingerprint %s\n", *name, admission.Fingerprint(devicePubRaw))
 	fmt.Printf("compare this fingerprint on the approving device before approving.\n")
 	fmt.Printf("waiting for approval")
@@ -800,6 +815,108 @@ approved:
 		return err
 	}
 	fmt.Printf("admitted to namespace %s as %q\n", resp.NamespaceDID, *name)
+	fmt.Printf("start the node with: fabric up -state %s\n", dir.Path)
+	return nil
+}
+
+// showDeviceIdentity is `fabric join` with nothing to join yet: it makes
+// sure this machine has a device key and prints the did:key an owner needs
+// for `fabric circle admit`, which produces the bundle `fabric join
+// <bundle>` installs. The two-step dance exists because an owner admits a
+// *key*, so the key must exist before the admission.
+func showDeviceIdentity(statePath string) error {
+	dir, err := state.Open(statePath)
+	if err != nil {
+		return err
+	}
+	if _, err := dir.LoadConfig(); err == nil {
+		return fmt.Errorf("state dir %s is already set up — 'fabric circle join <bundle>' adds a circle, 'fabric status' shows this node", dir.Path)
+	}
+	priv, reused, err := dir.EnsureDeviceKey()
+	if err != nil {
+		return err
+	}
+	raw, err := priv.GetPublic().Raw()
+	if err != nil {
+		return err
+	}
+	if !reused {
+		fmt.Println("created this device's identity key")
+	}
+	fmt.Printf("this device: %s\n", did.ForKey(ed25519.PublicKey(raw)))
+	fmt.Println("to join a circle without a key copy, an owner runs:")
+	fmt.Printf("  fabric circle admit %s -circle <name> [-role device|gate] [-tun] -out <file>\n", did.ForKey(ed25519.PublicKey(raw)))
+	fmt.Println("then move the file here privately and run: fabric join <file>")
+	fmt.Println("to join a gate's circle through its admission queue instead: fabric join -name <label> <gate>")
+	return nil
+}
+
+// joinBundle is the cold start (task circle-member-devices, slice E): a
+// machine with no circle installs a device bundle an owner signed for its
+// key and is thereby a device of exactly that circle — no namespace, no
+// cert, no overlay unless the attestation carries one. The bundle's gate
+// hints become its bootstrap peers; everything else arrives by gossip
+// inside the circle.
+func joinBundle(statePath, file, name string, listenAddrs []string) error {
+	dir, err := state.Open(statePath)
+	if err != nil {
+		return err
+	}
+	if _, err := dir.LoadConfig(); err == nil {
+		return fmt.Errorf("state dir %s is already set up — add the circle with 'fabric circle join %s' instead", dir.Path, file)
+	}
+	priv, reused, err := dir.EnsureDeviceKey()
+	if err != nil {
+		return err
+	}
+	if reused {
+		fmt.Println("reusing this device's existing identity key")
+	}
+	raw, err := priv.GetPublic().Raw()
+	if err != nil {
+		return err
+	}
+	devicePub := ed25519.PublicKey(raw)
+	b, err := circle.ReadBundle(file)
+	if err != nil {
+		return err
+	}
+	if b.HasKey() {
+		return fmt.Errorf("%s is an owner bundle (it carries the circle key); a cold start needs a device bundle from 'fabric circle admit %s -circle <name>' — or set the node up first and use 'fabric circle join'", file, did.ForKey(devicePub))
+	}
+	a, err := b.DeviceAttestation()
+	if err != nil {
+		return err
+	}
+	if err := a.Verify(devicePub, time.Now()); err != nil {
+		return fmt.Errorf("the bundle's attestation is not for this device: %w\nthis device is %s — an owner admits it with: fabric circle admit %s -circle <name> -out <file>", err, did.ForKey(devicePub), did.ForKey(devicePub))
+	}
+	c, err := circle.Join(circle.Root(dir.Path), b)
+	if err != nil {
+		return err
+	}
+	if name == "" {
+		name = a.Name
+	}
+	if name == "" {
+		name = "device"
+	}
+	if err := dir.SaveConfig(state.Config{
+		Name:        name,
+		ListenAddrs: listenAddrs,
+		Bootstrap:   b.Config.Gates,
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("joined circle %q %s as a %s (no key on this device)\n", c.Config.Name, c.Config.DID, a.Role())
+	if a.IP != "" {
+		fmt.Printf("overlay address %s in %s\n", a.IP, c.Config.Prefix)
+	}
+	if len(b.Config.Gates) > 0 {
+		fmt.Printf("gates: %s\n", strings.Join(b.Config.Gates, " "))
+	} else {
+		fmt.Println("warning: the bundle names no gate — this device can only be reached by devices that dial it; ask the owner for a bundle with -gate")
+	}
 	fmt.Printf("start the node with: fabric up -state %s\n", dir.Path)
 	return nil
 }
@@ -944,6 +1061,9 @@ func cmdApprove(args []string) error {
 	}
 	if match.Status != admission.StatusPending {
 		return fmt.Errorf("request %s is already %s", match.Fingerprint, match.Status)
+	}
+	if match.Circle != "" {
+		return fmt.Errorf("%q asked to join circle %s through the queue; per-circle approval through the queue is not built yet — admit the device with 'fabric circle admit did:key:… -circle <name>' and hand it the bundle", match.Name, match.Circle)
 	}
 
 	fmt.Printf("approving %q, key fingerprint %s\n", match.Name, match.Fingerprint)

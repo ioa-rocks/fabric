@@ -108,8 +108,16 @@ type Daemon struct {
 	graph graphCache // aggregated mesh link state for the UI
 }
 
-// New assembles a daemon from a state directory. The node must already hold
-// a membership certificate (fabric init or fabric join first).
+// New assembles a daemon from a state directory: a device key and the
+// circles under circles/*. The node presents one assert per circle it is a
+// device of — its membership cert (cert.cbor, the circle `fabric init` or
+// `fabric join <gate>` put it in) or the attestation a circle owner signed
+// into a circle directory (`fabric join <bundle>`, cold start). There is
+// no home circle (memo §5, decided 2026-11-04); what the code still calls
+// the namespace is the device's *first* circle: the one the config names
+// for the membership-event log, else the one its attestation is in. It is
+// where the overlay address, the admission queue and the Astral default
+// come from until those are per circle too (slice H).
 func New(dir state.Dir) (*Daemon, error) {
 	cfg, err := dir.LoadConfig()
 	if err != nil {
@@ -123,33 +131,32 @@ func New(dir state.Dir) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loading membership cert: %w", err)
 	}
-	if own == nil {
-		return nil, fmt.Errorf("no membership certificate in %s — run 'fabric join' first", dir.Path)
+	circles, err := circle.List(circle.Root(dir.Path))
+	if err != nil {
+		return nil, fmt.Errorf("reading circles: %w", err)
 	}
-	if !did.IsKey(cfg.NamespaceDID) {
-		return nil, fmt.Errorf("config namespace_did %q is not a did:key", cfg.NamespaceDID)
+	first, own, err := firstCircle(cfg, own, circles, time.Now())
+	if err != nil {
+		return nil, err
 	}
-	roots := statement.NewDIDRoots(append([]string{cfg.NamespaceDID}, cfg.HonouredRoots...)...)
+	cfg.NamespaceDID = first // in memory only: a cold-start config names no circle
+	roots := statement.NewDIDRoots(append([]string{first}, cfg.HonouredRoots...)...)
 	store := fabricnet.NewMemberStore(roots)
 	evLog := event.NewLog(roots)
 	// Every other circle this node holds brings its own roster into the
 	// union (memo §17: transport is the union of circles): a device
 	// attested only into `family` is admitted here because `family` is.
 	// Dirs whose DID the log-fed roster already honours are that roster.
-	if circles, err := circle.List(circle.Root(dir.Path)); err != nil {
-		log.Printf("circles unreadable, transport honours the home circle only: %v", err)
-	} else {
-		for _, c := range circles {
-			if roots.Honours(c.Config.DID) {
-				continue
-			}
-			roster, err := circle.OpenRoster(c, time.Now())
-			if err != nil {
-				log.Printf("circle %q: roster unreadable, starting empty: %v", c.Config.Name, err)
-				roster = circle.NewRoster(statement.NewDIDRoots(c.Config.DID))
-			}
-			store.AddRoster(roster)
+	for _, c := range circles {
+		if roots.Honours(c.Config.DID) {
+			continue
 		}
+		roster, err := circle.OpenRoster(c, time.Now())
+		if err != nil {
+			log.Printf("circle %q: roster unreadable, starting empty: %v", c.Config.Name, err)
+			roster = circle.NewRoster(statement.NewDIDRoots(c.Config.DID))
+		}
+		store.AddRoster(roster)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -347,6 +354,52 @@ func New(dir state.Dir) (*Daemon, error) {
 		})
 	}
 	return d, nil
+}
+
+// firstCircle settles which circle is the device's first and what it
+// presents for it: the config's circle (the membership-event log's) when
+// the config names one — its cert when there is one, else the attestation
+// in that circle's directory — or, on a cold-start device whose config
+// names none, the circle whose directory holds a live attestation for
+// this device (its cert view stands in for the membership cert). A node
+// with neither is not set up.
+func firstCircle(cfg state.Config, own *cert.Cert, circles []*circle.Circle, now time.Time) (string, *cert.Cert, error) {
+	fromDir := func(c *circle.Circle) *cert.Cert {
+		a, err := c.LoadAttestation()
+		if err != nil || a.Stmt == nil || a.Valid(now) != nil {
+			return nil
+		}
+		view, err := cert.FromStatement(a.Stmt)
+		if err != nil {
+			return nil
+		}
+		return view
+	}
+	if cfg.NamespaceDID != "" {
+		if !did.IsKey(cfg.NamespaceDID) {
+			return "", nil, fmt.Errorf("config namespace_did %q is not a did:key", cfg.NamespaceDID)
+		}
+		if own == nil {
+			for _, c := range circles {
+				if c.Config.DID == cfg.NamespaceDID {
+					own = fromDir(c)
+				}
+			}
+		}
+		if own == nil {
+			return "", nil, fmt.Errorf("no membership certificate in %s and no attestation in circle %s — run 'fabric join' first", cfg.NamespaceDID, cfg.NamespaceDID)
+		}
+		return cfg.NamespaceDID, own, nil
+	}
+	if own != nil {
+		return own.Payload.Sub, own, nil
+	}
+	for _, c := range circles {
+		if view := fromDir(c); view != nil {
+			return c.Config.DID, view, nil
+		}
+	}
+	return "", nil, errors.New("this node is in no circle yet — 'fabric init' mints one, 'fabric join <gate>' or 'fabric join <bundle>' joins one")
 }
 
 // isMasterDevice reports whether a peer is the master's device: the one the
