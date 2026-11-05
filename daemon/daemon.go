@@ -1039,14 +1039,23 @@ func (d *Daemon) applyRootEvent(e *event.Event, live bool) {
 	case event.KindRootMoved:
 		log.Printf("ROOT MOVED: this circle now continues under %s; %s stays honoured until retired", e.Payload.To, e.Payload.Ns)
 	case event.KindRootRetired:
-		log.Printf("root retired: %s is no longer honoured; %d member(s) still on it forgotten", e.Payload.Root, len(forget))
+		// Every device holding an assert in the retired root loses that
+		// entry; one that was a member only through it is cut off. A device
+		// re-issued under the new root keeps its other entry and stays
+		// (the roster holds one entry per device per root).
+		cut := 0
 		for _, p := range forget {
 			d.Store.Forget(p)
+			if d.Store.IsMember(p, time.Now()) {
+				continue
+			}
+			cut++
 			if live && d.Host != nil && p != d.Host.ID() {
 				d.Host.ConnManager().Unprotect(p, "fabric-member")
 				_ = d.Host.Network().ClosePeer(p)
 			}
 		}
+		log.Printf("root retired: %s is no longer honoured; %d device(s) held an assert in it, %d still on it forgotten", e.Payload.Root, len(forget), cut)
 	}
 }
 

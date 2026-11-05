@@ -16,8 +16,11 @@ import (
 
 // Roster is one circle's view of its own devices — the per-circle instance
 // of the namespace engine (ADR 0014; task circle-member-devices, slice A).
-// It holds the device asserts the circle has issued, by device DID, each
-// compiled once against the circle's honoured roots; the circle's
+// It holds the device asserts the circle has issued — one entry per device
+// per honoured root, so a device holding a membership under the old root
+// and one under the new root during a root move is both at once, and loses
+// nothing until the old root is retired — each compiled once against the
+// circle's honoured roots; the circle's
 // revocation set; and the verdict on every device: live, lapsed (expired
 // within LapsedRetention, kept as roster memory so a returning device is
 // known by name and address), or dead (revoked along its chain, swept, or
@@ -39,7 +42,7 @@ type Roster struct {
 	roots *statement.DIDRoots // primary DID first; old roots during a move
 	path  string              // devices.cbor the asserts are saved to; "" = memory only
 
-	devices map[string]*Device // by device DID (the assert's aud); never mutated in place
+	devices map[string]*Device // by entryKey(device DID, root DID); never mutated in place
 	revs    *statement.RevocationSet
 	sweeps  map[string]int64 // device DID -> cut-off (unix s): asserts issued up to it are dead
 }
@@ -203,16 +206,20 @@ func (r *Roster) clone() *Roster {
 }
 
 // Add verifies a device assert against the roster's roots and returns the
-// roster with it recorded, and whether that changed anything. Rules, as
-// the member store had them: a later-expiring assert for the same device
-// wins whatever order they arrive in (gossip, anti-entropy, handshakes),
-// except during a root move, where an assert under the primary root beats
-// one under an old root regardless of expiry; a live assert is never
-// demoted by a stale expired one; an expired assert within LapsedRetention
-// is kept as roster memory; older ones are refused. A revoked or swept
-// assert is recorded with its verdict (the device is then reported revoked
-// until the assert expires), so a later assert — a deliberate re-admission
-// — stands.
+// roster with it recorded, and whether that changed anything. A device has
+// one entry per root: within a root a later-expiring assert for the device
+// wins whatever order they arrive in (gossip, anti-entropy, handshakes) —
+// a renewal replaces the grant, so `renew -scope` demotes as the README
+// says; a live assert is never demoted by a stale expired one; an expired
+// assert within LapsedRetention is kept as roster memory; older ones are
+// refused. A revoked or swept assert is recorded with its verdict (the
+// device is then reported revoked until the assert expires), so a later
+// assert — a deliberate re-admission — stands. An assert under another
+// honoured root is another entry, not a rival: during a root move the
+// device keeps what the old root granted (its overlay address) beside what
+// the new root grants, until the old root is retired (Codex review,
+// 2026-11-05: one entry per device cannot hold both, and no pairwise rule
+// over them is both order-independent and grant-preserving).
 func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, error) {
 	if st == nil {
 		return r, false, errors.New("roster: nil statement")
@@ -236,96 +243,80 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, err
 		dev.lapsed = true
 	}
 	dev.dead = r.verdict(dev)
-	cur := r.devices[dev.DID]
-	if cur != nil && (cur.Stmt.ID() == st.ID() || !r.prefer(cur, dev)) {
+	k := entryKey(dev.DID, sub)
+	cur := r.devices[k]
+	if cur != nil && (cur.Stmt.ID() == st.ID() || !prefer(cur, dev)) {
 		return r, false, nil
 	}
 	nr := r.clone()
-	nr.devices[dev.DID] = dev
+	nr.devices[k] = dev
 	return nr, true, nil
 }
 
-// prefer decides whether next replaces cur. Every rule names a single
-// winner for a pair whatever the argument order, so the roster converges
-// on the same entry whichever assert arrived first.
-func (r *Roster) prefer(cur, next *Device) bool {
-	if cur.Sub() != next.Sub() {
-		// Across roots the primary's assert wins — with one exception: while
-		// both verify, an old root's assert that grants strictly more (the
-		// overlay address the move has not re-issued under the new root yet)
-		// keeps the entry, so the device does not drop off the TUN between
-		// root-moved and its re-issue (Codex review, 2026-11-05). A dead
-		// primary assert still wins: the circle revoked the device.
-		switch r.roots.Primary() {
-		case next.Sub():
-			return !outranksPrimary(cur, next)
-		case cur.Sub():
-			return outranksPrimary(next, cur)
+// entryKey names a device's entry under one root.
+func entryKey(deviceDID, rootDID string) string { return deviceDID + "\x00" + rootDID }
+
+// entries lists a device's entries, primary root first, then the other
+// honoured roots in order, then any root no longer honoured.
+func (r *Roster) entries(deviceDID string) []*Device {
+	var out []*Device
+	for _, dev := range r.devices {
+		if dev.DID == deviceDID {
+			out = append(out, dev)
 		}
 	}
+	r.sortEntries(out)
+	return out
+}
+
+// sortEntries orders entries by device DID, then by root rank, then root.
+func (r *Roster) sortEntries(devs []*Device) {
+	rank := map[string]int{}
+	for i, d := range r.roots.DIDs() {
+		rank[d] = i
+	}
+	rankOf := func(sub string) int {
+		if i, ok := rank[sub]; ok {
+			return i
+		}
+		return len(rank)
+	}
+	sort.Slice(devs, func(i, j int) bool {
+		a, b := devs[i], devs[j]
+		if a.DID != b.DID {
+			return a.DID < b.DID
+		}
+		if ra, rb := rankOf(a.Sub()), rankOf(b.Sub()); ra != rb {
+			return ra < rb
+		}
+		return a.Sub() < b.Sub()
+	})
+}
+
+// prefer decides whether next replaces cur, the same device's entry under
+// the same root. It is a total order — dead, lapsed, expiry, issue time,
+// statement ID — so two nodes seeing a pair in opposite orders keep the
+// same one, and three or more converge too (a pairwise rule that is not
+// an order, such as "the wider grant wins", can cycle: Codex review,
+// 2026-11-05).
+func prefer(cur, next *Device) bool {
 	if (cur.dead != nil) != (next.dead != nil) {
 		return cur.dead != nil // a verifying assert lifts a dead one (re-admission); a dead one never demotes
 	}
 	if cur.lapsed != next.lapsed {
 		return cur.lapsed // a live assert lifts a lapsed one; a stale one never demotes
 	}
-	// Grants add up; only a revocation or a sweep takes one away. So an
-	// assert granting strictly more outlives a later-expiring one granting
-	// less (a plain circle admission never costs a device its address), and
-	// a re-attest with fewer verbs changes nothing until the wider assert
-	// expires or is swept.
-	if wider(next, cur) {
-		return true
-	}
-	if wider(cur, next) {
-		return false
-	}
 	if !next.Exp.Equal(cur.Exp) {
 		return next.Exp.After(cur.Exp)
 	}
 	// Equal expiry (asserts issued within the same second carry the same
 	// unix-second window): the later-issued wins, then the greater
-	// statement ID — a total order, so two nodes seeing the pair in
-	// opposite orders keep the same one (Codex review, 2026-11-05).
+	// statement ID.
 	if ni, ci := next.Stmt.Payload.Iat, cur.Stmt.Payload.Iat; ni != ci {
 		return ni > ci
 	}
 	nid, cid := next.Stmt.ID(), cur.Stmt.ID()
 	return bytes.Compare(nid[:], cid[:]) > 0
-}
-
-// outranksPrimary says whether old, an assert in an old root still
-// honoured, keeps the roster entry over primary, the same device's assert
-// in the primary root: only while both verify and old grants strictly more.
-func outranksPrimary(old, primary *Device) bool {
-	return old.dead == nil && !old.lapsed && primary.dead == nil && wider(old, primary)
-}
-
-// grants is what an assert hands the device: its verbs, and the overlay
-// address it carries (an address is a grant to be routed to).
-func grants(dev *Device) map[string]bool {
-	out := make(map[string]bool, len(dev.Stmt.Payload.Verbs)+1)
-	for _, v := range dev.Stmt.Payload.Verbs {
-		out[v] = true
-	}
-	if m := dev.Stmt.Payload.Meta; m != nil && m.IP != "" {
-		out["ip:"+m.IP] = true
-	}
-	return out
-}
-
-// wider reports whether a grants a strict superset of what b grants.
-func wider(a, b *Device) bool {
-	ga, gb := grants(a), grants(b)
-	if len(ga) <= len(gb) {
-		return false
-	}
-	for g := range gb {
-		if !ga[g] {
-			return false
-		}
-	}
-	return true
 }
 
 // verdict is the time-independent half of the §6 checklist for one
@@ -349,9 +340,9 @@ func (r *Roster) verdict(dev *Device) error {
 // any root the roster honours to its asserts whichever root signed them.
 // Check only matches a revocation to a link in the same circle; after a
 // root move the circle is one under two keys, and the new root's revocation
-// must reach the device's old-root assert (which prefer may be keeping for
-// its address until re-issue) — else the device the circle revoked stays
-// routable until the old root is retired.
+// must reach the device's entry under the old root — else the device the
+// circle revoked stays a member (and routable) until the old root is
+// retired.
 func (r *Roster) revokedByCircle(dev *Device) error {
 	id := dev.Stmt.ID()
 	for _, st := range r.revs.Candidates(id, dev.DID) {
@@ -380,8 +371,8 @@ func (r *Roster) revokedByCircle(dev *Device) error {
 
 // rejudge re-derives one entry's verdict in place in a cloned roster,
 // replacing the entry (never the shared one) when it changed.
-func (r *Roster) rejudge(did string) bool {
-	dev := r.devices[did]
+func (r *Roster) rejudge(key string) bool {
+	dev := r.devices[key]
 	if dev == nil {
 		return false
 	}
@@ -391,7 +382,7 @@ func (r *Roster) rejudge(did string) bool {
 	}
 	nd := *dev
 	nd.dead = verdict
-	r.devices[did] = &nd
+	r.devices[key] = &nd
 	return true
 }
 
@@ -437,19 +428,33 @@ func (r *Roster) Sweep(deviceDID string, at time.Time) (*Roster, bool) {
 	}
 	nr := r.clone()
 	nr.sweeps[deviceDID] = cut
-	nr.rejudge(deviceDID)
+	for k, dev := range nr.devices {
+		if dev.DID == deviceDID {
+			nr.rejudge(k)
+		}
+	}
 	return nr, true
 }
 
-// Forget drops a device without revoking it: what a root retirement does
-// to devices whose assert is in the retired root (they re-join; they are
-// not banned).
+// Forget drops a device's entries under roots the roster no longer honours
+// without revoking it: what a root retirement does to the devices still on
+// the retired root (they re-join; they are not banned). An entry under a
+// root still honoured stays — the device's membership under the new root
+// is not the retirement's business.
 func (r *Roster) Forget(deviceDID string) (*Roster, bool) {
-	if _, had := r.devices[deviceDID]; !had {
+	var drop []string
+	for k, dev := range r.devices {
+		if dev.DID == deviceDID && !r.roots.Honours(dev.Sub()) {
+			drop = append(drop, k)
+		}
+	}
+	if len(drop) == 0 {
 		return r, false
 	}
 	nr := r.clone()
-	delete(nr.devices, deviceDID)
+	for _, k := range drop {
+		delete(nr.devices, k)
+	}
 	return nr, true
 }
 
@@ -478,14 +483,16 @@ func (r *Roster) Absorb(o *Roster, now time.Time) *Roster {
 	return nr
 }
 
-// Live returns the device if it is admitted right now: inside its window,
-// not lapsed, not dead.
+// Live returns the device's admitting entry if it is admitted right now —
+// an entry inside its window, not lapsed, not dead, under any honoured
+// root (the primary's first).
 func (r *Roster) Live(deviceDID string, now time.Time) (*Device, bool) {
-	dev := r.devices[deviceDID]
-	if dev == nil || !r.live(dev, now) {
-		return nil, false
+	for _, dev := range r.entries(deviceDID) {
+		if r.live(dev, now) {
+			return dev, true
+		}
 	}
-	return dev, true
+	return nil, false
 }
 
 func (r *Roster) live(dev *Device, now time.Time) bool {
@@ -496,27 +503,37 @@ func (r *Roster) lapsedAt(dev *Device, now time.Time) bool {
 	return dev.dead == nil && (dev.lapsed || !now.Before(dev.Exp)) && now.Before(dev.Exp.Add(LapsedRetention))
 }
 
-// Lapsed returns the device if its assert ran out unrenewed within
-// LapsedRetention: no member, but remembered.
+// Lapsed returns the device's entry if its asserts ran out unrenewed within
+// LapsedRetention: no member, but remembered. A device live under any root
+// is not lapsed.
 func (r *Roster) Lapsed(deviceDID string, now time.Time) (*Device, bool) {
-	dev := r.devices[deviceDID]
-	if dev == nil || !r.lapsedAt(dev, now) {
+	if _, live := r.Live(deviceDID, now); live {
 		return nil, false
 	}
-	return dev, true
+	for _, dev := range r.entries(deviceDID) {
+		if r.lapsedAt(dev, now) {
+			return dev, true
+		}
+	}
+	return nil, false
 }
 
 // Revoked reports whether the device is refused as revoked right now, and
-// until when: a dead assert until it would have expired, or a bare sweep
-// for sweepTombstone.
+// until when: a dead assert until it would have expired (the latest, when
+// several), or a bare sweep for sweepTombstone. An entry that is not dead
+// under any root — live or merely lapsed — means not revoked.
 func (r *Roster) Revoked(deviceDID string, now time.Time) (time.Time, bool) {
-	if dev := r.devices[deviceDID]; dev != nil {
-		if dev.dead != nil && now.Before(dev.Exp) {
-			return dev.Exp, true
-		}
+	var until time.Time
+	for _, dev := range r.entries(deviceDID) {
 		if dev.dead == nil {
 			return time.Time{}, false
 		}
+		if now.Before(dev.Exp) && dev.Exp.After(until) {
+			until = dev.Exp
+		}
+	}
+	if !until.IsZero() {
+		return until, true
 	}
 	if at, ok := r.sweeps[deviceDID]; ok {
 		until := time.Unix(at, 0).Add(sweepTombstone)
@@ -531,9 +548,12 @@ func (r *Roster) Revoked(deviceDID string, now time.Time) (time.Time, bool) {
 // of its tombstone.
 func (r *Roster) Tombstones(now time.Time) map[string]time.Time {
 	out := map[string]time.Time{}
-	for did := range r.devices {
-		if until, ok := r.Revoked(did, now); ok {
-			out[did] = until
+	for _, dev := range r.devices {
+		if _, seen := out[dev.DID]; seen {
+			continue
+		}
+		if until, ok := r.Revoked(dev.DID, now); ok {
+			out[dev.DID] = until
 		}
 	}
 	for did := range r.sweeps {
@@ -547,24 +567,47 @@ func (r *Roster) Tombstones(now time.Time) map[string]time.Time {
 	return out
 }
 
-// Device returns the roster's entry for a device, whatever its verdict.
+// Device returns the roster's entry for a device whatever its verdict: the
+// one under the primary root when it has one, else under the next honoured
+// root.
 func (r *Roster) Device(deviceDID string) (*Device, bool) {
-	dev, ok := r.devices[deviceDID]
-	return dev, ok
+	devs := r.entries(deviceDID)
+	if len(devs) == 0 {
+		return nil, false
+	}
+	return devs[0], true
 }
 
-// Devices lists every entry, by DID.
+// Devices lists every entry — a device under two roots is two — by DID,
+// the primary root's entry first.
 func (r *Roster) Devices() []*Device {
 	out := make([]*Device, 0, len(r.devices))
 	for _, dev := range r.devices {
 		out = append(out, dev)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].DID < out[j].DID })
+	r.sortEntries(out)
 	return out
 }
 
-// LiveDevices lists the devices admitted right now.
+// LiveDevices lists the devices admitted right now, one entry per device
+// (its admitting entry, as Live returns it).
 func (r *Roster) LiveDevices(now time.Time) []*Device {
+	var out []*Device
+	last := ""
+	for _, dev := range r.Devices() {
+		if dev.DID == last || !r.live(dev, now) {
+			continue
+		}
+		out = append(out, dev)
+		last = dev.DID
+	}
+	return out
+}
+
+// LiveAsserts lists every entry that admits its device right now — a
+// device live under two roots is two, for the question "who is still on
+// the old root".
+func (r *Roster) LiveAsserts(now time.Time) []*Device {
 	var out []*Device
 	for _, dev := range r.Devices() {
 		if r.live(dev, now) {
@@ -574,12 +617,18 @@ func (r *Roster) LiveDevices(now time.Time) []*Device {
 	return out
 }
 
-// LapsedDevices lists the devices remembered as expired.
+// LapsedDevices lists the devices remembered as expired, one entry each
+// (as Lapsed returns it).
 func (r *Roster) LapsedDevices(now time.Time) []*Device {
 	var out []*Device
+	seen := map[string]bool{}
 	for _, dev := range r.Devices() {
-		if r.lapsedAt(dev, now) {
-			out = append(out, dev)
+		if seen[dev.DID] {
+			continue
+		}
+		seen[dev.DID] = true
+		if d, ok := r.Lapsed(dev.DID, now); ok {
+			out = append(out, d)
 		}
 	}
 	return out
@@ -589,9 +638,11 @@ func (r *Roster) LapsedDevices(now time.Time) []*Device {
 // lapsed alike (a lapsed device keeps its address until it is back or
 // revoked), for the owner's allocation.
 func (r *Roster) UsedIPs() []string {
+	seen := map[string]bool{}
 	var out []string
 	for _, dev := range r.devices {
-		if m := dev.Stmt.Payload.Meta; m != nil && m.IP != "" {
+		if m := dev.Stmt.Payload.Meta; m != nil && m.IP != "" && !seen[m.IP] {
+			seen[m.IP] = true
 			out = append(out, m.IP)
 		}
 	}
@@ -599,7 +650,8 @@ func (r *Roster) UsedIPs() []string {
 	return out
 }
 
-// Len is the number of entries, live or not.
+// Len is the number of entries, live or not (a device under two roots
+// counts twice).
 func (r *Roster) Len() int { return len(r.devices) }
 
 // GC marks devices whose window closed as lapsed, drops lapsed entries past

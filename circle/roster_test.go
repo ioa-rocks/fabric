@@ -195,13 +195,13 @@ func TestRosterTieBreakIsDeterministic(t *testing.T) {
 	}
 }
 
-// A root move folds two rosters into one, one entry per device. A device
-// holding an old-root assert with an overlay address and a plain assert in
-// the destination circle keeps the wider one, whichever arrived first,
-// until the move re-issues its address under the new root — and a
-// revocation by the new root reaches the kept old-root assert all the same
-// (Codex review, 2026-11-05).
-func TestRootMoveKeepsTheWiderAssertUntilReissue(t *testing.T) {
+// A root move folds two rosters into one. A device holding an assert with
+// its overlay address under the old root and a plain assert in the
+// destination circle is an entry under each root: it keeps the address
+// (and so its route) whichever arrived first, until the old root is
+// retired; a revocation by the new root reaches both entries (Codex
+// review, 2026-11-05).
+func TestRootMoveKeepsBothEntriesUntilRetirement(t *testing.T) {
 	main, _ := Init(t.TempDir(), "main", "pw")
 	fam, _ := Init(t.TempDir(), "family", "pw")
 	mainPriv, _ := main.Unlock("pw")
@@ -211,7 +211,7 @@ func TestRootMoveKeepsTheWiderAssertUntilReissue(t *testing.T) {
 	now := time.Now()
 	tunVerbs := append(append([]string{}, DeviceVerbs...), statement.VerbTun)
 	mainTun, _ := AttestWith(mainPriv, nil, main.Config.DID, devPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
-	famPlain, _ := Attest(famPriv, devPub, now.Add(time.Minute)) // later-expiring, fewer grants
+	famPlain, _ := AttestFor(famPriv, devPub, now, 2*time.Hour) // family admitted nas earlier: no tun, later expiry
 	moved := statement.NewDIDRoots(fam.Config.DID, main.Config.DID)
 
 	for _, order := range [][]*Attestation{{mainTun, famPlain}, {famPlain, mainTun}} {
@@ -219,24 +219,48 @@ func TestRootMoveKeepsTheWiderAssertUntilReissue(t *testing.T) {
 		for _, a := range order {
 			r, _, _ = r.Add(a.Stmt, now)
 		}
-		d, _ := r.Device(dev)
-		if d.Stmt.ID() != mainTun.Stmt.ID() {
-			t.Fatalf("entry is the %s assert, want the old root's (it carries the address)", shortDID(d.Sub()))
+		if r.Len() != 2 || len(r.LiveDevices(now)) != 1 || len(r.LiveAsserts(now)) != 2 {
+			t.Fatalf("entries=%d live devices=%d live asserts=%d, want 2/1/2", r.Len(), len(r.LiveDevices(now)), len(r.LiveAsserts(now)))
 		}
-		if _, live := r.Live(dev, now.Add(time.Minute)); !live || len(r.UsedIPs()) != 1 {
+		if _, live := r.Live(dev, now); !live || len(r.UsedIPs()) != 1 {
 			t.Fatal("device not live with its address after the move")
 		}
-		// Re-issue under the new root: same grants, primary root — it wins.
-		famTun, _ := AttestWith(famPriv, nil, fam.Config.DID, devPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+		if d, _ := r.Device(dev); d.Sub() != fam.Config.DID {
+			t.Fatal("the representative entry is not the primary root's")
+		}
+		// Re-issue under the new root (root merge: full validity, so it
+		// outlives the plain admission), then retire the old root.
+		famTun, _ := AttestWith(famPriv, nil, fam.Config.DID, devPub, now, 3*time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
 		r, changed, _ := r.Add(famTun.Stmt, now)
-		if d, _ = r.Device(dev); !changed || d.Stmt.ID() != famTun.Stmt.ID() {
-			t.Fatal("the re-issued assert under the new root did not take over")
+		if d, _ := r.Device(dev); !changed || d.Stmt.ID() != famTun.Stmt.ID() || r.Len() != 2 {
+			t.Fatal("the re-issued assert did not replace the plain one under the new root")
+		}
+		retired := statement.NewDIDRoots(fam.Config.DID)
+		r2 := NewRoster(retired)
+		for _, d := range r.Devices() {
+			r2, _, _ = r2.Add(d.Stmt, now) // the old root's assert no longer compiles
+		}
+		r2, _ = r2.Forget(dev)
+		if r2.Len() != 1 || len(r2.UsedIPs()) != 1 {
+			t.Fatalf("after retirement: entries=%d ips=%d, want 1/1", r2.Len(), len(r2.UsedIPs()))
 		}
 	}
 
-	// Before re-issue the destination circle revokes the device: the kept
-	// old-root assert dies with it.
-	r := NewRoster(moved)
+	// Retirement before re-issue drops only the old root's entry: the
+	// device stays a (plain) member of the circle.
+	r := NewRoster(statement.NewDIDRoots(fam.Config.DID, main.Config.DID))
+	r, _, _ = r.Add(mainTun.Stmt, now)
+	r, _, _ = r.Add(famPlain.Stmt, now)
+	r.roots.Set([]string{fam.Config.DID})
+	r, _ = r.Recheck()
+	r, had := r.Forget(dev)
+	if _, live := r.Live(dev, now); !had || !live || r.Len() != 1 || len(r.UsedIPs()) != 0 {
+		t.Fatalf("after retiring the old root: had=%v live=%v entries=%d ips=%d", had, live, r.Len(), len(r.UsedIPs()))
+	}
+
+	// Before re-issue the destination circle revokes the device: both
+	// entries die with it.
+	r = NewRoster(moved)
 	r, _, _ = r.Add(mainTun.Stmt, now)
 	r, _, _ = r.Add(famPlain.Stmt, now)
 	rev, _ := Revoke(famPriv, dev, now.Add(time.Second))
@@ -244,26 +268,29 @@ func TestRootMoveKeepsTheWiderAssertUntilReissue(t *testing.T) {
 	if err != nil || !fresh {
 		t.Fatalf("AddRevocation: fresh=%v err=%v", fresh, err)
 	}
-	if _, live := r.Live(dev, now.Add(2*time.Second)); live {
-		t.Fatal("the new root's revocation missed the device's old-root assert")
+	at := now.Add(2 * time.Second)
+	if _, live := r.Live(dev, at); live {
+		t.Fatal("the new root's revocation missed the device's old-root entry")
 	}
-	if _, revoked := r.Revoked(dev, now.Add(2*time.Second)); !revoked {
+	if _, revoked := r.Revoked(dev, at); !revoked {
 		t.Fatal("device not reported revoked")
 	}
-	// And a dead primary assert wins over a verifying old-root one.
+	// The same revocation known first: later asserts under either root
+	// come in dead.
 	r = NewRoster(moved)
 	r, _, _ = r.AddRevocation(rev.Stmt)
 	r, _, _ = r.Add(famPlain.Stmt, now)
 	r, _, _ = r.Add(mainTun.Stmt, now)
-	if _, live := r.Live(dev, now.Add(2*time.Second)); live {
-		t.Fatal("a revoked device came back through its old-root assert")
+	if _, live := r.Live(dev, at); live {
+		t.Fatal("a revoked device came back through an old-root assert")
 	}
 }
 
-// Within one root a later-expiring assert granting less never takes a
-// grant away: a plain circle admission of a device that already holds an
-// address keeps the address.
-func TestWiderAssertOutlivesALaterPlainOne(t *testing.T) {
+// Within one root a renewal replaces the grant: `renew -scope` dropping tun
+// takes the address away (README, "Renewing certificates"), and a later
+// plain admission of a device that held an address does the same — the
+// operator renews with the scope they mean.
+func TestRenewalWithFewerVerbsDemotes(t *testing.T) {
 	c, _ := Init(t.TempDir(), "p", "pw")
 	priv, _ := c.Unlock("pw")
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
@@ -277,16 +304,43 @@ func TestWiderAssertOutlivesALaterPlainOne(t *testing.T) {
 		for _, a := range order {
 			r, _, _ = r.Add(a.Stmt, now)
 		}
-		if d, _ := r.Device(dev); d.Stmt.ID() != withIP.Stmt.ID() {
-			t.Fatal("a plain admission took the device's address away")
+		d, _ := r.Device(dev)
+		if d.Stmt.ID() != plain.Stmt.ID() || len(r.UsedIPs()) != 0 || r.Len() != 1 {
+			t.Fatal("the later renewal without tun did not take effect")
 		}
 	}
-	// A renewal carrying the same grants wins by expiry as before.
-	renewed, _ := AttestWith(priv, nil, c.Config.DID, devPub, now.Add(time.Minute), time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
-	r := NewRoster(statement.NewDIDRoots(c.Config.DID))
-	r, _, _ = r.Add(withIP.Stmt, now)
-	r, _, _ = r.Add(renewed.Stmt, now)
-	if d, _ := r.Device(dev); d.Stmt.ID() != renewed.Stmt.ID() {
-		t.Fatal("a renewal with the same grants did not replace the older assert")
+}
+
+// Three asserts for one device under one root with unrelated grants and
+// different expiries: every arrival order selects the same one. (A rule
+// that is not a total order over the entries — "the wider grant wins",
+// then expiry — cycles over such a triple: Codex review, 2026-11-05.)
+func TestRosterConvergesOverThreeAsserts(t *testing.T) {
+	c, _ := Init(t.TempDir(), "p", "pw")
+	priv, _ := c.Unlock("pw")
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	dev := did.ForKey(devPub)
+	now := time.Now()
+	m := statement.VerbMember
+	a, _ := AttestWith(priv, nil, c.Config.DID, devPub, now, time.Hour, []string{m, statement.VerbHost, statement.VerbSync}, nil)
+	b, _ := AttestWith(priv, nil, c.Config.DID, devPub, now, 3*time.Hour, []string{m, statement.VerbHost}, nil)
+	d, _ := AttestWith(priv, nil, c.Config.DID, devPub, now, 2*time.Hour, []string{m, statement.VerbSync, statement.VerbBlob}, nil)
+	all := []*Attestation{a, b, d}
+	orders := [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	want := [32]byte{}
+	for i, order := range orders {
+		r := NewRoster(statement.NewDIDRoots(c.Config.DID))
+		for _, k := range order {
+			r, _, _ = r.Add(all[k].Stmt, now)
+		}
+		got, _ := r.Device(dev)
+		if i == 0 {
+			want = got.Stmt.ID()
+			if want != b.Stmt.ID() {
+				t.Fatal("the latest-expiring assert did not win")
+			}
+		} else if got.Stmt.ID() != want {
+			t.Fatalf("order %v selects a different assert", order)
+		}
 	}
 }

@@ -275,6 +275,9 @@ func (s *state) snapshot() *View {
 			if err != nil {
 				continue
 			}
+			if _, done := v.addrOf[p]; done {
+				continue // Devices lists the primary root's entry first: it names the address
+			}
 			v.routes[pfx.Addr()] = deviceIn{r, dev}
 			v.addrOf[p] = pfx.Addr()
 			if name := c.Payload.Meta.Name; name != "" {
@@ -794,14 +797,16 @@ func (v *View) IsRevoked(p peer.ID, now time.Time) bool {
 	return false
 }
 
-// MembersIn lists the live devices whose assert is in the given circle DID
-// (an old root during a move names exactly the devices still on it; a
-// retirement forgets those).
+// MembersIn lists the live devices holding an admitting assert in the
+// given circle DID — for an old root during a move, every device still
+// holding one there, re-issued under the new root or not. A retirement
+// forgets those entries (Forget drops only the retired root's) and cuts
+// off the devices nothing else admits.
 func (v *View) MembersIn(circleDID string) []peer.ID {
 	now := time.Now()
 	var out []peer.ID
 	for _, r := range v.rosters {
-		for _, dev := range r.LiveDevices(now) {
+		for _, dev := range r.LiveAsserts(now) {
 			if dev.Sub() != circleDID {
 				continue
 			}
