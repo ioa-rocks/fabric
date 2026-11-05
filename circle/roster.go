@@ -347,6 +347,31 @@ func (r *Roster) Forget(deviceDID string) (*Roster, bool) {
 	return nr, true
 }
 
+// Absorb returns the roster with another circle's roster folded in: its
+// asserts re-verified against this roster's roots (which must honour the
+// other's circle — a root move made one circle of two), its revocations
+// and its sweeps. The other roster is unchanged.
+func (r *Roster) Absorb(o *Roster, now time.Time) *Roster {
+	nr := r.clone()
+	revs := nr.revs.Clone()
+	for _, st := range o.revs.All() {
+		_, _ = revs.Add(st)
+	}
+	nr.revs = revs
+	for did, at := range o.sweeps {
+		if at > nr.sweeps[did] {
+			nr.sweeps[did] = at
+		}
+	}
+	for did := range nr.devices {
+		nr.rejudge(did)
+	}
+	for _, dev := range o.Devices() {
+		nr, _, _ = nr.Add(dev.Stmt, now)
+	}
+	return nr
+}
+
 // Live returns the device if it is admitted right now: inside its window,
 // not lapsed, not dead.
 func (r *Roster) Live(deviceDID string, now time.Time) (*Device, bool) {

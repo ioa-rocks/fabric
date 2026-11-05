@@ -160,6 +160,50 @@ func (s *state) index(circleDID string) int {
 	return -1
 }
 
+// indices lists every roster honouring circleDID — more than one only in
+// the window between a root move and the recheck that merges them.
+func (s *state) indices(circleDID string) []int {
+	var out []int
+	for i, r := range s.rosters {
+		if r.Honours(circleDID) {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// merge keeps one roster per circle: when the first roster has come to
+// honour another roster's circle (a root move made the two one circle),
+// that roster is absorbed into the first and dropped — what startup does
+// with such a directory (Attach), done live. Without it a DID lookup
+// found the first roster and the destination circle's own members, held
+// in the second, escaped its revocations (Codex review, 2026-11-05).
+func (s *state) merge(now time.Time) {
+	if len(s.rosters) < 2 {
+		return
+	}
+	first := s.rosters[0]
+	kept := []*circle.Roster{first}
+	for _, r := range s.rosters[1:] {
+		if !first.Honours(r.Primary()) {
+			kept = append(kept, r)
+			continue
+		}
+		merged := first.Absorb(r, now)
+		if err := merged.Save(); err != nil {
+			kept = append(kept, r) // keep both until the disk takes it; lookups still see the first
+			continue
+		}
+		first = merged
+		s.dirty = true
+	}
+	kept[0] = first
+	if len(kept) != len(s.rosters) {
+		s.dirty = true
+	}
+	s.rosters = kept
+}
+
 func (t *PeerTable) signal() {
 	t.watchMu.Lock()
 	ws := append([]chan struct{}(nil), t.watchers...)
@@ -328,12 +372,17 @@ func (t *PeerTable) AddRevocation(circleDID string, st *statement.Statement) (fr
 		if i < 0 {
 			return fmt.Errorf("roster: circle %s is not honoured here", shortDID(circleDID))
 		}
-		nr, f, err := s.rosters[i].AddRevocation(st)
-		if err != nil || !f {
-			return err
+		for _, i := range s.indices(circleDID) {
+			nr, f, err := s.rosters[i].AddRevocation(st)
+			if err != nil {
+				return err
+			}
+			if f {
+				fresh = true
+				_ = s.replace(i, nr, false)
+			}
 		}
-		fresh = true
-		return s.replace(i, nr, false)
+		return nil
 	})
 	return fresh, err
 }
@@ -342,21 +391,24 @@ func (t *PeerTable) AddRevocation(circleDID string, st *statement.Statement) (fr
 // device revocation).
 func (t *PeerTable) SweepIn(circleDID, deviceDID string, at time.Time) {
 	_ = t.apply(func(s *state) error {
-		if i := s.index(circleDID); i >= 0 {
+		for _, i := range s.indices(circleDID) {
 			nr, _ := s.rosters[i].Sweep(deviceDID, at)
-			return s.replace(i, nr, false)
+			_ = s.replace(i, nr, false)
 		}
 		return nil
 	})
 }
 
-// Recheck re-derives every roster's verdicts (after a root move).
+// Recheck re-derives every roster's verdicts after the roots changed (a
+// root move or retirement) and merges a roster whose circle the first
+// roster now honours into it — one roster per circle.
 func (t *PeerTable) Recheck() {
 	_ = t.apply(func(s *state) error {
 		for i, r := range s.rosters {
 			nr, _ := r.Recheck()
 			_ = s.replace(i, nr, false)
 		}
+		s.merge(time.Now())
 		return nil
 	})
 }

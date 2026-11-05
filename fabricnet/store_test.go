@@ -609,3 +609,44 @@ func TestOwnerUnderConcurrentWritersAndReaders(t *testing.T) {
 		t.Fatal("no change signal reached the watcher")
 	}
 }
+
+// A root move that makes the first circle honour a circle this node
+// already holds leaves one roster per circle: the destination's roster is
+// absorbed into the first on the recheck, so its revocations reach every
+// member and nothing is held in a roster a DID lookup never reaches.
+func TestRootMoveMergesDestinationRoster(t *testing.T) {
+	main, _ := circle.Init(t.TempDir(), "main", "pw")
+	fam, _ := circle.Init(t.TempDir(), "family", "pw")
+	famPriv, _ := fam.Unlock("pw")
+	now := time.Now()
+	roots := statement.NewDIDRoots(main.Config.DID)
+	table := NewMemberStore(roots)
+	famRoster, _ := circle.OpenRoster(fam, now)
+	table.AddRoster(famRoster)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	a, _ := circle.Attest(famPriv, devPub, now)
+	if _, err := table.AddAssert(a.Stmt, now); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := PeerOfDID(cert.DIDForKey(devPub))
+	if !table.IsMember(p, now) {
+		t.Fatal("family device not a member")
+	}
+	// The mesh root moves to family's key: the first roster honours
+	// family too. One recheck later there is one roster for the circle.
+	roots.Set([]string{fam.Config.DID, main.Config.DID})
+	table.Recheck()
+	if n := len(table.Rosters()); n != 1 {
+		t.Fatalf("%d rosters after the move, want 1 (destination absorbed)", n)
+	}
+	if !table.IsMember(p, now) || !table.In(p, fam.Config.DID, now) {
+		t.Fatal("the absorbed device lost its membership")
+	}
+	rev, _ := circle.Revoke(famPriv, cert.DIDForKey(devPub), now.Add(time.Second))
+	if fresh, err := table.AddRevocation(fam.Config.DID, rev.Stmt); err != nil || !fresh {
+		t.Fatalf("AddRevocation: fresh=%v err=%v", fresh, err)
+	}
+	if table.IsMember(p, now.Add(2*time.Second)) {
+		t.Fatal("a destination-circle revocation missed a member held in the absorbed roster")
+	}
+}
