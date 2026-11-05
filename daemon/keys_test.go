@@ -21,13 +21,13 @@ func TestIssueKeyUnderOwnCert(t *testing.T) {
 	d := newTestDaemon(t, nsPriv, "desk", nil)
 	d.Circle = NewCircleService(d.Host, d.Auth, t.TempDir())
 	d.Circle.SetOwnCert(d.OwnCert)
-	d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.CertIn)
+	d.Circle.SetHome(d.CircleDID, d.Roots, d.Store.CertIn)
 
 	k, err := d.IssueKey("", []string{"subject:jobs"}, []string{"claim", "read"}, time.Hour, "worker")
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
-	if k.Circle != d.NamespaceDID() || len(k.Seed) != ed25519.SeedSize || len(k.Chain) == 0 {
+	if k.Circle != d.CircleDID() || len(k.Seed) != ed25519.SeedSize || len(k.Chain) == 0 {
 		t.Fatalf("issued key: %+v", k.KeyRecord)
 	}
 	st, err := statement.Decode(k.Chain)

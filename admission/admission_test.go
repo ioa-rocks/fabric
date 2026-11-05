@@ -88,8 +88,8 @@ func TestJoinFlow(t *testing.T) {
 	if resp.Status != StatusApproved {
 		t.Fatalf("status after approve = %q", resp.Status)
 	}
-	if resp.NamespaceDID != nsDID {
-		t.Fatalf("namespace = %q, want %q", resp.NamespaceDID, nsDID)
+	if resp.CircleDID != nsDID {
+		t.Fatalf("circle = %q, want %q", resp.CircleDID, nsDID)
 	}
 	got, err := cert.Unmarshal(resp.Cert)
 	if err != nil {

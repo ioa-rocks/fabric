@@ -158,10 +158,10 @@ func (n *meshNode) fabric(t *testing.T, root ed25519.PrivateKey, name string, bo
 		t.Fatal(err)
 	}
 	if err := n.dir.SaveConfig(fabricstate.Config{
-		Name:         name,
-		ListenAddrs:  []string{"/ip4/127.0.0.1/tcp/0"},
-		NamespaceDID: cert.DIDForKey(root.Public().(ed25519.PublicKey)),
-		Bootstrap:    bootstrap,
+		Name:        name,
+		ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"},
+		CircleDID:   cert.DIDForKey(root.Public().(ed25519.PublicKey)),
+		Bootstrap:   bootstrap,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -182,11 +182,11 @@ func (n *meshNode) fabric(t *testing.T, root ed25519.PrivateKey, name string, bo
 	// service fell back to the legacy exchange, which until 2026-11-05
 	// leaked every circle and so hid the missing wiring.
 	fd.Circle.SetOwnCert(fd.OwnCert)
-	fd.Circle.SetHome(fd.NamespaceDID, fd.Roots, fd.Store.CertIn)
+	fd.Circle.SetHome(fd.CircleDID, fd.Roots, fd.Store.CertIn)
 	fd.Circle.SetPeerTable(fd.Store)
 	fd.Circle.AttachSync(fd.Sync)
 	fd.Circle.SetOwnCert(fd.OwnCert)
-	fd.Circle.SetHome(fd.NamespaceDID, fd.Roots, fd.Store.CertIn)
+	fd.Circle.SetHome(fd.CircleDID, fd.Roots, fd.Store.CertIn)
 	return fd
 }
 

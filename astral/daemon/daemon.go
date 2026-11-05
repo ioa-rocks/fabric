@@ -230,13 +230,13 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 	return d, nil
 }
 
-// Home is the circle a bare name belongs to on this node: the namespace
+// Home is the circle a bare name belongs to on this node: the circle
 // (home circle) DID when on a mesh, astral.LocalCircle when solo.
 func (d *Daemon) Home() string {
 	if d.Fabric == nil {
 		return astral.LocalCircle
 	}
-	return d.Fabric.Config.NamespaceDID
+	return d.Fabric.Config.CircleDID
 }
 
 // Ref resolves (circle, name) with the home circle as default.

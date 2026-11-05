@@ -95,7 +95,7 @@ func TestVerifyRejectsForeignRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := VerifyKey(e, foreignPub, now); err == nil {
-		t.Fatal("event verified against a foreign namespace key")
+		t.Fatal("event verified against a foreign root key")
 	}
 }
 

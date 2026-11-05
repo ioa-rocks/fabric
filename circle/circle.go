@@ -4,11 +4,11 @@
 // neither owns it (ADR 0014's layering rule: vault/* → fabric core, never
 // the reverse). The package owns the circle directory, the user-key
 // custody (an age container, reusing the keystore that guards the
-// namespace root key), and nothing else: bucket handles, blobs,
+// root key), and nothing else: bucket handles, blobs,
 // placements and mounts are per-device state and stay in vault/store.
 //
 // A node holds any number of circles (ADR 0011: a device participates in
-// several namespaces): each lives in its own directory under the node's
+// several circles): each lives in its own directory under the node's
 // circle root, <fabric state>/circles/<name>/. The personal circle and a
 // shared "family" circle are two directories, nothing more.
 package circle
@@ -161,7 +161,7 @@ func (c *Circle) KeyPath() string { return keyPath(c.Path) }
 func keyPath(path string) string { return filepath.Join(path, keyFile) }
 
 // Init mints a circle: generates the owner user key into an age container
-// under the directory. The key custody model mirrors the namespace root
+// under the directory. The key custody model mirrors the circle root
 // key (spec §1 discipline): unlocked per signing operation, never
 // resident in the daemon.
 func Init(root, name, passphrase string) (*Circle, error) {
@@ -173,7 +173,7 @@ func Init(root, name, passphrase string) (*Circle, error) {
 }
 
 // InitFromSeed mints a circle around an existing key: how `fabric init`
-// makes the namespace root and the home circle one key (the mesh-root
+// makes the circle root and the home circle one key (the mesh-root
 // merge; statement-format task, decision 4).
 func InitFromSeed(root, name string, seed []byte, passphrase string) (*Circle, error) {
 	if err := validName(name); err != nil {

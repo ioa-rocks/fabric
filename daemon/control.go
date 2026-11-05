@@ -98,12 +98,12 @@ type MemberInfo struct {
 }
 
 type StatusReply struct {
-	Name         string `json:"name"`
-	PeerID       string `json:"peer_id"`
-	NamespaceDID string `json:"namespace_did"` // the home circle's DID
-	Master       bool   `json:"master"`        // holds the namespace root key
-	QueueHost    bool   `json:"queue_host"`    // runs the admission queue (lighthouse role)
-	Posture      string `json:"posture"`       // gater posture: dark (unknown inbound refused) / listed
+	Name      string `json:"name"`
+	PeerID    string `json:"peer_id"`
+	CircleDID string `json:"namespace_did"` // the home circle's DID
+	Master    bool   `json:"master"`        // holds the root key
+	QueueHost bool   `json:"queue_host"`    // runs the admission queue (lighthouse role)
+	Posture   string `json:"posture"`       // gater posture: dark (unknown inbound refused) / listed
 	// Inbound connections refused as unknown since start (dark posture): a
 	// non-zero count with a member missing from `peers` usually means its
 	// MemberAdded event has not reached this node yet.
@@ -198,7 +198,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	reply := StatusReply{
 		Name:         d.Config.Name,
 		PeerID:       d.Host.ID().String(),
-		NamespaceDID: d.NamespaceDID(),
+		CircleDID:    d.CircleDID(),
 		Master:       d.Dir.IsMaster(),
 		QueueHost:    d.Queue != nil,
 		Posture:      d.Gater.Posture(),
@@ -315,7 +315,7 @@ func (d *Daemon) sharedKnown(p peer.ID) []string {
 	}
 	var out []string
 	for _, did := range d.Circle.SharedKnown(p) {
-		if did != d.NamespaceDID() {
+		if did != d.CircleDID() {
 			out = append(out, did)
 		}
 	}
@@ -478,7 +478,7 @@ func (d *Daemon) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Ingest verifies the root-key signature — the daemon takes orders about
-	// membership only from the namespace root key, never from the socket.
+	// membership only from the root key, never from the socket.
 	if err := d.Ingest(e); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

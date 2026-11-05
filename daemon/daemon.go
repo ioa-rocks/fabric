@@ -113,7 +113,7 @@ type Daemon struct {
 // `fabric join <gate>` put it in) or the attestation a circle owner signed
 // into a circle directory (`fabric join <bundle>`, cold start). There is
 // no home circle (memo §5, decided 2026-11-04); what the code still calls
-// the namespace is the device's *first* circle: the one the config names
+// the circle is the device's *first* circle: the one the config names
 // for the membership-event log, else the one its attestation is in. It is
 // where the overlay address, the admission queue and the Astral default
 // come from until those are per circle too (slice H).
@@ -138,7 +138,7 @@ func New(dir state.Dir) (*Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.NamespaceDID = first // in memory only: a cold-start config names no circle
+	cfg.CircleDID = first // in memory only: a cold-start config names no circle
 	roots := statement.NewDIDRoot(first)
 	store := fabricnet.NewMemberStore(roots)
 	evLog := event.NewLog(roots)
@@ -343,7 +343,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		d.Queue = admission.NewQueue(func(p admission.PendingInfo) {
 			log.Printf("join request pending: %q fingerprint=%s (fabric approve %s)", p.Name, p.Fingerprint, p.Fingerprint)
 		})
-		admission.Attach(h, d.Queue, d.NamespaceDID)
+		admission.Attach(h, d.Queue, d.CircleDID)
 		admission.AttachQueue(h, d.Queue, d.Auth.RequireMember, d.isMasterDevice, func(eventBytes []byte) error {
 			e, err := event.Unmarshal(eventBytes)
 			if err != nil {
@@ -377,21 +377,21 @@ func firstCircle(cfg state.Config, own *cert.Cert, circles []*circle.Circle, now
 		}
 		return view
 	}
-	if cfg.NamespaceDID != "" {
-		if !did.IsKey(cfg.NamespaceDID) {
-			return "", nil, fmt.Errorf("config namespace_did %q is not a did:key", cfg.NamespaceDID)
+	if cfg.CircleDID != "" {
+		if !did.IsKey(cfg.CircleDID) {
+			return "", nil, fmt.Errorf("config namespace_did %q is not a did:key", cfg.CircleDID)
 		}
 		if own == nil {
 			for _, c := range circles {
-				if c.Config.DID == cfg.NamespaceDID {
+				if c.Config.DID == cfg.CircleDID {
 					own = fromDir(c)
 				}
 			}
 		}
 		if own == nil {
-			return "", nil, fmt.Errorf("no membership certificate in %s and no attestation in circle %s — run 'fabric join' first", cfg.NamespaceDID, cfg.NamespaceDID)
+			return "", nil, fmt.Errorf("no membership certificate in %s and no attestation in circle %s — run 'fabric join' first", cfg.CircleDID, cfg.CircleDID)
 		}
-		return cfg.NamespaceDID, own, nil
+		return cfg.CircleDID, own, nil
 	}
 	if own != nil {
 		return own.Payload.Sub, own, nil
@@ -719,7 +719,7 @@ func (d *Daemon) AddrReachability() (reachable, unreachable, unknown []string) {
 
 // AllocateOverlayIP picks the next free overlay address for a new member.
 // Used by the signing side (CLI/UI) at approval time; returns "" when the
-// namespace predates the overlay subnet (certs are then issued without an
+// circle predates the overlay subnet (certs are then issued without an
 // IP, as before). taken should be the current members' addresses.
 func AllocateOverlayIP(dir state.Dir, members []MemberInfo) (string, error) {
 	cfg, err := dir.LoadConfig()
@@ -754,7 +754,7 @@ func CheckOverlayIP(dir state.Dir, members []MemberInfo, want, fingerprint strin
 		return "", err
 	}
 	if cfg.Subnet == "" {
-		return "", errors.New("this namespace has no overlay subnet configured")
+		return "", errors.New("this circle has no overlay subnet configured")
 	}
 	subnet, err := netip.ParsePrefix(cfg.Subnet)
 	if err != nil {
@@ -823,7 +823,7 @@ func (d *Daemon) OwnCert() *cert.Cert {
 // must not keep this device on a root nobody honours (Codex review,
 // 2026-11-02).
 func (d *Daemon) adoptOwnCert(c *cert.Cert) {
-	ns := d.NamespaceDID()
+	ns := d.CircleDID()
 	d.certMu.Lock()
 	if cur := d.ownCert; cur != nil {
 		moving := cur.Payload.Sub != c.Payload.Sub && c.Payload.Sub == ns
@@ -967,11 +967,11 @@ func (d *Daemon) Ingest(e *event.Event) error {
 	return nil
 }
 
-// NamespaceDID is the home circle's DID.
-func (d *Daemon) NamespaceDID() string {
+// CircleDID is the home circle's DID.
+func (d *Daemon) CircleDID() string {
 	d.cfgMu.Lock()
 	defer d.cfgMu.Unlock()
-	return d.Config.NamespaceDID
+	return d.Config.CircleDID
 }
 
 func (d *Daemon) persistEvents() {

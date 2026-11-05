@@ -164,11 +164,11 @@ type signedRequest struct {
 	Scope []string `json:"scope,omitempty"`
 }
 
-// unlock loads the namespace root key with the passphrase from the request.
+// unlock loads the root key with the passphrase from the request.
 // The key lives only for the one signing operation.
 func (s *Server) unlock(pass string) (ed25519.PrivateKey, error) {
 	if !s.master {
-		return nil, errors.New("this node does not hold the namespace root key")
+		return nil, errors.New("this node does not hold the root key")
 	}
 	seed, err := keystore.LoadSeed(s.dir.KeystorePath(), pass)
 	if err != nil {

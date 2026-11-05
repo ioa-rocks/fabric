@@ -107,7 +107,7 @@ func (d *Daemon) devicePriv() (ed25519.PrivateKey, error) {
 // the home circle, its attestation otherwise. Only statement-form asserts
 // can parent a sub-key.
 func (d *Daemon) ownAssert(circleDID string) (*statement.Statement, error) {
-	if circleDID == d.NamespaceDID() {
+	if circleDID == d.CircleDID() {
 		c := d.OwnCert()
 		if c == nil || c.Stmt == nil {
 			return nil, errors.New("this device's membership cert predates statements — `fabric renew` it on the master first")
@@ -133,7 +133,7 @@ func (d *Daemon) ownAssert(circleDID string) (*statement.Statement, error) {
 
 // rootsFor is the Roots view a chain in circleDID compiles against.
 func (d *Daemon) rootsFor(circleDID string) statement.Roots {
-	if circleDID == d.NamespaceDID() {
+	if circleDID == d.CircleDID() {
 		return d.Roots
 	}
 	return statement.NewDIDRoot(circleDID)
@@ -144,7 +144,7 @@ func (d *Daemon) rootsFor(circleDID string) statement.Roots {
 // validity. The result carries the seed: show it once, never store it here.
 func (d *Daemon) IssueKey(circleDID string, res []string, verbs []string, validity time.Duration, label string) (*IssuedKey, error) {
 	if circleDID == "" {
-		circleDID = d.NamespaceDID()
+		circleDID = d.CircleDID()
 	}
 	if len(verbs) == 0 {
 		return nil, errors.New("a sub-key needs at least one verb")

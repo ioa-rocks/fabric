@@ -1,4 +1,4 @@
-// fabric is the node CLI: init a namespace (master), join an existing one,
+// fabric is the node CLI: mint a circle (master), join an existing one,
 // run the daemon, drive the admission queue, and own the circle and
 // buckets that ride the node (one noun per command group, each once).
 package main
@@ -147,8 +147,8 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: fabric <command> [flags]
 
-  init     create a new namespace on this device (it becomes the master)
-  join     request admission to an existing namespace; the bootstrap is a
+  init     create a new circle on this device (it becomes the master)
+  join     request admission to an existing circle; the bootstrap is a
            full multiaddr or a bare hostname with a _fabric TXT record
            (fabric join -name laptop gate.example.com)
   up       run the node daemon
@@ -221,7 +221,7 @@ func cmdInit(args []string) error {
 	name := fs.String("name", "", "human label for this device (required)")
 	listen := fs.String("listen", defaultListen, "listen multiaddrs, comma-separated")
 	subnet := fs.String("subnet", "100.64.0.0/24", "overlay subnet for the TUN bridge (empty to disable overlay addressing)")
-	circleName := fs.String("circle", "home", "name of the home circle minted around the root key (the namespace and the circle are one key)")
+	circleName := fs.String("circle", "home", "name of the home circle minted around the root key (the circle's key is the root key)")
 	fs.Parse(args)
 	if *name == "" {
 		return fmt.Errorf("init: -name is required")
@@ -254,20 +254,20 @@ func cmdInit(args []string) error {
 		fmt.Println("reusing this device's existing identity key")
 	}
 
-	// Mint the namespace: the first device self-signs (spec §6).
+	// Mint the home circle: the first device self-signs (spec §6).
 	seed := make([]byte, ed25519.SeedSize)
 	if _, err := rand.Read(seed); err != nil {
 		return err
 	}
 	rootPriv := ed25519.NewKeyFromSeed(seed)
-	pass, err := passphrase("passphrase for the namespace root key: ")
+	pass, err := passphrase("passphrase for the root key (it is also the home circle's key): ")
 	if err != nil {
 		return err
 	}
 	if err := keystore.SaveSeed(dir.KeystorePath(), seed, pass); err != nil {
 		return err
 	}
-	// The home circle is the same key: the namespace DID is the circle DID,
+	// The home circle is the same key: the circle DID is the root,
 	// the device cert is the home-circle attestation (mesh-root merge).
 	home, err := circle.InitFromSeed(circle.Root(dir.Path), *circleName, seed, pass)
 	if err != nil {
@@ -307,15 +307,15 @@ func cmdInit(args []string) error {
 
 	nsDID := cert.DIDForKey(rootPriv.Public().(ed25519.PublicKey))
 	if err := dir.SaveConfig(state.Config{
-		Name:         *name,
-		ListenAddrs:  listenAddrs,
-		NamespaceDID: nsDID,
-		Subnet:       *subnet,
+		Name:        *name,
+		ListenAddrs: listenAddrs,
+		CircleDID:   nsDID,
+		Subnet:      *subnet,
 	}); err != nil {
 		return err
 	}
 
-	fmt.Printf("namespace created: %s\n", nsDID)
+	fmt.Printf("home circle created: %s (its key is the root key)\n", nsDID)
 	fmt.Printf("this device (%q) is the master and holds the root key; home circle %q is the same key\n", *name, *circleName)
 	if masterIP != "" {
 		fmt.Printf("overlay subnet %s; this device is %s\n", *subnet, masterIP)
@@ -361,7 +361,7 @@ func cmdUp(args []string) error {
 	if !*noVault || !*noAstral {
 		d.Circle = daemon.NewCircleService(d.Host, d.Auth, circlesRoot)
 		d.Circle.SetOwnCert(d.OwnCert)
-		d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.CertIn)
+		d.Circle.SetHome(d.CircleDID, d.Roots, d.Store.CertIn)
 		d.Circle.SetPeerTable(d.Store)
 		d.Circle.AttachSync(d.Sync)
 	}
@@ -465,7 +465,7 @@ func cmdStatus(args []string) error {
 	if s.RefusedInbound > 0 {
 		fmt.Printf("dark: refused %d inbound connection(s) from peers not in the member store since start\n", s.RefusedInbound)
 	}
-	fmt.Printf("namespace %s\n", s.NamespaceDID)
+	fmt.Printf("circle %s\n", s.CircleDID)
 	if s.OverlayIP != "" {
 		tun := "tun down (other transports still work)"
 		if s.TUNActive {
@@ -704,7 +704,7 @@ func cmdJoin(args []string) error {
 		return err
 	}
 	if _, err := dir.LoadConfig(); err == nil {
-		return fmt.Errorf("state dir %s already belongs to a namespace — to re-join a new one, remove %s/config.json (and the old cert.cbor/events.cbor) first; the device key is kept", dir.Path, dir.Path)
+		return fmt.Errorf("state dir %s already belongs to a circle — to re-join a new one, remove %s/config.json (and the old cert.cbor/events.cbor) first; the device key is kept", dir.Path, dir.Path)
 	}
 	priv, reused, err := dir.EnsureDeviceKey()
 	if err != nil {
@@ -739,19 +739,19 @@ func cmdJoin(args []string) error {
 		resp, err = admission.Request(ctx, h, target.ID, req)
 		cancel()
 		// The joiner's side of the ceremony: the master's human compares
-		// OUR fingerprint; we get shown the namespace we are about to
-		// trust. A DNS-pinned namespace (ns= in the TXT record) verifies
+		// OUR fingerprint; we get shown the circle we are about to
+		// trust. A DNS-pinned circle (ns= in the TXT record) verifies
 		// itself; otherwise it's the human's to check.
-		if err == nil && !shownNS && resp.NamespaceDID != "" {
+		if err == nil && !shownNS && resp.CircleDID != "" {
 			shownNS = true
-			fmt.Printf("\nqueue host serves namespace %s\n", resp.NamespaceDID)
+			fmt.Printf("\nqueue host serves circle %s\n", resp.CircleDID)
 			switch {
 			case expectNS == "":
-				fmt.Println("verify this matches the namespace on the master (fabric status / UI header) before it approves.")
-			case resp.NamespaceDID != expectNS:
-				return fmt.Errorf("namespace mismatch: the _fabric DNS record promises %s — refusing to join", expectNS)
+				fmt.Println("verify this matches the circle on the master (fabric status / UI header) before it approves.")
+			case resp.CircleDID != expectNS:
+				return fmt.Errorf("circle mismatch: the _fabric DNS record promises %s — refusing to join", expectNS)
 			default:
-				fmt.Println("matches the _fabric DNS record — namespace pre-verified.")
+				fmt.Println("matches the _fabric DNS record — circle pre-verified.")
 			}
 			fmt.Print("waiting for approval")
 		}
@@ -782,16 +782,16 @@ func cmdJoin(args []string) error {
 
 approved:
 	fmt.Println()
-	if expectNS != "" && resp.NamespaceDID != expectNS {
-		return fmt.Errorf("namespace mismatch: the _fabric DNS record promises %s but the cert came from %s — refusing to join", expectNS, resp.NamespaceDID)
+	if expectNS != "" && resp.CircleDID != expectNS {
+		return fmt.Errorf("circle mismatch: the _fabric DNS record promises %s but the cert came from %s — refusing to join", expectNS, resp.CircleDID)
 	}
 	c, err := cert.Unmarshal(resp.Cert)
 	if err != nil {
 		return fmt.Errorf("received cert: %w", err)
 	}
-	nsPub, err := cert.KeyForDID(resp.NamespaceDID)
+	nsPub, err := cert.KeyForDID(resp.CircleDID)
 	if err != nil {
-		return fmt.Errorf("received namespace DID: %w", err)
+		return fmt.Errorf("received circle DID: %w", err)
 	}
 	if err := cert.Verify(c, nsPub, time.Now()); err != nil {
 		return fmt.Errorf("received cert does not verify: %w", err)
@@ -808,14 +808,14 @@ approved:
 		return err
 	}
 	if err := dir.SaveConfig(state.Config{
-		Name:         *name,
-		ListenAddrs:  listenAddrs,
-		NamespaceDID: resp.NamespaceDID,
-		Bootstrap:    bootAddrs,
+		Name:        *name,
+		ListenAddrs: listenAddrs,
+		CircleDID:   resp.CircleDID,
+		Bootstrap:   bootAddrs,
 	}); err != nil {
 		return err
 	}
-	fmt.Printf("admitted to namespace %s as %q\n", resp.NamespaceDID, *name)
+	fmt.Printf("admitted to circle %s as %q\n", resp.CircleDID, *name)
 	fmt.Printf("start the node with: fabric up -state %s\n", dir.Path)
 	return nil
 }
@@ -854,7 +854,7 @@ func showDeviceIdentity(statePath string) error {
 
 // joinBundle is the cold start (task circle-member-devices, slice E): a
 // machine with no circle installs a device bundle an owner signed for its
-// key and is thereby a device of exactly that circle — no namespace, no
+// key and is thereby a device of exactly that circle — no circle, no
 // cert, no overlay unless the attestation carries one. The bundle's gate
 // hints become its bootstrap peers; everything else arrives by gossip
 // inside the circle.
@@ -933,7 +933,7 @@ func joinBundle(statePath, file, name string, listenAddrs []string) error {
 //     _fabric.gate.example.com. TXT "v=fabric1; peer=<peer-id>; ns=<did:key:…>"
 //
 //     (`fabric announce txt` on the lighthouse prints that line.) The
-//     optional ns= pre-pins the namespace: the join hard-fails on any
+//     optional ns= pre-pins the circle: the join hard-fails on any
 //     mismatch instead of leaning on the human fingerprint check.
 func resolveBootstrap(arg string) (addrs []string, expectNS string, err error) {
 	if strings.HasPrefix(arg, "/") {
@@ -951,7 +951,7 @@ func resolveBootstrap(arg string) (addrs []string, expectNS string, err error) {
 		}
 		return nil, "", fmt.Errorf(`cannot resolve %q as a join shortcut: _fabric.%s TXT lookup: %v
 publish this DNS record (printed by 'fabric announce txt' on the queue host):
-  _fabric.%s. TXT "v=fabric1; peer=<peer-id>; ns=<namespace-did>"
+  _fabric.%s. TXT "v=fabric1; peer=<peer-id>; ns=<circle-did>"
 or pass a full multiaddr including /p2p/<peer-id>`, arg, host, err, host)
 	}
 	comp := "/dns4/" + host
@@ -968,7 +968,7 @@ or pass a full multiaddr including /p2p/<peer-id>`, arg, host, err, host)
 	}, ns, nil
 }
 
-// parseFabricTXT picks the peer-ID and optional namespace DID out of
+// parseFabricTXT picks the peer-ID and optional circle DID out of
 // _fabric TXT strings ("v=fabric1; peer=<id>; ns=<did>").
 func parseFabricTXT(txts []string) (peerID, ns string) {
 	for _, txt := range txts {
@@ -1041,7 +1041,7 @@ func cmdApprove(args []string) error {
 		return err
 	}
 	if !dir.IsMaster() {
-		return fmt.Errorf("no namespace root key in %s — approvals happen on the master", dir.Path)
+		return fmt.Errorf("no root key in %s — approvals happen on the master", dir.Path)
 	}
 	client := daemon.NewClient(dir)
 	pending, err := client.Pending()
@@ -1120,10 +1120,10 @@ func cmdApprove(args []string) error {
 	return nil
 }
 
-// unlockRootKey prompts for the passphrase and loads the namespace root key.
+// unlockRootKey prompts for the passphrase and loads the root key.
 // Signing always happens in the CLI process; the daemon never sees the key.
 func unlockRootKey(dir state.Dir) (ed25519.PrivateKey, error) {
-	pass, err := passphrase("namespace root key passphrase: ")
+	pass, err := passphrase("root key passphrase: ")
 	if err != nil {
 		return nil, err
 	}
@@ -1148,7 +1148,7 @@ func cmdRevoke(args []string) error {
 		return err
 	}
 	if !dir.IsMaster() {
-		return fmt.Errorf("no namespace root key in %s — revocation happens on the master", dir.Path)
+		return fmt.Errorf("no root key in %s — revocation happens on the master", dir.Path)
 	}
 	client := daemon.NewClient(dir)
 	members, err := client.Members()
@@ -1196,7 +1196,7 @@ func cmdRevoke(args []string) error {
 	if err := client.Revoke(signedEv); err != nil {
 		return err
 	}
-	fmt.Printf("revoked: %q is out of the namespace\n", m.Name)
+	fmt.Printf("revoked: %q is out of the circle\n", m.Name)
 	return nil
 }
 
@@ -1246,7 +1246,7 @@ func cmdRenew(args []string) error {
 		return err
 	}
 	if !dir.IsMaster() {
-		return fmt.Errorf("no namespace root key in %s — renewal happens on the master", dir.Path)
+		return fmt.Errorf("no root key in %s — renewal happens on the master", dir.Path)
 	}
 	client := daemon.NewClient(dir)
 	members, err := client.Members()
@@ -1691,6 +1691,6 @@ func cmdAnnounceTXT(args []string) error {
 		}
 	}
 	fmt.Printf("publish this DNS record to enable 'fabric join %s':\n", host)
-	fmt.Printf("_fabric.%s. 300 IN TXT \"v=fabric1; peer=%s; ns=%s\"\n", host, pid, cfg.NamespaceDID)
+	fmt.Printf("_fabric.%s. 300 IN TXT \"v=fabric1; peer=%s; ns=%s\"\n", host, pid, cfg.CircleDID)
 	return nil
 }

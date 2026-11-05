@@ -365,7 +365,7 @@ func TestOlderExchangeVersionsSeeOnlyLegacyForms(t *testing.T) {
 }
 
 // A node's membership cert doubles as its attestation into its home circle
-// (the circle whose DID is the namespace DID): no separate `circle attest`.
+// (the circle whose DID is the circle DID): no separate `circle attest`.
 func TestHomeCircleAttestedByCert(t *testing.T) {
 	owner, err := circle.Init(t.TempDir(), "home", "pw")
 	if err != nil {

@@ -1,4 +1,4 @@
-// Package keystore stores the namespace root seed at rest as an
+// Package keystore stores the root key seed at rest as an
 // age-encrypted file (passphrase mode, scrypt KDF) — the "strongly encrypted
 // container" of the security-model spec §1. The plaintext seed must only
 // ever live in memory during a signing session; callers are responsible for

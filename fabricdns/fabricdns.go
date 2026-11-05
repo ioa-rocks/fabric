@@ -1,6 +1,6 @@
 // Package fabricdns answers `<member>.fabric` — the mesh's own name
 // service. The zone is the member store: every cert carries a name and an
-// overlay IP, both signed by the namespace root key, so resolution needs no
+// overlay IP, both signed by the root key, so resolution needs no
 // extra state, no coordination, and no external DNS. The server binds the
 // node's own overlay address (it exists exactly when the TUN bridge is up)
 // and answers only for the .fabric suffix; everything else is refused so a

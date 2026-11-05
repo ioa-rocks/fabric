@@ -54,9 +54,9 @@ func newTestDaemonCfg(t *testing.T, nsPriv ed25519.PrivateKey, name string, even
 		t.Fatal(err)
 	}
 	cfg := state.Config{
-		Name:         name,
-		ListenAddrs:  []string{"/ip4/127.0.0.1/udp/0/quic-v1", "/ip4/127.0.0.1/tcp/0"},
-		NamespaceDID: cert.DIDForKey(nsPriv.Public().(ed25519.PublicKey)),
+		Name:        name,
+		ListenAddrs: []string{"/ip4/127.0.0.1/udp/0/quic-v1", "/ip4/127.0.0.1/tcp/0"},
+		CircleDID:   cert.DIDForKey(nsPriv.Public().(ed25519.PublicKey)),
 	}
 	if tweak != nil {
 		tweak(&cfg)
@@ -271,7 +271,7 @@ func TestRemoteQueueDrivenByMasterDevice(t *testing.T) {
 func attachCircles(d *Daemon) {
 	d.Circle = NewCircleService(d.Host, d.Auth, circle.Root(d.Dir.Path))
 	d.Circle.SetOwnCert(d.OwnCert)
-	d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.CertIn)
+	d.Circle.SetHome(d.CircleDID, d.Roots, d.Store.CertIn)
 	d.Circle.SetPeerTable(d.Store)
 	d.Circle.AttachSync(d.Sync)
 }
@@ -383,8 +383,8 @@ func TestColdStartDeviceJoinsOneCircleThroughGate(t *testing.T) {
 		cold.Stop()
 	})
 	attachCircles(cold)
-	if cold.NamespaceDID() != famDID {
-		t.Fatalf("cold device's first circle = %s, want family", cold.NamespaceDID())
+	if cold.CircleDID() != famDID {
+		t.Fatalf("cold device's first circle = %s, want family", cold.CircleDID())
 	}
 	if c := cold.OwnCert(); c == nil || c.Payload.Sub != famDID || c.Payload.Meta.Name != "her-pc" {
 		t.Fatalf("cold device's own assert view: %+v", c)

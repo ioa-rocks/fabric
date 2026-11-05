@@ -267,7 +267,7 @@ func TestDelegatedCertAcceptedAndCascades(t *testing.T) {
 	}
 }
 
-func TestForeignNamespaceCertRejected(t *testing.T) {
+func TestForeignCircleCertRejected(t *testing.T) {
 	nsPub, nsPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -277,14 +277,14 @@ func TestForeignNamespaceCertRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := newNode(t, nsPub, nsPriv, "node-b", true, 300*time.Millisecond)
-	// Holds a formally valid cert — but from a different namespace root.
+	// Holds a formally valid cert — but from a different circle root.
 	imposter := newNode(t, nsPub, foreignPriv, "imposter", true, 300*time.Millisecond)
 
 	connect(t, imposter, b)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := imposter.auth.Authenticate(ctx, b.host.ID()); err == nil {
-		t.Fatal("foreign-namespace cert accepted")
+		t.Fatal("foreign-circle cert accepted")
 	}
 	if b.store.IsMember(imposter.host.ID(), time.Now()) {
 		t.Fatal("imposter recorded as member")

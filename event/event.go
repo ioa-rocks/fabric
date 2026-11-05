@@ -39,7 +39,7 @@ type Payload struct {
 	At     int64  `cbor:"at"`               // unix seconds
 }
 
-// Event is a payload plus the namespace root key's signature over the
+// Event is a payload plus the root key's signature over the
 // payload's deterministic CBOR encoding.
 type Event struct {
 	Payload Payload `cbor:"payload"`
@@ -68,7 +68,7 @@ func NewAdded(rootPriv ed25519.PrivateKey, c *cert.Cert, at time.Time) (*Event, 
 }
 
 // NewRevoked signs a MemberRevoked event cutting a device key out of the
-// namespace.
+// circle.
 func NewRevoked(rootPriv ed25519.PrivateKey, devicePub ed25519.PublicKey, at time.Time) (*Event, error) {
 	if len(devicePub) != ed25519.PublicKeySize {
 		return nil, errors.New("device key is not an ed25519 public key")
@@ -129,8 +129,8 @@ func Verify(e *Event, roots statement.Roots, now time.Time) error {
 }
 
 // VerifyKey is Verify against a single root key.
-func VerifyKey(e *Event, namespacePub ed25519.PublicKey, now time.Time) error {
-	return Verify(e, statement.NewDIDRoot(cert.DIDForKey(namespacePub)), now)
+func VerifyKey(e *Event, rootPub ed25519.PublicKey, now time.Time) error {
+	return Verify(e, statement.NewDIDRoot(cert.DIDForKey(rootPub)), now)
 }
 
 // AddedCert decodes the certificate carried by a MemberAdded event.

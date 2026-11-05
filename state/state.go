@@ -1,12 +1,12 @@
 // Package state persists a node's identity and configuration in a state
 // directory (default ~/.config/fabric):
 //
-//	config.json        — name, listen addrs, namespace DID, bootstrap peers
+//	config.json        — name, listen addrs, circle DID, bootstrap peers
 //	device.key         — libp2p ed25519 identity (protobuf), 0600
 //	cert.cbor          — this node's membership certificate
 //	events.cbor        — membership-event log (admissions, revocations)
 //	records.cbor       — cached signed peer address records (restart warm-up)
-//	namespace.key.age  — namespace root seed, master only (see keystore)
+//	namespace.key.age  — root key seed, master only (see keystore)
 //	control.sock       — daemon control socket, runtime only
 package state
 
@@ -29,10 +29,10 @@ import (
 )
 
 type Config struct {
-	Name         string   `json:"name"`
-	ListenAddrs  []string `json:"listen_addrs"`
-	NamespaceDID string   `json:"namespace_did"` // the home circle's DID: the root certs verify against
-	Bootstrap    []string `json:"bootstrap"`     // multiaddrs including /p2p/<peer-id>; operator-configured (join, peer add): the lighthouses this node trusts as NAT oracles
+	Name        string   `json:"name"`
+	ListenAddrs []string `json:"listen_addrs"`
+	CircleDID   string   `json:"namespace_did"` // the home circle's DID: the root certs verify against
+	Bootstrap   []string `json:"bootstrap"`     // multiaddrs including /p2p/<peer-id>; operator-configured (join, peer add): the lighthouses this node trusts as NAT oracles
 	// DiscoveredBootstrap are lighthouse addresses pinned from what connected
 	// members advertised (daemon.pinQueueHosts): dialed like Bootstrap for
 	// recovery, but not trusted for anything — a member can advertise a
@@ -81,7 +81,7 @@ func (d Dir) certPath() string      { return filepath.Join(d.Path, "cert.cbor") 
 func (d Dir) eventsPath() string    { return filepath.Join(d.Path, "events.cbor") }
 func (d Dir) recordsPath() string   { return filepath.Join(d.Path, "records.cbor") }
 
-// KeystorePath is where the master's namespace root seed lives.
+// KeystorePath is where the master's root key seed lives.
 func (d Dir) KeystorePath() string { return filepath.Join(d.Path, "namespace.key.age") }
 
 // ControlSocketPath is the daemon's local control endpoint. Unix socket
@@ -101,7 +101,7 @@ func (d Dir) ControlSocketPath() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("fabric-%s.sock", hex.EncodeToString(sum[:6])))
 }
 
-// IsMaster reports whether this state dir holds the namespace root seed.
+// IsMaster reports whether this state dir holds the root key seed.
 func (d Dir) IsMaster() bool {
 	_, err := os.Stat(d.KeystorePath())
 	return err == nil
@@ -129,8 +129,8 @@ func (d Dir) LoadConfig() (Config, error) {
 
 // EnsureDeviceKey returns this node's libp2p identity, generating and
 // persisting one on first use. An existing key is never overwritten — a
-// device keeps its identity across namespaces (re-join after a namespace
-// re-init reuses it; only membership is namespace-specific). reused reports
+// device keeps its identity across circles (re-join after a circle
+// re-init reuses it; only membership is circle-specific). reused reports
 // whether a key was already there.
 func (d Dir) EnsureDeviceKey() (priv crypto.PrivKey, reused bool, err error) {
 	if data, err := os.ReadFile(d.deviceKeyPath()); err == nil {

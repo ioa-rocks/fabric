@@ -31,11 +31,11 @@ func TestSaveLoadRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The restored seed must re-derive the same namespace key (the
+	// The restored seed must re-derive the same circle key (the
 	// "recovery drill" property from spec §1).
 	want := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
 	if !want.Equal(ed25519.NewKeyFromSeed(got).Public().(ed25519.PublicKey)) {
-		t.Fatal("restored seed derives a different namespace key")
+		t.Fatal("restored seed derives a different circle key")
 	}
 }
 

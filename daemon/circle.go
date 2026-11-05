@@ -68,7 +68,7 @@ type CircleService struct {
 	auth *fabricnet.AuthService
 	root string
 	// ownCert, when set, is this node's membership cert: for the home
-	// circle (the circle whose DID is the namespace DID) it *is* the device
+	// circle (the circle whose DID is the circle DID) it *is* the device
 	// attestation — one assert per device (mesh-root merge) — so a node
 	// needs no separate `circle attest` into its own home circle.
 	ownCert func() *cert.Cert

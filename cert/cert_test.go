@@ -94,9 +94,9 @@ func TestVerifyRejections(t *testing.T) {
 		return c
 	}
 
-	t.Run("wrong namespace", func(t *testing.T) {
+	t.Run("wrong circle", func(t *testing.T) {
 		if err := Verify(valid(t), otherPub, now); err == nil {
-			t.Fatal("verified against wrong namespace key")
+			t.Fatal("verified against wrong circle key")
 		}
 	})
 	t.Run("expired", func(t *testing.T) {

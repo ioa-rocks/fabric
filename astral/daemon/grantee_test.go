@@ -81,7 +81,7 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	}
 	if err := gate.dir.SaveConfig(fabricstate.Config{
 		Name: "gate", ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"},
-		NamespaceDID: cert.DIDForKey(root.Public().(ed25519.PublicKey)), Listed: true,
+		CircleDID: cert.DIDForKey(root.Public().(ed25519.PublicKey)), Listed: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -97,11 +97,11 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	// service fell back to the legacy exchange, which until 2026-11-05
 	// leaked every circle and so hid the missing wiring.
 	fgate.Circle.SetOwnCert(fgate.OwnCert)
-	fgate.Circle.SetHome(fgate.NamespaceDID, fgate.Roots, fgate.Store.CertIn)
+	fgate.Circle.SetHome(fgate.CircleDID, fgate.Roots, fgate.Store.CertIn)
 	fgate.Circle.SetPeerTable(fgate.Store)
 	fgate.Circle.AttachSync(fgate.Sync)
 	fgate.Circle.SetOwnCert(fgate.OwnCert)
-	fgate.Circle.SetHome(fgate.NamespaceDID, fgate.Roots, fgate.Store.CertIn)
+	fgate.Circle.SetHome(fgate.CircleDID, fgate.Roots, fgate.Store.CertIn)
 	dgate := startDaemon(t, gate.statePath, fgate)
 	clGate := daemon.NewClient(gate.statePath)
 	if err := clGate.Declare("subject:jobs", astral.DeliveryShared, nil); err != nil {
@@ -157,7 +157,7 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 			case w.ID().String():
 				worker = p.Grantee && len(p.Circles) == 1 && p.Circles[0] == signer.Circle
 			case fdesk.Host.ID().String():
-				member = p.Member && len(p.Circles) == 1 && p.Circles[0] == st.NamespaceDID
+				member = p.Member && len(p.Circles) == 1 && p.Circles[0] == st.CircleDID
 			}
 		}
 		if !worker || !member {

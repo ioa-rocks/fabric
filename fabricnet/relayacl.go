@@ -7,7 +7,7 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-// RelayACL restricts a lighthouse's circuit-relay-v2 service to namespace
+// RelayACL restricts a lighthouse's circuit-relay-v2 service to circle
 // members: only members may reserve a slot, and circuits are allowed only
 // between two members. The relay carries whatever the mesh needs (TUN
 // traffic included, hence infinite limits at the call site) — but never

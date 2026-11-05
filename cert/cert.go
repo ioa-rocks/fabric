@@ -192,7 +192,7 @@ func ScopeString(scope []string) string {
 // view every caller reads for a statement certificate too (derived from the
 // statement: Cmd from the admin verb, Meta.Scope from the resource verbs).
 type Payload struct {
-	Iss   string   `cbor:"iss"` // issuer: namespace root key, did:key
+	Iss   string   `cbor:"iss"` // issuer: root key, did:key
 	Aud   string   `cbor:"aud"` // audience: the member device key, did:key
 	Sub   string   `cbor:"sub"` // subject: the circle DID (== Iss until the mesh-root merge)
 	Cmd   string   `cbor:"cmd"` // role: CmdMember or CmdAdmin
@@ -395,7 +395,7 @@ func Renew(rootPriv ed25519.PrivateKey, old *Cert, nbf time.Time, validity time.
 // renewal, never a new identity). Identity and role are still preserved.
 func RenewMeta(rootPriv ed25519.PrivateKey, old *Cert, meta Meta, nbf time.Time, validity time.Duration) (*Cert, error) {
 	if did.ForKey(rootPriv.Public().(ed25519.PublicKey)) != old.Payload.Iss {
-		return nil, errors.New("renewal key does not match the certificate's namespace")
+		return nil, errors.New("renewal key does not match the certificate's circle")
 	}
 	devPub, err := old.DeviceKey()
 	if err != nil {
@@ -423,18 +423,18 @@ func (c *Cert) payloadBytes() ([]byte, error) {
 // Verify checks a certificate against the expected root key at the given
 // time. It returns nil only if the cert is a currently valid membership
 // proof for the circle that key roots.
-func Verify(c *Cert, namespacePub ed25519.PublicKey, now time.Time) error {
+func Verify(c *Cert, rootPub ed25519.PublicKey, now time.Time) error {
 	if c.Stmt != nil {
-		return VerifyRoots(c, statement.RootMap{did.ForKey(namespacePub): {namespacePub}}, now)
+		return VerifyRoots(c, statement.RootMap{did.ForKey(rootPub): {rootPub}}, now)
 	}
 	issKey, err := did.KeyFor(c.Payload.Iss)
 	if err != nil {
 		return fmt.Errorf("issuer: %w", err)
 	}
-	if !bytes.Equal(issKey, namespacePub) {
-		return errors.New("issuer is not this namespace's root key")
+	if !bytes.Equal(issKey, rootPub) {
+		return errors.New("issuer is not this circle's root key")
 	}
-	// A legacy cert is always root-issued: issuer owns the namespace and
+	// A legacy cert is always root-issued: issuer owns the circle and
 	// the proof chain is empty (parsed, but rejected — spec §2).
 	if c.Payload.Sub != c.Payload.Iss {
 		return errors.New("legacy certificate with sub != iss")
@@ -455,7 +455,7 @@ func Verify(c *Cert, namespacePub ed25519.PublicKey, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	if !ed25519.Verify(namespacePub, msg, c.Sig) {
+	if !ed25519.Verify(rootPub, msg, c.Sig) {
 		return errors.New("signature verification failed")
 	}
 	return nil

@@ -41,7 +41,7 @@ import (
 // The circle is the node's ownership layer (ADR 0017): a user key that
 // buckets — and, next, astral subjects and grants — belong to. A node holds
 // any number of circles under <state>/circles/<name> (ADR 0011: a device
-// participates in several namespaces): its owner's personal circle, a
+// participates in several circles): its owner's personal circle, a
 // shared "family" circle, … Each is managed here, not by any one data
 // plane. Vault serves a bucket only to verified devices of the circle that
 // owns it — mesh membership alone grants nothing.
@@ -902,7 +902,7 @@ func cmdCircleAdmit(args []string) error {
 		}
 		prefix := c.Config.Prefix
 		cfg, _ := dir.LoadConfig()
-		if cfg.NamespaceDID != "" && cfg.NamespaceDID != c.Config.DID {
+		if cfg.CircleDID != "" && cfg.CircleDID != c.Config.DID {
 			// One overlay per device until the per-circle bridge lands
 			// (task slice H): the bridge has one route table and would
 			// route between prefixes (Codex review, 2026-11-05).
@@ -916,7 +916,7 @@ func cmdCircleAdmit(args []string) error {
 		if where, ip := deviceOverlayElsewhere(root, client, c, deviceDID); where != "" {
 			return fmt.Errorf("%s already holds overlay address %s in circle %s — one overlay per device until the per-circle bridge lands; admit without -tun", memberName, ip, where)
 		}
-		if prefix == "" && cfg.NamespaceDID == c.Config.DID {
+		if prefix == "" && cfg.CircleDID == c.Config.DID {
 			prefix = cfg.Subnet // the first circle minted before prefixes lived with the circle
 		}
 		if prefix == "" {

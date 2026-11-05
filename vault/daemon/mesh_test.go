@@ -117,17 +117,17 @@ func (n *meshNode) writeConfig(t *testing.T, root ed25519.PrivateKey, name strin
 		t.Fatalf("SaveEvents: %v", err)
 	}
 	if err := n.dir.SaveConfig(fabricstate.Config{
-		Name:         name,
-		ListenAddrs:  []string{"/ip4/127.0.0.1/tcp/0"},
-		NamespaceDID: cert.DIDForKey(root.Public().(ed25519.PublicKey)),
-		Bootstrap:    bootstrap,
+		Name:        name,
+		ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"},
+		CircleDID:   cert.DIDForKey(root.Public().(ed25519.PublicKey)),
+		Bootstrap:   bootstrap,
 	}); err != nil {
 		t.Fatalf("SaveConfig: %v", err)
 	}
 }
 
 // TestTwoNodeMesh runs two vault daemons whose fabric nodes share a
-// namespace but serve *different* circles, lets B dial A, and asserts B's
+// circle but serve *different* circles, lets B dial A, and asserts B's
 // status shows A as a vault peer claiming alex's circle — and not as a
 // device of B's own circle: member auth, the hello card, vault-peer
 // discovery and the circle exchange all work over a real transport.

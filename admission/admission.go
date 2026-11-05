@@ -55,13 +55,13 @@ type JoinRequest struct {
 }
 
 // JoinResponse reports the request's state. On approval it carries the
-// signed membership certificate and the namespace DID the joiner should
+// signed membership certificate and the circle DID the joiner should
 // verify it against (trust in that DID is established by the out-of-band
 // fingerprint comparison, spec §3).
 type JoinResponse struct {
-	Status       Status `cbor:"status"`
-	NamespaceDID string `cbor:"namespace,omitempty"`
-	Cert         []byte `cbor:"cert,omitempty"`
+	Status    Status `cbor:"status"`
+	CircleDID string `cbor:"namespace,omitempty"`
+	Cert      []byte `cbor:"cert,omitempty"`
 }
 
 // Fingerprint is the short human-comparable handle for a device key, shown
@@ -188,8 +188,8 @@ func (q *Queue) Deny(fingerprint string) error {
 }
 
 // Attach wires the queue onto a host as the /fabric/join/1 responder.
-// namespaceDID is read per request, not captured.
-func Attach(h host.Host, q *Queue, namespaceDID func() string) {
+// circleDID is read per request, not captured.
+func Attach(h host.Host, q *Queue, circleDID func() string) {
 	h.SetStreamHandler(ProtocolID, func(s network.Stream) {
 		defer s.Close()
 		_ = s.SetDeadline(time.Now().Add(30 * time.Second))
@@ -204,7 +204,7 @@ func Attach(h host.Host, q *Queue, namespaceDID func() string) {
 			return
 		}
 		status, certBytes := q.Submit(req)
-		resp := JoinResponse{Status: status, NamespaceDID: namespaceDID(), Cert: certBytes}
+		resp := JoinResponse{Status: status, CircleDID: circleDID(), Cert: certBytes}
 		out, err := cbor.Marshal(resp)
 		if err != nil {
 			s.Reset()
