@@ -194,3 +194,99 @@ func TestRosterTieBreakIsDeterministic(t *testing.T) {
 		t.Fatal("the winner of an expiry tie depends on arrival order")
 	}
 }
+
+// A root move folds two rosters into one, one entry per device. A device
+// holding an old-root assert with an overlay address and a plain assert in
+// the destination circle keeps the wider one, whichever arrived first,
+// until the move re-issues its address under the new root — and a
+// revocation by the new root reaches the kept old-root assert all the same
+// (Codex review, 2026-11-05).
+func TestRootMoveKeepsTheWiderAssertUntilReissue(t *testing.T) {
+	main, _ := Init(t.TempDir(), "main", "pw")
+	fam, _ := Init(t.TempDir(), "family", "pw")
+	mainPriv, _ := main.Unlock("pw")
+	famPriv, _ := fam.Unlock("pw")
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	dev := did.ForKey(devPub)
+	now := time.Now()
+	tunVerbs := append(append([]string{}, DeviceVerbs...), statement.VerbTun)
+	mainTun, _ := AttestWith(mainPriv, nil, main.Config.DID, devPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	famPlain, _ := Attest(famPriv, devPub, now.Add(time.Minute)) // later-expiring, fewer grants
+	moved := statement.NewDIDRoots(fam.Config.DID, main.Config.DID)
+
+	for _, order := range [][]*Attestation{{mainTun, famPlain}, {famPlain, mainTun}} {
+		r := NewRoster(moved)
+		for _, a := range order {
+			r, _, _ = r.Add(a.Stmt, now)
+		}
+		d, _ := r.Device(dev)
+		if d.Stmt.ID() != mainTun.Stmt.ID() {
+			t.Fatalf("entry is the %s assert, want the old root's (it carries the address)", shortDID(d.Sub()))
+		}
+		if _, live := r.Live(dev, now.Add(time.Minute)); !live || len(r.UsedIPs()) != 1 {
+			t.Fatal("device not live with its address after the move")
+		}
+		// Re-issue under the new root: same grants, primary root — it wins.
+		famTun, _ := AttestWith(famPriv, nil, fam.Config.DID, devPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+		r, changed, _ := r.Add(famTun.Stmt, now)
+		if d, _ = r.Device(dev); !changed || d.Stmt.ID() != famTun.Stmt.ID() {
+			t.Fatal("the re-issued assert under the new root did not take over")
+		}
+	}
+
+	// Before re-issue the destination circle revokes the device: the kept
+	// old-root assert dies with it.
+	r := NewRoster(moved)
+	r, _, _ = r.Add(mainTun.Stmt, now)
+	r, _, _ = r.Add(famPlain.Stmt, now)
+	rev, _ := Revoke(famPriv, dev, now.Add(time.Second))
+	r, fresh, err := r.AddRevocation(rev.Stmt)
+	if err != nil || !fresh {
+		t.Fatalf("AddRevocation: fresh=%v err=%v", fresh, err)
+	}
+	if _, live := r.Live(dev, now.Add(2*time.Second)); live {
+		t.Fatal("the new root's revocation missed the device's old-root assert")
+	}
+	if _, revoked := r.Revoked(dev, now.Add(2*time.Second)); !revoked {
+		t.Fatal("device not reported revoked")
+	}
+	// And a dead primary assert wins over a verifying old-root one.
+	r = NewRoster(moved)
+	r, _, _ = r.AddRevocation(rev.Stmt)
+	r, _, _ = r.Add(famPlain.Stmt, now)
+	r, _, _ = r.Add(mainTun.Stmt, now)
+	if _, live := r.Live(dev, now.Add(2*time.Second)); live {
+		t.Fatal("a revoked device came back through its old-root assert")
+	}
+}
+
+// Within one root a later-expiring assert granting less never takes a
+// grant away: a plain circle admission of a device that already holds an
+// address keeps the address.
+func TestWiderAssertOutlivesALaterPlainOne(t *testing.T) {
+	c, _ := Init(t.TempDir(), "p", "pw")
+	priv, _ := c.Unlock("pw")
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	dev := did.ForKey(devPub)
+	now := time.Now()
+	tunVerbs := append(append([]string{}, DeviceVerbs...), statement.VerbTun)
+	withIP, _ := AttestWith(priv, nil, c.Config.DID, devPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	plain, _ := AttestFor(priv, devPub, now, 2*time.Hour)
+	for _, order := range [][]*Attestation{{withIP, plain}, {plain, withIP}} {
+		r := NewRoster(statement.NewDIDRoots(c.Config.DID))
+		for _, a := range order {
+			r, _, _ = r.Add(a.Stmt, now)
+		}
+		if d, _ := r.Device(dev); d.Stmt.ID() != withIP.Stmt.ID() {
+			t.Fatal("a plain admission took the device's address away")
+		}
+	}
+	// A renewal carrying the same grants wins by expiry as before.
+	renewed, _ := AttestWith(priv, nil, c.Config.DID, devPub, now.Add(time.Minute), time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	r := NewRoster(statement.NewDIDRoots(c.Config.DID))
+	r, _, _ = r.Add(withIP.Stmt, now)
+	r, _, _ = r.Add(renewed.Stmt, now)
+	if d, _ := r.Device(dev); d.Stmt.ID() != renewed.Stmt.ID() {
+		t.Fatal("a renewal with the same grants did not replace the older assert")
+	}
+}

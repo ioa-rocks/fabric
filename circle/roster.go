@@ -245,14 +245,22 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, err
 	return nr, true, nil
 }
 
-// prefer decides whether next replaces cur.
+// prefer decides whether next replaces cur. Every rule names a single
+// winner for a pair whatever the argument order, so the roster converges
+// on the same entry whichever assert arrived first.
 func (r *Roster) prefer(cur, next *Device) bool {
 	if cur.Sub() != next.Sub() {
+		// Across roots the primary's assert wins — with one exception: while
+		// both verify, an old root's assert that grants strictly more (the
+		// overlay address the move has not re-issued under the new root yet)
+		// keeps the entry, so the device does not drop off the TUN between
+		// root-moved and its re-issue (Codex review, 2026-11-05). A dead
+		// primary assert still wins: the circle revoked the device.
 		switch r.roots.Primary() {
 		case next.Sub():
-			return true
+			return !outranksPrimary(cur, next)
 		case cur.Sub():
-			return false
+			return outranksPrimary(next, cur)
 		}
 	}
 	if (cur.dead != nil) != (next.dead != nil) {
@@ -260,6 +268,17 @@ func (r *Roster) prefer(cur, next *Device) bool {
 	}
 	if cur.lapsed != next.lapsed {
 		return cur.lapsed // a live assert lifts a lapsed one; a stale one never demotes
+	}
+	// Grants add up; only a revocation or a sweep takes one away. So an
+	// assert granting strictly more outlives a later-expiring one granting
+	// less (a plain circle admission never costs a device its address), and
+	// a re-attest with fewer verbs changes nothing until the wider assert
+	// expires or is swept.
+	if wider(next, cur) {
+		return true
+	}
+	if wider(cur, next) {
+		return false
 	}
 	if !next.Exp.Equal(cur.Exp) {
 		return next.Exp.After(cur.Exp)
@@ -275,6 +294,40 @@ func (r *Roster) prefer(cur, next *Device) bool {
 	return bytes.Compare(nid[:], cid[:]) > 0
 }
 
+// outranksPrimary says whether old, an assert in an old root still
+// honoured, keeps the roster entry over primary, the same device's assert
+// in the primary root: only while both verify and old grants strictly more.
+func outranksPrimary(old, primary *Device) bool {
+	return old.dead == nil && !old.lapsed && primary.dead == nil && wider(old, primary)
+}
+
+// grants is what an assert hands the device: its verbs, and the overlay
+// address it carries (an address is a grant to be routed to).
+func grants(dev *Device) map[string]bool {
+	out := make(map[string]bool, len(dev.Stmt.Payload.Verbs)+1)
+	for _, v := range dev.Stmt.Payload.Verbs {
+		out[v] = true
+	}
+	if m := dev.Stmt.Payload.Meta; m != nil && m.IP != "" {
+		out["ip:"+m.IP] = true
+	}
+	return out
+}
+
+// wider reports whether a grants a strict superset of what b grants.
+func wider(a, b *Device) bool {
+	ga, gb := grants(a), grants(b)
+	if len(ga) <= len(gb) {
+		return false
+	}
+	for g := range gb {
+		if !ga[g] {
+			return false
+		}
+	}
+	return true
+}
+
 // verdict is the time-independent half of the §6 checklist for one
 // device: sweeps, root still honoured, presenting key, member verb, and
 // revocations over the chain (Check at the window's start, so only the
@@ -283,10 +336,46 @@ func (r *Roster) verdict(dev *Device) error {
 	if at, ok := r.sweeps[dev.DID]; ok && dev.Stmt.Payload.Iat <= at {
 		return errors.New("device swept by the circle")
 	}
+	if err := r.revokedByCircle(dev); err != nil {
+		return err
+	}
 	return dev.Chain.Check(r.roots, r.revs, statement.Want{
 		Sub: dev.Sub(), Res: memberRes, Verb: statement.VerbMember,
 		PresentingKey: dev.DID, Now: dev.Nbf,
 	})
+}
+
+// revokedByCircle applies a root-issued revocation of the device signed by
+// any root the roster honours to its asserts whichever root signed them.
+// Check only matches a revocation to a link in the same circle; after a
+// root move the circle is one under two keys, and the new root's revocation
+// must reach the device's old-root assert (which prefer may be keeping for
+// its address until re-issue) — else the device the circle revoked stays
+// routable until the old root is retired.
+func (r *Roster) revokedByCircle(dev *Device) error {
+	id := dev.Stmt.ID()
+	for _, st := range r.revs.Candidates(id, dev.DID) {
+		t := st.Payload.Target
+		if t == nil || !st.IsRootIssued() || st.Payload.Sub == dev.Sub() || !r.roots.Honours(st.Payload.Sub) {
+			continue
+		}
+		if len(t.ID) != 0 && !bytes.Equal(t.ID, id[:]) {
+			continue
+		}
+		if len(t.ID) == 0 && (t.Aud != dev.DID || dev.Stmt.Payload.Iat > t.Before) {
+			continue
+		}
+		key, err := st.IssuerKey()
+		if err != nil {
+			continue
+		}
+		for _, rk := range r.roots.RootKeys(st.Payload.Sub) {
+			if bytes.Equal(rk, key) {
+				return fmt.Errorf("device revoked by the circle's root %s", st.Payload.Sub)
+			}
+		}
+	}
+	return nil
 }
 
 // rejudge re-derives one entry's verdict in place in a cloned roster,

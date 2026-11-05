@@ -686,3 +686,72 @@ func TestAttachLoadsTheCircleRevocations(t *testing.T) {
 		t.Fatal("the revoked device is not reported revoked")
 	}
 }
+
+// The route a device has in the overlay circle survives the root move
+// until its address is re-issued under the new root: the destination
+// circle's plain assert for the same device must not displace the old
+// root's assert that carries the address (Codex review, 2026-11-05).
+func TestRootMoveKeepsTheRouteUntilReissue(t *testing.T) {
+	main, _ := circle.Init(t.TempDir(), "main", "pw")
+	fam, _ := circle.Init(t.TempDir(), "family", "pw")
+	mainPriv, _ := main.Unlock("pw")
+	famPriv, _ := fam.Unlock("pw")
+	now := time.Now()
+	tunVerbs := append(append([]string{}, circle.DeviceVerbs...), statement.VerbTun)
+	nasPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	nas, _ := PeerOfDID(cert.DIDForKey(nasPub))
+	addr := netip.MustParseAddr("100.64.0.2")
+	nasMain, _ := circle.AttestWith(mainPriv, nil, main.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	nasFam, _ := circle.AttestFor(famPriv, nasPub, now, 2*time.Hour) // family admitted nas earlier: no tun
+
+	setup := func() (*PeerTable, *statement.DIDRoots) {
+		roots := statement.NewDIDRoots(main.Config.DID)
+		table := NewMemberStore(roots)
+		table.AddRoster(circle.NewRoster(statement.NewDIDRoots(fam.Config.DID)))
+		table.SetOverlay(netip.MustParsePrefix("100.64.0.1/24"))
+		for _, a := range []*circle.Attestation{nasMain, nasFam} {
+			if _, err := table.AddAssert(a.Stmt, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if p, ok := table.Route(addr); !ok || p != nas {
+			t.Fatalf("route before the move = %v %v", p, ok)
+		}
+		// root-moved published: the mesh continues under family's key.
+		roots.Set([]string{fam.Config.DID, main.Config.DID})
+		table.Recheck()
+		return table, roots
+	}
+
+	table, roots := setup()
+	if p, ok := table.Route(addr); !ok || p != nas {
+		t.Fatalf("route after the move, before re-issue = %v %v (want kept)", p, ok)
+	}
+	if !table.In(nas, fam.Config.DID, now) || !table.IsMember(nas, now) {
+		t.Fatal("nas lost its membership across the move")
+	}
+	// Re-issue under the new root, then retire the old one: the route stays.
+	nasFamTun, _ := circle.AttestWith(famPriv, nil, fam.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	if _, err := table.AddAssert(nasFamTun.Stmt, now); err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := table.Cert(nas); !ok || c.Stmt.Payload.Sub != fam.Config.DID {
+		t.Fatal("the re-issued assert under the new root did not take over")
+	}
+	roots.Set([]string{fam.Config.DID})
+	table.Recheck()
+	if p, ok := table.Route(addr); !ok || p != nas {
+		t.Fatalf("route after retirement = %v %v", p, ok)
+	}
+
+	// Before re-issue the circle revokes nas: the route goes, old-root
+	// assert or not.
+	table, _ = setup()
+	rev, _ := circle.Revoke(famPriv, cert.DIDForKey(nasPub), now.Add(time.Second))
+	if fresh, err := table.AddRevocation(fam.Config.DID, rev.Stmt); err != nil || !fresh {
+		t.Fatalf("AddRevocation: fresh=%v err=%v", fresh, err)
+	}
+	if _, ok := table.Route(addr); ok || table.IsMember(nas, now.Add(2*time.Second)) {
+		t.Fatal("a revoked device kept its route through its old-root assert")
+	}
+}
