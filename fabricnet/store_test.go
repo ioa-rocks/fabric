@@ -871,3 +871,111 @@ func TestRevokedEntryBorrowsNothingFromALiveOne(t *testing.T) {
 		t.Fatalf("nas.fabric = %v %v, want .2", a, ok)
 	}
 }
+
+// A device has one overlay address at a time — its first admitting
+// entry's, primary root first — and Route, AddrOf and Resolve all answer
+// with that one, settled per query: two live entries with different
+// addresses never make one-way traffic, and an entry running out hands
+// over to the next at once, no GC tick in between (Codex review,
+// 2026-11-05).
+func TestOneOverlayAddressAtATime(t *testing.T) {
+	main, _ := circle.Init(t.TempDir(), "main", "pw")
+	fam, _ := circle.Init(t.TempDir(), "family", "pw")
+	mainPriv, _ := main.Unlock("pw")
+	famPriv, _ := fam.Unlock("pw")
+	now := time.Now()
+	tunVerbs := append(append([]string{}, circle.DeviceVerbs...), statement.VerbTun)
+	nasPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	nas, _ := PeerOfDID(cert.DIDForKey(nasPub))
+	dot2, dot3 := netip.MustParseAddr("100.64.0.2"), netip.MustParseAddr("100.64.0.3")
+	moved := func(asserts ...*circle.Attestation) *PeerTable {
+		table := NewMemberStore(statement.NewDIDRoots(fam.Config.DID, main.Config.DID))
+		table.SetOverlay(netip.MustParsePrefix("100.64.0.1/24"))
+		for _, a := range asserts {
+			if _, err := table.AddAssert(a.Stmt, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return table
+	}
+	// Old root .2 for three hours, new root .3 for one: .3 while both
+	// admit, .2 the moment .3 runs out.
+	old2, _ := circle.AttestWith(mainPriv, nil, main.Config.DID, nasPub, now, 3*time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	new3, _ := circle.AttestWith(famPriv, nil, fam.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.3/24"})
+	table := moved(old2, new3)
+	v := table.View()
+	if a, _ := v.AddrOf(nas, now); a != dot3 {
+		t.Fatalf("address while both admit = %v, want the primary root's .3", a)
+	}
+	if p, ok := v.Route(dot3, now); !ok || p != nas {
+		t.Fatal(".3 does not route while it is nas's address")
+	}
+	if _, ok := v.Route(dot2, now); ok {
+		t.Fatal(".2 routes while nas's address is .3: inbound from .2 would be dropped as spoofed — one-way traffic")
+	}
+	later := now.Add(2 * time.Hour) // .3 expired, .2 admits; no GC ran
+	if a, ok := v.AddrOf(nas, later); !ok || a != dot2 {
+		t.Fatalf("address after .3 expired = %v %v, want .2 at once", a, ok)
+	}
+	if p, ok := v.Route(dot2, later); !ok || p != nas {
+		t.Fatal(".2 does not route after .3 expired")
+	}
+	if _, ok := v.Route(dot3, later); ok {
+		t.Fatal("an expired entry's address still routes")
+	}
+	if a, ok := v.Resolve("nas", later); !ok || a != dot2 {
+		t.Fatalf("nas.fabric after .3 expired = %v %v, want .2", a, ok)
+	}
+	// Both entries carry .2: the new root's runs out, the old root's
+	// answers for the same address without a gap.
+	new2, _ := circle.AttestWith(famPriv, nil, fam.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	v = moved(old2, new2).View()
+	for _, at := range []time.Time{now, later} {
+		if p, ok := v.Route(dot2, at); !ok || p != nas {
+			t.Fatalf("at +%v .2 does not route", at.Sub(now))
+		}
+		if a, ok := v.AddrOf(nas, at); !ok || a != dot2 {
+			t.Fatalf("at +%v nas's address = %v %v", at.Sub(now), a, ok)
+		}
+	}
+}
+
+// The handshake judges the assert the peer presented, on its own: an older
+// assert revoked by ID is refused although a newer one of the same device
+// under the same root is live (Codex review, 2026-11-05).
+func TestPresentedRevokedAssertIsRefused(t *testing.T) {
+	c, _ := circle.Init(t.TempDir(), "p", "pw")
+	priv, _ := c.Unlock("pw")
+	now := time.Now()
+	nasPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	nas, _ := PeerOfDID(cert.DIDForKey(nasPub))
+	older, _ := circle.AttestFor(priv, nasPub, now, time.Hour)
+	newer, _ := circle.AttestFor(priv, nasPub, now, 2*time.Hour)
+	id := older.Stmt.ID()
+	rev, _ := circle.RevokeAs(priv, nil, c.Config.DID, statement.Target{ID: id[:]}, now.Add(time.Second))
+	table := NewMemberStore(statement.NewDIDRoots(c.Config.DID))
+	if _, err := table.AddAssert(newer.Stmt, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := table.AddRevocation(c.Config.DID, rev.Stmt); err != nil {
+		t.Fatal(err)
+	}
+	if !table.IsMember(nas, now) {
+		t.Fatal("nas is not a member through its newer assert")
+	}
+	if _, held, live, err := table.Verify(nas, older.Stmt); err != nil || !held || live {
+		t.Fatalf("Verify of the revoked older assert: held=%v live=%v err=%v (want held, not live)", held, live, err)
+	}
+	if oc, _ := cert.FromStatement(older.Stmt); table.Admit(nas, oc) == nil {
+		t.Fatal("Admit accepted a revoked assert because a newer one is live")
+	}
+	if _, _, live, err := table.Verify(nas, newer.Stmt); err != nil || !live {
+		t.Fatalf("Verify of the live newer assert: live=%v err=%v", live, err)
+	}
+	if nc, _ := cert.FromStatement(newer.Stmt); table.Admit(nas, nc) != nil {
+		t.Fatal("Admit refused the live newer assert")
+	}
+	if !table.IsMember(nas, now) {
+		t.Fatal("presenting a revoked assert cost nas its membership")
+	}
+}

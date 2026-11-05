@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -235,38 +236,45 @@ func (t *PeerTable) Watch() <-chan struct{} {
 // change.
 type View struct {
 	rosters []*circle.Roster
-	byPeer  map[peer.ID][]deviceIn  // every entry for the peer, any verdict, roster order
-	routes  map[netip.Addr]deviceIn // overlay circle's asserts with an address in the prefix
-	addrOf  map[peer.ID]netip.Addr  // the same, by peer
-	zone    map[string]deviceIn     // lower-cased name -> entry, overlay circle only
+	byPeer  map[peer.ID][]deviceIn // every entry for the peer, any verdict, roster order
+	// The overlay circle's standing entries carrying an address in the
+	// prefix, by peer, primary root first. A device has one overlay address
+	// at a time: its first admitting entry's (addrEntry), settled at query
+	// time, so Route and AddrOf always agree and an entry running out
+	// hands over to the next on the spot — no GC tick, no republish (Codex
+	// review, 2026-11-05).
+	addrs   map[peer.ID][]deviceIn
+	holders map[netip.Addr][]peer.ID // peers with an entry carrying the address
+	names   map[string][]peer.ID     // lower-cased name -> peers with an entry labelled so
 	version uint64
 }
 
-// deviceIn is one roster's entry for a peer.
+// deviceIn is one roster's entry for a peer; addr is the overlay address
+// the entry carries when it is in addrs.
 type deviceIn struct {
 	roster *circle.Roster
 	dev    *circle.Device
+	addr   netip.Addr
 }
 
 func (s *state) snapshot() *View {
 	v := &View{rosters: append([]*circle.Roster(nil), s.rosters...), byPeer: map[peer.ID][]deviceIn{},
-		routes: map[netip.Addr]deviceIn{}, addrOf: map[peer.ID]netip.Addr{}, zone: map[string]deviceIn{}, version: s.version}
+		addrs: map[peer.ID][]deviceIn{}, holders: map[netip.Addr][]peer.ID{}, names: map[string][]peer.ID{}, version: s.version}
 	for _, r := range s.rosters {
 		for _, dev := range r.Devices() {
 			p, err := PeerOfDID(dev.DID)
 			if err != nil {
 				continue
 			}
-			v.byPeer[p] = append(v.byPeer[p], deviceIn{r, dev})
+			v.byPeer[p] = append(v.byPeer[p], deviceIn{roster: r, dev: dev})
 		}
 	}
 	if s.overlay && len(s.rosters) > 0 {
 		r := s.rosters[0]
-		// Every standing entry with an address routes (Route settles the
-		// moment); a dead or lapsed one never does, so it cannot shadow a
-		// standing one of the same device under another root. The device's
-		// own address and name are its first standing entry's — Devices
-		// lists the primary root's first.
+		// Every standing entry carrying an address in the prefix is a
+		// candidate; which one gives the device its address is settled per
+		// query (addrEntry). A dead or lapsed entry is no candidate, so it
+		// cannot shadow a standing one of the same device under another root.
 		for _, dev := range r.Devices() {
 			c := view(dev)
 			if c == nil || !dev.Standing() || c.Payload.Meta.IP == "" || !c.Allows(cert.ScopeTun) {
@@ -280,17 +288,12 @@ func (s *state) snapshot() *View {
 			if err != nil {
 				continue
 			}
-			if _, taken := v.routes[pfx.Addr()]; !taken {
-				v.routes[pfx.Addr()] = deviceIn{r, dev}
+			v.addrs[p] = append(v.addrs[p], deviceIn{roster: r, dev: dev, addr: pfx.Addr()})
+			if !slices.Contains(v.holders[pfx.Addr()], p) {
+				v.holders[pfx.Addr()] = append(v.holders[pfx.Addr()], p)
 			}
-			if _, done := v.addrOf[p]; done {
-				continue
-			}
-			v.addrOf[p] = pfx.Addr()
-			if name := c.Payload.Meta.Name; name != "" {
-				if _, taken := v.zone[strings.ToLower(name)]; !taken {
-					v.zone[strings.ToLower(name)] = deviceIn{r, dev}
-				}
+			if name := strings.ToLower(c.Payload.Meta.Name); name != "" && !slices.Contains(v.names[name], p) {
+				v.names[name] = append(v.names[name], p)
 			}
 		}
 	}
@@ -455,17 +458,13 @@ func (t *PeerTable) Admit(p peer.ID, c *cert.Cert) error {
 	if !ok {
 		return fmt.Errorf("certificate circle %s is not honoured here", c.Payload.Sub)
 	}
-	// Judged by the entry under the presented cert's root — not by any
-	// entry of the device, or a revoked cert would ride a live one.
-	dev, ok := r.Entry(deviceDID, c.Payload.Sub)
-	switch {
-	case ok && dev.Admits(now):
-		return nil
-	case ok && dev.Dead() != nil:
-		return fmt.Errorf("device is not admitted: %w", dev.Dead())
-	default:
-		return errors.New("device is not admitted: assert expired")
+	// The presented cert is judged on its own — not the device's entry
+	// under that root (a newer, live assert), not an entry under another
+	// root — so a revoked cert is refused whatever else the device holds.
+	if err := r.Judge(c.Stmt, now); err != nil {
+		return fmt.Errorf("device is not admitted: %w", err)
 	}
+	return nil
 }
 
 // Verify judges one assert a peer presented on the v2 handshake: it must
@@ -497,10 +496,7 @@ func (t *PeerTable) Verify(p peer.ID, st *statement.Statement) (circleDID string
 	if !ok {
 		return "", false, false, nil
 	}
-	if dev, ok := r.Entry(deviceDID, c.Payload.Sub); ok {
-		live = dev.Admits(now) // this circle's entry: a revoked assert does not ride a live one under another root
-	}
-	return r.Primary(), true, live, nil
+	return r.Primary(), true, r.Judge(st, now) == nil, nil // the presented assert itself, see Admit
 }
 
 // AddMember records a verified certificate learned from the event log or
@@ -852,52 +848,51 @@ func (v *View) LiveIn(circleDID string) []peer.ID {
 	return out
 }
 
+// addrEntry is the entry that gives the peer its overlay address right now:
+// its first admitting entry carrying one (the primary root's before an old
+// root's). One address per device at a time — the one Route, AddrOf and
+// Resolve all answer with.
+func (v *View) addrEntry(p peer.ID, now time.Time) (deviceIn, bool) {
+	for _, d := range v.addrs[p] {
+		if d.dev.Admits(now) {
+			return d, true
+		}
+	}
+	return deviceIn{}, false
+}
+
 // Route answers the bridge: which live device of the overlay circle holds
-// the destination address right now. The routes are in the view, so a
-// revocation or a new assert changes the answer with the next publish and
-// nothing is ever rebuilt or installed (Codex reviews, 2026-11-05).
+// the destination address right now. The candidates are in the view and
+// the choice is made here, so a revocation, a new assert or an expiry
+// changes the answer at once and nothing is ever rebuilt or installed
+// (Codex reviews, 2026-11-05).
 func (v *View) Route(dst netip.Addr, now time.Time) (peer.ID, bool) {
-	d, ok := v.routes[dst]
-	if !ok {
-		return "", false
+	for _, p := range v.holders[dst] {
+		if d, ok := v.addrEntry(p, now); ok && d.addr == dst {
+			return p, true
+		}
 	}
-	if !d.dev.Admits(now) {
-		return "", false
-	}
-	p, err := PeerOfDID(d.dev.DID)
-	return p, err == nil
+	return "", false
 }
 
 // AddrOf is the overlay address a live device of the overlay circle holds
-// — what inbound frames from it must carry as source.
+// — what inbound frames from it must carry as source, and the only
+// address Route sends to it.
 func (v *View) AddrOf(p peer.ID, now time.Time) (netip.Addr, bool) {
-	a, ok := v.addrOf[p]
-	if !ok {
-		return netip.Addr{}, false
-	}
-	if d, ok := v.routes[a]; !ok || !v.liveEntry(d, now) {
-		return netip.Addr{}, false
-	}
-	return a, true
+	d, ok := v.addrEntry(p, now)
+	return d.addr, ok
 }
 
-// Resolve answers `<name>.fabric`: the overlay address of the live device
-// of the overlay circle labelled name.
+// Resolve answers `<name>.fabric`: the current overlay address of the live
+// device of the overlay circle labelled name.
 func (v *View) Resolve(name string, now time.Time) (netip.Addr, bool) {
-	d, ok := v.zone[strings.ToLower(name)]
-	if !ok || !v.liveEntry(d, now) {
-		return netip.Addr{}, false
+	for _, p := range v.names[strings.ToLower(name)] {
+		if a, ok := v.AddrOf(p, now); ok {
+			return a, true
+		}
 	}
-	pfx, err := netip.ParsePrefix(d.dev.Stmt.Payload.Meta.IP)
-	if err != nil {
-		return netip.Addr{}, false
-	}
-	return pfx.Addr(), true
+	return netip.Addr{}, false
 }
-
-// liveEntry judges the entry a route or name points at — that assert, not
-// the device's standing under some other root.
-func (v *View) liveEntry(d deviceIn, now time.Time) bool { return d.dev.Admits(now) }
 
 // ---- helpers ------------------------------------------------------------------
 

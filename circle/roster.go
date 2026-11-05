@@ -240,29 +240,11 @@ func (r *Roster) clone() *Roster {
 // 2026-11-05: one entry per device cannot hold both, and no pairwise rule
 // over them is both order-independent and grant-preserving).
 func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, error) {
-	if st == nil {
-		return r, false, errors.New("roster: nil statement")
-	}
-	sub := st.Payload.Sub
-	if len(r.roots.RootKeys(sub)) == 0 {
-		return r, false, fmt.Errorf("roster: circle %s is not honoured here", shortDID(sub))
-	}
-	chain, err := statement.Compile(st, nil, sub, r.roots)
+	dev, err := r.judge(st, now)
 	if err != nil {
-		return r, false, fmt.Errorf("roster: %w", err)
+		return r, false, err
 	}
-	if !chain.Allows(sub, memberRes, statement.VerbMember) {
-		return r, false, errors.New("roster: statement does not grant member")
-	}
-	dev := &Device{DID: st.Payload.Aud, Stmt: st, Chain: chain, Nbf: chain.Nbf, Exp: chain.Exp}
-	if !now.Before(dev.Exp) {
-		if !now.Before(dev.Exp.Add(LapsedRetention)) {
-			return r, false, errors.New("roster: assert expired past retention")
-		}
-		dev.lapsed = true
-	}
-	dev.dead = r.verdict(dev)
-	k := entryKey(dev.DID, sub)
+	k := entryKey(dev.DID, st.Payload.Sub)
 	cur := r.devices[k]
 	if cur != nil && (cur.Stmt.ID() == st.ID() || !prefer(cur, dev)) {
 		return r, false, nil
@@ -270,6 +252,54 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, err
 	nr := r.clone()
 	nr.devices[k] = dev
 	return nr, true, nil
+}
+
+// Judge answers for one assert on its own — the one a peer presented: nil
+// when that statement admits its device right now, else why not. Add
+// records; Judge never consults the roster's entry for the device (which
+// may be a newer, live assert under the same root), so a revoked assert
+// presented on the handshake is refused whatever else the device holds
+// (Codex review, 2026-11-05).
+func (r *Roster) Judge(st *statement.Statement, now time.Time) error {
+	dev, err := r.judge(st, now)
+	if err != nil {
+		return err
+	}
+	if dev.dead != nil {
+		return dev.dead
+	}
+	if !dev.Admits(now) {
+		return errors.New("assert is not in its validity window")
+	}
+	return nil
+}
+
+// judge compiles an assert against the roster's roots and gives it its
+// verdict as an entry, without recording it.
+func (r *Roster) judge(st *statement.Statement, now time.Time) (*Device, error) {
+	if st == nil {
+		return nil, errors.New("roster: nil statement")
+	}
+	sub := st.Payload.Sub
+	if len(r.roots.RootKeys(sub)) == 0 {
+		return nil, fmt.Errorf("roster: circle %s is not honoured here", shortDID(sub))
+	}
+	chain, err := statement.Compile(st, nil, sub, r.roots)
+	if err != nil {
+		return nil, fmt.Errorf("roster: %w", err)
+	}
+	if !chain.Allows(sub, memberRes, statement.VerbMember) {
+		return nil, errors.New("roster: statement does not grant member")
+	}
+	dev := &Device{DID: st.Payload.Aud, Stmt: st, Chain: chain, Nbf: chain.Nbf, Exp: chain.Exp}
+	if !now.Before(dev.Exp) {
+		if !now.Before(dev.Exp.Add(LapsedRetention)) {
+			return nil, errors.New("roster: assert expired past retention")
+		}
+		dev.lapsed = true
+	}
+	dev.dead = r.verdict(dev)
+	return dev, nil
 }
 
 // entryKey names a device's entry under one root.
@@ -579,14 +609,6 @@ func (r *Roster) Tombstones(now time.Time) map[string]time.Time {
 		}
 	}
 	return out
-}
-
-// Entry returns the device's entry under one root, whatever its verdict:
-// what a presented assert is judged by (the entry under its circle, which
-// may be a newer assert of the same device there).
-func (r *Roster) Entry(deviceDID, rootDID string) (*Device, bool) {
-	dev, ok := r.devices[entryKey(deviceDID, rootDID)]
-	return dev, ok
 }
 
 // Device returns the roster's entry for a device whatever its verdict: the
