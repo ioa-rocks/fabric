@@ -529,6 +529,28 @@ func (t *PeerTable) MembersIn(circleDID string) []peer.ID {
 	return out
 }
 
+// LiveIn lists the live devices of the circle that honours circleDID —
+// during a root move the devices still on the old root included, since
+// the roster is one circle under two keys. MembersIn names the devices on
+// exactly one root (a retirement forgets those); routes and other
+// "who is in this circle" questions go by LiveIn (Codex review,
+// 2026-11-05: a merge dropped routes until every cert was reissued).
+func (t *PeerTable) LiveIn(circleDID string) []peer.ID {
+	now := time.Now()
+	var out []peer.ID
+	for _, r := range t.Rosters() {
+		if !r.Honours(circleDID) {
+			continue
+		}
+		for _, dev := range r.LiveDevices(now) {
+			if p, err := PeerOfDID(dev.DID); err == nil {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
 // GC moves expired devices to lapsed memory, drops lapsed entries past
 // their retention, and drops spent sweeps, in every roster.
 func (t *PeerTable) GC(now time.Time) {

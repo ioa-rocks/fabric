@@ -319,6 +319,16 @@ func attestDevice(statePath string, c *circle.Circle, pass string) error {
 	return nil
 }
 
+// certDue reports whether the membership cert needs re-signing: expired,
+// or past half-life when renewing the expiring.
+func certDue(own *cert.Cert, now time.Time, expiring bool) bool {
+	nbf, exp := time.Unix(own.Payload.Nbf, 0), own.Expiry()
+	if !now.Before(exp) {
+		return true
+	}
+	return expiring && now.After(nbf.Add(exp.Sub(nbf)/2))
+}
+
 // renewOwnCertFrom adopts a first-circle attestation as this device's
 // membership cert.
 func renewOwnCertFrom(dir state.Dir, root ed25519.PrivateKey, a *circle.Attestation, now time.Time) error {
@@ -377,12 +387,21 @@ func cmdCircleAttest(args []string) error {
 			return err
 		}
 		now := time.Now()
+		// For the circle the device was joined in, the membership cert is
+		// the transport assert: it is due when it is, whatever the
+		// attestation file says (Codex review, 2026-11-05).
+		var own *cert.Cert
+		if dir, err := state.Open(*statePath); err == nil {
+			own, _ = dir.LoadCert()
+		}
 		for _, c := range all {
 			a, err := c.LoadAttestation()
 			switch {
 			case err != nil, a.Valid(now) != nil, c.Revoked(a, now):
 				targets = append(targets, c)
 			case *expiring && a.PastHalfLife(now):
+				targets = append(targets, c)
+			case own != nil && own.Payload.Sub == c.Config.DID && certDue(own, now, *expiring):
 				targets = append(targets, c)
 			}
 		}

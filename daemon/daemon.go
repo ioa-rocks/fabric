@@ -69,8 +69,17 @@ type Daemon struct {
 	cfgMu sync.Mutex // guards Config writes (root moves, bootstrap pins)
 
 	bridgeIP string // overlay address fabric0 was brought up with (renumbering notice)
-	Sync     *fabricnet.EventSync
-	Queue    *admission.Queue // nil unless this node runs the admission queue
+
+	// Route refreshes are serialised (routesMu: build and install under one
+	// lock, so an older snapshot can never land over a newer one) and the
+	// roster hook only kicks a worker (routesKick), since the hook runs
+	// inside roster notification and under whatever lock the mutator holds
+	// — a root retirement rechecks the store with cfgMu held, which
+	// NamespaceDID also takes (Codex review, 2026-11-05).
+	routesMu   sync.Mutex
+	routesKick chan struct{}
+	Sync       *fabricnet.EventSync
+	Queue      *admission.Queue // nil unless this node runs the admission queue
 	// Circle answers "is this member one of my circle's devices?" — set by
 	// the composition root when the node has a circle (NewCircleService);
 	// nil on pure-connectivity nodes. Vault gates on it (memo §9 step 3).
@@ -530,6 +539,14 @@ func (d *Daemon) startTUN() {
 		d.Bridge.SetLocal(pfx.Addr())
 	}
 	d.refreshRoutes()
+	// Routes follow the rosters, not only the membership log: a circle
+	// revocation or a gossiped assert changes who is routable without any
+	// membership event (Codex review, 2026-11-05: a device revoked from
+	// this circle but still a member elsewhere kept its route). The hook
+	// kicks a worker rather than refreshing inline — see routesKick.
+	d.routesKick = make(chan struct{}, 1)
+	go d.routesWorker()
+	d.Store.OnChange(d.kickRoutes)
 	log.Printf("tun: fabric0 up, this node is %s", d.OwnCert().Payload.Meta.IP)
 	d.startDNS()
 }
@@ -628,14 +645,42 @@ func registerWithResolved(ip netip.Addr) error {
 		int32(ifc.Index), []domain{{Name: fabricdns.Suffix, RouteOnly: true}}).Err
 }
 
-// refreshRoutes rebuilds the overlay routing table from the member store —
-// the cert is the source of address truth.
+// refreshRoutes rebuilds the overlay routing table from the first
+// circle's roster — the assert is the source of address truth. Serialised:
+// two refreshes never interleave build and install, so the table always
+// reflects the newest roster state that triggered a refresh.
 func (d *Daemon) refreshRoutes() {
 	if d.Bridge == nil {
 		return
 	}
+	d.routesMu.Lock()
+	defer d.routesMu.Unlock()
 	within, _ := netip.ParsePrefix(d.bridgeIP)
 	d.Bridge.SetRoutes(overlayRoutes(membersIn(d.Store, d.NamespaceDID()), within))
+}
+
+// kickRoutes asks the route worker for a refresh without blocking or
+// taking any lock: safe to call from a roster change hook.
+func (d *Daemon) kickRoutes() {
+	if d.routesKick == nil {
+		return
+	}
+	select {
+	case d.routesKick <- struct{}{}:
+	default: // a refresh is already pending; it will read the newer state
+	}
+}
+
+// routesWorker refreshes the routes on every kick, one at a time.
+func (d *Daemon) routesWorker() {
+	for {
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-d.routesKick:
+			d.refreshRoutes()
+		}
+	}
 }
 
 // membersIn is the route source: the devices of one circle, each by its
@@ -646,7 +691,7 @@ func (d *Daemon) refreshRoutes() {
 // slice H gives every overlay circle its own (Codex review, 2026-11-05).
 func membersIn(t *fabricnet.PeerTable, circleDID string) map[peer.ID]*cert.Cert {
 	out := map[peer.ID]*cert.Cert{}
-	for _, p := range t.MembersIn(circleDID) {
+	for _, p := range t.LiveIn(circleDID) {
 		if c, ok := t.CertIn(p, circleDID); ok {
 			out[p] = c
 		}

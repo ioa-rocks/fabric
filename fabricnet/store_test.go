@@ -341,3 +341,38 @@ func TestCertInIsPerCircle(t *testing.T) {
 		t.Fatal("CertIn answered for a circle the device is not in")
 	}
 }
+
+// During a root move the circle is one roster under two keys: LiveIn names
+// the devices still on the old root too, MembersIn only those on the
+// named root (Codex review, 2026-11-05: routes vanished mid-merge).
+func TestLiveInSpansHonouredRoots(t *testing.T) {
+	oldPub, oldPriv, _ := ed25519.GenerateKey(rand.Reader)
+	newPub, newPriv, _ := ed25519.GenerateKey(rand.Reader)
+	oldDID, newDID := cert.DIDForKey(oldPub), cert.DIDForKey(newPub)
+	table := NewMemberStore(statement.NewDIDRoots(newDID, oldDID))
+	now := time.Now()
+	onOld, _, _ := ed25519.GenerateKey(rand.Reader)
+	onNew, _, _ := ed25519.GenerateKey(rand.Reader)
+	a1, err := circle.AttestWith(oldPriv, nil, oldDID, onOld, now, time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a2, err := circle.AttestWith(newPriv, nil, newDID, onNew, now, time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "new"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []*circle.Attestation{a1, a2} {
+		if _, err := table.Rosters()[0].Add(a.Stmt, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := table.LiveIn(newDID); len(got) != 2 {
+		t.Fatalf("LiveIn(new) = %d devices, want both (the old root is still honoured)", len(got))
+	}
+	if got := table.MembersIn(newDID); len(got) != 1 {
+		t.Fatalf("MembersIn(new) = %d devices, want the one on the new root", len(got))
+	}
+	if got := table.MembersIn(oldDID); len(got) != 1 {
+		t.Fatalf("MembersIn(old) = %d devices, want the one still on the old root", len(got))
+	}
+}

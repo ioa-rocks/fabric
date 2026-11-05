@@ -704,3 +704,30 @@ func TestRoutesComeFromFirstCircleOnly(t *testing.T) {
 		t.Fatalf("routes = %v, want nas at 100.64.0.2 alone", routes)
 	}
 }
+
+// The roster change hook must never block or take a daemon lock: it runs
+// inside roster notification, under whatever lock the mutator holds (a
+// root retirement rechecks the store with cfgMu held). kickRoutes only
+// signals the worker; a second kick while one is pending is dropped, and
+// a daemon without a bridge has no worker to kick.
+func TestKickRoutesNeverBlocks(t *testing.T) {
+	d := &Daemon{routesKick: make(chan struct{}, 1)}
+	d.cfgMu.Lock()
+	defer d.cfgMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 3; i++ {
+			d.kickRoutes()
+		}
+		(&Daemon{}).kickRoutes()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("kickRoutes blocked")
+	}
+	if len(d.routesKick) != 1 {
+		t.Fatalf("pending kicks = %d, want exactly one coalesced", len(d.routesKick))
+	}
+}
