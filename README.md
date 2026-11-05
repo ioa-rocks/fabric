@@ -365,9 +365,11 @@ roster as **expired** (`fabric status`: `EXPIRED`; UI: "expired —
 re-join needed") rather than vanishing: an expired device that connects
 is shown by name instead of as an anonymous stranger, an offline one is
 still listed, its address stays reserved, and `renew` refuses it with a
-pointer to `join`. That memory lasts a year past expiry
-(`cert.LapsedRetention`); revoking the device ("Forget device" in the
-UI) ends it early. Renewal is also how members admitted before the TUN
+pointer to `join`. That memory lasts 400 days past expiry
+(`cert.LapsedRetention`, the longest window an admission can have, so a
+superseded admission that resurfaces has always expired by the time the
+roster forgets what superseded it); revoking the device ("Forget device"
+in the UI) ends it early. Renewal is also how members admitted before the TUN
 bridge (certs without an overlay IP) get re-issued — though they
 currently keep their empty IP; assigning one at renewal is a small
 follow-up.

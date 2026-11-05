@@ -54,8 +54,9 @@ const RenewBelow = 183 * 24 * time.Hour
 // still known by name, address, and scope, so a node that was off for a
 // season comes back as "nas — expired" rather than as an anonymous stranger,
 // and its overlay address is held for it. Re-admission (`fabric join`, same
-// device key) or revocation ends the retention early.
-const LapsedRetention = DefaultValidity
+// device key) or revocation ends the retention early. It is at least
+// MaxValidity for the reason circle.LapsedRetention gives.
+const LapsedRetention = statement.MaxValidity
 
 const nonceSize = 16
 

@@ -90,7 +90,15 @@ func (d *Device) Standing() bool { return d.dead == nil && !d.lapsed }
 // address, so a node that was off for a season comes back as "nas —
 // expired" rather than as an anonymous stranger, and its overlay address is
 // held for it. Re-admission (a fresh admission) or revocation ends it early.
-const LapsedRetention = DefaultValidity
+//
+// It is at least statement.MaxValidity, and that is load-bearing: a roster
+// keeps one entry per device and forgets what the entry superseded. When
+// GC drops the entry, an admission it superseded may be replayed, and it
+// is harmless only if it has expired by then — which holds exactly when
+// the retention is no shorter than the longest window an admission can
+// have (Codex review, 2026-11-05: at a 365-day retention a 400-day
+// admission superseded by a one-second one revived for 35 days).
+const LapsedRetention = statement.MaxValidity
 
 // sweepTombstone is how long a sweep of a device the roster never saw an
 // admission for is reported as a revocation (the gater refuses it meanwhile).
@@ -247,8 +255,10 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, err
 // a newer, live admission), so a revoked admission presented on the
 // handshake is refused whatever else the device holds (Codex review,
 // 2026-11-05). The entry can only count against the presented statement:
-// an admission superseded by a later-issued one that is revoked is refused
-// too, so the handshake agrees with the roster.
+// an admission superseded by a later-issued one is refused unless that
+// later one admits the device right now (a renewal the device has not yet
+// synced must not lock it out), so a device the roster calls revoked or
+// lapsed cannot get in on an older admission (Codex review, 2026-11-05).
 func (r *Roster) Judge(st *statement.Statement, now time.Time) error {
 	dev, err := r.judge(st, now)
 	if err != nil {
@@ -257,8 +267,11 @@ func (r *Roster) Judge(st *statement.Statement, now time.Time) error {
 	if dev.dead != nil {
 		return dev.dead
 	}
-	if cur := r.devices[dev.DID]; cur != nil && cur.dead != nil && cur.Stmt.ID() != st.ID() && !prefer(cur, dev) {
-		return fmt.Errorf("superseded by a later admission that is %w", cur.dead)
+	if cur := r.devices[dev.DID]; cur != nil && cur.Stmt.ID() != st.ID() && !prefer(cur, dev) && !cur.Admits(now) {
+		if cur.dead != nil {
+			return fmt.Errorf("superseded by a later admission that is %w", cur.dead)
+		}
+		return errors.New("superseded by a later admission that has expired")
 	}
 	if !dev.Admits(now) {
 		return errors.New("admission is not in its validity window")

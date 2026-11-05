@@ -192,9 +192,9 @@ func TestLogGC(t *testing.T) {
 	if l.Len() != 2 {
 		t.Fatalf("after default cert lifetime: %d events left, want 2", l.Len())
 	}
-	l.GC(now.Add(cert.MaxValidity + 30*time.Minute)) // revocation spent; lapsed retention (expiry + DefaultValidity) over too
-	if l.Len() != 0 {
-		t.Fatalf("after max cert lifetime: %d events left, want 0", l.Len())
+	l.GC(now.Add(cert.MaxValidity + 30*time.Minute)) // revocation spent; the lapsed admission is kept for LapsedRetention past its expiry
+	if l.Len() != 1 {
+		t.Fatalf("after max cert lifetime: %d events left, want 1 (the lapsed admission)", l.Len())
 	}
 	l.GC(now.Add(time.Hour + cert.LapsedRetention + time.Minute)) // lapsed retention over
 	if l.Len() != 0 {

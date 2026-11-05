@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	mrand "math/rand"
+	"sort"
 	"testing"
 	"time"
 
@@ -24,11 +25,17 @@ import (
 //     (issue time, then expiry, then statement ID).
 //  2. Revocations and sweeps only grow.
 //  3. Nothing supersedes across keys: another key's admissions are not facts.
-//  4. GC drops the expired — past LapsedRetention nothing is remembered.
+//  4. GC drops the expired — past LapsedRetention an admission is no fact.
 //
-// Scripts stay inside the retention window (rule 4 is checked at the end by
-// jumping past it): a roster keeps one entry per device, so facts older
-// than the retention are outside the convergence claim by design.
+// A roster keeps one entry per device and forgets what it superseded, so
+// once GC has dropped the entry a superseded admission can be replayed and
+// stand as the roster's memory of the device. The membership verdict must
+// not move for that — the retention is at least the longest window, so
+// anything revivable has expired — but the memory may: inside the
+// retention the roster is held to the oracle exactly, past it on
+// membership (live, revoked) only. Codex review, 2026-11-05: a 400-day
+// admission superseded by a one-second one came back live for 35 days at
+// the 365-day retention.
 type oracle struct {
 	circle  string
 	adms    []*Admission
@@ -66,10 +73,14 @@ func later(a, b *Admission) bool {
 	return bytes.Compare(ai[:], bi[:]) > 0
 }
 
-// pick is the circle's latest word on the device.
-func (o *oracle) pick(dev string) *Admission {
+// pick is the circle's latest word on the device among the admissions
+// still facts at now (rule 4).
+func (o *oracle) pick(dev string, now time.Time) *Admission {
 	var best *Admission
 	for _, a := range o.adms {
+		if !now.Before(a.Expiry().Add(LapsedRetention)) {
+			continue
+		}
 		if a.Stmt.Payload.Aud == dev && (best == nil || later(a, best)) {
 			best = a
 		}
@@ -93,7 +104,7 @@ const (
 )
 
 func (o *oracle) standing(dev string, now time.Time) standing {
-	a := o.pick(dev)
+	a := o.pick(dev, now)
 	switch {
 	case a == nil:
 		return absent
@@ -109,14 +120,25 @@ func (o *oracle) standing(dev string, now time.Time) standing {
 }
 
 // admits is the handshake's answer for one presented admission: it must
-// verify on its own, and no revoked later word on the device may stand
-// over it.
+// verify on its own, and a later word on the device may stand over it only
+// if that word admits the device right now.
 func (o *oracle) admits(a *Admission, now time.Time) bool {
 	if o.dead(a) || now.Before(a.Stmt.NotBefore()) || !now.Before(a.Expiry()) {
 		return false
 	}
-	p := o.pick(a.Stmt.Payload.Aud)
-	return p == nil || p.Stmt.ID() == a.Stmt.ID() || !later(p, a) || !o.dead(p)
+	p := o.pick(a.Stmt.Payload.Aud, now)
+	if p == nil || p.Stmt.ID() == a.Stmt.ID() || !later(p, a) {
+		return true
+	}
+	return !o.dead(p) && !now.Before(p.Stmt.NotBefore()) && now.Before(p.Expiry())
+}
+
+// member reduces a standing to what transport acts on.
+func member(s standing) standing {
+	if s == live || s == revoked {
+		return s
+	}
+	return "not a member"
 }
 
 func rosterStanding(r *Roster, dev string, now time.Time) standing {
@@ -183,13 +205,15 @@ func (o *oracle) apply(p op) {
 }
 
 // script draws a random sequence of operations over a few devices. Issue
-// times tie often (same second), validities run from a second to a month
-// and the clock advances up to three days a step, so admissions expire,
-// get renewed, revoked and swept mid-script in every combination.
+// times tie often (same second), validities run from a second to the
+// longest allowed and the clock advances up to three days a step, so
+// admissions expire, get renewed, revoked and swept mid-script in every
+// combination, and long windows outlive short later ones by far more than
+// the retention lasts after the short ones.
 func script(rng *mrand.Rand, rootPriv ed25519.PrivateKey, foreignPriv ed25519.PrivateKey, devs []ed25519.PublicKey, t0 time.Time, steps int) []op {
 	circleDID := did.ForKey(rootPriv.Public().(ed25519.PublicKey))
 	foreignDID := did.ForKey(foreignPriv.Public().(ed25519.PublicKey))
-	validities := []time.Duration{time.Second, time.Minute, time.Hour, 24 * time.Hour, 7 * 24 * time.Hour, 30 * 24 * time.Hour}
+	validities := []time.Duration{time.Second, time.Minute, time.Hour, 24 * time.Hour, 7 * 24 * time.Hour, 30 * 24 * time.Hour, 200 * 24 * time.Hour, statement.MaxValidity}
 	clock := t0
 	var ops []op
 	var seen []*Admission
@@ -249,14 +273,19 @@ func TestRosterAgreesWithTheOracle(t *testing.T) {
 			}
 			t.Fatalf("seed %d: %s%s", seed, fmt.Sprintf(format, args...), trace.String())
 		}
-		compare := func(r *Roster, o *oracle, now time.Time, where string) {
+		// exact holds the roster to the oracle on memory too; false compares
+		// membership only (past the retention, see the package comment).
+		compare := func(r *Roster, o *oracle, now time.Time, exact bool, where string) {
 			t.Helper()
 			for _, dev := range devDIDs {
 				want, got := o.standing(dev, now), rosterStanding(r, dev, now)
+				if !exact {
+					want, got = member(want), member(got)
+				}
 				if want != got {
 					fail("%s: device %s is %s, oracle says %s", where, shortDID(dev), got, want)
 				}
-				if p := o.pick(dev); p != nil {
+				if p := o.pick(dev, now); p != nil && exact {
 					if entry, ok := r.Device(dev); !ok || entry.Stmt.ID() != p.Stmt.ID() {
 						fail("%s: device %s: the roster's entry is not the latest-issued admission", where, shortDID(dev))
 					}
@@ -277,9 +306,9 @@ func TestRosterAgreesWithTheOracle(t *testing.T) {
 			r = apply(r, p)
 			o.apply(p)
 			r, _, _ = r.GC(p.at)
-			compare(r, o, p.at, fmt.Sprintf("step %d", i))
+			compare(r, o, p.at, true, fmt.Sprintf("step %d", i))
 		}
-		end := ops[len(ops)-1].at
+		end := ops[len(ops)-1].at // within the retention of everything: no GC drop yet
 
 		// Shuffled, all at the end: the same facts in any order are the
 		// same ledger.
@@ -291,15 +320,35 @@ func TestRosterAgreesWithTheOracle(t *testing.T) {
 			s = apply(s, p)
 		}
 		s, _, _ = s.GC(end)
-		compare(s, o, end, fmt.Sprintf("shuffled %v", perm))
-		later := end.Add(40 * 24 * time.Hour) // every window has closed
-		compare(r, o, later, "in order, later")
-		compare(s, o, later, "shuffled, later")
+		compare(s, o, end, true, fmt.Sprintf("shuffled %v", perm))
 
-		// Rule 4: past the retention, nothing is remembered.
-		gone := later.Add(LapsedRetention)
+		// Rule 4, at every instant where something changes — a second after
+		// each admission expires and a second after its retention ends: GC,
+		// compare membership, replay every statement (a peer's
+		// anti-entropy), compare again.
+		var instants []time.Time
+		for _, a := range o.adms {
+			for _, d := range []time.Duration{time.Second, LapsedRetention + time.Second} {
+				if x := a.Expiry().Add(d); x.After(end) {
+					instants = append(instants, x)
+				}
+			}
+		}
+		sort.Slice(instants, func(i, j int) bool { return instants[i].Before(instants[j]) })
+		for _, now := range instants {
+			r, _, _ = r.GC(now)
+			compare(r, o, now, false, fmt.Sprintf("+%s after GC", now.Sub(end).Round(time.Hour)))
+			for _, k := range rng.Perm(len(ops)) {
+				p := ops[k]
+				p.at = now
+				r = apply(r, p)
+			}
+			r, _, _ = r.GC(now)
+			compare(r, o, now, false, fmt.Sprintf("+%s after replay", now.Sub(end).Round(time.Hour)))
+		}
+		gone := end.Add(statement.MaxValidity + LapsedRetention + time.Second)
 		if r, _, _ = r.GC(gone); r.Len() != 0 {
-			fail("%d entries survive GC past the retention", r.Len())
+			fail("%d entries survive GC past every retention", r.Len())
 		}
 	}
 }
