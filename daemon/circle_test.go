@@ -45,7 +45,7 @@ func newCircleTestNode(t *testing.T, nsPub ed25519.PublicKey, nsRoot ed25519.Pri
 	if err != nil {
 		t.Fatal(err)
 	}
-	roots := statement.NewDIDRoots(cert.DIDForKey(nsPub))
+	roots := statement.NewDIDRoot(cert.DIDForKey(nsPub))
 	store := fabricnet.NewMemberStore(roots)
 	// Listed: these nodes meet by handshake, not by gossip (dark posture is
 	// covered in daemon_test.go and fabricnet/gater_test.go).
@@ -623,7 +623,7 @@ func TestGateReplaysStoredRevocationsIntoTheTable(t *testing.T) {
 	}
 	nsDID := cert.DIDForKey(nsPub)
 	gate := newCircleTestNode(t, nsPub, nsRoot, "gate", nil, false)
-	gate.svc.SetHome(func() string { return nsDID }, statement.NewDIDRoots(nsDID), gate.store.CertIn)
+	gate.svc.SetHome(func() string { return nsDID }, statement.NewDIDRoot(nsDID), gate.store.CertIn)
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	devCert, err := cert.Issue(nsRoot, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, time.Now(), time.Hour)
 	if err != nil {
@@ -647,7 +647,7 @@ func TestGateReplaysStoredRevocationsIntoTheTable(t *testing.T) {
 	}
 	// Restart: a fresh table from the log (device live), a fresh service
 	// over the same root (revocations loaded from disk).
-	store2 := fabricnet.NewMemberStore(statement.NewDIDRoots(nsDID))
+	store2 := fabricnet.NewMemberStore(statement.NewDIDRoot(nsDID))
 	if _, err := store2.AddAssert(devCert.Stmt, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -655,7 +655,7 @@ func TestGateReplaysStoredRevocationsIntoTheTable(t *testing.T) {
 		t.Fatal("the rebuilt table should start with the device live")
 	}
 	svc2 := NewCircleService(gate.h, gate.auth, gate.root)
-	svc2.SetHome(func() string { return nsDID }, statement.NewDIDRoots(nsDID), store2.CertIn)
+	svc2.SetHome(func() string { return nsDID }, statement.NewDIDRoot(nsDID), store2.CertIn)
 	svc2.SetPeerTable(store2)
 	if store2.IsMember(p, at) {
 		t.Fatal("after the restart the table admits a device the stored revocation killed")

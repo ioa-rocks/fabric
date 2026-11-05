@@ -117,7 +117,7 @@ func NewAuthService(h host.Host, store *PeerTable, ownCert *cert.Cert, grace tim
 	h.Network().Notify(nb)
 	a.stopWatch = func() { h.Network().StopNotify(nb) }
 	// A roster change can end a membership without any event naming the
-	// peer (a circle revocation learned by gossip, a root retired): the
+	// peer (a circle revocation learned by gossip): the
 	// connections of peers that are no longer members are closed here.
 	go func() {
 		for range store.Watch() {
@@ -524,7 +524,6 @@ func (a *AuthService) verifyHello(p peer.ID, hello Hello) ([]string, *cert.Cert,
 // noteMember records a handshake the peer table has already admitted:
 // handshake memory, connection protection, and the hooks.
 func (a *AuthService) noteMember(p peer.ID, c *cert.Cert, known bool, hs Handshake) {
-	a.store.NotePresented(p, c)
 	a.mu.Lock()
 	a.shook[p] = hs
 	a.mu.Unlock()

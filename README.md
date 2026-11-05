@@ -743,9 +743,6 @@ the UI and daemon use a non-default Astral state directory.
 | Command | Where | What |
 |---|---|---|
 | `fabric init -name <label> [-circle <name>]` | first device | mint the namespace, become master; the root key is also the home circle (default `home`) |
-| `fabric root status` | any member | current root, roots still honoured during a move, members that have not yet *presented* a cert under the new root in a handshake with this daemon (the log alone only proves the cert was issued) |
-| `fabric root merge -circle <name>` | master | move the namespace onto a circle's key: re-issues every cert under it, publishes `root-moved` (signed by the old root), installs the circle key as the root container; the old root stays honoured. Idempotent: if it fails part-way, rerun it and it resumes (re-issues only missing certs, installs the key only if still pending) |
-| `fabric root retire [-force] <did>` | master | publish `root-retired` (signed by the new root): the old root stops verifying everywhere; refuses while a live member has not presented a new-root cert to this daemon unless `-force` (those members are cut off and must re-join) |
 | `fabric up` | any member | run the node daemon (serves buckets when the node has a circle; `-no-vault` / `-vault-state <dir>`) |
 | `fabric status` | any member | node, membership, and connection state |
 | `fabric graph [-json]` | any member | whole-mesh link map, human or machine readable |
@@ -763,7 +760,7 @@ the UI and daemon use a non-default Astral state directory.
 | `fabric circle attest [-expiring]` | each device of a circle | sign this device into the circle (done automatically by `circle init`/`join` when the node already has a fabric identity), or renew: attestations live one year like certs; `-expiring` re-signs every one past half-life. Peers sync buckets and serve blobs only to attested devices of their own circle — mesh membership alone no longer grants vault access |
 | `fabric circle revoke [-circle <name>] <member \| did:key>` | an owner device of the circle | sign a device out of the circle; devices of the circle learn it on their next circle exchange, the running daemon pushes it to those connected now (see *Circle attestations*) |
 | `fabric circle export [-circle <name>] <file>` / `fabric circle join <file>` | another device | carry a circle to another device, which then holds its key and is attested into it (interim until sub-key grants). A shared circle is how two people share buckets: both devices hold it, neither holds the other's personal circle |
-| `fabric circle passphrase [-circle <name>]` | each device holding the circle | re-encrypt the circle's key container under a new passphrase. The key does not change, so nothing is re-signed or re-sent; when the circle is the mesh root (after `root merge`) the root key container is rewritten with it. Other devices holding the circle keep the old passphrase until the same is run there (or they re-join from a fresh `export`). There is no recovery for a forgotten passphrase: back up the container (`circles/<name>/user.key.age`) and the passphrase off the device |
+| `fabric circle passphrase [-circle <name>]` | each device holding the circle | re-encrypt the circle's key container under a new passphrase. The key does not change, so nothing is re-signed or re-sent; when the circle's key is the root (circle `main` since the 2026-11-02 migration) the root key container is rewritten with it. Other devices holding the circle keep the old passphrase until the same is run there (or they re-join from a fresh `export`). There is no recovery for a forgotten passphrase: back up the container (`circles/<name>/user.key.age`) and the passphrase off the device |
 | `fabric circle grant new -res <subjects> [-verbs claim] [-exp 2160h] -out worker.key [-gate addr]…` / `grant list` / `grant revoke <id>` | an owner device of the circle | hand a new key a root-signed grant on named subjects, written as one key file with gate hints (the grantee's only credential); list them; revoke one by ID (stored, pushed to connected members) |
 | `fabric circle status` | any member | circles held, this device's role and attestation (expiry, revoked), revocations held, buckets per circle, mounts, folders, mesh, and which circles each vault peer verifiably shares |
 | `fabric bucket ...` | any member | the circle's buckets: `create`, `list`, `place <b> full\|cache\|none\|folder <dir>`, `mount`, `put/ls/get/rm/…` (`fabric bucket -h`; a `vault` symlink means the same) |
@@ -797,11 +794,13 @@ user key) to skip the interactive prompts (CI, scripts).
   (passphrase / scrypt). The seed exists in memory only during a signing
   session — approval happens in the CLI process; the daemon never holds
   the root key.
-- `event` — signed membership events (`MemberAdded` / `MemberRevoked`,
-  plus `root-moved` / `root-retired` for the mesh-root merge) and the
-  deduplicating, expiry-GC'd event log they accumulate in: the durable
-  membership view every node carries. Verified against the node's
-  honoured roots (`namespace_did` + `honoured_roots` in config).
+- `event` — signed membership events (`MemberAdded` / `MemberRevoked`)
+  and the deduplicating, expiry-GC'd event log they accumulate in: the
+  durable membership view every node carries. Verified against the home
+  circle's root (`namespace_did` in config). Logs written before
+  2026-11-05 may still hold `root-moved` / `root-retired` records from the
+  one-time mesh-root → circle-main migration; they fail verification as
+  unknown kinds and drop out like any stale entry.
 - `fabricnet` — membership enforcement on a libp2p host, layered:
   a connection gater (hard-denies revoked peers; dark by default, so a
   node refuses inbound peers outside its member store before any

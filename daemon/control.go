@@ -95,24 +95,15 @@ type MemberInfo struct {
 	Connected   bool      `json:"connected"`
 	Self        bool      `json:"self,omitempty"`    // the answering daemon's own entry
 	Expired     bool      `json:"expired,omitempty"` // lapsed: not a member, cert expired; re-join needed
-	// What the peer last presented in a handshake with this daemon (since it
-	// started), as opposed to what the log says was issued to it. Empty when
-	// the peer has not handshaken with this daemon yet. `fabric root
-	// status|retire` read this to know who has really adopted a new root.
-	PresentedSub string     `json:"presented_sub,omitempty"`
-	PresentedAt  *time.Time `json:"presented_at,omitempty"`
 }
 
 type StatusReply struct {
 	Name         string `json:"name"`
 	PeerID       string `json:"peer_id"`
 	NamespaceDID string `json:"namespace_did"` // the home circle's DID
-	// Further roots still honoured (a root move in progress); empty when
-	// the mesh has one root.
-	HonouredRoots []string `json:"honoured_roots,omitempty"`
-	Master        bool     `json:"master"`     // holds the namespace root key
-	QueueHost     bool     `json:"queue_host"` // runs the admission queue (lighthouse role)
-	Posture       string   `json:"posture"`    // gater posture: dark (unknown inbound refused) / listed
+	Master       bool   `json:"master"`        // holds the namespace root key
+	QueueHost    bool   `json:"queue_host"`    // runs the admission queue (lighthouse role)
+	Posture      string `json:"posture"`       // gater posture: dark (unknown inbound refused) / listed
 	// Inbound connections refused as unknown since start (dark posture): a
 	// non-zero count with a member missing from `peers` usually means its
 	// MemberAdded event has not reached this node yet.
@@ -218,9 +209,6 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		DNSActive:    d.DNS != nil,
 	}
 	reply.RefusedInbound = d.Gater.RefusedInbound()
-	if roots := d.HonouredRoots(); len(roots) > 1 {
-		reply.HonouredRoots = roots[1:]
-	}
 	reply.ReachableAddrs, reply.UnreachableAddrs, reply.UnverifiedAddrs = d.AddrReachability()
 	ownExp := d.OwnCert().Expiry()
 	reply.CertExpiry = &ownExp
@@ -365,19 +353,15 @@ func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
 			Self:        self,
 			Expired:     expired,
 		}
-		if self {
-			info.PresentedSub = c.Payload.Sub
-		} else if pc, at, ok := d.Store.Presented(p); ok {
-			info.PresentedSub = pc.Payload.Sub
-			info.PresentedAt = &at
-		}
 		out = append(out, info)
 	}
-	// The store never holds this node's own cert — include it explicitly so
-	// the signing side can renew every member of the mesh, itself included.
+	// This node is listed once, by the cert it holds (cert.cbor): the
+	// roster's own entry for it may be a bare attestation without a name.
 	add(d.Host.ID(), d.OwnCert(), true, false)
 	for p, c := range members {
-		add(p, c, false, false)
+		if p != d.Host.ID() {
+			add(p, c, false, false)
+		}
 	}
 	// Lapsed members ride along flagged: the signing side must not renew
 	// them (nothing could deliver it) but must keep their address reserved
@@ -525,9 +509,9 @@ func (d *Daemon) handleRenew(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"result": "renewed"})
 }
 
-// handlePublish ingests any signed membership event (root moves and
-// retirements included). As everywhere, Ingest verifies the signature
-// against the honoured roots; the socket carries no authority of its own.
+// handlePublish ingests any signed membership event. As everywhere, Ingest
+// verifies the signature against the root; the socket carries no authority
+// of its own.
 func (d *Daemon) handlePublish(w http.ResponseWriter, r *http.Request) {
 	var body renewBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -822,8 +806,7 @@ func (c *Client) Revoke(signedEvent []byte) error {
 	}, nil)
 }
 
-// Publish delivers any signed event (a root move or retirement) for ingest
-// and gossip.
+// Publish delivers any signed event for ingest and gossip.
 func (c *Client) Publish(signedEvent []byte) error {
 	return c.post("/v0/publish", renewBody{EventB64: base64.StdEncoding.EncodeToString(signedEvent)}, nil)
 }

@@ -131,7 +131,7 @@ func TestVerifyRejectsExpiredAddedCert(t *testing.T) {
 func TestLogDedupAndOrder(t *testing.T) {
 	nsPub, nsPriv := testKeys(t)
 	now := time.Now()
-	l := NewLog(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
+	l := NewLog(statement.NewDIDRoot(cert.DIDForKey(nsPub)))
 
 	c := testCert(t, nsPriv, "nas", now, time.Hour)
 	added, err := NewAdded(nsPriv, c, now)
@@ -167,7 +167,7 @@ func TestLogDedupAndOrder(t *testing.T) {
 func TestLogGC(t *testing.T) {
 	nsPub, nsPriv := testKeys(t)
 	now := time.Now()
-	l := NewLog(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
+	l := NewLog(statement.NewDIDRoot(cert.DIDForKey(nsPub)))
 
 	c := testCert(t, nsPriv, "shortlived", now, time.Hour)
 	added, _ := NewAdded(nsPriv, c, now)
@@ -208,7 +208,7 @@ func TestLogGC(t *testing.T) {
 func TestLogKeepsLapsedAdmission(t *testing.T) {
 	nsPub, nsPriv := testKeys(t)
 	now := time.Now()
-	l := NewLog(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
+	l := NewLog(statement.NewDIDRoot(cert.DIDForKey(nsPub)))
 
 	lapsed := testCert(t, nsPriv, "nas", now.Add(-2*time.Hour), time.Hour)
 	e, _ := NewAdded(nsPriv, lapsed, now.Add(-2*time.Hour))
@@ -232,51 +232,5 @@ func TestLogKeepsLapsedAdmission(t *testing.T) {
 	e.Payload.At++
 	if _, err := l.Add(e, now); err == nil {
 		t.Fatal("tampered lapsed admission accepted")
-	}
-}
-
-// Root events: a move is signed by the current root and names another
-// did:key; a retirement is signed by the new root. Both survive GC.
-func TestRootEvents(t *testing.T) {
-	r1Pub, r1, _ := ed25519.GenerateKey(rand.Reader)
-	r2Pub, r2, _ := ed25519.GenerateKey(rand.Reader)
-	d1, d2 := cert.DIDForKey(r1Pub), cert.DIDForKey(r2Pub)
-	now := time.Now()
-
-	moved, err := NewRootMoved(r1, d2, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := Verify(moved, statement.NewDIDRoots(d1), now); err != nil {
-		t.Fatalf("root-moved under the old root: %v", err)
-	}
-	if err := Verify(moved, statement.NewDIDRoots(d2), now); err == nil {
-		t.Fatal("root-moved verified on a node that does not honour its signer")
-	}
-	if _, err := NewRootMoved(r1, d1, now); err == nil {
-		t.Fatal("a root moved onto itself")
-	}
-	retired, err := NewRootRetired(r2, d1, now.Add(time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := Verify(retired, statement.NewDIDRoots(d2, d1), now); err != nil {
-		t.Fatalf("root-retired under the new root: %v", err)
-	}
-	if _, err := NewRootRetired(r2, d2, now); err == nil {
-		t.Fatal("a root retired itself")
-	}
-	if !moved.IsRootEvent() || !retired.IsRootEvent() {
-		t.Fatal("IsRootEvent")
-	}
-	l := NewLog(statement.NewDIDRoots(d1, d2))
-	for _, e := range []*Event{moved, retired} {
-		if fresh, err := l.Add(e, now.Add(time.Hour)); err != nil || !fresh {
-			t.Fatalf("Add: %v %v", fresh, err)
-		}
-	}
-	l.GC(now.Add(10 * cert.MaxValidity))
-	if l.Len() != 2 {
-		t.Fatalf("root events dropped by GC: %d left", l.Len())
 	}
 }

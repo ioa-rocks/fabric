@@ -450,12 +450,11 @@ func TestForeignGrantWithIdentityChain(t *testing.T) {
 	mustFail(t, err, "identity link")
 }
 
-func TestCheckRechecksHonouredRoots(t *testing.T) {
-	// A Compiled is meant to be cached. Retiring a root (root-retired during
-	// a mesh-root move) must stop a cached chain at its next Check, without
-	// recompiling.
+func TestCheckRechecksRoots(t *testing.T) {
+	// A Compiled is meant to be cached. A circle this node no longer holds
+	// must stop a cached chain at its next Check, without recompiling.
 	h := newHome(t)
-	roots := NewDIDRoots(h.did)
+	roots := NewDIDRoot(h.did)
 	c, err := Compile(h.devA, nil, h.did, roots)
 	if err != nil {
 		t.Fatal(err)
@@ -464,8 +463,7 @@ func TestCheckRechecksHonouredRoots(t *testing.T) {
 	if err := c.Check(roots, nil, w); err != nil {
 		t.Fatal(err)
 	}
-	roots.Set(nil)
-	mustFail(t, c.Check(roots, nil, w), "no longer honoured")
+	mustFail(t, c.Check(RootMap{}, nil, w), "no longer honoured")
 
 	// The identity anchor is re-checked too when it was a held circle: the
 	// circle moving to a new key ends chains anchored at the old one.

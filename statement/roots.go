@@ -2,72 +2,31 @@ package statement
 
 import (
 	"crypto/ed25519"
-	"slices"
-	"sync"
 
 	"ioa.rocks/fabric/did"
 )
 
-// DIDRoots is a mutable honoured-roots store over circle DIDs that are
-// did:keys: the node's own circle (config namespace_did) plus any roots
-// still honoured during a root move. It is shared by the member store and
-// the event log, so a root-moved or root-retired event takes effect on both
-// at once.
-type DIDRoots struct {
-	mu   sync.RWMutex
-	dids []string
+// DIDRoot is the Roots of one circle whose DID is a did:key: the circle's
+// key is its root, and nothing else verifies for it. A circle has one root
+// at a time; a key change is a handover in the circle's key history (a
+// parked design, task single-writer-store), never two keys honoured at
+// once — the 2026-11-02 mesh-root → circle-main migration was the one time
+// that happened, and its machinery is gone.
+type DIDRoot struct {
+	did string
 }
 
-// NewDIDRoots honours the given circle DIDs.
-func NewDIDRoots(dids ...string) *DIDRoots {
-	r := &DIDRoots{}
-	r.Set(dids)
-	return r
-}
+// NewDIDRoot is the Roots of the circle with that DID.
+func NewDIDRoot(circleDID string) *DIDRoot { return &DIDRoot{did: circleDID} }
 
-// Set replaces the honoured set (duplicates and empties dropped).
-func (r *DIDRoots) Set(dids []string) {
-	var out []string
-	for _, d := range dids {
-		if d != "" && !slices.Contains(out, d) {
-			out = append(out, d)
-		}
-	}
-	r.mu.Lock()
-	r.dids = out
-	r.mu.Unlock()
-}
+// DID is the circle's DID.
+func (r *DIDRoot) DID() string { return r.did }
 
-// DIDs lists the honoured circle DIDs, primary first.
-func (r *DIDRoots) DIDs() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return slices.Clone(r.dids)
-}
+// Honours reports whether circleDID is this circle.
+func (r *DIDRoot) Honours(circleDID string) bool { return r.did != "" && circleDID == r.did }
 
-// Primary is the circle DID this node's own membership continues under:
-// the first honoured root. During a root move the others are old roots,
-// honoured only until retired; a cert under the primary root is preferred
-// over one under an old root whatever their expiries (see
-// fabricnet.MemberStore.AddMember).
-func (r *DIDRoots) Primary() string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if len(r.dids) == 0 {
-		return ""
-	}
-	return r.dids[0]
-}
-
-// Honours reports whether the DID is in the set.
-func (r *DIDRoots) Honours(circleDID string) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return slices.Contains(r.dids, circleDID)
-}
-
-// RootKeys implements Roots: an honoured did:key resolves to its key.
-func (r *DIDRoots) RootKeys(circleDID string) []ed25519.PublicKey {
+// RootKeys implements Roots: the circle's did:key resolves to its key.
+func (r *DIDRoot) RootKeys(circleDID string) []ed25519.PublicKey {
 	if !r.Honours(circleDID) {
 		return nil
 	}

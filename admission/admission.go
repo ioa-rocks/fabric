@@ -188,7 +188,7 @@ func (q *Queue) Deny(fingerprint string) error {
 }
 
 // Attach wires the queue onto a host as the /fabric/join/1 responder.
-// namespaceDID is read per request: a root move changes it live.
+// namespaceDID is read per request, not captured.
 func Attach(h host.Host, q *Queue, namespaceDID func() string) {
 	h.SetStreamHandler(ProtocolID, func(s network.Stream) {
 		defer s.Close()

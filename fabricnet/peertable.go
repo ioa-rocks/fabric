@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,12 +44,6 @@ type PeerTable struct {
 	watchMu  sync.Mutex
 	watchers []chan struct{}
 
-	// presented is handshake-only memory, per connection, not ledger: what
-	// a peer last showed, as opposed to what the log says was issued to it
-	// (the two differ during a root move).
-	presentedMu sync.RWMutex
-	presented   map[peer.ID]presented
-
 	// st is owned by the goroutine running ops; nothing else reads it.
 	st state
 }
@@ -66,24 +59,17 @@ type state struct {
 	dirty         bool
 }
 
-type presented struct {
-	cert *cert.Cert
-	at   time.Time
-}
-
 // NewPeerTable returns an empty table; AddRoster gives it circles.
 func NewPeerTable() *PeerTable {
-	t := &PeerTable{ops: make(chan func()), stop: make(chan struct{}), presented: map[peer.ID]presented{}}
+	t := &PeerTable{ops: make(chan func()), stop: make(chan struct{})}
 	t.view.Store(t.st.snapshot())
 	go t.run()
 	return t
 }
 
-// NewMemberStore is a table over one memory-only roster honouring roots —
-// the first circle, fed by the membership-event log. The roots store is
-// shared with the event log, so a root move takes effect on both at once
-// (call Recheck afterwards).
-func NewMemberStore(roots *statement.DIDRoots) *PeerTable {
+// NewMemberStore is a table over one memory-only roster of the circle
+// roots names — the first circle, fed by the membership-event log.
+func NewMemberStore(roots *statement.DIDRoot) *PeerTable {
 	t := NewPeerTable()
 	t.AddRoster(circle.NewRoster(roots))
 	return t
@@ -161,50 +147,6 @@ func (s *state) index(circleDID string) int {
 	return -1
 }
 
-// indices lists every roster honouring circleDID — more than one only in
-// the window between a root move and the recheck that merges them.
-func (s *state) indices(circleDID string) []int {
-	var out []int
-	for i, r := range s.rosters {
-		if r.Honours(circleDID) {
-			out = append(out, i)
-		}
-	}
-	return out
-}
-
-// merge keeps one roster per circle: when the first roster has come to
-// honour another roster's circle (a root move made the two one circle),
-// that roster is absorbed into the first and dropped — what startup does
-// with such a directory (Attach), done live. Without it a DID lookup
-// found the first roster and the destination circle's own members, held
-// in the second, escaped its revocations (Codex review, 2026-11-05).
-func (s *state) merge(now time.Time) {
-	if len(s.rosters) < 2 {
-		return
-	}
-	first := s.rosters[0]
-	kept := []*circle.Roster{first}
-	for _, r := range s.rosters[1:] {
-		if !first.Honours(r.Primary()) {
-			kept = append(kept, r)
-			continue
-		}
-		merged := first.Absorb(r, now)
-		if err := merged.Save(); err != nil {
-			kept = append(kept, r) // keep both until the disk takes it; lookups still see the first
-			continue
-		}
-		first = merged
-		s.dirty = true
-	}
-	kept[0] = first
-	if len(kept) != len(s.rosters) {
-		s.dirty = true
-	}
-	s.rosters = kept
-}
-
 func (t *PeerTable) signal() {
 	t.watchMu.Lock()
 	ws := append([]chan struct{}(nil), t.watchers...)
@@ -236,16 +178,15 @@ func (t *PeerTable) Watch() <-chan struct{} {
 // change.
 type View struct {
 	rosters []*circle.Roster
-	byPeer  map[peer.ID][]deviceIn // every entry for the peer, any verdict, roster order
-	// The overlay circle's standing entries carrying an address in the
-	// prefix, by peer, primary root first. A device has one overlay address
-	// at a time: its first admitting entry's (addrEntry), settled at query
-	// time, so Route and AddrOf always agree and an entry running out
-	// hands over to the next on the spot — no GC tick, no republish (Codex
-	// review, 2026-11-05).
-	addrs   map[peer.ID][]deviceIn
-	holders map[netip.Addr][]peer.ID // peers with an entry carrying the address
-	names   map[string][]peer.ID     // lower-cased name -> peers with an entry labelled so
+	byPeer  map[peer.ID][]deviceIn // the peer's entry in each roster, any verdict, roster order
+	// The overlay circle's standing entry carrying an address in the
+	// prefix, by peer. Whether the address is the device's right now is
+	// settled at query time (addrEntry), so Route and AddrOf always agree
+	// and an entry running out stops routing on the spot — no GC tick, no
+	// republish (Codex review, 2026-11-05).
+	addrs   map[peer.ID]deviceIn
+	holders map[netip.Addr][]peer.ID // peers whose entry carries the address
+	names   map[string][]peer.ID     // lower-cased name -> peers whose entry is labelled so
 	version uint64
 }
 
@@ -259,7 +200,7 @@ type deviceIn struct {
 
 func (s *state) snapshot() *View {
 	v := &View{rosters: append([]*circle.Roster(nil), s.rosters...), byPeer: map[peer.ID][]deviceIn{},
-		addrs: map[peer.ID][]deviceIn{}, holders: map[netip.Addr][]peer.ID{}, names: map[string][]peer.ID{}, version: s.version}
+		addrs: map[peer.ID]deviceIn{}, holders: map[netip.Addr][]peer.ID{}, names: map[string][]peer.ID{}, version: s.version}
 	for _, r := range s.rosters {
 		for _, dev := range r.Devices() {
 			p, err := PeerOfDID(dev.DID)
@@ -271,10 +212,9 @@ func (s *state) snapshot() *View {
 	}
 	if s.overlay && len(s.rosters) > 0 {
 		r := s.rosters[0]
-		// Every standing entry carrying an address in the prefix is a
-		// candidate; which one gives the device its address is settled per
-		// query (addrEntry). A dead or lapsed entry is no candidate, so it
-		// cannot shadow a standing one of the same device under another root.
+		// A standing entry carrying an address in the prefix is a
+		// candidate; whether it routes right now is settled per query
+		// (addrEntry). A dead or lapsed entry is no candidate.
 		for _, dev := range r.Devices() {
 			c := view(dev)
 			if c == nil || !dev.Standing() || c.Payload.Meta.IP == "" || !c.Allows(cert.ScopeTun) {
@@ -288,11 +228,9 @@ func (s *state) snapshot() *View {
 			if err != nil {
 				continue
 			}
-			v.addrs[p] = append(v.addrs[p], deviceIn{roster: r, dev: dev, addr: pfx.Addr()})
-			if !slices.Contains(v.holders[pfx.Addr()], p) {
-				v.holders[pfx.Addr()] = append(v.holders[pfx.Addr()], p)
-			}
-			if name := strings.ToLower(c.Payload.Meta.Name); name != "" && !slices.Contains(v.names[name], p) {
+			v.addrs[p] = deviceIn{roster: r, dev: dev, addr: pfx.Addr()}
+			v.holders[pfx.Addr()] = append(v.holders[pfx.Addr()], p)
+			if name := strings.ToLower(c.Payload.Meta.Name); name != "" {
 				v.names[name] = append(v.names[name], p)
 			}
 		}
@@ -317,13 +255,12 @@ func (t *PeerTable) AddRoster(r *circle.Roster) {
 	})
 }
 
-// Attach folds a circle directory the first roster honours into it: the
-// circle's revocations and sweeps, then its devices.cbor, which the roster
-// persists to from then on. The circle the membership-event log feeds thus
-// keeps the asserts the log never carries (a `circle admit` into it)
-// across a restart (Codex review, 2026-11-04), and after a root move the
-// destination circle's directory is read with its revocations, so a
-// device revoked there before the restart stays revoked (Codex review,
+// Attach folds the first roster's circle directory into it: the circle's
+// revocations and sweeps, then its devices.cbor, which the roster persists
+// to from then on. The circle the membership-event log feeds thus keeps
+// the asserts the log never carries (a `circle admit` into it) across a
+// restart (Codex review, 2026-11-04), read with its revocations, so a
+// device revoked before the restart stays revoked (Codex review,
 // 2026-11-05).
 func (t *PeerTable) Attach(c *circle.Circle, now time.Time) error {
 	return t.apply(func(s *state) error {
@@ -342,11 +279,8 @@ func (t *PeerTable) Attach(c *circle.Circle, now time.Time) error {
 
 // SetOverlay makes the first circle's asserts route on this node's
 // interface, inside the given range — set once when the bridge comes up;
-// the view's routes and zone are empty before that. The overlay is the
-// first *roster*, not a DID: a root move renames the circle (the roster
-// honours the new root beside the old, then the old is retired) and the
-// interface must follow it without anyone re-pointing it (Codex review,
-// 2026-11-05). One interface per overlay circle is slice H's.
+// the view's routes and zone are empty before that. One interface per
+// overlay circle is slice H's.
 func (t *PeerTable) SetOverlay(within netip.Prefix) {
 	_ = t.apply(func(s *state) error {
 		s.overlay, s.overlayPrefix = true, within
@@ -391,15 +325,13 @@ func (t *PeerTable) AddRevocation(circleDID string, st *statement.Statement) (fr
 		if i < 0 {
 			return fmt.Errorf("roster: circle %s is not honoured here", shortDID(circleDID))
 		}
-		for _, i := range s.indices(circleDID) {
-			nr, f, err := s.rosters[i].AddRevocation(st)
-			if err != nil {
-				return err
-			}
-			if f {
-				fresh = true
-				_ = s.replace(i, nr, false)
-			}
+		nr, f, err := s.rosters[i].AddRevocation(st)
+		if err != nil {
+			return err
+		}
+		if f {
+			fresh = true
+			_ = s.replace(i, nr, false)
 		}
 		return nil
 	})
@@ -410,24 +342,10 @@ func (t *PeerTable) AddRevocation(circleDID string, st *statement.Statement) (fr
 // device revocation).
 func (t *PeerTable) SweepIn(circleDID, deviceDID string, at time.Time) {
 	_ = t.apply(func(s *state) error {
-		for _, i := range s.indices(circleDID) {
+		if i := s.index(circleDID); i >= 0 {
 			nr, _ := s.rosters[i].Sweep(deviceDID, at)
 			_ = s.replace(i, nr, false)
 		}
-		return nil
-	})
-}
-
-// Recheck re-derives every roster's verdicts after the roots changed (a
-// root move or retirement) and merges a roster whose circle the first
-// roster now honours into it — one roster per circle.
-func (t *PeerTable) Recheck() {
-	_ = t.apply(func(s *state) error {
-		for i, r := range s.rosters {
-			nr, _ := r.Recheck()
-			_ = s.replace(i, nr, false)
-		}
-		s.merge(time.Now())
 		return nil
 	})
 }
@@ -458,9 +376,9 @@ func (t *PeerTable) Admit(p peer.ID, c *cert.Cert) error {
 	if !ok {
 		return fmt.Errorf("certificate circle %s is not honoured here", c.Payload.Sub)
 	}
-	// The presented cert is judged on its own — not the device's entry
-	// under that root (a newer, live assert), not an entry under another
-	// root — so a revoked cert is refused whatever else the device holds.
+	// The presented cert is judged on its own — not the device's entry (a
+	// newer, live assert) — so a revoked cert is refused whatever else the
+	// device holds.
 	if err := r.Judge(c.Stmt, now); err != nil {
 		return fmt.Errorf("device is not admitted: %w", err)
 	}
@@ -472,7 +390,7 @@ func (t *PeerTable) Admit(p peer.ID, c *cert.Cert) error {
 // circle must be held here (else held = false — skipped, the peer guessed);
 // it enters that circle's roster and live says whether the device is
 // admitted there now (a revoked or expired assert is recorded with its
-// verdict and skipped). circleDID is the roster's primary DID.
+// verdict and skipped). circleDID is the circle's DID.
 func (t *PeerTable) Verify(p peer.ID, st *statement.Statement) (circleDID string, held, live bool, err error) {
 	c, err := cert.FromStatement(st)
 	if err != nil {
@@ -496,7 +414,7 @@ func (t *PeerTable) Verify(p peer.ID, st *statement.Statement) (circleDID string
 	if !ok {
 		return "", false, false, nil
 	}
-	return r.Primary(), true, r.Judge(st, now) == nil, nil // the presented assert itself, see Admit
+	return r.CircleDID(), true, r.Judge(st, now) == nil, nil // the presented assert itself, see Admit
 }
 
 // AddMember records a verified certificate learned from the event log or
@@ -536,28 +454,6 @@ func (t *PeerTable) RevokeIn(circleDID string, p peer.ID, now time.Time) {
 	}
 }
 
-// Forget drops a peer from every roster without marking it revoked: what a
-// root retirement does to members whose cert is in the retired circle
-// (they re-join or receive a new cert; they are not banned).
-func (t *PeerTable) Forget(p peer.ID) {
-	deviceDID, err := DeviceDID(p)
-	if err != nil {
-		return
-	}
-	_ = t.apply(func(s *state) error {
-		for i, r := range s.rosters {
-			nr, had := r.Forget(deviceDID)
-			if had {
-				_ = s.replace(i, nr, true)
-			}
-		}
-		return nil
-	})
-	t.presentedMu.Lock()
-	delete(t.presented, p)
-	t.presentedMu.Unlock()
-}
-
 // GC moves expired devices to lapsed memory, drops lapsed entries past
 // their retention and sweeps that can no longer kill anything.
 func (t *PeerTable) GC(now time.Time) {
@@ -570,27 +466,6 @@ func (t *PeerTable) GC(now time.Time) {
 		}
 		return nil
 	})
-}
-
-// ---- handshake memory (per connection, not ledger) ------------------------
-
-// NotePresented records the cert a peer showed in a handshake just now. It
-// is handshake-only memory (not persisted, not fed by gossip): what
-// `fabric root status` and `root retire` read to know which devices have
-// really moved to a new root.
-func (t *PeerTable) NotePresented(p peer.ID, c *cert.Cert) {
-	t.presentedMu.Lock()
-	defer t.presentedMu.Unlock()
-	t.presented[p] = presented{cert: c, at: time.Now()}
-}
-
-// Presented returns the cert a peer last showed in a handshake since this
-// process started, and when.
-func (t *PeerTable) Presented(p peer.ID) (*cert.Cert, time.Time, bool) {
-	t.presentedMu.RLock()
-	defer t.presentedMu.RUnlock()
-	pr, ok := t.presented[p]
-	return pr.cert, pr.at, ok
 }
 
 // ---- readers: thin wrappers over the current view ---------------------------
@@ -621,7 +496,6 @@ func (t *PeerTable) Snapshot() (map[peer.ID]*cert.Cert, map[peer.ID]time.Time) {
 }
 func (t *PeerTable) Lapsed() map[peer.ID]*cert.Cert          { return t.View().Lapsed() }
 func (t *PeerTable) IsRevoked(p peer.ID, now time.Time) bool { return t.View().IsRevoked(p, now) }
-func (t *PeerTable) MembersIn(circleDID string) []peer.ID    { return t.View().MembersIn(circleDID) }
 func (t *PeerTable) LiveIn(circleDID string) []peer.ID       { return t.View().LiveIn(circleDID) }
 func (t *PeerTable) Route(dst netip.Addr) (peer.ID, bool)    { return t.View().Route(dst, time.Now()) }
 func (t *PeerTable) AddrOf(p peer.ID) (netip.Addr, bool)     { return t.View().AddrOf(p, time.Now()) }
@@ -631,8 +505,8 @@ func (t *PeerTable) Resolve(name string) (netip.Addr, bool) {
 
 type tableRoots struct{ t *PeerTable }
 
-// RootKeys is the union of the rosters' honoured roots: what certs on the
-// handshake are verified against.
+// RootKeys is the union of the rosters' roots: what certs on the handshake
+// are verified against.
 func (r tableRoots) RootKeys(circleDID string) []ed25519.PublicKey {
 	if ro, ok := r.t.RosterFor(circleDID); ok {
 		return ro.Roots().RootKeys(circleDID)
@@ -645,7 +519,7 @@ func (r tableRoots) RootKeys(circleDID string) []ed25519.PublicKey {
 // Rosters lists the rosters in the union, insertion order. Read only.
 func (v *View) Rosters() []*circle.Roster { return v.rosters }
 
-// RosterFor returns the roster whose roots honour circleDID. Read only.
+// RosterFor returns the roster of the circle circleDID. Read only.
 func (v *View) RosterFor(circleDID string) (*circle.Roster, bool) {
 	for _, r := range v.rosters {
 		if r.Honours(circleDID) {
@@ -669,11 +543,11 @@ func (v *View) live(p peer.ID, now time.Time) []deviceIn {
 // here.
 func (v *View) IsMember(p peer.ID, now time.Time) bool { return len(v.live(p, now)) > 0 }
 
-// Circles lists the circles (primary DIDs) the peer is a live device of.
+// Circles lists the circles (by DID) the peer is a live device of.
 func (v *View) Circles(p peer.ID, now time.Time) []string {
 	var out []string
 	for _, d := range v.live(p, now) {
-		out = append(out, d.roster.Primary())
+		out = append(out, d.roster.CircleDID())
 	}
 	return out
 }
@@ -808,30 +682,7 @@ func (v *View) IsRevoked(p peer.ID, now time.Time) bool {
 	return false
 }
 
-// MembersIn lists the live devices holding an admitting assert in the
-// given circle DID — for an old root during a move, every device still
-// holding one there, re-issued under the new root or not. A retirement
-// forgets those entries (Forget drops only the retired root's) and cuts
-// off the devices nothing else admits.
-func (v *View) MembersIn(circleDID string) []peer.ID {
-	now := time.Now()
-	var out []peer.ID
-	for _, r := range v.rosters {
-		for _, dev := range r.LiveAsserts(now) {
-			if dev.Sub() != circleDID {
-				continue
-			}
-			if p, err := PeerOfDID(dev.DID); err == nil {
-				out = append(out, p)
-			}
-		}
-	}
-	return out
-}
-
-// LiveIn lists the live devices of the circle that honours circleDID —
-// during a root move the devices still on the old root included, since
-// the roster is one circle under two keys.
+// LiveIn lists the live devices of the circle circleDID.
 func (v *View) LiveIn(circleDID string) []peer.ID {
 	now := time.Now()
 	var out []peer.ID
@@ -849,16 +700,14 @@ func (v *View) LiveIn(circleDID string) []peer.ID {
 }
 
 // addrEntry is the entry that gives the peer its overlay address right now:
-// its first admitting entry carrying one (the primary root's before an old
-// root's). One address per device at a time — the one Route, AddrOf and
-// Resolve all answer with.
+// its overlay-circle entry, when it carries one and admits the device at
+// this moment — the one address Route, AddrOf and Resolve all answer with.
 func (v *View) addrEntry(p peer.ID, now time.Time) (deviceIn, bool) {
-	for _, d := range v.addrs[p] {
-		if d.dev.Admits(now) {
-			return d, true
-		}
+	d, ok := v.addrs[p]
+	if !ok || !d.dev.Admits(now) {
+		return deviceIn{}, false
 	}
-	return deviceIn{}, false
+	return d, true
 }
 
 // Route answers the bridge: which live device of the overlay circle holds

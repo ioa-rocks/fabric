@@ -36,7 +36,7 @@ type syncNode struct {
 func newSyncNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.PrivateKey, name string) *syncNode {
 	t.Helper()
 	n := &syncNode{node: newNode(t, nsPub, nsPriv, name, true, 5*time.Second)}
-	n.log = event.NewLog(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
+	n.log = event.NewLog(statement.NewDIDRoot(cert.DIDForKey(nsPub)))
 	n.sync = NewEventSync(n.host, n.log, n.store, func(e *event.Event) {
 		if e.Payload.Kind != event.KindRevoked {
 			return
@@ -336,7 +336,7 @@ func TestSyncV2SendsOnlySharedCircleSets(t *testing.T) {
 	attB, _ := circle.Attest(famPriv, bPub, time.Now())
 	rawA, _ := attA.Stmt.Bytes()
 	for _, n := range []*syncNode{a, b} {
-		n.store.AddRoster(circle.NewRoster(statement.NewDIDRoots(famDID)))
+		n.store.AddRoster(circle.NewRoster(statement.NewDIDRoot(famDID)))
 	}
 	// The owner admitted the device: its assert is in the owner's roster.
 	if _, err := a.store.AddAssert(attB.Stmt, time.Now()); err != nil {
@@ -391,7 +391,7 @@ func TestVerifyRejectsAssertForAnotherDevice(t *testing.T) {
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	otherPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	other, _ := PeerIDForKey(otherPub)
-	s := NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
+	s := NewMemberStore(statement.NewDIDRoot(cert.DIDForKey(nsPub)))
 	c, _ := cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, time.Now(), time.Hour)
 	if _, _, _, err := s.Verify(other, c.Stmt); err == nil {
 		t.Fatal("assert for another device verified for the presenting peer")
@@ -414,7 +414,7 @@ func TestLegacyProtocolsServeFirstCircleOnly(t *testing.T) {
 	aPub, _ := a.host.Peerstore().PubKey(a.host.ID()).Raw()
 	attA, _ := circle.Attest(famPriv, aPub, time.Now())
 	rawA, _ := attA.Stmt.Bytes()
-	a.store.AddRoster(circle.NewRoster(statement.NewDIDRoots(famDID)))
+	a.store.AddRoster(circle.NewRoster(statement.NewDIDRoot(famDID)))
 	a.auth.SetPresenter(func(_ peer.ID, verified []string) Hello {
 		for _, c := range verified {
 			if c == famDID {
@@ -428,7 +428,7 @@ func TestLegacyProtocolsServeFirstCircleOnly(t *testing.T) {
 	// family attestation.
 	bPriv, _, _ := crypto.GenerateEd25519Key(rand.Reader)
 	bStore := NewPeerTable()
-	bStore.AddRoster(circle.NewRoster(statement.NewDIDRoots(famDID)))
+	bStore.AddRoster(circle.NewRoster(statement.NewDIDRoot(famDID)))
 	bGater := NewGater(bStore)
 	bGater.SetListed(true)
 	bHost, err := libp2p.New(libp2p.Identity(bPriv), libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"), libp2p.ConnectionGater(bGater))

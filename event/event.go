@@ -14,23 +14,20 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/cert"
-	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/statement"
 
 	"github.com/fxamacker/cbor/v2"
 )
 
 // Kinds of membership events.
+//
+// Logs written before 2026-11-05 may still carry `root-moved` and
+// `root-retired` records from the one-time mesh-root → circle-main
+// migration; Verify refuses them as unknown and they drop out of the log
+// like any other stale entry.
 const (
 	KindAdded   = "member-added"
 	KindRevoked = "member-revoked"
-	// KindRootMoved, signed by the circle's current root, says the circle
-	// continues under the root named by To (the mesh-root merge: the home
-	// circle's key takes over). Nodes honour To from then on and keep the
-	// signer honoured until a KindRootRetired, signed by the new root,
-	// names it. Together they make the move a gossip, not a flag day.
-	KindRootMoved   = "root-moved"
-	KindRootRetired = "root-retired"
 )
 
 // Payload is the signed portion of a membership event.
@@ -39,8 +36,6 @@ type Payload struct {
 	Kind   string `cbor:"kind"`             // one of the Kind constants
 	Cert   []byte `cbor:"cert,omitempty"`   // KindAdded: the signed membership cert
 	Device []byte `cbor:"device,omitempty"` // KindRevoked: the revoked device pubkey
-	To     string `cbor:"to,omitempty"`     // KindRootMoved: the root that takes over
-	Root   string `cbor:"root,omitempty"`   // KindRootRetired: the root no longer honoured
 	At     int64  `cbor:"at"`               // unix seconds
 }
 
@@ -81,35 +76,6 @@ func NewRevoked(rootPriv ed25519.PrivateKey, devicePub ed25519.PublicKey, at tim
 	return sign(rootPriv, Payload{Kind: KindRevoked, Device: devicePub, At: at.Unix()})
 }
 
-// NewRootMoved is signed by the current root: the circle continues under
-// the root named by to.
-func NewRootMoved(rootPriv ed25519.PrivateKey, to string, at time.Time) (*Event, error) {
-	if !did.IsKey(to) {
-		return nil, errors.New("root-moved target is not a did:key")
-	}
-	if to == did.ForKey(rootPriv.Public().(ed25519.PublicKey)) {
-		return nil, errors.New("root-moved target is the signing root itself")
-	}
-	return sign(rootPriv, Payload{Kind: KindRootMoved, To: to, At: at.Unix()})
-}
-
-// NewRootRetired is signed by the (new) root: the root named is no longer
-// honoured; certificates in its circle stop verifying everywhere.
-func NewRootRetired(rootPriv ed25519.PrivateKey, retired string, at time.Time) (*Event, error) {
-	if !did.IsKey(retired) {
-		return nil, errors.New("root-retired target is not a did:key")
-	}
-	if retired == did.ForKey(rootPriv.Public().(ed25519.PublicKey)) {
-		return nil, errors.New("a root cannot retire itself")
-	}
-	return sign(rootPriv, Payload{Kind: KindRootRetired, Root: retired, At: at.Unix()})
-}
-
-// IsRootEvent reports whether the event is about roots rather than a device.
-func (e *Event) IsRootEvent() bool {
-	return e.Payload.Kind == KindRootMoved || e.Payload.Kind == KindRootRetired
-}
-
 func sign(rootPriv ed25519.PrivateKey, p Payload) (*Event, error) {
 	p.Ns = cert.DIDForKey(rootPriv.Public().(ed25519.PublicKey))
 	msg, err := encMode.Marshal(p)
@@ -119,12 +85,11 @@ func sign(rootPriv ed25519.PrivateKey, p Payload) (*Event, error) {
 	return &Event{Payload: p, Sig: ed25519.Sign(rootPriv, msg)}, nil
 }
 
-// Verify checks the event against the honoured roots: its signer must be a
-// root honoured for the circle it names, and for MemberAdded events the
-// embedded certificate is verified too, so a verified added-event's cert
-// can be trusted as a membership proof. An added event whose cert has
-// already expired fails verification — it is stale, not dangerous, and
-// callers simply drop it.
+// Verify checks the event against roots: its signer must be the root of
+// the circle it names, and for MemberAdded events the embedded certificate
+// is verified too, so a verified added-event's cert can be trusted as a
+// membership proof. An added event whose cert has already expired fails
+// verification — it is stale, not dangerous, and callers simply drop it.
 func Verify(e *Event, roots statement.Roots, now time.Time) error {
 	keys := roots.RootKeys(e.Payload.Ns)
 	if len(keys) == 0 {
@@ -157,14 +122,6 @@ func Verify(e *Event, roots statement.Roots, now time.Time) error {
 		if len(e.Payload.Device) != ed25519.PublicKeySize {
 			return errors.New("revoked-event device key is not an ed25519 public key")
 		}
-	case KindRootMoved:
-		if !did.IsKey(e.Payload.To) || e.Payload.To == e.Payload.Ns {
-			return errors.New("root-moved target is not another did:key")
-		}
-	case KindRootRetired:
-		if !did.IsKey(e.Payload.Root) || e.Payload.Root == e.Payload.Ns {
-			return errors.New("root-retired target is not another did:key")
-		}
 	default:
 		return fmt.Errorf("unknown event kind %q", e.Payload.Kind)
 	}
@@ -173,7 +130,7 @@ func Verify(e *Event, roots statement.Roots, now time.Time) error {
 
 // VerifyKey is Verify against a single root key.
 func VerifyKey(e *Event, namespacePub ed25519.PublicKey, now time.Time) error {
-	return Verify(e, statement.NewDIDRoots(cert.DIDForKey(namespacePub)), now)
+	return Verify(e, statement.NewDIDRoot(cert.DIDForKey(namespacePub)), now)
 }
 
 // AddedCert decodes the certificate carried by a MemberAdded event.

@@ -13,15 +13,13 @@ import (
 // unit exchanged in anti-entropy gossip and persisted across restarts.
 // Everything in the log passed Verify on the way in.
 type Log struct {
-	roots statement.Roots // honoured roots; shared with the member store
+	roots statement.Roots // the circle's root; shared with the member store
 
 	mu     sync.Mutex
 	events map[string]*Event // by Event.ID()
 }
 
-// NewLog returns an empty log verifying against roots. A root-moved or
-// root-retired event applied by the daemon changes what roots honours, and
-// the log sees it at once.
+// NewLog returns an empty log verifying against roots.
 func NewLog(roots statement.Roots) *Log {
 	return &Log{roots: roots, events: make(map[string]*Event)}
 }
@@ -111,8 +109,6 @@ func (l *Log) GC(now time.Time) {
 				delete(l.events, id)
 			}
 		}
-		// Root events are kept: a late joiner must still learn how the
-		// circle's root moved.
 	}
 }
 

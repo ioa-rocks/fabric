@@ -72,7 +72,7 @@ type CircleService struct {
 	// attestation — one assert per device (mesh-root merge) — so a node
 	// needs no separate `circle attest` into its own home circle.
 	ownCert func() *cert.Cert
-	// home is the home circle's DID, roots the honoured roots for it and
+	// home is the home circle's DID, roots its root and
 	// certOf the member store: a peer's chain in the home circle is its
 	// membership cert (one assert per device, mesh-root merge), which the
 	// circle exchange never carries.
@@ -336,7 +336,7 @@ func (s *CircleService) hello(p peer.ID, verified []string) fabricnet.Hello {
 	for _, o := range s.ownAsserts(now) {
 		switch {
 		case verified != nil:
-			if slices.Contains(verified, o.roster.Primary()) {
+			if slices.Contains(verified, o.roster.CircleDID()) {
 				chosen = append(chosen, o)
 			}
 		default:
@@ -541,7 +541,7 @@ func (s *CircleService) Circles() []*circle.Circle {
 			roster, err := circle.OpenRoster(c, time.Now())
 			if err != nil {
 				log.Printf("circle %q: roster unreadable, starting empty: %v", c.Config.Name, err)
-				roster = circle.NewRoster(statement.NewDIDRoots(c.Config.DID))
+				roster = circle.NewRoster(statement.NewDIDRoot(c.Config.DID))
 			}
 			s.table.AddRoster(roster)
 		}
@@ -808,7 +808,7 @@ func (s *CircleService) Verify(ctx context.Context, p peer.ID, want statement.Wa
 	if chain == nil {
 		return legacyAllows(circle.DeviceVerbs, want)
 	}
-	return chain.Check(statement.NewDIDRoots(c.Config.DID), s.revsFor(want.Sub, want.Now), want)
+	return chain.Check(statement.NewDIDRoot(c.Config.DID), s.revsFor(want.Sub, want.Now), want)
 }
 
 // verifyHome is Verify for the home circle: the chain is the membership
@@ -1027,8 +1027,8 @@ func (s *CircleService) validLocked(c *statement.Compiled, now time.Time) error 
 // ErrNotPresented is a verb under a chain this connection never presented.
 var ErrNotPresented = errors.New("chain not presented on this connection")
 
-// rootsFor is the Roots view for a circle this node answers for: the
-// honoured roots for the home circle, the circle's own key when held.
+// rootsFor is the Roots view for a circle this node answers for: the home
+// circle's root, the circle's own key when held.
 func (s *CircleService) rootsFor(circleDID string) (statement.Roots, error) {
 	if s.home != nil && circleDID == s.home() && s.roots != nil {
 		return s.roots, nil
@@ -1036,7 +1036,7 @@ func (s *CircleService) rootsFor(circleDID string) (statement.Roots, error) {
 	if s.circleByDID(circleDID) == nil {
 		return nil, fmt.Errorf("circle %s is not held by this node", shortDID(circleDID))
 	}
-	return statement.NewDIDRoots(circleDID), nil
+	return statement.NewDIDRoot(circleDID), nil
 }
 
 // Present compiles a chain a connection peer shows for a principal below

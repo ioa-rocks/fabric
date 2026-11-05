@@ -47,7 +47,7 @@ func TestRelayIsMembersOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	relayStore := NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub)))
+	relayStore := NewMemberStore(statement.NewDIDRoot(cert.DIDForKey(nsPub)))
 	r := newRelayHost(t, relayStore)
 	rInfo := peer.AddrInfo{ID: r.ID(), Addrs: r.Addrs()}
 

@@ -432,8 +432,8 @@ func cmdCircleAttest(args []string) error {
 
 // cmdCirclePassphrase re-encrypts a circle's key container under a new
 // passphrase on this device. The key is unchanged, so nothing is re-signed;
-// when the circle is the mesh root (root merge), the root key container is
-// the same key and is rewritten too. Other devices holding the circle are
+// when the circle's key is the root (circle `main` since the 2026-11-02
+// migration), the root key container is the same key and is rewritten too. Other devices holding the circle are
 // not reached: run it there as well, or re-export.
 func cmdCirclePassphrase(args []string) error {
 	fs := flag.NewFlagSet("circle passphrase", flag.ExitOnError)
@@ -1323,3 +1323,11 @@ type stringList []string
 
 func (l *stringList) String() string     { return strings.Join(*l, ",") }
 func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
+
+// shortDID is the tail of a did:key for display: the last eight characters.
+func shortDID(did string) string {
+	if len(did) > 8 {
+		return did[len(did)-8:]
+	}
+	return did
+}

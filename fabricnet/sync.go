@@ -69,7 +69,7 @@ type syncPayload struct {
 // circleSet is one circle's anti-entropy set in a v2 exchange.
 type circleSet struct {
 	DID         string         `cbor:"did"`
-	Roots       []string       `cbor:"roots,omitempty"` // every DID the sender's roster honours (a root move in progress)
+	Roots       []string       `cbor:"roots,omitempty"` // the circle DID again (older binaries listed every root they honoured)
 	Asserts     [][]byte       `cbor:"a,omitempty"`     // device asserts, statement bytes (live and lapsed)
 	Revocations [][]byte       `cbor:"r,omitempty"`     // statement and legacy forms
 	Events      []*event.Event `cbor:"e,omitempty"`     // legacy envelopes (first circle only), one release
@@ -337,11 +337,11 @@ func (s *EventSync) setsFor(p peer.ID, evs []*event.Event, full bool) []circleSe
 	hooks := s.circleHooks()
 	var out []circleSet
 	for i, r := range s.store.Rosters() {
-		did := r.Primary()
+		did := r.CircleDID()
 		if !s.store.In(p, did, now) {
 			continue
 		}
-		set := circleSet{DID: did, Roots: r.Roots().DIDs()}
+		set := circleSet{DID: did, Roots: []string{did}}
 		if i == 0 {
 			set.Events = evs
 		}
@@ -538,9 +538,8 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 		deltas      []circleSet
 	)
 	for _, set := range pl.Circles {
-		// The sender keys the set by its primary DID; during a root move a
-		// peer that has not learned the move yet honours only the old
-		// root, so every DID the sender honours is tried.
+		// The set is keyed by the circle DID; Roots repeats it (a peer on
+		// an older binary may list more than one).
 		roster, ok := s.store.RosterFor(set.DID)
 		for _, did := range set.Roots {
 			if ok {
@@ -605,7 +604,7 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 // whole event log (Codex review, 2026-11-04).
 func (s *EventSync) inFirstCircle(p peer.ID) bool {
 	rosters := s.store.Rosters()
-	return len(rosters) > 0 && s.store.In(p, rosters[0].Primary(), time.Now())
+	return len(rosters) > 0 && s.store.In(p, rosters[0].CircleDID(), time.Now())
 }
 
 // handleSync is the responder side of /fabric/sync/1: apply theirs, answer

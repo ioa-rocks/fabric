@@ -32,13 +32,7 @@ type Config struct {
 	Name         string   `json:"name"`
 	ListenAddrs  []string `json:"listen_addrs"`
 	NamespaceDID string   `json:"namespace_did"` // the home circle's DID: the root certs verify against
-	// HonouredRoots are further circle DIDs whose certs this node still
-	// admits: the previous root during a mesh-root merge, until the new
-	// root retires it (event.KindRootMoved / KindRootRetired). Maintained by
-	// the daemon from gossip; edit by hand only to bootstrap a node that
-	// missed the move.
-	HonouredRoots []string `json:"honoured_roots,omitempty"`
-	Bootstrap     []string `json:"bootstrap"` // multiaddrs including /p2p/<peer-id>; operator-configured (join, peer add): the lighthouses this node trusts as NAT oracles
+	Bootstrap    []string `json:"bootstrap"`     // multiaddrs including /p2p/<peer-id>; operator-configured (join, peer add): the lighthouses this node trusts as NAT oracles
 	// DiscoveredBootstrap are lighthouse addresses pinned from what connected
 	// members advertised (daemon.pinQueueHosts): dialed like Bootstrap for
 	// recovery, but not trusted for anything — a member can advertise a

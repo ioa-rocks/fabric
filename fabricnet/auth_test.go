@@ -53,7 +53,7 @@ func newScopedNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.Private
 		t.Fatal(err)
 	}
 
-	n := &node{store: NewMemberStore(statement.NewDIDRoots(cert.DIDForKey(nsPub)))}
+	n := &node{store: NewMemberStore(statement.NewDIDRoot(cert.DIDForKey(nsPub)))}
 	// Listed posture: these tests exercise the handshake, which on a dark
 	// node only an already-known member reaches (gater_test.go covers dark).
 	n.gater = NewGater(n.store)
@@ -221,7 +221,7 @@ func TestDelegatedCertAcceptedAndCascades(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := NewMemberStore(statement.NewDIDRoots(circleDID))
+	store := NewMemberStore(statement.NewDIDRoot(circleDID))
 	p, _ := PeerIDForKey(devPub)
 	var buf bytes.Buffer
 	if err := writeCert(&buf, delegated); err != nil {

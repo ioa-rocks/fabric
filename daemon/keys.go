@@ -136,7 +136,7 @@ func (d *Daemon) rootsFor(circleDID string) statement.Roots {
 	if circleDID == d.NamespaceDID() {
 		return d.Roots
 	}
-	return statement.NewDIDRoots(circleDID)
+	return statement.NewDIDRoot(circleDID)
 }
 
 // IssueKey mints a sub-key under this device's assert in circleDID, allowed

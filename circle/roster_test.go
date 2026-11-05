@@ -125,7 +125,7 @@ func TestRosterLifecycle(t *testing.T) {
 // ones, and tombstones an unknown device for a day.
 func TestRosterSweep(t *testing.T) {
 	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
-	roster := NewRoster(statement.NewDIDRoots(did.ForKey(rootPub)))
+	roster := NewRoster(statement.NewDIDRoot(did.ForKey(rootPub)))
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	devDID := did.ForKey(devPub)
 	then := time.Now().Add(-time.Hour)
@@ -182,107 +182,16 @@ func TestRosterTieBreakIsDeterministic(t *testing.T) {
 	if a.Expiry() != b.Expiry() {
 		t.Skip("windows differ (second boundary crossed)")
 	}
-	r1 := NewRoster(statement.NewDIDRoots(root.Config.DID))
+	r1 := NewRoster(statement.NewDIDRoot(root.Config.DID))
 	r1, _, _ = r1.Add(a.Stmt, now)
 	r1, _, _ = r1.Add(b.Stmt, now)
-	r2 := NewRoster(statement.NewDIDRoots(root.Config.DID))
+	r2 := NewRoster(statement.NewDIDRoot(root.Config.DID))
 	r2, _, _ = r2.Add(b.Stmt, now)
 	r2, _, _ = r2.Add(a.Stmt, now)
 	d1, _ := r1.Device(did.ForKey(devPub))
 	d2, _ := r2.Device(did.ForKey(devPub))
 	if d1.Stmt.ID() != d2.Stmt.ID() {
 		t.Fatal("the winner of an expiry tie depends on arrival order")
-	}
-}
-
-// A root move folds two rosters into one. A device holding an assert with
-// its overlay address under the old root and a plain assert in the
-// destination circle is an entry under each root: it keeps the address
-// (and so its route) whichever arrived first, until the old root is
-// retired; a revocation by the new root reaches both entries (Codex
-// review, 2026-11-05).
-func TestRootMoveKeepsBothEntriesUntilRetirement(t *testing.T) {
-	main, _ := Init(t.TempDir(), "main", "pw")
-	fam, _ := Init(t.TempDir(), "family", "pw")
-	mainPriv, _ := main.Unlock("pw")
-	famPriv, _ := fam.Unlock("pw")
-	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	dev := did.ForKey(devPub)
-	now := time.Now()
-	tunVerbs := append(append([]string{}, DeviceVerbs...), statement.VerbTun)
-	mainTun, _ := AttestWith(mainPriv, nil, main.Config.DID, devPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
-	famPlain, _ := AttestFor(famPriv, devPub, now, 2*time.Hour) // family admitted nas earlier: no tun, later expiry
-	moved := statement.NewDIDRoots(fam.Config.DID, main.Config.DID)
-
-	for _, order := range [][]*Attestation{{mainTun, famPlain}, {famPlain, mainTun}} {
-		r := NewRoster(moved)
-		for _, a := range order {
-			r, _, _ = r.Add(a.Stmt, now)
-		}
-		if r.Len() != 2 || len(r.LiveDevices(now)) != 1 || len(r.LiveAsserts(now)) != 2 {
-			t.Fatalf("entries=%d live devices=%d live asserts=%d, want 2/1/2", r.Len(), len(r.LiveDevices(now)), len(r.LiveAsserts(now)))
-		}
-		if _, live := r.Live(dev, now); !live || len(r.UsedIPs()) != 1 {
-			t.Fatal("device not live with its address after the move")
-		}
-		if d, _ := r.Device(dev); d.Sub() != fam.Config.DID {
-			t.Fatal("the representative entry is not the primary root's")
-		}
-		// Re-issue under the new root (root merge: full validity, so it
-		// outlives the plain admission), then retire the old root.
-		famTun, _ := AttestWith(famPriv, nil, fam.Config.DID, devPub, now, 3*time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
-		r, changed, _ := r.Add(famTun.Stmt, now)
-		if d, _ := r.Device(dev); !changed || d.Stmt.ID() != famTun.Stmt.ID() || r.Len() != 2 {
-			t.Fatal("the re-issued assert did not replace the plain one under the new root")
-		}
-		retired := statement.NewDIDRoots(fam.Config.DID)
-		r2 := NewRoster(retired)
-		for _, d := range r.Devices() {
-			r2, _, _ = r2.Add(d.Stmt, now) // the old root's assert no longer compiles
-		}
-		r2, _ = r2.Forget(dev)
-		if r2.Len() != 1 || len(r2.UsedIPs()) != 1 {
-			t.Fatalf("after retirement: entries=%d ips=%d, want 1/1", r2.Len(), len(r2.UsedIPs()))
-		}
-	}
-
-	// Retirement before re-issue drops only the old root's entry: the
-	// device stays a (plain) member of the circle.
-	r := NewRoster(statement.NewDIDRoots(fam.Config.DID, main.Config.DID))
-	r, _, _ = r.Add(mainTun.Stmt, now)
-	r, _, _ = r.Add(famPlain.Stmt, now)
-	r.roots.Set([]string{fam.Config.DID})
-	r, _ = r.Recheck()
-	r, had := r.Forget(dev)
-	if _, live := r.Live(dev, now); !had || !live || r.Len() != 1 || len(r.UsedIPs()) != 0 {
-		t.Fatalf("after retiring the old root: had=%v live=%v entries=%d ips=%d", had, live, r.Len(), len(r.UsedIPs()))
-	}
-
-	// Before re-issue the destination circle revokes the device: both
-	// entries die with it.
-	r = NewRoster(moved)
-	r, _, _ = r.Add(mainTun.Stmt, now)
-	r, _, _ = r.Add(famPlain.Stmt, now)
-	rev, _ := Revoke(famPriv, dev, now.Add(time.Second))
-	r, fresh, err := r.AddRevocation(rev.Stmt)
-	if err != nil || !fresh {
-		t.Fatalf("AddRevocation: fresh=%v err=%v", fresh, err)
-	}
-	at := now.Add(2 * time.Second)
-	if _, live := r.Live(dev, at); live {
-		t.Fatal("the new root's revocation missed the device's old-root entry")
-	}
-	if _, revoked := r.Revoked(dev, at); !revoked {
-		t.Fatal("device not reported revoked")
-	}
-	// The same revocation known first: later asserts under either root
-	// come in dead.
-	r = NewRoster(moved)
-	r, _, _ = r.AddRevocation(rev.Stmt)
-	r, _, _ = r.Add(famPlain.Stmt, now)
-	r, _, _ = r.Add(mainTun.Stmt, now)
-	if _, live := r.Live(dev, at); live {
-		t.Fatal("a revoked device came back through an old-root assert")
 	}
 }
 
@@ -300,7 +209,7 @@ func TestRenewalWithFewerVerbsDemotes(t *testing.T) {
 	withIP, _ := AttestWith(priv, nil, c.Config.DID, devPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
 	plain, _ := AttestFor(priv, devPub, now, 2*time.Hour)
 	for _, order := range [][]*Attestation{{withIP, plain}, {plain, withIP}} {
-		r := NewRoster(statement.NewDIDRoots(c.Config.DID))
+		r := NewRoster(statement.NewDIDRoot(c.Config.DID))
 		for _, a := range order {
 			r, _, _ = r.Add(a.Stmt, now)
 		}
@@ -329,7 +238,7 @@ func TestRosterConvergesOverThreeAsserts(t *testing.T) {
 	orders := [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
 	want := [32]byte{}
 	for i, order := range orders {
-		r := NewRoster(statement.NewDIDRoots(c.Config.DID))
+		r := NewRoster(statement.NewDIDRoot(c.Config.DID))
 		for _, k := range order {
 			r, _, _ = r.Add(all[k].Stmt, now)
 		}

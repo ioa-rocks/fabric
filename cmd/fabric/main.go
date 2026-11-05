@@ -133,8 +133,6 @@ func main() {
 		err = cmdAnnounce(args)
 	case "circle":
 		err = cmdCircle(args)
-	case "root":
-		err = cmdRoot(args)
 	default:
 		fmt.Fprintf(os.Stderr, "fabric: unknown command %q\n\n", cmd)
 		usage()
@@ -164,9 +162,6 @@ func usage() {
            -expiring renews everything past half-life, this node included
   ui       serve the topology/admin web UI on localhost
   queue    queue on|off — run the admission queue on this node (lighthouse)
-  root     root status | root merge -circle <name> | root retire <did> —
-           move the namespace onto a circle's key (mesh-root merge) and,
-           once every member holds a cert under it, retire the old root
   dns      dns on|off; sudo dns setup — allow resolver self-registration
   peer     peer add <multiaddr> — add a bootstrap peer
   announce announce add <hostname|ip|multiaddr> — also advertise an address

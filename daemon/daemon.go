@@ -12,7 +12,6 @@ import (
 	"log"
 	"net"
 	"net/netip"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -62,11 +61,10 @@ type Daemon struct {
 	Gater  *fabricnet.Gater // dark (default) or listed posture; see fabricnet.Gater
 	Auth   *fabricnet.AuthService
 	Log    *event.Log // membership events: admissions + revocations (spec §5)
-	// Roots is the honoured-roots store: the home circle (config
-	// namespace_did) plus roots kept during a root move. Shared by Store
-	// and Log; changed only by applyRootEvent.
-	Roots *statement.DIDRoots
-	cfgMu sync.Mutex // guards Config writes (root moves, bootstrap pins)
+	// Roots is the home circle's root (config namespace_did), shared by
+	// Store and Log.
+	Roots *statement.DIDRoot
+	cfgMu sync.Mutex // guards Config writes (bootstrap pins)
 
 	bridgeIP string // overlay address fabric0 was brought up with (renumbering notice)
 
@@ -141,7 +139,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		return nil, err
 	}
 	cfg.NamespaceDID = first // in memory only: a cold-start config names no circle
-	roots := statement.NewDIDRoots(append([]string{first}, cfg.HonouredRoots...)...)
+	roots := statement.NewDIDRoot(first)
 	store := fabricnet.NewMemberStore(roots)
 	evLog := event.NewLog(roots)
 	// Every other circle this node holds brings its own roster into the
@@ -161,7 +159,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		roster, err := circle.OpenRoster(c, time.Now())
 		if err != nil {
 			log.Printf("circle %q: roster unreadable, starting empty: %v", c.Config.Name, err)
-			roster = circle.NewRoster(statement.NewDIDRoots(c.Config.DID))
+			roster = circle.NewRoster(statement.NewDIDRoot(c.Config.DID))
 		}
 		store.AddRoster(roster)
 	}
@@ -177,17 +175,13 @@ func New(dir state.Dir) (*Daemon, error) {
 
 	// The persisted event log is the durable membership view: it survives
 	// restarts, so a revocation learned yesterday still holds today even if
-	// the master is offline. Root events are applied as they load, so the
-	// admissions signed by a root that took over mid-log verify too.
+	// the master is offline.
 	if evs, err := dir.LoadEvents(); err != nil {
 		log.Printf("event log unreadable, starting empty: %v", err)
 	} else {
 		now := time.Now()
 		for _, e := range evs {
-			fresh, _ := evLog.Add(e, now) // stale/invalid entries drop out here
-			if fresh && e.IsRootEvent() {
-				d.applyRootEvent(e, false)
-			}
+			_, _ = evLog.Add(e, now) // stale/invalid entries drop out here
 		}
 	}
 	for _, addr := range append(append([]string{}, cfg.Bootstrap...), cfg.DiscoveredBootstrap...) {
@@ -824,9 +818,10 @@ func (d *Daemon) OwnCert() *cert.Cert {
 // adoptOwnCert swaps in a re-signed certificate for this device (spec §5
 // renewal): persist it and present it in handshakes from now on — no
 // restart. Only a cert that outlives the current one is adopted, except
-// during a root move, where a cert under the new (primary) root replaces
-// one under an old root whatever the expiries — otherwise a long-lived old
-// cert would keep this device from ever moving (Codex review, 2026-11-02).
+// that a cert in the home circle replaces one in any other circle whatever
+// the expiries — a cert.cbor left from before the 2026-11-02 migration
+// must not keep this device on a root nobody honours (Codex review,
+// 2026-11-02).
 func (d *Daemon) adoptOwnCert(c *cert.Cert) {
 	ns := d.NamespaceDID()
 	d.certMu.Lock()
@@ -855,10 +850,8 @@ func (d *Daemon) adoptOwnCert(c *cert.Cert) {
 }
 
 // representCert re-runs the handshake with every connected member after
-// this node adopted a new cert, so peers record what this device now
-// presents (MemberStore.NotePresented). That record is how the master knows
-// a device has really moved during a root merge; gossip alone only proves
-// the master issued the cert, not that the device holds it.
+// this node adopted a new cert, so peers judge what this device now holds
+// rather than what they last saw it present.
 func (d *Daemon) representCert() {
 	if d.Host == nil || d.ctx == nil {
 		return
@@ -882,9 +875,6 @@ func (d *Daemon) representCert() {
 func (d *Daemon) hydrateStore() {
 	now := time.Now()
 	for _, e := range d.Log.All() {
-		if e.IsRootEvent() {
-			continue // applied while loading (New)
-		}
 		devKey, err := e.DeviceKey()
 		if err != nil {
 			continue
@@ -914,14 +904,6 @@ func (d *Daemon) hydrateStore() {
 // store (revocations also cut live connections), surface the spec-§5
 // notification, and persist the log.
 func (d *Daemon) applyEvent(e *event.Event) {
-	if e.IsRootEvent() {
-		d.applyRootEvent(e, true)
-		// root-retired is the last event of a move; nothing follows it to
-		// flush the log, and Run does not save on shutdown — without this
-		// a restart forgets the retirement (agy review, 2026-11-02).
-		d.persistEvents()
-		return
-	}
 	devKey, err := e.DeviceKey()
 	if err != nil {
 		return
@@ -985,97 +967,11 @@ func (d *Daemon) Ingest(e *event.Event) error {
 	return nil
 }
 
-// NamespaceDID is the home circle's DID as of now (a root move changes it).
+// NamespaceDID is the home circle's DID.
 func (d *Daemon) NamespaceDID() string {
 	d.cfgMu.Lock()
 	defer d.cfgMu.Unlock()
 	return d.Config.NamespaceDID
-}
-
-// HonouredRoots lists the circle DIDs whose certs this node admits: the
-// home circle first, then roots kept during a move.
-func (d *Daemon) HonouredRoots() []string { return d.Roots.DIDs() }
-
-// applyRootEvent is the mesh-root merge in motion. root-moved (signed by
-// the current root, verified on ingest): the circle continues under To —
-// To becomes the home circle, the old root stays honoured so certs issued
-// under it keep verifying until root-retired (signed by the new root) names
-// it, at which point members still on it are forgotten (not revoked: they
-// re-join). Config is persisted so a restart starts from the moved state;
-// live is false while replaying the log at start.
-func (d *Daemon) applyRootEvent(e *event.Event, live bool) {
-	d.cfgMu.Lock()
-	cfg := d.Config
-	changed := false
-	var forget []peer.ID
-	switch e.Payload.Kind {
-	case event.KindRootMoved:
-		if cfg.NamespaceDID != e.Payload.To {
-			old := cfg.NamespaceDID
-			cfg.NamespaceDID = e.Payload.To
-			cfg.HonouredRoots = addDID(removeDID(cfg.HonouredRoots, e.Payload.To), old, e.Payload.Ns)
-			changed = true
-		}
-	case event.KindRootRetired:
-		if e.Payload.Root != cfg.NamespaceDID && slices.Contains(cfg.HonouredRoots, e.Payload.Root) {
-			cfg.HonouredRoots = removeDID(cfg.HonouredRoots, e.Payload.Root)
-			changed = true
-			forget = d.Store.MembersIn(e.Payload.Root)
-		}
-	}
-	if changed {
-		d.Config = cfg
-		d.Roots.Set(append([]string{cfg.NamespaceDID}, cfg.HonouredRoots...))
-		d.Store.Recheck()
-		if err := d.Dir.SaveConfig(cfg); err != nil {
-			log.Printf("persisting config after %s: %v", e.Payload.Kind, err)
-		}
-	}
-	d.cfgMu.Unlock()
-	if !changed {
-		return
-	}
-	switch e.Payload.Kind {
-	case event.KindRootMoved:
-		log.Printf("ROOT MOVED: this circle now continues under %s; %s stays honoured until retired", e.Payload.To, e.Payload.Ns)
-	case event.KindRootRetired:
-		// Every device holding an assert in the retired root loses that
-		// entry; one that was a member only through it is cut off. A device
-		// re-issued under the new root keeps its other entry and stays
-		// (the roster holds one entry per device per root).
-		cut := 0
-		for _, p := range forget {
-			d.Store.Forget(p)
-			if d.Store.IsMember(p, time.Now()) {
-				continue
-			}
-			cut++
-			if live && d.Host != nil && p != d.Host.ID() {
-				d.Host.ConnManager().Unprotect(p, "fabric-member")
-				_ = d.Host.Network().ClosePeer(p)
-			}
-		}
-		log.Printf("root retired: %s is no longer honoured; %d device(s) held an assert in it, %d still on it forgotten", e.Payload.Root, len(forget), cut)
-	}
-}
-
-func addDID(list []string, dids ...string) []string {
-	for _, d := range dids {
-		if d != "" && !slices.Contains(list, d) {
-			list = append(list, d)
-		}
-	}
-	return list
-}
-
-func removeDID(list []string, did string) []string {
-	out := list[:0:0]
-	for _, d := range list {
-		if d != did {
-			out = append(out, d)
-		}
-	}
-	return out
 }
 
 func (d *Daemon) persistEvents() {
