@@ -70,6 +70,25 @@ func (d *Device) Issued() time.Time { return time.Unix(d.Stmt.Payload.Iat, 0) }
 // when it is live or merely lapsed.
 func (d *Device) Dead() error { return d.dead }
 
+// Admits reports whether this entry admits its device right now: inside
+// its window, not lapsed, not dead. The verdict of one assert — a reader
+// holding an entry judges that entry, never "any entry of the device",
+// or a revoked assert would borrow a live one's standing (Codex review,
+// 2026-11-05).
+func (d *Device) Admits(now time.Time) bool {
+	return !d.lapsed && d.dead == nil && !now.Before(d.Nbf) && now.Before(d.Exp)
+}
+
+// LapsedAt reports whether this entry ran out unrevoked within
+// LapsedRetention: not admitting, but remembered.
+func (d *Device) LapsedAt(now time.Time) bool {
+	return d.dead == nil && (d.lapsed || !now.Before(d.Exp)) && now.Before(d.Exp.Add(LapsedRetention))
+}
+
+// Standing reports whether the entry could admit at some time: not dead,
+// not lapsed. What the view keeps routes for; Admits settles the moment.
+func (d *Device) Standing() bool { return d.dead == nil && !d.lapsed }
+
 // LapsedRetention is how long an expired, unrevoked device stays on the
 // roster as "expired": no peer admits it, but it is still known by name and
 // address, so a node that was off for a season comes back as "nas —
@@ -495,13 +514,8 @@ func (r *Roster) Live(deviceDID string, now time.Time) (*Device, bool) {
 	return nil, false
 }
 
-func (r *Roster) live(dev *Device, now time.Time) bool {
-	return !dev.lapsed && dev.dead == nil && !now.Before(dev.Nbf) && now.Before(dev.Exp)
-}
-
-func (r *Roster) lapsedAt(dev *Device, now time.Time) bool {
-	return dev.dead == nil && (dev.lapsed || !now.Before(dev.Exp)) && now.Before(dev.Exp.Add(LapsedRetention))
-}
+func (r *Roster) live(dev *Device, now time.Time) bool     { return dev.Admits(now) }
+func (r *Roster) lapsedAt(dev *Device, now time.Time) bool { return dev.LapsedAt(now) }
 
 // Lapsed returns the device's entry if its asserts ran out unrenewed within
 // LapsedRetention: no member, but remembered. A device live under any root
@@ -565,6 +579,14 @@ func (r *Roster) Tombstones(now time.Time) map[string]time.Time {
 		}
 	}
 	return out
+}
+
+// Entry returns the device's entry under one root, whatever its verdict:
+// what a presented assert is judged by (the entry under its circle, which
+// may be a newer assert of the same device there).
+func (r *Roster) Entry(deviceDID, rootDID string) (*Device, bool) {
+	dev, ok := r.devices[entryKey(deviceDID, rootDID)]
+	return dev, ok
 }
 
 // Device returns the roster's entry for a device whatever its verdict: the

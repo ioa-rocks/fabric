@@ -783,3 +783,91 @@ func TestRootMoveKeepsTheRouteUntilRetirement(t *testing.T) {
 		t.Fatal("a revoked device kept its route through its old-root entry")
 	}
 }
+
+// A device under two roots is two entries, each judged on its own: a
+// revoked assert under one root borrows nothing from a live one under the
+// other — not a route, not a protocol, not a handshake verdict — and a dead
+// entry's address never shadows a standing one (Codex review, 2026-11-05).
+func TestRevokedEntryBorrowsNothingFromALiveOne(t *testing.T) {
+	main, _ := circle.Init(t.TempDir(), "main", "pw")
+	fam, _ := circle.Init(t.TempDir(), "family", "pw")
+	mainPriv, _ := main.Unlock("pw")
+	famPriv, _ := fam.Unlock("pw")
+	now := time.Now()
+	tunVerbs := append(append([]string{}, circle.DeviceVerbs...), statement.VerbTun)
+	nasPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	nas, _ := PeerOfDID(cert.DIDForKey(nasPub))
+	nasMain, _ := circle.AttestWith(mainPriv, nil, main.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	nasFam, _ := circle.AttestFor(famPriv, nasPub, now, 2*time.Hour)
+	byID := func(priv ed25519.PrivateKey, circleDID string, st *statement.Statement) *statement.Statement {
+		id := st.ID()
+		rev, err := circle.RevokeAs(priv, nil, circleDID, statement.Target{ID: id[:]}, now.Add(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rev.Stmt
+	}
+	moved := func(asserts ...*circle.Attestation) *PeerTable {
+		roots := statement.NewDIDRoots(fam.Config.DID, main.Config.DID)
+		table := NewMemberStore(roots)
+		table.SetOverlay(netip.MustParsePrefix("100.64.0.1/24"))
+		for _, a := range asserts {
+			if _, err := table.AddAssert(a.Stmt, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return table
+	}
+	at := now.Add(2 * time.Second)
+
+	// P1: the old root revokes nas's tun assert; the plain new-root one
+	// stays. nas is a member — of nothing with an address or tun.
+	table := moved(nasMain, nasFam)
+	if fresh, err := table.AddRevocation(main.Config.DID, byID(mainPriv, main.Config.DID, nasMain.Stmt)); err != nil || !fresh {
+		t.Fatalf("AddRevocation: fresh=%v err=%v", fresh, err)
+	}
+	if !table.IsMember(nas, at) {
+		t.Fatal("nas lost its plain membership with the tun assert")
+	}
+	if _, ok := table.Route(netip.MustParseAddr("100.64.0.2")); ok {
+		t.Fatal("a revoked assert's address still routes")
+	}
+	if _, ok := table.AddrOf(nas); ok {
+		t.Fatal("a revoked assert still names the device's address")
+	}
+	if table.Allows(nas, "/fabric/tun/1.0.0", at) {
+		t.Fatal("a revoked assert's tun grant still applies")
+	}
+	if _, held, live, err := table.Verify(nas, nasMain.Stmt); err != nil || !held || live {
+		t.Fatalf("Verify of the revoked assert: held=%v live=%v err=%v (want held, not live)", held, live, err)
+	}
+	if c, _ := cert.FromStatement(nasMain.Stmt); table.Admit(nas, c) == nil {
+		t.Fatal("Admit accepted the revoked assert on the strength of another root's entry")
+	}
+	if _, held, live, err := table.Verify(nas, nasFam.Stmt); err != nil || !held || !live {
+		t.Fatalf("Verify of the live plain assert: held=%v live=%v err=%v", held, live, err)
+	}
+
+	// P2: the new root's tun assert (.3) is revoked while the old root's
+	// (.2) stands: .2 routes and is the device's address; .3 is nothing.
+	nasFamTun, _ := circle.AttestWith(famPriv, nil, fam.Config.DID, nasPub, now, 3*time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.3/24"})
+	table = moved(nasMain, nasFamTun)
+	if a, ok := table.AddrOf(nas); !ok || a != netip.MustParseAddr("100.64.0.3") {
+		t.Fatalf("before the revocation the primary root's address is nas's: got %v %v", a, ok)
+	}
+	if fresh, err := table.AddRevocation(fam.Config.DID, byID(famPriv, fam.Config.DID, nasFamTun.Stmt)); err != nil || !fresh {
+		t.Fatalf("AddRevocation: fresh=%v err=%v", fresh, err)
+	}
+	if p, ok := table.Route(netip.MustParseAddr("100.64.0.2")); !ok || p != nas {
+		t.Fatalf("the standing old-root address does not route: %v %v", p, ok)
+	}
+	if _, ok := table.Route(netip.MustParseAddr("100.64.0.3")); ok {
+		t.Fatal("the revoked address still routes")
+	}
+	if a, ok := table.AddrOf(nas); !ok || a != netip.MustParseAddr("100.64.0.2") {
+		t.Fatalf("nas's address = %v %v, want the standing .2", a, ok)
+	}
+	if a, ok := table.Resolve("nas"); !ok || a != netip.MustParseAddr("100.64.0.2") {
+		t.Fatalf("nas.fabric = %v %v, want .2", a, ok)
+	}
+}

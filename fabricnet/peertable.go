@@ -262,9 +262,14 @@ func (s *state) snapshot() *View {
 	}
 	if s.overlay && len(s.rosters) > 0 {
 		r := s.rosters[0]
+		// Every standing entry with an address routes (Route settles the
+		// moment); a dead or lapsed one never does, so it cannot shadow a
+		// standing one of the same device under another root. The device's
+		// own address and name are its first standing entry's — Devices
+		// lists the primary root's first.
 		for _, dev := range r.Devices() {
 			c := view(dev)
-			if c == nil || c.Payload.Meta.IP == "" || !c.Allows(cert.ScopeTun) {
+			if c == nil || !dev.Standing() || c.Payload.Meta.IP == "" || !c.Allows(cert.ScopeTun) {
 				continue
 			}
 			pfx, err := netip.ParsePrefix(c.Payload.Meta.IP)
@@ -275,13 +280,17 @@ func (s *state) snapshot() *View {
 			if err != nil {
 				continue
 			}
-			if _, done := v.addrOf[p]; done {
-				continue // Devices lists the primary root's entry first: it names the address
+			if _, taken := v.routes[pfx.Addr()]; !taken {
+				v.routes[pfx.Addr()] = deviceIn{r, dev}
 			}
-			v.routes[pfx.Addr()] = deviceIn{r, dev}
+			if _, done := v.addrOf[p]; done {
+				continue
+			}
 			v.addrOf[p] = pfx.Addr()
 			if name := c.Payload.Meta.Name; name != "" {
-				v.zone[strings.ToLower(name)] = deviceIn{r, dev}
+				if _, taken := v.zone[strings.ToLower(name)]; !taken {
+					v.zone[strings.ToLower(name)] = deviceIn{r, dev}
+				}
 			}
 		}
 	}
@@ -446,13 +455,17 @@ func (t *PeerTable) Admit(p peer.ID, c *cert.Cert) error {
 	if !ok {
 		return fmt.Errorf("certificate circle %s is not honoured here", c.Payload.Sub)
 	}
-	if _, live := r.Live(deviceDID, now); !live {
-		if dev, ok := r.Device(deviceDID); ok && dev.Dead() != nil {
-			return fmt.Errorf("device is not admitted: %w", dev.Dead())
-		}
+	// Judged by the entry under the presented cert's root — not by any
+	// entry of the device, or a revoked cert would ride a live one.
+	dev, ok := r.Entry(deviceDID, c.Payload.Sub)
+	switch {
+	case ok && dev.Admits(now):
+		return nil
+	case ok && dev.Dead() != nil:
+		return fmt.Errorf("device is not admitted: %w", dev.Dead())
+	default:
 		return errors.New("device is not admitted: assert expired")
 	}
-	return nil
 }
 
 // Verify judges one assert a peer presented on the v2 handshake: it must
@@ -484,7 +497,9 @@ func (t *PeerTable) Verify(p peer.ID, st *statement.Statement) (circleDID string
 	if !ok {
 		return "", false, false, nil
 	}
-	_, live = r.Live(deviceDID, now)
+	if dev, ok := r.Entry(deviceDID, c.Payload.Sub); ok {
+		live = dev.Admits(now) // this circle's entry: a revoked assert does not ride a live one under another root
+	}
 	return r.Primary(), true, live, nil
 }
 
@@ -647,7 +662,7 @@ func (v *View) RosterFor(circleDID string) (*circle.Roster, bool) {
 func (v *View) live(p peer.ID, now time.Time) []deviceIn {
 	var out []deviceIn
 	for _, d := range v.byPeer[p] {
-		if _, ok := d.roster.Live(d.dev.DID, now); ok {
+		if d.dev.Admits(now) {
 			out = append(out, d)
 		}
 	}
@@ -730,7 +745,7 @@ func (v *View) LapsedCert(p peer.ID) (*cert.Cert, bool) {
 		return nil, false
 	}
 	for _, d := range v.byPeer[p] {
-		if _, ok := d.roster.Lapsed(d.dev.DID, now); ok {
+		if d.dev.LapsedAt(now) {
 			if c := view(d.dev); c != nil {
 				return c, true
 			}
@@ -846,7 +861,7 @@ func (v *View) Route(dst netip.Addr, now time.Time) (peer.ID, bool) {
 	if !ok {
 		return "", false
 	}
-	if _, live := d.roster.Live(d.dev.DID, now); !live {
+	if !d.dev.Admits(now) {
 		return "", false
 	}
 	p, err := PeerOfDID(d.dev.DID)
@@ -880,10 +895,9 @@ func (v *View) Resolve(name string, now time.Time) (netip.Addr, bool) {
 	return pfx.Addr(), true
 }
 
-func (v *View) liveEntry(d deviceIn, now time.Time) bool {
-	_, live := d.roster.Live(d.dev.DID, now)
-	return live
-}
+// liveEntry judges the entry a route or name points at — that assert, not
+// the device's standing under some other root.
+func (v *View) liveEntry(d deviceIn, now time.Time) bool { return d.dev.Admits(now) }
 
 // ---- helpers ------------------------------------------------------------------
 
