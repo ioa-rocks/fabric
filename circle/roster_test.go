@@ -182,3 +182,42 @@ func TestRosterSaveFailureIsReported(t *testing.T) {
 		t.Fatalf("devices.cbor not written on replay: %v", err)
 	}
 }
+
+// A revocation that lands while a new assert stands in memory, before the
+// save that would make it durable fails, must still kill the device once
+// the old assert is restored.
+func TestRosterRollbackRechecksRestoredAssert(t *testing.T) {
+	c, _ := Init(t.TempDir(), "p", "pw")
+	priv, _ := c.Unlock("pw")
+	r := NewRoster(statement.NewDIDRoots(c.Config.DID))
+	dir := t.TempDir()
+	r.path = filepath.Join(dir, "devices.cbor")
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+	first, _ := AttestFor(priv, devPub, now, time.Hour)
+	if _, err := r.Add(first.Stmt, now); err != nil {
+		t.Fatal(err)
+	}
+	// The next save fails; meanwhile the circle revokes the device.
+	r.path = filepath.Join(dir, "missing", "devices.cbor")
+	r.hookBeforeSave = func() {
+		rev, err := Revoke(priv, first.Device, now.Add(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.AddRevocation(rev.Stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	second, _ := AttestFor(priv, devPub, now.Add(time.Second), 2*time.Hour)
+	if _, err := r.Add(second.Stmt, now.Add(time.Second)); err == nil {
+		t.Fatal("save should have failed")
+	}
+	if _, live := r.Live(first.Device, now.Add(2*time.Second)); live {
+		t.Fatal("revoked device is live after the rollback restored its old assert")
+	}
+	dev, ok := r.Device(first.Device)
+	if !ok || dev.Stmt.ID() != first.Stmt.ID() || dev.Dead() == nil {
+		t.Fatalf("restored assert should be the first and judged dead: ok=%v dead=%v", ok, dev != nil && dev.Dead() != nil)
+	}
+}

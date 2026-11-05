@@ -634,9 +634,24 @@ func (d *Daemon) refreshRoutes() {
 	if d.Bridge == nil {
 		return
 	}
-	members, _ := d.Store.Snapshot()
 	within, _ := netip.ParsePrefix(d.bridgeIP)
-	d.Bridge.SetRoutes(overlayRoutes(members, within))
+	d.Bridge.SetRoutes(overlayRoutes(membersIn(d.Store, d.NamespaceDID()), within))
+}
+
+// membersIn is the route source: the devices of one circle, each by its
+// assert *in that circle* — never the union's summary, which would let
+// another circle's assert for the same device, or a device of another
+// circle whose range overlaps, onto this interface. The interface belongs
+// to the circle this device's address is in (its first circle) until
+// slice H gives every overlay circle its own (Codex review, 2026-11-05).
+func membersIn(t *fabricnet.PeerTable, circleDID string) map[peer.ID]*cert.Cert {
+	out := map[peer.ID]*cert.Cert{}
+	for _, p := range t.MembersIn(circleDID) {
+		if c, ok := t.CertIn(p, circleDID); ok {
+			out[p] = c
+		}
+	}
+	return out
 }
 
 // overlayRoutes derives the TUN routing table from member certs: an address

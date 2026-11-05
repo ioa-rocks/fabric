@@ -27,6 +27,7 @@ import (
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/did"
+	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/fabricnet"
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
@@ -286,12 +287,14 @@ func attestDevice(statePath string, c *circle.Circle, pass string) error {
 	// re-attestation would outrank the named one by expiry in every
 	// roster and strip the device of its address.
 	var prev *statement.Statement
+	firstCircle := false
 	if own, err := dir.LoadCert(); err == nil && own.Stmt != nil && own.Payload.Sub == c.Config.DID {
-		prev = own.Stmt
+		prev, firstCircle = own.Stmt, true
 	} else if cur, err := c.LoadAttestation(); err == nil && cur.Stmt != nil {
 		prev = cur.Stmt
 	}
-	a, err := circle.Reattest(priv, prev, c.Config.DID, ed25519.PublicKey(raw), time.Now(), circle.DefaultValidity)
+	now := time.Now()
+	a, err := circle.Reattest(priv, prev, c.Config.DID, ed25519.PublicKey(raw), now, circle.DefaultValidity)
 	if err != nil {
 		return err
 	}
@@ -303,6 +306,46 @@ func attestDevice(statePath string, c *circle.Circle, pass string) error {
 		kept = fmt.Sprintf(" as %s", strings.TrimSpace(a.Name+" "+a.IP))
 	}
 	fmt.Printf("device attested into circle %q%s until %s (%s) — a running daemon picks it up without restart\n", c.Config.Name, kept, a.Expiry().Format("2006-01-02"), c.AttestationPath())
+	if firstCircle {
+		// The circle is the one the device was joined in: the attestation
+		// *is* its membership cert there (same root, same statement
+		// shape), so the transport cert follows — through the daemon when
+		// it runs (spec §5 renewal: adopted and gossiped as a MemberAdded
+		// event), else written to cert.cbor (Codex review, 2026-11-05:
+		// the stored attestation changed while the handshake kept
+		// presenting the old cert).
+		return renewOwnCertFrom(dir, priv, a, now)
+	}
+	return nil
+}
+
+// renewOwnCertFrom adopts a first-circle attestation as this device's
+// membership cert.
+func renewOwnCertFrom(dir state.Dir, root ed25519.PrivateKey, a *circle.Attestation, now time.Time) error {
+	view, err := cert.FromStatement(a.Stmt)
+	if err != nil {
+		return fmt.Errorf("attestation as membership cert: %w", err)
+	}
+	client := daemon.NewClient(dir)
+	if _, err := client.Status(); err == nil {
+		ev, err := event.NewAdded(root, view, now)
+		if err != nil {
+			return err
+		}
+		raw, err := ev.Marshal()
+		if err != nil {
+			return err
+		}
+		if err := client.Renew(raw); err != nil {
+			return fmt.Errorf("renewing the membership cert through the daemon: %w", err)
+		}
+		fmt.Println("membership cert renewed with it (the daemon presents the new one and gossips it)")
+		return nil
+	}
+	if err := dir.SaveCert(view); err != nil {
+		return err
+	}
+	fmt.Println("membership cert renewed with it (cert.cbor; the daemon is not running)")
 	return nil
 }
 

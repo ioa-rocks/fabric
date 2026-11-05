@@ -669,3 +669,38 @@ func TestFirstCircleAdmissionSurvivesRestart(t *testing.T) {
 		t.Fatal("admission into the first circle was lost on restart")
 	}
 }
+
+// The route table is built from the first circle's asserts alone: a
+// device of another circle, even with an address inside this circle's
+// range, and another circle's assert for a device of this circle, never
+// become routes (Codex review, 2026-11-05).
+func TestRoutesComeFromFirstCircleOnly(t *testing.T) {
+	first, _ := circle.Init(t.TempDir(), "main", "pw")
+	other, _ := circle.Init(t.TempDir(), "family", "pw")
+	fPriv, _ := first.Unlock("pw")
+	oPriv, _ := other.Unlock("pw")
+	now := time.Now()
+	tunVerbs := append(append([]string{}, circle.DeviceVerbs...), statement.VerbTun)
+	nasPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	herPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	nasMain, _ := circle.AttestWith(fPriv, nil, first.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	nasFamily, _ := circle.AttestWith(oPriv, nil, other.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.7/24"})
+	herFamily, _ := circle.AttestWith(oPriv, nil, other.Config.DID, herPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "her-pc", IP: "100.64.0.9/24"})
+
+	table := fabricnet.NewMemberStore(statement.NewDIDRoots(first.Config.DID))
+	family := circle.NewRoster(statement.NewDIDRoots(other.Config.DID))
+	table.AddRoster(family)
+	if _, err := table.Rosters()[0].Add(nasMain.Stmt, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []*circle.Attestation{nasFamily, herFamily} {
+		if _, err := family.Add(a.Stmt, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nas, _ := fabricnet.PeerOfDID(cert.DIDForKey(nasPub))
+	routes := overlayRoutes(membersIn(table, first.Config.DID), netip.MustParsePrefix("100.64.0.1/24"))
+	if len(routes) != 1 || routes[netip.MustParseAddr("100.64.0.2")] != nas {
+		t.Fatalf("routes = %v, want nas at 100.64.0.2 alone", routes)
+	}
+}

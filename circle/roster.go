@@ -40,6 +40,8 @@ type Roster struct {
 	revs     *statement.RevocationSet
 	sweeps   map[string]int64 // device DID -> cut-off (unix s): asserts issued up to it are dead
 	onChange []func()
+
+	hookBeforeSave func() // tests only: runs between Add's memory change and its save
 }
 
 // Device is one device assert in a roster with its verdict.
@@ -211,11 +213,18 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (bool, error) {
 	}
 	r.devices[dev.DID] = dev
 	r.mu.Unlock()
+	if r.hookBeforeSave != nil {
+		r.hookBeforeSave()
+	}
 	if err := r.saveLocked(); err != nil {
 		r.mu.Lock()
 		if cur == nil {
 			delete(r.devices, dev.DID)
 		} else {
+			// A revocation or sweep that arrived while the new assert
+			// stood was judged against that one; the restored assert
+			// must be judged again (Codex review, 2026-11-05).
+			cur.dead = r.verdictLocked(cur)
 			r.devices[dev.DID] = cur
 		}
 		r.mu.Unlock()
