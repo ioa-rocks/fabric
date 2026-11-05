@@ -35,6 +35,14 @@ func runDaemon(t *testing.T, statePath string) (*daemon.Daemon, func()) {
 	st := openTestStore(t, statePath)
 	if fd != nil {
 		fd.Circle = fabricdaemon.NewCircleService(fd.Host, fd.Auth, st.CircleRoot)
+		// Wired as `fabric up` wires it: own cert, home circle, the peer table
+		// (rosters, v2 handshake) and the per-circle sync. Without these the
+		// service fell back to the legacy exchange, which until 2026-11-05
+		// leaked every circle and so hid the missing wiring.
+		fd.Circle.SetOwnCert(fd.OwnCert)
+		fd.Circle.SetHome(fd.NamespaceDID, fd.Roots, fd.Store.Cert)
+		fd.Circle.SetPeerTable(fd.Store)
+		fd.Circle.AttachSync(fd.Sync)
 	}
 	d, err := daemon.New(st, fd)
 	if err != nil {
@@ -93,6 +101,7 @@ func TestReplaySeafileIncident(t *testing.T) {
 	}
 	a := newMeshNode(t, root, nil, "alex", "a-vault")
 	b := newMeshNode(t, root, a.bundle, "alex", "b-vault")
+	a.admits(t, b, "alex")
 	a.writeConfig(t, root, "a-vault", nil, a.event, b.event)
 	da, stopA := runDaemon(t, a.statePath)
 	addrs := da.Fabric.Host.Addrs()

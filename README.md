@@ -418,7 +418,8 @@ circle's roster at once and gossips it to the circle's devices, so the
 device is admitted the moment it connects (`-tun` also signs an address
 in the circle's overlay range). `circle status` names the role: owner /
 device / gate. A device's attestation is renewed by the owner admitting
-it again; an owner's own with `fabric circle attest -expiring`. A key
+it again; an owner's own with `fabric circle attest -expiring` (a renewal
+keeps the device's name, overlay address and verbs). A key
 copy (`circle export` / `circle join` of a bundle with the key) makes a
 co-owner — a one-way door, since revoking that device's attestation
 later cannot take root authority back.

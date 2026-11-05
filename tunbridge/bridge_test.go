@@ -126,6 +126,26 @@ func TestBridgeRelaysAndPinsSource(t *testing.T) {
 		t.Fatal("follow-up packet never arrived")
 	}
 
+	// Transit: a frame for an address that is not B's own — even one A
+	// routes toward B — never reaches B's kernel (the bridge is an
+	// endpoint, not a router).
+	bb.SetLocal(ipB)
+	ba.SetRoutes(map[netip.Addr]peer.ID{ipB: hb.ID(), netip.MustParseAddr("100.64.0.3"): hb.ID()})
+	devA.in <- ipv4Packet("100.64.0.1", "100.64.0.3", 0x88)
+	devA.in <- ipv4Packet("100.64.0.1", "100.64.0.2", 0x44)
+	select {
+	case pkt := <-devB.out:
+		if pkt[20] == 0x88 {
+			t.Fatal("frame for another destination was written to B's device")
+		}
+		if pkt[20] != 0x44 {
+			t.Fatalf("unexpected payload %x", pkt[20])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow-up packet never arrived")
+	}
+	ba.SetRoutes(map[netip.Addr]peer.ID{ipB: hb.ID()})
+
 	// Unknown destination: dropped at the sender, nothing explodes.
 	devA.in <- ipv4Packet("100.64.0.1", "100.64.0.77", 0x55)
 	select {

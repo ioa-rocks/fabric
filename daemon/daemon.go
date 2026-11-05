@@ -526,6 +526,9 @@ func (d *Daemon) startTUN() {
 	}
 	d.Bridge = tunbridge.New(d.Host, dev, d.Auth.RequireMember)
 	d.bridgeIP = d.OwnCert().Payload.Meta.IP
+	if pfx, err := netip.ParsePrefix(d.bridgeIP); err == nil {
+		d.Bridge.SetLocal(pfx.Addr())
+	}
 	d.refreshRoutes()
 	log.Printf("tun: fabric0 up, this node is %s", d.OwnCert().Payload.Meta.IP)
 	d.startDNS()
@@ -632,21 +635,32 @@ func (d *Daemon) refreshRoutes() {
 		return
 	}
 	members, _ := d.Store.Snapshot()
-	d.Bridge.SetRoutes(overlayRoutes(members))
+	within, _ := netip.ParsePrefix(d.bridgeIP)
+	d.Bridge.SetRoutes(overlayRoutes(members, within))
 }
 
 // overlayRoutes derives the TUN routing table from member certs: an address
 // is routable only if the cert carries one *and* its scope admits the TUN
 // family (fabric ADR 0005) — the outbound half of the no-TUN-leg bound.
-func overlayRoutes(members map[peer.ID]*cert.Cert) map[netip.Addr]peer.ID {
+// Routes are fenced to this device's own overlay range: the peer table is
+// the union of every circle held here, and an address another circle
+// assigned is not reachable through this interface — one interface per
+// overlay (task slice H; Codex review, 2026-11-05). An invalid `within`
+// (no own address) fences nothing out.
+func overlayRoutes(members map[peer.ID]*cert.Cert, within netip.Prefix) map[netip.Addr]peer.ID {
 	routes := make(map[netip.Addr]peer.ID, len(members))
 	for p, c := range members {
 		if c.Payload.Meta.IP == "" || !c.Allows(cert.ScopeTun) {
 			continue
 		}
-		if pfx, err := netip.ParsePrefix(c.Payload.Meta.IP); err == nil {
-			routes[pfx.Addr()] = p
+		pfx, err := netip.ParsePrefix(c.Payload.Meta.IP)
+		if err != nil {
+			continue
 		}
+		if within.IsValid() && !within.Masked().Contains(pfx.Addr()) {
+			continue
+		}
+		routes[pfx.Addr()] = p
 	}
 	return routes
 }

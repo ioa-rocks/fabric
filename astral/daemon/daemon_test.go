@@ -177,6 +177,14 @@ func (n *meshNode) fabric(t *testing.T, root ed25519.PrivateKey, name string, bo
 	// The composition root always attaches the circle service: astral
 	// verbs are checked against it (home circle = membership cert).
 	fd.Circle = fabricdaemon.NewCircleService(fd.Host, fd.Auth, filepath.Join(n.statePath, "circles"))
+	// Wired as `fabric up` wires it: own cert, home circle, the peer table
+	// (rosters, v2 handshake) and the per-circle sync. Without these the
+	// service fell back to the legacy exchange, which until 2026-11-05
+	// leaked every circle and so hid the missing wiring.
+	fd.Circle.SetOwnCert(fd.OwnCert)
+	fd.Circle.SetHome(fd.NamespaceDID, fd.Roots, fd.Store.Cert)
+	fd.Circle.SetPeerTable(fd.Store)
+	fd.Circle.AttachSync(fd.Sync)
 	fd.Circle.SetOwnCert(fd.OwnCert)
 	fd.Circle.SetHome(fd.NamespaceDID, fd.Roots, fd.Store.Cert)
 	return fd

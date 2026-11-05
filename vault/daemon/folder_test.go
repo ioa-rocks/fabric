@@ -36,6 +36,7 @@ func TestFolderReplicaOverMesh(t *testing.T) {
 	}
 	a := newMeshNode(t, root, nil, "alex", "a-vault")
 	b := newMeshNode(t, root, a.bundle, "alex", "b-vault")
+	a.admits(t, b, "alex")
 	a.writeConfig(t, root, "a-vault", nil, a.event, b.event)
 	da := startDaemon(t, a.statePath)
 	addrs := da.Fabric.Host.Addrs()

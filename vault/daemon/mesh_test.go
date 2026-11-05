@@ -68,6 +68,35 @@ func newMeshNode(t *testing.T, root ed25519.PrivateKey, shared *circle.Bundle, c
 	return &meshNode{statePath: statePath, dir: dir, cert: c, event: ev, bundle: bundle, devPub: ed25519.PublicKey(pubRaw)}
 }
 
+// admits seeds this node's roster of the circle with other's attestation —
+// what `fabric circle admit` does on the owner's desk. Since the legacy
+// exchange stopped naming circles the peer is not known in (2026-11-05),
+// two devices holding the same circle key learn of each other only
+// through an admission or the gossip it starts; self-attestation alone is
+// not discovery.
+func (n *meshNode) admits(t *testing.T, other *meshNode, circleName string) {
+	t.Helper()
+	theirs, err := circle.ByName(circle.Root(other.statePath), circleName)
+	if err != nil {
+		t.Fatalf("circle.ByName: %v", err)
+	}
+	a, err := theirs.LoadAttestation()
+	if err != nil {
+		t.Fatalf("LoadAttestation: %v", err)
+	}
+	mine, err := circle.ByName(circle.Root(n.statePath), circleName)
+	if err != nil {
+		t.Fatalf("circle.ByName: %v", err)
+	}
+	r, err := circle.OpenRoster(mine, time.Now())
+	if err != nil {
+		t.Fatalf("OpenRoster: %v", err)
+	}
+	if _, err := r.Add(a.Stmt, time.Now()); err != nil {
+		t.Fatalf("roster.Add: %v", err)
+	}
+}
+
 // initAlso mints a second circle on this node (the shared "family" circle
 // beside the personal one), attests the device into it, and returns its
 // bundle for another device.
@@ -127,13 +156,17 @@ func TestTwoNodeMesh(t *testing.T) {
 		if err == nil && st.Mesh {
 			for _, p := range st.Peers {
 				if p.Vault && p.Name == "a-vault" {
-					if len(p.Circles) != 1 || p.Circles[0].Name != "alex" || p.Circles[0].DID == "" {
-						t.Fatalf("hello card wrong: %+v", p)
+					// The hello card names only circles the two share: B, a
+					// device of wife's circle alone, learns that A is a
+					// vault node and nothing about alex's circle (Codex
+					// review, 2026-11-05).
+					if len(p.Circles) != 0 {
+						t.Fatalf("hello card names a circle B is not in: %+v", p)
 					}
 					if len(p.Shared) != 0 {
 						t.Fatalf("A serves alex's circle, B serves wife's — must share nothing verified: %+v", p)
 					}
-					return // B sees A as a vault node serving alex's circle, not its own
+					return // B sees A as a vault node, not which circles it serves
 				}
 			}
 		}
@@ -211,6 +244,7 @@ func TestSharedCircleBesidePersonal(t *testing.T) {
 	desk := newMeshNode(t, root, nil, "alex", "desk")
 	family := desk.initAlso(t, "family")
 	hers := newMeshNode(t, root, family, "family", "her-pc")
+	desk.admits(t, hers, "family")
 	roster := []*event.Event{desk.event, hers.event}
 	desk.writeConfig(t, root, "desk", nil, roster...)
 	dd := startDaemon(t, desk.statePath)

@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"slices"
 	"sync"
 	"time"
 
@@ -262,7 +263,10 @@ func (d *Daemon) adopt(genesis, policy []byte) (*store.Handle, error) {
 func (d *Daemon) handleHello(s network.Stream) {
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(5 * time.Second))
-	_ = json.NewEncoder(s).Encode(d.helloCard())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	card := d.helloCardFor(ctx, s.Conn().RemotePeer())
+	cancel()
+	_ = json.NewEncoder(s).Encode(card)
 }
 
 // hello asks a peer for its vault card.
@@ -280,10 +284,20 @@ func (d *Daemon) hello(ctx context.Context, p peer.ID) (*Hello, error) {
 	return &h, nil
 }
 
-// helloCard is what this node claims on HelloProtocol.
-func (d *Daemon) helloCard() Hello {
+// helloCardFor is what this node tells p on HelloProtocol: its version
+// and the circles the two verifiably share — never the others (Codex
+// review, 2026-11-05: the card listed every circle held here to any
+// member).
+func (d *Daemon) helloCardFor(ctx context.Context, p peer.ID) Hello {
 	h := Hello{Version: Version}
+	var shared []string
+	if d.Fabric != nil && d.Fabric.Circle != nil {
+		shared = d.Fabric.Circle.Shared(ctx, p)
+	}
 	for _, c := range d.Store.Circles() {
+		if !slices.Contains(shared, c.Config.DID) {
+			continue
+		}
 		h.Circles = append(h.Circles, HelloCircle{DID: c.Config.DID, Name: c.Config.Name})
 	}
 	return h

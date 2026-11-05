@@ -5,8 +5,12 @@ import (
 	"crypto/rand"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 	"time"
+
+	"ioa.rocks/fabric/did"
+	"ioa.rocks/fabric/statement"
 
 	"ioa.rocks/fabric/cert"
 )
@@ -127,5 +131,44 @@ func TestAttestationStorage(t *testing.T) {
 	foreign, _ := Attest(otherPriv, dpub, time.Now())
 	if err := c.SaveAttestation(foreign); err == nil {
 		t.Fatal("saved an attestation for a different circle")
+	}
+}
+
+func TestReattestCarriesAttributesForward(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	devPub, _, _ := ed25519.GenerateKey(nil)
+	now := time.Now()
+	circleDID := did.ForKey(pub)
+	first, err := AttestWith(priv, nil, circleDID, devPub, now, DefaultValidity,
+		append(append([]string{}, DeviceVerbs...), statement.VerbTun), &statement.Meta{Name: "desk", IP: "100.64.0.1/24"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := Reattest(priv, first.Stmt, circleDID, devPub, now.Add(time.Hour), DefaultValidity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Name != "desk" || again.IP != "100.64.0.1/24" {
+		t.Fatalf("re-attestation lost attributes: name=%q ip=%q", again.Name, again.IP)
+	}
+	if !slices.Contains(again.Verbs, statement.VerbTun) {
+		t.Fatalf("re-attestation lost tun: %v", again.Verbs)
+	}
+	if !again.Expiry().After(first.Expiry()) {
+		t.Fatal("re-attestation should outrank the first by expiry")
+	}
+	// Nothing to carry: a plain device assert.
+	bare, err := Reattest(priv, nil, circleDID, devPub, now, DefaultValidity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bare.Name != "" || bare.IP != "" || slices.Contains(bare.Verbs, statement.VerbTun) {
+		t.Fatalf("bare re-attestation should carry DeviceVerbs only: %v %q %q", bare.Verbs, bare.Name, bare.IP)
+	}
+	// Another circle's assert says nothing about this one.
+	other, _, _ := ed25519.GenerateKey(nil)
+	foreign, err := Reattest(priv, first.Stmt, did.ForKey(other), devPub, now, DefaultValidity)
+	if err == nil && (foreign.Name != "" || foreign.IP != "") {
+		t.Fatalf("attributes leaked across circles: %q %q", foreign.Name, foreign.IP)
 	}
 }

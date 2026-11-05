@@ -486,13 +486,17 @@ func (s *CircleService) homeAttestation(c *circle.Circle) *circle.Attestation {
 	return a
 }
 
-// liveAttestation is the attestation this node presents for c: the stored
-// one when live, else the home-circle cert. nil when the node has none.
+// liveAttestation is the attestation this node presents for c: the
+// membership cert when c is the circle the device was joined in (what the
+// v2 handshake presents too — the cert carries the name and overlay
+// address; a bare `circle attest` file must not shadow it on the legacy
+// exchange), else the stored attestation when live. nil when the node has
+// none.
 func (s *CircleService) liveAttestation(c *circle.Circle, now time.Time) *circle.Attestation {
-	if a, err := c.LoadAttestation(); err == nil && a.Valid(now) == nil && !c.Revoked(a, now) {
+	if a := s.homeAttestation(c); a != nil && a.Valid(now) == nil && !c.Revoked(a, now) {
 		return a
 	}
-	if a := s.homeAttestation(c); a != nil && a.Valid(now) == nil && !c.Revoked(a, now) {
+	if a, err := c.LoadAttestation(); err == nil && a.Valid(now) == nil && !c.Revoked(a, now) {
 		return a
 	}
 	return nil
@@ -608,9 +612,12 @@ func (s *CircleService) Close() {
 // dead one (expired, or revoked by the circle) is not shown — peers would
 // refuse it anyway, and showing it would poison the list. Statement-form
 // attestations go only to peers that speak v4.
-func (s *CircleService) ownAttestations(now time.Time, statements bool) ([][]byte, error) {
+func (s *CircleService) ownAttestations(now time.Time, statements bool, only []string) ([][]byte, error) {
 	var out [][]byte
 	for _, c := range s.Circles() {
+		if !slices.Contains(only, c.Config.DID) {
+			continue
+		}
 		a := s.liveAttestation(c, now)
 		if a == nil || (a.IsStatement() && !statements) {
 			continue
@@ -624,13 +631,16 @@ func (s *CircleService) ownAttestations(now time.Time, statements bool) ([][]byt
 	return out, nil
 }
 
-// ownRevocations is every live revocation this node holds, across its
+// ownRevocations is every live revocation this node holds in the named
 // circles; statement-form ones only for v4 peers.
-func (s *CircleService) ownRevocations(now time.Time, statements bool) ([][]byte, error) {
+func (s *CircleService) ownRevocations(now time.Time, statements bool, only []string) ([][]byte, error) {
 	var out [][]byte
 	if statements {
 		s.mu.RLock()
 		for circleDID, set := range s.extraRevs {
+			if !slices.Contains(only, circleDID) {
+				continue
+			}
 			for _, st := range set.All() {
 				r, err := circle.RevocationFromStatement(st)
 				if err != nil || r.Circle != circleDID {
@@ -644,6 +654,9 @@ func (s *CircleService) ownRevocations(now time.Time, statements bool) ([][]byte
 		s.mu.RUnlock()
 	}
 	for _, c := range s.Circles() {
+		if !slices.Contains(only, c.Config.DID) {
+			continue
+		}
 		rs, err := c.Revocations(now)
 		if err != nil {
 			return nil, err
@@ -660,6 +673,51 @@ func (s *CircleService) ownRevocations(now time.Time, statements bool) ([][]byte
 		}
 	}
 	return out, nil
+}
+
+// heldDIDs lists the DIDs of every circle this node holds.
+func (s *CircleService) heldDIDs() []string {
+	var out []string
+	for _, c := range s.Circles() {
+		out = append(out, c.Config.DID)
+	}
+	return out
+}
+
+// presentable lists the circles this node names on a legacy exchange it
+// opens toward p — the v2 hello's rule: the circles whose roster already
+// knows the device, or whose gate hints name the peer. A peer known
+// nowhere gets the circle the device was joined in alone (what v1 always
+// showed). The responder then answers with exactly the circles the dialer
+// verified in, so neither side learns of a circle it is not in (Codex
+// review, 2026-11-05: any member could read every circle held here).
+func (s *CircleService) presentable(p peer.ID) []string {
+	var out []string
+	deviceDID, _ := fabricnet.DeviceDID(p)
+	for _, c := range s.Circles() {
+		known := s.hinted(c.Config.DID, p)
+		if !known && s.table != nil {
+			if r, ok := s.table.RosterFor(c.Config.DID); ok {
+				_, known = r.Device(deviceDID)
+			}
+		}
+		if known {
+			out = append(out, c.Config.DID)
+		}
+	}
+	if len(out) == 0 {
+		var own *cert.Cert
+		if s.ownCert != nil {
+			own = s.ownCert()
+		}
+		if own == nil && s.auth != nil {
+			own = s.auth.Own()
+		}
+		if own != nil {
+			out = append(out, own.Payload.Sub)
+		}
+	}
+	return out
 }
 
 func (s *CircleService) remember(p peer.ID, dids []string, chains map[string]*statement.Compiled) {
@@ -1168,7 +1226,7 @@ func (s *CircleService) Ensure(ctx context.Context, p peer.ID) ([]string, error)
 		_ = st.SetDeadline(dl)
 	}
 	v := versionOf(st.Protocol())
-	if err := s.writeOwn(st, v); err != nil {
+	if err := s.writeOwn(st, v, s.presentable(p)); err != nil {
 		st.Reset()
 		return nil, err
 	}
@@ -1349,22 +1407,24 @@ func (s *CircleService) handle(st network.Stream, v int) {
 		return
 	}
 	s.remember(st.Conn().RemotePeer(), dids, chains)
-	if err := s.writeOwn(st, v); err != nil {
+	// Answer with the circles the peer just proved itself in, no others.
+	if err := s.writeOwn(st, v, dids); err != nil {
 		st.Reset()
 	}
 }
 
-// writeOwn sends this node's attestations (and, from v3, revocations) as one
-// frame. Empty when the node is in no circle, or not yet attested into any.
-func (s *CircleService) writeOwn(st network.Stream, v int) error {
+// writeOwn sends this node's attestations (and, from v3, revocations) for
+// the named circles as one frame. Empty when none of them is held or
+// attested into.
+func (s *CircleService) writeOwn(st network.Stream, v int, only []string) error {
 	now := time.Now()
-	own, err := s.ownAttestations(now, v >= 4)
+	own, err := s.ownAttestations(now, v >= 4, only)
 	if err != nil {
 		return err
 	}
 	var raw []byte
 	if v >= 3 {
-		revs, err := s.ownRevocations(now, v >= 4)
+		revs, err := s.ownRevocations(now, v >= 4, only)
 		if err != nil {
 			return err
 		}

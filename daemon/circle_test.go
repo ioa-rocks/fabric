@@ -285,6 +285,58 @@ func tryStream(ctx context.Context, from host.Host, to peer.ID, proto string) er
 // it stands, and an expired attestation is worth nothing.
 // Statement-form attestations and revocations are presented only on the v4
 // exchange; older peers get the legacy forms they can parse.
+// The legacy exchange follows the v2 rule: the dialer names the circles
+// it knows the peer in (its first circle when none), the responder answers
+// with exactly those the dialer proved itself in. A device of family alone
+// never reads the desk's alex attestation or alex's revocations off the
+// legacy stream (Codex review, 2026-11-05).
+func TestLegacyExchangeNamesOnlySharedCircles(t *testing.T) {
+	nsPub, nsRoot, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alex, alexDID := mintCircle(t, "alex")
+	family, familyDID := mintCircle(t, "family")
+	desk := newCircleTestNode(t, nsPub, nsRoot, "desk", []*circle.Bundle{alex, family}, true)
+	hers := newCircleTestNode(t, nsPub, nsRoot, "her-pc", []*circle.Bundle{family}, true)
+	admit(t, desk, hers, familyDID)
+	meshConnect(t, hers, desk)
+	waitShared(t, desk, hers, []string{familyDID})
+	waitShared(t, hers, desk, []string{familyDID})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if got := desk.svc.presentable(hers.h.ID()); !slices.Equal(got, []string{familyDID}) {
+		t.Fatalf("desk would present %v to her PC, want [family]", got)
+	}
+	stranger := newCircleTestNode(t, nsPub, nsRoot, "stranger", nil, false)
+	if got := desk.svc.presentable(stranger.h.ID()); !slices.Equal(got, []string{desk.own.Payload.Sub}) {
+		t.Fatalf("desk would present %v to a peer known nowhere, want its first circle alone", got)
+	}
+
+	// Her PC runs the legacy exchange toward the desk by hand (a v2 peer
+	// skips it): the answer names family and nothing else.
+	st, err := hers.h.NewStream(ctx, desk.h.ID(), CircleProtocolV4ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := hers.svc.writeOwn(st, 4, hers.svc.presentable(desk.h.ID())); err != nil {
+		t.Fatal(err)
+	}
+	deskPub, _ := ed25519Of(hers.h.Peerstore().PubKey(desk.h.ID()))
+	dids, _, err := hers.svc.readHello(st, deskPub, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(dids, []string{familyDID}) {
+		t.Fatalf("legacy exchange named %v, want [family]", dids)
+	}
+	if slices.Contains(dids, alexDID) {
+		t.Fatal("alex leaked over the legacy exchange")
+	}
+}
+
 func TestOlderExchangeVersionsSeeOnlyLegacyForms(t *testing.T) {
 	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
 	owner, err := circle.Init(t.TempDir(), "alex", "pw")
@@ -294,20 +346,20 @@ func TestOlderExchangeVersionsSeeOnlyLegacyForms(t *testing.T) {
 	b, _ := owner.Export()
 	n := newCircleTestNode(t, nsPub, nsPriv, "nas", []*circle.Bundle{b}, true)
 	now := time.Now()
-	if own, _ := n.svc.ownAttestations(now, true); len(own) != 1 {
+	if own, _ := n.svc.ownAttestations(now, true, n.svc.heldDIDs()); len(own) != 1 {
 		t.Fatalf("v4 presents %d attestations, want 1", len(own))
 	}
-	if own, _ := n.svc.ownAttestations(now, false); len(own) != 0 {
+	if own, _ := n.svc.ownAttestations(now, false, n.svc.heldDIDs()); len(own) != 0 {
 		t.Fatalf("v3 presents %d statement attestations, want 0", len(own))
 	}
 	priv, _ := owner.Unlock("pw")
 	r, _ := circle.Revoke(priv, cert.DIDForKey(n.devPub), now)
 	c, _ := circle.ByDID(n.root, owner.Config.DID)
 	c.AddRevocations(now, r)
-	if revs, _ := n.svc.ownRevocations(now, true); len(revs) != 1 {
+	if revs, _ := n.svc.ownRevocations(now, true, n.svc.heldDIDs()); len(revs) != 1 {
 		t.Fatalf("v4 presents %d revocations, want 1", len(revs))
 	}
-	if revs, _ := n.svc.ownRevocations(now, false); len(revs) != 0 {
+	if revs, _ := n.svc.ownRevocations(now, false, n.svc.heldDIDs()); len(revs) != 0 {
 		t.Fatalf("v3 presents %d statement revocations, want 0", len(revs))
 	}
 }
@@ -335,7 +387,7 @@ func TestHomeCircleAttestedByCert(t *testing.T) {
 	if !n.svc.Attested(c) {
 		t.Fatal("home-circle cert not accepted as attestation")
 	}
-	if own, _ := n.svc.ownAttestations(time.Now(), true); len(own) != 1 {
+	if own, _ := n.svc.ownAttestations(time.Now(), true, n.svc.heldDIDs()); len(own) != 1 {
 		t.Fatalf("presents %d attestations, want the cert", len(own))
 	}
 	info := n.svc.Info(time.Now())

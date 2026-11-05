@@ -56,6 +56,7 @@ func TestSubKeyActsWithinItsVerbs(t *testing.T) {
 	}
 	attestInto(t, nas, x)
 	joinCircle(t, desk, bundle, true)
+	admits(t, nas, x, desk)
 	xDID := x.Config.DID
 
 	fnas := nas.fabric(t, root, "nas", nil, roster...)
@@ -180,6 +181,7 @@ func TestRevocationPushesLeasesAndWaits(t *testing.T) {
 	bundle, _ := x.Export()
 	attestInto(t, nas, x)
 	joinCircle(t, desk, bundle, true)
+	admits(t, nas, x, desk)
 	xDID := x.Config.DID
 
 	fnas := nas.fabric(t, root, "nas", nil, roster...)
@@ -276,6 +278,7 @@ func TestOfflineDeviceHoldRecheckedAgainstCircle(t *testing.T) {
 	bundle, _ := x.Export()
 	attestInto(t, nas, x)
 	joinCircle(t, desk, bundle, true)
+	admits(t, nas, x, desk)
 	xDID := x.Config.DID
 
 	fnas := nas.fabric(t, root, "nas", nil, roster...)

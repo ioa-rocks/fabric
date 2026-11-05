@@ -20,11 +20,14 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 
+	"github.com/libp2p/go-libp2p/core/peer"
 	"ioa.rocks/fabric/astral"
+
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/did"
+	"ioa.rocks/fabric/fabricnet"
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
 	"ioa.rocks/fabric/statement"
@@ -277,14 +280,29 @@ func attestDevice(statePath string, c *circle.Circle, pass string) error {
 	if err != nil {
 		return err
 	}
-	a, err := circle.Attest(priv, ed25519.PublicKey(raw), time.Now())
+	// Carry the device's current assert in this circle forward: the
+	// membership cert when the circle is the one it was joined in (name,
+	// overlay address, owner verbs), else the attestation on disk. A bare
+	// re-attestation would outrank the named one by expiry in every
+	// roster and strip the device of its address.
+	var prev *statement.Statement
+	if own, err := dir.LoadCert(); err == nil && own.Stmt != nil && own.Payload.Sub == c.Config.DID {
+		prev = own.Stmt
+	} else if cur, err := c.LoadAttestation(); err == nil && cur.Stmt != nil {
+		prev = cur.Stmt
+	}
+	a, err := circle.Reattest(priv, prev, c.Config.DID, ed25519.PublicKey(raw), time.Now(), circle.DefaultValidity)
 	if err != nil {
 		return err
 	}
 	if err := c.SaveAttestation(a); err != nil {
 		return err
 	}
-	fmt.Printf("device attested into circle %q until %s (%s) — a running daemon picks it up without restart\n", c.Config.Name, a.Expiry().Format("2006-01-02"), c.AttestationPath())
+	kept := ""
+	if a.Name != "" || a.IP != "" {
+		kept = fmt.Sprintf(" as %s", strings.TrimSpace(a.Name+" "+a.IP))
+	}
+	fmt.Printf("device attested into circle %q%s until %s (%s) — a running daemon picks it up without restart\n", c.Config.Name, kept, a.Expiry().Format("2006-01-02"), c.AttestationPath())
 	return nil
 }
 
@@ -670,6 +688,49 @@ func circlePrefix(root string, c *circle.Circle, subnet string) (string, error) 
 	return prefix, nil
 }
 
+// deviceOverlayElsewhere reports the circle (name, or DID when unnamed
+// here) in which the device already holds a live overlay address other
+// than c, and that address — from the rosters of the circles this node
+// holds and from the running daemon's peer view. "" when none is known.
+func deviceOverlayElsewhere(root string, client *daemon.Client, c *circle.Circle, deviceDID string) (where, ip string) {
+	now := time.Now()
+	all, _ := circle.List(root)
+	for _, other := range all {
+		if other.Config.DID == c.Config.DID {
+			continue
+		}
+		r, err := circle.OpenRoster(other, now)
+		if err != nil {
+			continue
+		}
+		if dev, ok := r.Live(deviceDID, now); ok {
+			if v, err := cert.FromStatement(dev.Stmt); err == nil && v.Payload.Meta.IP != "" {
+				return other.Config.Name, v.Payload.Meta.IP
+			}
+		}
+	}
+	if client != nil {
+		if st, err := client.Status(); err == nil {
+			for _, sp := range st.Peers {
+				if sp.IP == "" || !sp.Member {
+					continue
+				}
+				pid, err := peer.Decode(sp.ID)
+				if err != nil {
+					continue
+				}
+				if did, err := fabricnet.DeviceDID(pid); err != nil || did != deviceDID {
+					continue
+				}
+				if !slices.Contains(sp.Circles, c.Config.DID) && len(sp.Circles) > 0 {
+					return shortDID(sp.Circles[0]), sp.IP
+				}
+			}
+		}
+	}
+	return "", ""
+}
+
 // listedGateHints returns this node's globally dialable addresses when it
 // is a listed node, for a bundle's gate hints; a dark owner device cannot
 // be dialed by a newcomer and offers none.
@@ -774,6 +835,14 @@ func cmdCircleAdmit(args []string) error {
 			// (task slice H): the bridge has one route table and would
 			// route between prefixes (Codex review, 2026-11-05).
 			return fmt.Errorf("circle %q is not this node's first circle — an overlay in a second circle arrives with the per-circle bridge; admit without -tun for now", c.Config.Name)
+		}
+		// The same rule from the device's side: a device already holding
+		// an address in another circle — known here from that circle's
+		// roster or from the daemon's view — gets no second one (Codex
+		// review, 2026-11-05: the owner-side check alone let an owner
+		// hand a second overlay to a device of another circle).
+		if where, ip := deviceOverlayElsewhere(root, client, c, deviceDID); where != "" {
+			return fmt.Errorf("%s already holds overlay address %s in circle %s — one overlay per device until the per-circle bridge lands; admit without -tun", memberName, ip, where)
 		}
 		if prefix == "" && cfg.NamespaceDID == c.Config.DID {
 			prefix = cfg.Subnet // the first circle minted before prefixes lived with the circle

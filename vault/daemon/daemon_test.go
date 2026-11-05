@@ -50,6 +50,14 @@ func startDaemon(t *testing.T, statePath string) *daemon.Daemon {
 		// The composition root attaches the circle service (as `fabric up`
 		// does) — vault gates sync and blobs on it.
 		fd.Circle = fabricdaemon.NewCircleService(fd.Host, fd.Auth, st.CircleRoot)
+		// Wired as `fabric up` wires it: own cert, home circle, the peer table
+		// (rosters, v2 handshake) and the per-circle sync. Without these the
+		// service fell back to the legacy exchange, which until 2026-11-05
+		// leaked every circle and so hid the missing wiring.
+		fd.Circle.SetOwnCert(fd.OwnCert)
+		fd.Circle.SetHome(fd.NamespaceDID, fd.Roots, fd.Store.Cert)
+		fd.Circle.SetPeerTable(fd.Store)
+		fd.Circle.AttachSync(fd.Sync)
 	}
 	d, err := daemon.New(st, fd)
 	if err != nil {

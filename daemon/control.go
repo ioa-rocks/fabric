@@ -278,7 +278,10 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		reply.Peers = append(reply.Peers, sp)
 		seen[sp.ID] = true
 	}
-	// The event log makes offline members part of the picture too.
+	// The rosters make offline members part of the picture too. This node
+	// is in them as well (its own asserts travel the same way) and is
+	// never an offline peer of itself.
+	seen[d.Host.ID().String()] = true
 	for p, c := range members {
 		if !seen[p.String()] {
 			exp := c.Expiry()

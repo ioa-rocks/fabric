@@ -92,6 +92,14 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	}
 	fgate.DisableTUN = true
 	fgate.Circle = fabricdaemon.NewCircleService(fgate.Host, fgate.Auth, gate.circleRoot())
+	// Wired as `fabric up` wires it: own cert, home circle, the peer table
+	// (rosters, v2 handshake) and the per-circle sync. Without these the
+	// service fell back to the legacy exchange, which until 2026-11-05
+	// leaked every circle and so hid the missing wiring.
+	fgate.Circle.SetOwnCert(fgate.OwnCert)
+	fgate.Circle.SetHome(fgate.NamespaceDID, fgate.Roots, fgate.Store.Cert)
+	fgate.Circle.SetPeerTable(fgate.Store)
+	fgate.Circle.AttachSync(fgate.Sync)
 	fgate.Circle.SetOwnCert(fgate.OwnCert)
 	fgate.Circle.SetHome(fgate.NamespaceDID, fgate.Roots, fgate.Store.Cert)
 	dgate := startDaemon(t, gate.statePath, fgate)

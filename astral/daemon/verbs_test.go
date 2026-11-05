@@ -28,6 +28,35 @@ func joinCircle(t *testing.T, n *meshNode, b *circle.Bundle, attest bool) {
 	}
 }
 
+// admits seeds the owner's roster of c with the device's attestation —
+// what `fabric circle admit` does. Since the legacy exchange stopped
+// naming circles the peer is not known in (2026-11-05), two devices
+// holding the same circle key learn of each other only through an
+// admission or the gossip it starts; self-attestation alone is not
+// discovery.
+func admits(t *testing.T, owner *meshNode, c *circle.Circle, device *meshNode) {
+	t.Helper()
+	theirs, err := circle.ByName(device.circleRoot(), c.Config.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := theirs.LoadAttestation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine, err := circle.ByName(owner.circleRoot(), c.Config.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := circle.OpenRoster(mine, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Add(a.Stmt, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // attestInto signs the node's device into a circle it holds.
 func attestInto(t *testing.T, n *meshNode, c *circle.Circle) {
 	t.Helper()
@@ -74,6 +103,7 @@ func TestVerbsCheckedAgainstCircle(t *testing.T) {
 	}
 	attestInto(t, nas, x) // the minting node is a device of its circle too
 	joinCircle(t, desk, bundle, true)
+	admits(t, nas, x, desk)
 	joinCircle(t, guest, bundle, false) // holds X's bundle, is no device of X
 	xDID := x.Config.DID
 

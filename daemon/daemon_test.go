@@ -242,8 +242,9 @@ func TestOverlayRoutesHonourScope(t *testing.T) {
 	add(issue("tun-scoped", "100.64.0.3/24", []string{cert.ScopeTun, cert.ScopeVault}))
 	add(issue("no-ip", "", nil))
 	add(issue("vault-only-with-stale-ip", "100.64.0.4/24", []string{cert.ScopeVault}))
+	add(issue("other-overlay", "100.64.7.2/24", nil))
 
-	routes := overlayRoutes(members)
+	routes := overlayRoutes(members, netip.MustParsePrefix("100.64.0.1/24"))
 	want := map[string]peer.ID{"100.64.0.2": "full", "100.64.0.3": "tun-scoped"}
 	if len(routes) != len(want) {
 		t.Fatalf("routes = %v, want %v", routes, want)

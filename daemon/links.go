@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -45,7 +46,7 @@ func (d *Daemon) attachLinks() {
 	d.Host.SetStreamHandler(LinksProtocolID, d.Auth.RequireMember(func(s network.Stream) {
 		defer s.Close()
 		_ = s.SetDeadline(time.Now().Add(linkQueryTimeout))
-		data, err := cbor.Marshal(d.ownLinks())
+		data, err := cbor.Marshal(d.ownLinksFor(s.Conn().RemotePeer()))
 		if err != nil {
 			s.Reset()
 			return
@@ -54,12 +55,32 @@ func (d *Daemon) attachLinks() {
 	}))
 }
 
-// ownLinks reports this node's live member connections.
-func (d *Daemon) ownLinks() []LinkInfo {
+// ownLinks reports this node's live member connections — the local view,
+// for this node's own UI.
+func (d *Daemon) ownLinks() []LinkInfo { return d.linksWhere(func(peer.ID) bool { return true }) }
+
+// ownLinksFor is what a member asking over the links protocol is told:
+// only the links to peers it shares a circle with. A device of `family`
+// does not learn who else this node talks to in `main` (Codex review,
+// 2026-11-05).
+func (d *Daemon) ownLinksFor(asker peer.ID) []LinkInfo {
+	now := time.Now()
+	theirs := d.Store.Circles(asker, now)
+	return d.linksWhere(func(p peer.ID) bool {
+		for _, did := range d.Store.Circles(p, now) {
+			if slices.Contains(theirs, did) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func (d *Daemon) linksWhere(keep func(peer.ID) bool) []LinkInfo {
 	now := time.Now()
 	var out []LinkInfo
 	for _, p := range d.Host.Network().Peers() {
-		if !d.Store.IsMember(p, now) {
+		if !d.Store.IsMember(p, now) || !keep(p) {
 			continue
 		}
 		l := LinkInfo{A: d.Host.ID().String(), B: p.String()}

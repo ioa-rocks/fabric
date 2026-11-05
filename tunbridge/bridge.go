@@ -43,6 +43,7 @@ type Bridge struct {
 	routesMu sync.RWMutex
 	byIP     map[netip.Addr]peer.ID
 	byPeer   map[peer.ID]netip.Addr
+	local    netip.Addr // this device's own overlay address; inbound packets go nowhere else
 
 	linksMu sync.Mutex
 	links   map[peer.ID]*link
@@ -68,6 +69,16 @@ func New(h host.Host, dev io.ReadWriteCloser, gate func(network.StreamHandler) n
 
 // SetRoutes replaces the overlay routing table (overlay IP per peer, from
 // the members' certs).
+// SetLocal pins the inbound side to this device's own address: a packet a
+// peer sends for any other destination is dropped, never written to the
+// kernel — the bridge is an endpoint, not a router between members or
+// between overlays (Codex review, 2026-11-05).
+func (b *Bridge) SetLocal(addr netip.Addr) {
+	b.routesMu.Lock()
+	b.local = addr
+	b.routesMu.Unlock()
+}
+
 func (b *Bridge) SetRoutes(routes map[netip.Addr]peer.ID) {
 	byPeer := make(map[peer.ID]netip.Addr, len(routes))
 	for a, p := range routes {
@@ -173,7 +184,9 @@ func (b *Bridge) send(p peer.ID, pkt []byte) {
 
 // handleInbound moves packets from a peer to the kernel. Source addresses
 // are pinned to the sender's own overlay IP — a member cannot inject
-// packets as somebody else (defense in depth on top of the membership gate).
+// packets as somebody else — and destinations to this device's own address
+// (SetLocal), so nothing is ever routed onward (defense in depth on top of
+// the membership gate).
 func (b *Bridge) handleInbound(s network.Stream) {
 	defer s.Close()
 	remote := s.Conn().RemotePeer()
@@ -186,11 +199,16 @@ func (b *Bridge) handleInbound(s network.Stream) {
 		if !ok {
 			continue
 		}
+		dst, _ := dstIPv4(pkt)
 		b.routesMu.RLock()
 		expected, known := b.byPeer[remote]
+		local := b.local
 		b.routesMu.RUnlock()
 		if !known || src != expected {
 			continue // spoofed or stale-route source — drop
+		}
+		if local.IsValid() && dst != local {
+			continue // not for this device — the bridge never forwards
 		}
 		b.devWriteMu.Lock()
 		_, err = b.dev.Write(pkt)

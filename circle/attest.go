@@ -148,6 +148,28 @@ func AttestAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID strin
 	return AttestWith(priv, own, circleDID, devicePub, now, validity, DeviceVerbs, nil)
 }
 
+// Reattest re-signs a device into circleDID carrying forward what its
+// current assert says about it — verbs, label, overlay address — so a
+// renewal (`circle attest`) never silently strips a device of its address
+// or its role: a fresh assert outranks the old one everywhere by expiry,
+// and a bare one would have shadowed the named cert in every roster
+// (desk listed as "?" without an address, 2026-11-05). prev nil, or a
+// legacy attestation without statement form, falls back to DeviceVerbs
+// and no attributes.
+func Reattest(priv ed25519.PrivateKey, prev *statement.Statement, circleDID string, devicePub ed25519.PublicKey, now time.Time, validity time.Duration) (*Attestation, error) {
+	verbs, meta := DeviceVerbs, (*statement.Meta)(nil)
+	if prev != nil && prev.Payload.Sub == circleDID && prev.Payload.Aud == did.ForKey(devicePub) {
+		if len(prev.Payload.Verbs) > 0 {
+			verbs = prev.Payload.Verbs
+		}
+		if prev.Payload.Meta != nil && (prev.Payload.Meta.Name != "" || prev.Payload.Meta.IP != "") {
+			m := *prev.Payload.Meta
+			meta = &m
+		}
+	}
+	return AttestWith(priv, nil, circleDID, devicePub, now, validity, verbs, meta)
+}
+
 // AttestWith is AttestAs with the verbs and attributes chosen: a role
 // preset (VerbsForRole) plus `tun`, and meta carrying the device's label
 // and — when `tun` is signed — its overlay address inside the circle's
