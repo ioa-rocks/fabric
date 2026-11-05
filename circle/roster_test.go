@@ -168,3 +168,29 @@ func must(pub ed25519.PublicKey, _ ed25519.PrivateKey, err error) ed25519.Public
 	}
 	return pub
 }
+
+// Two asserts for one device with the same window (issued within the same
+// second) are ordered by statement ID, not by arrival: both orders keep
+// the same one.
+func TestRosterTieBreakIsDeterministic(t *testing.T) {
+	root, _ := Init(t.TempDir(), "p", "pw")
+	priv, _ := root.Unlock("pw")
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+	a, _ := AttestWith(priv, nil, root.Config.DID, devPub, now, time.Hour, DeviceVerbs, &statement.Meta{Name: "a"})
+	b, _ := AttestWith(priv, nil, root.Config.DID, devPub, now, time.Hour, DeviceVerbs, &statement.Meta{Name: "b"})
+	if a.Expiry() != b.Expiry() {
+		t.Skip("windows differ (second boundary crossed)")
+	}
+	r1 := NewRoster(statement.NewDIDRoots(root.Config.DID))
+	r1, _, _ = r1.Add(a.Stmt, now)
+	r1, _, _ = r1.Add(b.Stmt, now)
+	r2 := NewRoster(statement.NewDIDRoots(root.Config.DID))
+	r2, _, _ = r2.Add(b.Stmt, now)
+	r2, _, _ = r2.Add(a.Stmt, now)
+	d1, _ := r1.Device(did.ForKey(devPub))
+	d2, _ := r2.Device(did.ForKey(devPub))
+	if d1.Stmt.ID() != d2.Stmt.ID() {
+		t.Fatal("the winner of an expiry tie depends on arrival order")
+	}
+}

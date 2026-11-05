@@ -431,14 +431,23 @@ func TestViewIsOrderIndependent(t *testing.T) {
 	aLong, _ := circle.AttestFor(priv, devA, now, 2*time.Hour)
 	b, _ := circle.AttestFor(priv, devB, now, time.Hour)
 	revokeB, _ := circle.Revoke(priv, cert.DIDForKey(devB), now.Add(time.Second))
+	// Device C: two asserts with the same window (same second) and
+	// different labels — an expiry tie, broken by statement ID.
+	devC, _, _ := ed25519.GenerateKey(rand.Reader)
+	c1, _ := circle.AttestWith(priv, nil, c.Config.DID, devC, now, time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "c-one"})
+	c2, _ := circle.AttestWith(priv, nil, c.Config.DID, devC, now, time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "c-two"})
 	ops := []func(t *PeerTable){
 		func(t *PeerTable) { t.AddAssert(aShort.Stmt, now) },
 		func(t *PeerTable) { t.AddAssert(aLong.Stmt, now) },
 		func(t *PeerTable) { t.AddAssert(b.Stmt, now) },
 		func(t *PeerTable) { t.AddRevocation(c.Config.DID, revokeB.Stmt) },
+		func(t *PeerTable) { t.AddAssert(c1.Stmt, now) },
+		func(t *PeerTable) { t.AddAssert(c2.Stmt, now) },
 	}
 	pA, _ := PeerOfDID(cert.DIDForKey(devA))
 	pB, _ := PeerOfDID(cert.DIDForKey(devB))
+	pC, _ := PeerOfDID(cert.DIDForKey(devC))
+	winnerC := ""
 	var perms [][]int
 	var permute func(cur, rest []int)
 	permute = func(cur, rest []int) {
@@ -451,7 +460,7 @@ func TestViewIsOrderIndependent(t *testing.T) {
 			permute(append(cur, rest[i]), next)
 		}
 	}
-	permute(nil, []int{0, 1, 2, 3})
+	permute(nil, []int{0, 1, 2, 3, 4, 5})
 	at := now.Add(2 * time.Second)
 	for _, perm := range perms {
 		table := NewMemberStore(statement.NewDIDRoots(c.Config.DID))
@@ -464,6 +473,15 @@ func TestViewIsOrderIndependent(t *testing.T) {
 		}
 		if table.IsMember(pB, at) || !table.IsRevoked(pB, at) {
 			t.Fatalf("order %v: revoked device B is member=%v revoked=%v", perm, table.IsMember(pB, at), table.IsRevoked(pB, at))
+		}
+		cC, ok := table.Cert(pC)
+		if !ok {
+			t.Fatalf("order %v: device C missing", perm)
+		}
+		if winnerC == "" {
+			winnerC = cC.Payload.Meta.Name
+		} else if cC.Payload.Meta.Name != winnerC {
+			t.Fatalf("order %v: expiry tie for device C resolved to %q, another order gave %q", perm, cC.Payload.Meta.Name, winnerC)
 		}
 	}
 }
@@ -495,7 +513,7 @@ func TestViewRoutesFollowTheOverlayCircle(t *testing.T) {
 	if _, ok := table.Route(netip.MustParseAddr("100.64.0.2")); ok {
 		t.Fatal("routes exist before the overlay circle is set")
 	}
-	table.SetOverlay(first.Config.DID, netip.MustParsePrefix("100.64.0.1/24"))
+	table.SetOverlay(netip.MustParsePrefix("100.64.0.1/24"))
 	nas, _ := PeerOfDID(cert.DIDForKey(nasPub))
 	if p, ok := table.Route(netip.MustParseAddr("100.64.0.2")); !ok || p != nas {
 		t.Fatalf("route to nas = %v %v", p, ok)

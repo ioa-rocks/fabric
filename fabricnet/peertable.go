@@ -58,8 +58,8 @@ type PeerTable struct {
 type MemberStore = PeerTable
 
 type state struct {
-	rosters       []*circle.Roster // insertion order: the log-fed roster first
-	overlayCircle string           // the circle whose asserts route on this node's interface
+	rosters       []*circle.Roster // insertion order: the first circle's (log-fed) roster first
+	overlay       bool             // the first roster's asserts route on this node's interface
 	overlayPrefix netip.Prefix     // and the range they must lie in
 	version       uint64
 	dirty         bool
@@ -216,8 +216,8 @@ func (s *state) snapshot() *View {
 			v.byPeer[p] = append(v.byPeer[p], deviceIn{r, dev})
 		}
 	}
-	if i := s.index(s.overlayCircle); i >= 0 && s.overlayCircle != "" {
-		r := s.rosters[i]
+	if s.overlay && len(s.rosters) > 0 {
+		r := s.rosters[0]
 		for _, dev := range r.Devices() {
 			c := view(dev)
 			if c == nil || c.Payload.Meta.IP == "" || !c.Allows(cert.ScopeTun) {
@@ -277,12 +277,16 @@ func (t *PeerTable) Attach(c *circle.Circle, now time.Time) error {
 	})
 }
 
-// SetOverlay names the circle whose asserts route on this node's interface
-// and the range they must lie in — set once when the bridge comes up. The
-// view's routes and zone are empty before that.
-func (t *PeerTable) SetOverlay(circleDID string, within netip.Prefix) {
+// SetOverlay makes the first circle's asserts route on this node's
+// interface, inside the given range — set once when the bridge comes up;
+// the view's routes and zone are empty before that. The overlay is the
+// first *roster*, not a DID: a root move renames the circle (the roster
+// honours the new root beside the old, then the old is retired) and the
+// interface must follow it without anyone re-pointing it (Codex review,
+// 2026-11-05). One interface per overlay circle is slice H's.
+func (t *PeerTable) SetOverlay(within netip.Prefix) {
 	_ = t.apply(func(s *state) error {
-		s.overlayCircle, s.overlayPrefix = circleDID, within
+		s.overlay, s.overlayPrefix = true, within
 		s.dirty = true
 		return nil
 	})

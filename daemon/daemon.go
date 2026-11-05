@@ -532,7 +532,7 @@ func (d *Daemon) startTUN() {
 	// view (task single-writer-store).
 	d.bridgeIP = d.OwnCert().Payload.Meta.IP
 	pfx, _ := netip.ParsePrefix(d.bridgeIP)
-	d.Store.SetOverlay(d.NamespaceDID(), pfx)
+	d.Store.SetOverlay(pfx)
 	d.Bridge = tunbridge.New(d.Host, dev, d.Store, d.Auth.RequireMember)
 	if pfx.IsValid() {
 		d.Bridge.SetLocal(pfx.Addr())

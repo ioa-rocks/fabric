@@ -1,6 +1,7 @@
 package circle
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -243,7 +244,18 @@ func (r *Roster) prefer(cur, next *Device) bool {
 	if cur.lapsed != next.lapsed {
 		return cur.lapsed // a live assert lifts a lapsed one; a stale one never demotes
 	}
-	return !next.Exp.Before(cur.Exp)
+	if !next.Exp.Equal(cur.Exp) {
+		return next.Exp.After(cur.Exp)
+	}
+	// Equal expiry (asserts issued within the same second carry the same
+	// unix-second window): the later-issued wins, then the greater
+	// statement ID — a total order, so two nodes seeing the pair in
+	// opposite orders keep the same one (Codex review, 2026-11-05).
+	if ni, ci := next.Stmt.Payload.Iat, cur.Stmt.Payload.Iat; ni != ci {
+		return ni > ci
+	}
+	nid, cid := next.Stmt.ID(), cur.Stmt.ID()
+	return bytes.Compare(nid[:], cid[:]) > 0
 }
 
 // verdict is the time-independent half of the §6 checklist for one
