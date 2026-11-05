@@ -16,23 +16,23 @@ import (
 )
 
 // joinCircle puts a mesh node into a circle (from the owner's bundle) and
-// attests its device when attest is true.
-func joinCircle(t *testing.T, n *meshNode, b *circle.Bundle, attest bool) {
+// admits its device when admit is true.
+func joinCircle(t *testing.T, n *meshNode, b *circle.Bundle, admit bool) {
 	t.Helper()
 	c, err := circle.Join(n.circleRoot(), b)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if attest {
-		attestInto(t, n, c)
+	if admit {
+		admitInto(t, n, c)
 	}
 }
 
-// admits seeds the owner's roster of c with the device's attestation —
+// admits seeds the owner's roster of c with the device's admission —
 // what `fabric circle admit` does. Since the legacy exchange stopped
 // naming circles the peer is not known in (2026-11-05), two devices
 // holding the same circle key learn of each other only through an
-// admission or the gossip it starts; self-attestation alone is not
+// admission or the gossip it starts; self-admission alone is not
 // discovery.
 func admits(t *testing.T, owner *meshNode, c *circle.Circle, device *meshNode) {
 	t.Helper()
@@ -40,7 +40,7 @@ func admits(t *testing.T, owner *meshNode, c *circle.Circle, device *meshNode) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := theirs.LoadAttestation()
+	a, err := theirs.LoadAdmission()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,8 +61,8 @@ func admits(t *testing.T, owner *meshNode, c *circle.Circle, device *meshNode) {
 	}
 }
 
-// attestInto signs the node's device into a circle it holds.
-func attestInto(t *testing.T, n *meshNode, c *circle.Circle) {
+// admitInto signs the node's device into a circle it holds.
+func admitInto(t *testing.T, n *meshNode, c *circle.Circle) {
 	t.Helper()
 	priv, err := c.Unlock("pw")
 	if err != nil {
@@ -72,11 +72,11 @@ func attestInto(t *testing.T, n *meshNode, c *circle.Circle) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := circle.Attest(priv, devPub, time.Now())
+	a, err := circle.Admit(priv, devPub, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.SaveAttestation(a); err != nil {
+	if err := c.SaveAdmission(a); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -96,7 +96,7 @@ func TestVerbsCheckedAgainstCircle(t *testing.T) {
 	guest := newMeshNode(t, root, "guest")
 	roster := []*event.Event{nas.event, desk.event, carbon.event, guest.event}
 
-	// Circle X is minted on nas; desk joins and attests; carbon holds no X.
+	// Circle X is minted on nas; desk joins and admits; carbon holds no X.
 	x, err := circle.Init(nas.circleRoot(), "x", "pw")
 	if err != nil {
 		t.Fatal(err)
@@ -105,7 +105,7 @@ func TestVerbsCheckedAgainstCircle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attestInto(t, nas, x) // the minting node is a device of its circle too
+	admitInto(t, nas, x) // the minting node is a device of its circle too
 	joinCircle(t, desk, bundle, true)
 	admits(t, nas, x, desk)
 	joinCircle(t, guest, bundle, false) // holds X's bundle, is no device of X

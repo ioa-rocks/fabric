@@ -20,7 +20,7 @@ import (
 // Circle selects which circle names refer to; "" is the node's home circle.
 // Signer, when set, makes every call act as that sub-key: the client signs
 // the operation and the daemon (and the remote host) check the key's chain
-// instead of the device's own assert.
+// instead of the device's own admission.
 type Client struct {
 	Circle string
 	Signer *astral.Signer

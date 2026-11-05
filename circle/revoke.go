@@ -18,13 +18,13 @@ import (
 	"ioa.rocks/fabric/statement"
 )
 
-// Revocation is a signed statement that kills attestations in a circle.
+// Revocation is a signed statement that kills admissions in a circle.
 // Since 2026-11-02 it is a statement revoke (package statement) with one of
-// two targets: {aud, before} — every attestation of that device issued up
+// two targets: {aud, before} — every admission of that device issued up
 // to before, today's lost-device sweep — or {id}, one statement. It is
 // signed by the root (kills anything in the circle) or by an admin desk
-// under its own assert (kills only what chains through that assert;
-// verifier rule 3). An attestation issued after a sweep's `before` is a
+// under its own admission (kills only what chains through that admission;
+// verifier rule 3). An admission issued after a sweep's `before` is a
 // deliberate re-admission and stands.
 //
 // Revocations travel inside the circle: devices of the circle swap their
@@ -36,7 +36,7 @@ type Revocation struct {
 	Circle   string // circle DID
 	Device   string // swept device key, did:key; "" for a by-id revocation
 	TargetID []byte // revoked statement ID; nil for a sweep
-	At       int64  // unix seconds; sweeps kill attestations with Iat <= At
+	At       int64  // unix seconds; sweeps kill admissions with Iat <= At
 	Sig      []byte
 	Stmt     *statement.Statement // statement form; nil for legacy bytes
 	raw      []byte
@@ -66,7 +66,7 @@ func Revoke(circlePriv ed25519.PrivateKey, deviceDID string, now time.Time) (*Re
 }
 
 // RevokeAs signs any revocation: by the root (own == nil) or by an admin
-// desk under its own assert (own), targeting a device sweep or a statement
+// desk under its own admission (own), targeting a device sweep or a statement
 // ID in circleDID.
 func RevokeAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, target statement.Target, now time.Time) (*Revocation, error) {
 	s, err := statement.Revoke(priv, circleDID, own, target, now)
@@ -99,7 +99,7 @@ func revocationFromStatement(s *statement.Statement) (*Revocation, error) {
 // Verify checks the revocation's signatures and shape: a legacy or
 // root-signed one must be signed by the circle's root; a delegated one must
 // ride a chain whose leaf names the revoker, in this circle. Whether a
-// delegated revocation actually reaches a given attestation is rule 3, in
+// delegated revocation actually reaches a given admission is rule 3, in
 // Circle.Revoked.
 func (r *Revocation) Verify() error {
 	if r.Stmt != nil {
@@ -125,7 +125,7 @@ func (r *Revocation) Verify() error {
 		// root and be delegable, or anyone could flood a circle with
 		// revocations under throwaway keys (stored for MaxValidity,
 		// re-gossiped, cache-thrashing) — whether a revocation reaches a
-		// given attestation is still rule 3 (agy review, 2026-11-02).
+		// given admission is still rule 3 (agy review, 2026-11-02).
 		parent := r.Stmt.Parent()
 		if _, err := statement.Compile(parent, nil, r.Circle, didKeyRoots{}); err != nil {
 			return fmt.Errorf("revocation chain: %w", err)
@@ -156,13 +156,13 @@ func (r *Revocation) Verify() error {
 // the root's signature.
 func (r *Revocation) Delegated() bool { return r.Stmt != nil && !r.Stmt.IsRootIssued() }
 
-// Kills reports whether this revocation voids the attestation on its own:
+// Kills reports whether this revocation voids the admission on its own:
 // same circle and, for a sweep, same device issued no later than the
 // sweep; for a by-id revocation, that very statement. Only root authority
 // is judged here; a delegated revocation is applied by Circle.Revoked
-// through the verifier, since whether it reaches the attestation depends
-// on the attestation's chain.
-func (r *Revocation) Kills(a *Attestation) bool {
+// through the verifier, since whether it reaches the admission depends
+// on the admission's chain.
+func (r *Revocation) Kills(a *Admission) bool {
 	if a.Circle != r.Circle || r.Delegated() {
 		return false
 	}
@@ -179,7 +179,7 @@ func (r *Revocation) Kills(a *Attestation) bool {
 // Time is when the revocation was signed (sweeps: the cut-off).
 func (r *Revocation) Time() time.Time { return time.Unix(r.At, 0) }
 
-// Spent reports whether every attestation this revocation could kill has
+// Spent reports whether every admission this revocation could kill has
 // expired on its own, so the record can be dropped (task file, Retention).
 func (r *Revocation) Spent(now time.Time) bool {
 	if r.Stmt != nil {
@@ -353,15 +353,15 @@ func (c *Circle) RevocationSet(now time.Time) (*statement.RevocationSet, error) 
 	return set, nil
 }
 
-// Revoked reports whether the attestation is dead under this circle's
-// revocation set: a root sweep or by-id revocation of the attestation
-// itself (Kills), or — for a statement attestation — any statement
+// Revoked reports whether the admission is dead under this circle's
+// revocation set: a root sweep or by-id revocation of the admission
+// itself (Kills), or — for a statement admission — any statement
 // revocation reaching a link of its chain (verifier rule 3: the root
-// revoking a desk's assert kills what the desk attested; a delegated
+// revoking a desk's admission kills what the desk admitted; a delegated
 // revocation kills what lies under its chain). Kills alone sees only the
 // leaf, so the chain check runs whenever a statement revocation exists,
 // not only a delegated one (Codex review, 2026-11-02).
-func (c *Circle) Revoked(a *Attestation, now time.Time) bool {
+func (c *Circle) Revoked(a *Admission, now time.Time) bool {
 	rs, err := c.Revocations(now)
 	if err != nil {
 		return false

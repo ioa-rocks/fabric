@@ -108,13 +108,13 @@ type Daemon struct {
 }
 
 // New assembles a daemon from a state directory: a device key and the
-// circles under circles/*. The node presents one assert per circle it is a
+// circles under circles/*. The node presents one admission per circle it is a
 // device of — its membership cert (cert.cbor, the circle `fabric init` or
-// `fabric join <gate>` put it in) or the attestation a circle owner signed
+// `fabric join <gate>` put it in) or the admission a circle owner signed
 // into a circle directory (`fabric join <bundle>`, cold start). There is
 // no home circle (memo §5, decided 2026-11-04); what the code still calls
 // the circle is the device's *first* circle: the one the config names
-// for the membership-event log, else the one its attestation is in. It is
+// for the membership-event log, else the one its admission is in. It is
 // where the overlay address, the admission queue and the Astral default
 // come from until those are per circle too (slice H).
 func New(dir state.Dir) (*Daemon, error) {
@@ -144,12 +144,12 @@ func New(dir state.Dir) (*Daemon, error) {
 	evLog := event.NewLog(roots)
 	// Every other circle this node holds brings its own roster into the
 	// union (memo §17: transport is the union of circles): a device
-	// attested only into `family` is admitted here because `family` is.
+	// admitted only into `family` is admitted here because `family` is.
 	// Dirs whose DID the log-fed roster already honours are that roster.
 	for _, c := range circles {
 		if roots.Honours(c.Config.DID) {
 			// The first circle's directory: the log-fed roster persists
-			// there too, so an assert the log never carries (a `circle
+			// there too, so an admission the log never carries (a `circle
 			// admit` into this circle) survives a restart.
 			if err := store.Attach(c, time.Now()); err != nil {
 				log.Printf("circle %q: devices.cbor unreadable: %v", c.Config.Name, err)
@@ -243,7 +243,7 @@ func New(dir state.Dir) (*Daemon, error) {
 			libp2p.EnableNATService(),
 		)
 		if len(cfg.AnnounceAddrs) > 0 {
-			// An operator who announces an address is attesting that this
+			// An operator who announces an address is admitting that this
 			// node is publicly reachable — don't wait for another oracle
 			// to confirm it. Without this, a single-lighthouse mesh can
 			// never light its relay: libp2p only starts the relay service
@@ -360,14 +360,14 @@ func New(dir state.Dir) (*Daemon, error) {
 
 // firstCircle settles which circle is the device's first and what it
 // presents for it: the config's circle (the membership-event log's) when
-// the config names one — its cert when there is one, else the attestation
+// the config names one — its cert when there is one, else the admission
 // in that circle's directory — or, on a cold-start device whose config
-// names none, the circle whose directory holds a live attestation for
+// names none, the circle whose directory holds a live admission for
 // this device (its cert view stands in for the membership cert). A node
 // with neither is not set up.
 func firstCircle(cfg state.Config, own *cert.Cert, circles []*circle.Circle, now time.Time) (string, *cert.Cert, error) {
 	fromDir := func(c *circle.Circle) *cert.Cert {
-		a, err := c.LoadAttestation()
+		a, err := c.LoadAdmission()
 		if err != nil || a.Stmt == nil || a.Valid(now) != nil {
 			return nil
 		}
@@ -389,7 +389,7 @@ func firstCircle(cfg state.Config, own *cert.Cert, circles []*circle.Circle, now
 			}
 		}
 		if own == nil {
-			return "", nil, fmt.Errorf("no membership certificate in %s and no attestation in circle %s — run 'fabric join' first", cfg.CircleDID, cfg.CircleDID)
+			return "", nil, fmt.Errorf("no membership certificate in %s and no admission in circle %s — run 'fabric join' first", cfg.CircleDID, cfg.CircleDID)
 		}
 		return cfg.CircleDID, own, nil
 	}
@@ -518,9 +518,9 @@ func (d *Daemon) startTUN() {
 		log.Printf("tun: %v — running without the IP bridge (grant CAP_NET_ADMIN to enable: sudo setcap cap_net_admin+ep <fabric binary>)", err)
 		return
 	}
-	// The routes are in the peer table's published view: the asserts of
+	// The routes are in the peer table's published view: the admissions of
 	// the circle this device's address is in (its first circle, until slice
-	// H gives every overlay circle its own interface), each by its assert in
+	// H gives every overlay circle its own interface), each by its admission in
 	// that circle, inside the circle's range. Nothing is rebuilt or
 	// installed on change — the bridge looks each packet up in the current
 	// view (task single-writer-store).

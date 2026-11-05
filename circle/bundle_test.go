@@ -13,8 +13,8 @@ import (
 )
 
 // A device bundle carries the circle's config (gate hints, prefix) and the
-// device's attestation, no key: the joining device is a device, not an
-// owner; its attestation is installed and its role reads off the verbs.
+// device's admission, no key: the joining device is a device, not an
+// owner; its admission is installed and its role reads off the verbs.
 func TestDeviceBundleJoinsWithoutKey(t *testing.T) {
 	owner, err := Init(t.TempDir(), "family", "pw")
 	if err != nil {
@@ -29,7 +29,7 @@ func TestDeviceBundleJoinsWithoutKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := AttestWith(priv, nil, owner.Config.DID, devPub, time.Now(), time.Hour, verbs, &statement.Meta{Name: "gate-hetz"})
+	a, err := AdmitWith(priv, nil, owner.Config.DID, devPub, time.Now(), time.Hour, verbs, &statement.Meta{Name: "gate-hetz"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,25 +62,25 @@ func TestDeviceBundleJoinsWithoutKey(t *testing.T) {
 	if joined.Config.Prefix != owner.Config.Prefix || len(joined.Config.Gates) != 1 || joined.Config.Gates[0] != gates[0] {
 		t.Fatalf("joined config %+v lost prefix or gate hints", joined.Config)
 	}
-	got, err := joined.LoadAttestation()
+	got, err := joined.LoadAdmission()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Device != did.ForKey(devPub) || got.Role() != RoleGate || got.Name != "gate-hetz" {
-		t.Fatalf("installed attestation: device %s role %s name %q", got.Device, got.Role(), got.Name)
+		t.Fatalf("installed admission: device %s role %s name %q", got.Device, got.Role(), got.Name)
 	}
 	if got.Verify(devPub, time.Now()) != nil {
-		t.Fatal("installed attestation does not verify")
+		t.Fatal("installed admission does not verify")
 	}
 	// A key-less circle exports nothing: there is no key to copy.
 	if _, err := joined.Export(); err == nil {
 		t.Fatal("a device exported an owner bundle without a key")
 	}
-	// An attestation for another circle is refused at join.
+	// An admission for another circle is refused at join.
 	other, _ := Init(t.TempDir(), "other", "pw")
-	bad := &Bundle{Config: other.Config, Attestation: read.Attestation}
+	bad := &Bundle{Config: other.Config, Admission: read.Admission}
 	if _, err := Join(t.TempDir(), bad); err == nil {
-		t.Fatal("bundle with a foreign attestation joined")
+		t.Fatal("bundle with a foreign admission joined")
 	}
 }
 
@@ -102,14 +102,14 @@ func TestDefaultPrefixAndTunAddress(t *testing.T) {
 	priv, _ := c.Unlock("pw")
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	verbs := append(DeviceVerbs, statement.VerbTun)
-	a, err := AttestWith(priv, nil, c.Config.DID, devPub, time.Now(), time.Hour, verbs, &statement.Meta{Name: "nas", IP: pfx.Addr().Next().String() + "/24"})
+	a, err := AdmitWith(priv, nil, c.Config.DID, devPub, time.Now(), time.Hour, verbs, &statement.Meta{Name: "nas", IP: pfx.Addr().Next().String() + "/24"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a.IP == "" || a.Role() != RoleDevice {
-		t.Fatalf("tun attestation: ip %q role %s", a.IP, a.Role())
+		t.Fatalf("tun admission: ip %q role %s", a.IP, a.Role())
 	}
-	if _, err := AttestWith(priv, nil, c.Config.DID, devPub, time.Now(), time.Hour, DeviceVerbs, &statement.Meta{IP: "100.64.0.9/24"}); err == nil {
+	if _, err := AdmitWith(priv, nil, c.Config.DID, devPub, time.Now(), time.Hour, DeviceVerbs, &statement.Meta{IP: "100.64.0.9/24"}); err == nil {
 		t.Fatal("an address without tun was signed")
 	}
 }

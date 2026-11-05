@@ -128,7 +128,7 @@ func New(c *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
 	if fd != nil {
 		// Trust boundary (l0-connectivity memo §9 step 3): sync and blobs
 		// are served only to verified devices of *this circle* — the
-		// fabric daemon's CircleService decides, from attestations, never
+		// fabric daemon's CircleService decides, from admissions, never
 		// from mesh membership alone. Hello stays member-wide: it is the
 		// presence card that lets status show who claims what.
 		if fd.Circle == nil {
@@ -165,8 +165,8 @@ func (d *Daemon) Run() error {
 
 	for _, c := range d.Store.Circles() {
 		log.Printf("vault subsystem up: circle %q (%s)", c.Config.Name, c.Config.DID)
-		if d.Fabric != nil && !d.Fabric.Circle.Attested(c) {
-			log.Printf("vault: this device holds no attestation for circle %q — its peers will not sync with it until 'fabric circle attest' runs here (no restart needed)", c.Config.Name)
+		if d.Fabric != nil && !d.Fabric.Circle.Admitted(c) {
+			log.Printf("vault: this device holds no admission for circle %q — its peers will not sync with it until 'fabric circle renew' runs here (no restart needed)", c.Config.Name)
 		}
 	}
 

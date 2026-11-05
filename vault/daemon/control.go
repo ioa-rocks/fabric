@@ -119,7 +119,7 @@ type PeerInfo struct {
 type CircleInfo struct {
 	DID      string `json:"did"`
 	Name     string `json:"name"`
-	Attested bool   `json:"attested"` // this device holds its attestation
+	Admitted bool   `json:"attested"` // this device holds its admission
 	Buckets  int    `json:"buckets"`
 }
 
@@ -265,8 +265,8 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, c := range d.Store.Circles() {
 		ci := CircleInfo{DID: c.Config.DID, Name: c.Config.Name}
-		if _, err := c.LoadAttestation(); err == nil {
-			ci.Attested = true
+		if _, err := c.LoadAdmission(); err == nil {
+			ci.Admitted = true
 		}
 		for _, b := range buckets {
 			if b.Genesis.Owner == c.Config.DID {

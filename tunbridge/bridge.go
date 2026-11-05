@@ -39,7 +39,7 @@ type link struct {
 // RouteSource answers the bridge's two questions from the current
 // membership view: which peer holds a destination address, and which
 // address a peer holds. The peer table's published view implements it, so
-// a revocation or a new assert changes the answer with the next publish
+// a revocation or a new admission changes the answer with the next publish
 // and no table is ever rebuilt or installed here (task
 // single-writer-store).
 type RouteSource interface {

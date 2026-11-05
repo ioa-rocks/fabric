@@ -27,14 +27,14 @@ import (
 // Members only; strangers are reset.
 //
 // SyncProtocolID carries membership events plus signed peer address
-// records (the knowledge plane's WHERE, self-attested by each device's
+// records (the knowledge plane's WHERE, self-admitted by each device's
 // key). EventsProtocolID is the events-only predecessor, still served so
 // a mixed-version mesh keeps its membership gossip during rolling
 // upgrades.
 //
 // SyncProtocolV2ID (step 5, slice C; memo l0-overlapping-circles §17) carries
 // one set per circle *both* peers are verified in — the circle's device
-// asserts and revocations as statements, plus the legacy event envelopes of
+// admissions and revocations as statements, plus the legacy event envelopes of
 // the first circle for one release — and the address records. A device
 // never learns another circle's roster; a circle's set is relayed only to
 // peers verified in it.
@@ -70,7 +70,7 @@ type syncPayload struct {
 type circleSet struct {
 	DID         string         `cbor:"did"`
 	Roots       []string       `cbor:"roots,omitempty"` // the circle DID again (older binaries listed every root they honoured)
-	Asserts     [][]byte       `cbor:"a,omitempty"`     // device asserts, statement bytes (live and lapsed)
+	Admissions  [][]byte       `cbor:"a,omitempty"`     // admissions, statement bytes (live and lapsed)
 	Revocations [][]byte       `cbor:"r,omitempty"`     // statement and legacy forms
 	Events      []*event.Event `cbor:"e,omitempty"`     // legacy envelopes (first circle only), one release
 }
@@ -82,13 +82,13 @@ type syncPayloadV2 struct {
 }
 
 // CircleHooks is what the circle service lends the gossip: this node's own
-// asserts per circle (a roster holds other devices, not oneself), the live
+// admissions per circle (a roster holds other devices, not oneself), the live
 // revocations per circle, and where a peer's revocations go (returns the
 // ones that were new, for the relay).
 type CircleHooks struct {
-	OwnAsserts  func(circleDID string) [][]byte
-	Revocations func(circleDID string) [][]byte
-	Ingest      func(from peer.ID, revocations [][]byte) (fresh [][]byte, err error)
+	OwnAdmissions func(circleDID string) [][]byte
+	Revocations   func(circleDID string) [][]byte
+	Ingest        func(from peer.ID, revocations [][]byte) (fresh [][]byte, err error)
 }
 
 // kickDelay debounces the anti-entropy kick a roster change triggers.
@@ -184,7 +184,7 @@ func (s *EventSync) republishRecords() {
 // Close detaches the service from the host.
 // SetCircleHooks lends the gossip the circle service's view (see
 // CircleHooks). Without them, v2 carries rosters and events but no own
-// asserts or revocations — a pure-connectivity node.
+// admissions or revocations — a pure-connectivity node.
 func (s *EventSync) SetCircleHooks(h CircleHooks) {
 	s.mu.Lock()
 	s.hooks = h
@@ -277,15 +277,15 @@ func (s *EventSync) ExchangeAsync(p peer.ID) {
 	}()
 }
 
-// PublishStatements pushes freshly learned or signed asserts and
+// PublishStatements pushes freshly learned or signed admissions and
 // revocations of one circle to the connected members verified in it — the
 // rumor-mill push for the statement set (a `circle admit` or `circle
 // revoke` here).
-func (s *EventSync) PublishStatements(circleDID string, asserts, revocations [][]byte) {
-	if len(asserts) == 0 && len(revocations) == 0 {
+func (s *EventSync) PublishStatements(circleDID string, admissions, revocations [][]byte) {
+	if len(admissions) == 0 && len(revocations) == 0 {
 		return
 	}
-	s.publishSets([]circleSet{{DID: circleDID, Asserts: asserts, Revocations: revocations}}, "")
+	s.publishSets([]circleSet{{DID: circleDID, Admissions: admissions, Revocations: revocations}}, "")
 }
 
 // publishSets pushes per-circle deltas to the connected members verified
@@ -330,7 +330,7 @@ func (s *EventSync) publishSets(sets []circleSet, except peer.ID) {
 // setsFor builds the per-circle sets for one peer: a set for every circle
 // the peer is a live device of here, with the given events (the
 // membership-event log belongs to the first circle, the one it was always
-// about) and — for a full exchange — every assert the roster holds, this
+// about) and — for a full exchange — every admission the roster holds, this
 // node's own, and the circle's live revocations.
 func (s *EventSync) setsFor(p peer.ID, evs []*event.Event, full bool) []circleSet {
 	now := time.Now()
@@ -348,11 +348,11 @@ func (s *EventSync) setsFor(p peer.ID, evs []*event.Event, full bool) []circleSe
 		if full {
 			for _, dev := range r.Devices() {
 				if raw, err := dev.Stmt.Bytes(); err == nil {
-					set.Asserts = append(set.Asserts, raw)
+					set.Admissions = append(set.Admissions, raw)
 				}
 			}
-			if hooks.OwnAsserts != nil {
-				set.Asserts = append(set.Asserts, hooks.OwnAsserts(did)...)
+			if hooks.OwnAdmissions != nil {
+				set.Admissions = append(set.Admissions, hooks.OwnAdmissions(did)...)
 			}
 			if hooks.Revocations != nil {
 				set.Revocations = hooks.Revocations(did)
@@ -528,7 +528,7 @@ func (s *EventSync) handleSyncV2(str network.Stream) {
 // applyV2 ingests per-circle sets: each into the roster of its circle (a
 // set for a circle not held here is dropped unread), events through the
 // log as in v1, revocations through the circle hooks. What was genuinely
-// new is relayed on — events to every member, asserts and revocations only
+// new is relayed on — events to every member, admissions and revocations only
 // to the members verified in that circle.
 func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 	now := time.Now()
@@ -565,13 +565,13 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 				s.onApply(e)
 			}
 		}
-		for _, raw := range set.Asserts {
+		for _, raw := range set.Admissions {
 			st, err := statement.Decode(raw)
 			if err != nil {
 				continue
 			}
-			if fresh, err := s.store.AddAssert(st, now); err == nil && fresh {
-				delta.Asserts = append(delta.Asserts, raw)
+			if fresh, err := s.store.AddAdmission(st, now); err == nil && fresh {
+				delta.Admissions = append(delta.Admissions, raw)
 			}
 		}
 		if hooks.Ingest != nil && len(set.Revocations) > 0 {
@@ -581,7 +581,7 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 			}
 			delta.Revocations = fresh
 		}
-		if len(delta.Asserts) > 0 || len(delta.Revocations) > 0 {
+		if len(delta.Admissions) > 0 || len(delta.Revocations) > 0 {
 			deltas = append(deltas, delta)
 		}
 	}

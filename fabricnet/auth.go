@@ -25,14 +25,14 @@ import (
 // The mutual membership handshake, spec §4. Possession of the device key is
 // already proven by libp2p's transport security (Noise/TLS authenticates the
 // peer ID), so the exchange carries only statements: each side shows what it
-// holds and validates that the other's asserts (a) verify against the roots
+// holds and validates that the other's admissions (a) verify against the roots
 // of a circle held here and (b) are bound to the peer ID it is talking to.
 //
 // Version 2 (step 5, slice B; memo l0-overlapping-circles §17): one frame
-// each way carrying a list of device asserts — one per circle the two
+// each way carrying a list of admissions — one per circle the two
 // peers share — plus the revocations of those circles. The dialer presents
 // the circles it knows the peer in (its rosters, or the gate hints that
-// named the peer); the responder answers with its asserts for exactly the
+// named the peer); the responder answers with its admissions for exactly the
 // circles it verified the dialer in. Nothing about a circle the peer is not
 // in ever crosses the wire. Version 1 carries one membership cert each way
 // (the device's first circle) and is served and dialed for one release.
@@ -46,12 +46,12 @@ const (
 	maxHelloWireSize = 64 * 1024
 )
 
-// Hello is one direction of a v2 handshake: the asserts the sender shows
+// Hello is one direction of a v2 handshake: the admissions the sender shows
 // for the circles it believes it shares with the peer, and the live
 // revocations of those circles (so a freshly signed revocation reaches a
 // device the moment it reconnects).
 type Hello struct {
-	Asserts     [][]byte `cbor:"a"`
+	Admissions  [][]byte `cbor:"a"`
 	Revocations [][]byte `cbor:"r,omitempty"`
 }
 
@@ -63,7 +63,7 @@ type Hello struct {
 type Presenter func(p peer.ID, verified []string) Hello
 
 // RevocationSink ingests the revocations a peer sent in its hello, before
-// its asserts are judged (one of them may name the very device talking).
+// its admissions are judged (one of them may name the very device talking).
 type RevocationSink func(p peer.ID, revocations [][]byte) error
 
 // JoinObserver is notified when a never-before-seen member authenticates —
@@ -94,7 +94,7 @@ type AuthService struct {
 	shook     map[peer.ID]Handshake
 	presenter Presenter
 	sink      RevocationSink
-	ownAllows func(family string) bool // any own assert admits the family; nil = the own cert alone
+	ownAllows func(family string) bool // any own admission admits the family; nil = the own cert alone
 	v1To      func(peer.ID) bool       // may v1 be dialed toward a peer in no roster (a bootstrap)? nil = yes
 	v2        bool                     // dial v2 (tests turn it off to exercise the v1 path)
 }
@@ -184,7 +184,7 @@ func (a *AuthService) SetRevocationSink(f RevocationSink) {
 }
 
 // SetOwnAllows installs the own-scope view over every circle this node is
-// a device of: a protocol family is served when *any* own assert carries
+// a device of: a protocol family is served when *any* own admission carries
 // its verbs, not only the first circle's cert (a gate in one circle can be
 // a full device in another; Codex review, 2026-11-04).
 func (a *AuthService) SetOwnAllows(f func(family string) bool) {
@@ -193,7 +193,7 @@ func (a *AuthService) SetOwnAllows(f func(family string) bool) {
 	a.mu.Unlock()
 }
 
-// OwnScopeAllows reports whether any of this node's own asserts admits the
+// OwnScopeAllows reports whether any of this node's own admissions admits the
 // protocol family (see SetOwnAllows) — for data planes with their own
 // stream gate.
 func (a *AuthService) OwnScopeAllows(family string) bool { return a.ownScopeAllows(family) }
@@ -316,7 +316,7 @@ func (a *AuthService) Authenticate(ctx context.Context, p peer.ID) error {
 		return a.authenticateV1(s, p)
 	}
 	hello := a.present(p, nil)
-	if len(hello.Asserts) == 0 {
+	if len(hello.Admissions) == 0 {
 		s.Reset()
 		return fmt.Errorf("nothing to present to %s: it is in no circle held here and no gate hint names it", p)
 	}
@@ -451,7 +451,7 @@ func (a *AuthService) present(p peer.ID, verified []string) Hello {
 		return hello
 	}
 	ownCircle := own.Payload.Sub
-	for _, raw := range hello.Asserts {
+	for _, raw := range hello.Admissions {
 		if st, err := statement.Decode(raw); err == nil && st.Payload.Sub == ownCircle {
 			return hello
 		}
@@ -466,18 +466,18 @@ func (a *AuthService) present(p peer.ID, verified []string) Hello {
 		if !found {
 			return hello
 		}
-	} else if len(hello.Asserts) > 0 {
+	} else if len(hello.Admissions) > 0 {
 		return hello
 	}
 	if raw, err := own.Stmt.Bytes(); err == nil {
-		hello.Asserts = append(hello.Asserts, raw)
+		hello.Admissions = append(hello.Admissions, raw)
 	}
 	return hello
 }
 
-// verifyHello ingests the peer's revocations, then judges every assert: a
+// verifyHello ingests the peer's revocations, then judges every admission: a
 // forgery — not a statement, wrong device, a chain that does not verify —
-// fails the handshake; an assert for a circle not held here is skipped
+// fails the handshake; an admission for a circle not held here is skipped
 // (the peer guessed from a stale roster); a dead one — expired, revoked —
 // is skipped too, since an honest device can lag a renewal. At least one
 // must leave the device live in a circle held here. Returns the circles
@@ -491,21 +491,21 @@ func (a *AuthService) verifyHello(p peer.ID, hello Hello) ([]string, *cert.Cert,
 			return nil, nil, err
 		}
 	}
-	if len(hello.Asserts) == 0 {
-		return nil, nil, errors.New("peer presented no assert")
+	if len(hello.Admissions) == 0 {
+		return nil, nil, errors.New("peer presented no admission")
 	}
 	var (
 		verified []string
 		first    *cert.Cert
 	)
-	for _, raw := range hello.Asserts {
+	for _, raw := range hello.Admissions {
 		st, err := statement.Decode(raw)
 		if err != nil {
-			return nil, nil, fmt.Errorf("presented assert: %w", err)
+			return nil, nil, fmt.Errorf("presented admission: %w", err)
 		}
 		circleDID, held, live, err := a.store.Verify(p, st)
 		if err != nil {
-			return nil, nil, fmt.Errorf("presented assert: %w", err)
+			return nil, nil, fmt.Errorf("presented admission: %w", err)
 		}
 		if !held || !live {
 			continue
@@ -516,7 +516,7 @@ func (a *AuthService) verifyHello(p peer.ID, hello Hello) ([]string, *cert.Cert,
 		}
 	}
 	if len(verified) == 0 {
-		return nil, nil, errors.New("no presented assert verifies for a circle held here")
+		return nil, nil, errors.New("no presented admission verifies for a circle held here")
 	}
 	return verified, first, nil
 }
@@ -589,7 +589,7 @@ func (a *AuthService) Allows(p peer.ID, protocolID string) bool {
 
 // readAndValidateCert reads one v1 cert frame and checks both chain
 // validity against the honoured roots and the binding to the remote peer's
-// identity key. Delegated certs (issued under an admin assert) pass: since
+// identity key. Delegated certs (issued under an admin admission) pass: since
 // step 5 the peer table re-checks revocations along the whole chain, so
 // revoking the issuer reaches what it issued.
 func readAndValidateCert(r io.Reader, roots statement.Roots, remote peer.ID) (*cert.Cert, error) {

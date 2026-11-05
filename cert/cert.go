@@ -1,6 +1,6 @@
 // Package cert implements the Fabric membership certificate. Since
 // 2026-11-02 a certificate is a statement (package statement): the device
-// assert {iss root, aud device, sub circle, res *, verbs member (+admin)
+// admission {iss root, aud device, sub circle, res *, verbs member (+admin)
 // (+tun) + the resource verbs of its scope, meta name/ip}; this package is
 // the constructor/decoder over it that the rest of the mesh keeps calling
 // (Issue, Renew, Verify, Allows, Meta.Scope). Certificates minted before
@@ -258,7 +258,7 @@ var familyVerbs = map[string][]string{
 func VerbsForScope(cmd string, scope []string) []string {
 	verbs := []string{statement.VerbMember}
 	if cmd == CmdAdmin {
-		// terminate rides with admin so an admin assert can attenuate it
+		// terminate rides with admin so an admin admission can attenuate it
 		// onto a gateway grant; it means nothing on a device itself.
 		verbs = append(verbs, statement.VerbAdmin, statement.VerbTerminate)
 	}
@@ -306,7 +306,7 @@ func Issue(rootPriv ed25519.PrivateKey, devicePub ed25519.PublicKey, cmd string,
 }
 
 // IssueAs signs a membership certificate into circleDID with any key that
-// may: the root (own == nil) or an admin desk under its own admin assert
+// may: the root (own == nil) or an admin desk under its own admin admission
 // (own), in which case the cert chains through it and dies with it
 // (verifier rule 8 lets only such issuers hand out member/tun/ip).
 //
@@ -315,7 +315,7 @@ func Issue(rootPriv ed25519.PrivateKey, devicePub ed25519.PublicKey, cmd string,
 // an admin cert none (del 0). The daemon's device key is hot and
 // unencrypted; a delegable admin cert on it would let anyone who reads the
 // state directory mint members without the root passphrase (agy review,
-// 2026-11-02). Delegable admin asserts come with keystore-backed desk
+// 2026-11-02). Delegable admin admissions come with keystore-backed desk
 // signing (build step 5); until then IssueAsDel is for tests and tooling.
 func IssueAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, devicePub ed25519.PublicKey, cmd string, meta Meta, nbf time.Time, validity time.Duration) (*Cert, error) {
 	return IssueAsDel(priv, own, circleDID, devicePub, cmd, meta, nbf, validity, DefaultDel(cmd))
@@ -363,7 +363,7 @@ func IssueAsDel(priv ed25519.PrivateKey, own *statement.Statement, circleDID str
 func FromStatement(s *statement.Statement) (*Cert, error) {
 	p := s.Payload
 	if p.Typ != statement.TypeAssert {
-		return nil, errors.New("not a certificate: statement is not an assert")
+		return nil, errors.New("not a certificate: statement is not an admission")
 	}
 	if !slices.Contains(p.Verbs, statement.VerbMember) {
 		return nil, errors.New("not a certificate: statement does not carry member")

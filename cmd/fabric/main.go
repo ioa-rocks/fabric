@@ -175,14 +175,14 @@ func usage() {
            -out <file> — sign a device in without copying the key (owner);
            circle join <file> — install the bundle on the device (a bundle
            with the key makes a co-owner, a one-way door; circle export);
-           circle attest [-expiring] — renew this owner device's own
-           attestation (attestations live a year, like certs);
+           circle renew [-expiring] — renew this owner device's own
+           admission (admissions live a year, like certs);
            circle revoke <member> — sign a device out (owner device);
            circle passphrase [-circle <name>] — re-encrypt the key container
            under a new passphrase (the key is unchanged; per device);
            circle grant new|list|revoke — a root-signed grant on subjects to
            a bare key (a worker that joins nothing; fabric astral worker);
-           circle status — circles, this device's attestation, buckets, peers
+           circle status — circles, this device's admission, buckets, peers
   bucket   buckets of the circle ('fabric bucket -h'): create, list, place
            (full|cache|none|folder <dir>), mount, put/ls/get/rm, policy…;
            a "vault" symlink to this binary is the same group
@@ -268,7 +268,7 @@ func cmdInit(args []string) error {
 		return err
 	}
 	// The home circle is the same key: the circle DID is the root,
-	// the device cert is the home-circle attestation (mesh-root merge).
+	// the device cert is the home-circle renewal (mesh-root merge).
 	home, err := circle.InitFromSeed(circle.Root(dir.Path), *circleName, seed, pass)
 	if err != nil {
 		return fmt.Errorf("minting the home circle: %w", err)
@@ -560,20 +560,20 @@ func printExpiryWarnings(s *daemon.StatusReply) {
 			lines = append(lines, fmt.Sprintf("%s expires in %dd (%s)", name, days(*p.CertExpiry), p.CertExpiry.Format("2006-01-02")))
 		}
 	}
-	// Circle attestations have the same lifecycle (circle.DefaultValidity):
+	// Circle admissions have the same lifecycle (circle.DefaultValidity):
 	// an expired or revoked one drops this device out of that circle's
 	// sync, as silently as a lapsed cert drops it off the mesh.
 	var circleLines []string
 	for _, ci := range s.Circles {
 		switch {
 		case ci.Revoked:
-			circleLines = append(circleLines, fmt.Sprintf("circle %q: this device is REVOKED — its peers refuse it; an owner device re-attests it to re-admit", ci.Name))
+			circleLines = append(circleLines, fmt.Sprintf("circle %q: this device is REVOKED — its peers refuse it; an owner device re-admits it", ci.Name))
 		case ci.Expiry == nil:
-			// not attested at all — 'fabric circle status' says so
-		case !ci.Attested:
-			circleLines = append(circleLines, fmt.Sprintf("circle %q: this device's attestation EXPIRED %dd ago — fabric circle attest -circle %s", ci.Name, -days(*ci.Expiry), ci.Name))
+			// not admitted at all — 'fabric circle status' says so
+		case !ci.Admitted:
+			circleLines = append(circleLines, fmt.Sprintf("circle %q: this device's admission EXPIRED %dd ago — fabric circle renew -circle %s", ci.Name, -days(*ci.Expiry), ci.Name))
 		case ci.Expiry.Sub(now) < loud:
-			circleLines = append(circleLines, fmt.Sprintf("circle %q: this device's attestation expires in %dd (%s) — fabric circle attest -expiring", ci.Name, days(*ci.Expiry), ci.Expiry.Format("2006-01-02")))
+			circleLines = append(circleLines, fmt.Sprintf("circle %q: this device's admission expires in %dd (%s) — fabric circle renew -expiring", ci.Name, days(*ci.Expiry), ci.Expiry.Format("2006-01-02")))
 		}
 	}
 	if len(lines) == 0 && len(circleLines) == 0 {
@@ -587,7 +587,7 @@ func printExpiryWarnings(s *daemon.StatusReply) {
 		fmt.Println("!!!   renew on the master: fabric renew -expiring")
 	}
 	if len(circleLines) > 0 {
-		fmt.Println("!!! CIRCLE ATTESTATIONS NEED ATTENTION — an expired or revoked device drops out of that circle's sync:")
+		fmt.Println("!!! CIRCLE ADMISSIONS NEED ATTENTION — an expired or revoked device drops out of that circle's sync:")
 		for _, l := range circleLines {
 			fmt.Printf("!!!   %s\n", l)
 		}
@@ -855,7 +855,7 @@ func showDeviceIdentity(statePath string) error {
 // joinBundle is the cold start (task circle-member-devices, slice E): a
 // machine with no circle installs a device bundle an owner signed for its
 // key and is thereby a device of exactly that circle — no circle, no
-// cert, no overlay unless the attestation carries one. The bundle's gate
+// cert, no overlay unless the admission carries one. The bundle's gate
 // hints become its bootstrap peers; everything else arrives by gossip
 // inside the circle.
 func joinBundle(statePath, file, name string, listenAddrs []string) error {
@@ -885,12 +885,12 @@ func joinBundle(statePath, file, name string, listenAddrs []string) error {
 	if b.HasKey() {
 		return fmt.Errorf("%s is an owner bundle (it carries the circle key); a cold start needs a device bundle from 'fabric circle admit %s -circle <name>' — or set the node up first and use 'fabric circle join'", file, did.ForKey(devicePub))
 	}
-	a, err := b.DeviceAttestation()
+	a, err := b.DeviceAdmission()
 	if err != nil {
 		return err
 	}
 	if err := a.Verify(devicePub, time.Now()); err != nil {
-		return fmt.Errorf("the bundle's attestation is not for this device: %w\nthis device is %s — an owner admits it with: fabric circle admit %s -circle <name> -out <file>", err, did.ForKey(devicePub), did.ForKey(devicePub))
+		return fmt.Errorf("the bundle's admission is not for this device: %w\nthis device is %s — an owner admits it with: fabric circle admit %s -circle <name> -out <file>", err, did.ForKey(devicePub), did.ForKey(devicePub))
 	}
 	c, err := circle.Join(circle.Root(dir.Path), b)
 	if err != nil {

@@ -166,7 +166,7 @@ func TestVerifyRejections(t *testing.T) {
 	})
 	t.Run("delegated cert verifies through its chain", func(t *testing.T) {
 		deskPub, deskPriv := genKey(t)
-		// A plain admin cert is not delegable (hot device key); a desk assert
+		// A plain admin cert is not delegable (hot device key); a desk admission
 		// is issued delegable explicitly.
 		plain, _ := Issue(nsPriv, deskPub, CmdAdmin, Meta{Name: "desk"}, now, time.Hour)
 		if plain.Stmt.Payload.Del != 0 {
@@ -344,7 +344,7 @@ func TestVerifyAndForwardUnknownPayloadFields(t *testing.T) {
 }
 
 // A fresh cert is a statement on the wire: it decodes with package
-// statement, labels as a device assert, and the Payload view derives role
+// statement, labels as a admission, and the Payload view derives role
 // and scope from its verbs. A legacy cert still round-trips byte-for-byte
 // and renews into a statement.
 func TestStatementCertWireAndLegacyRenewal(t *testing.T) {
@@ -360,7 +360,7 @@ func TestStatementCertWireAndLegacyRenewal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Label() != "admin assert" || s.Payload.Del != 0 {
+	if s.Label() != "admin admission" || s.Payload.Del != 0 {
 		t.Fatalf("label %q del %d", s.Label(), s.Payload.Del)
 	}
 	back, _ := Unmarshal(wire)

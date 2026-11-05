@@ -10,13 +10,13 @@ import (
 	"ioa.rocks/fabric/statement"
 )
 
-func TestRevocationKillsEarlierAttestationsOnly(t *testing.T) {
+func TestRevocationKillsEarlierAdmissionsOnly(t *testing.T) {
 	_, cpriv, _ := ed25519.GenerateKey(rand.Reader)
 	dpub, _, _ := ed25519.GenerateKey(rand.Reader)
 	other, _, _ := ed25519.GenerateKey(rand.Reader)
 	t0 := time.Now()
 
-	before, _ := Attest(cpriv, dpub, t0.Add(-time.Hour))
+	before, _ := Admit(cpriv, dpub, t0.Add(-time.Hour))
 	r, err := Revoke(cpriv, cert.DIDForKey(dpub), t0)
 	if err != nil {
 		t.Fatal(err)
@@ -33,17 +33,17 @@ func TestRevocationKillsEarlierAttestationsOnly(t *testing.T) {
 		t.Fatal("ID changed across the wire")
 	}
 	if !back.Kills(before) {
-		t.Fatal("revocation must kill an attestation issued before it")
+		t.Fatal("revocation must kill an admission issued before it")
 	}
-	same, _ := Attest(cpriv, dpub, t0)
+	same, _ := Admit(cpriv, dpub, t0)
 	if !back.Kills(same) {
-		t.Fatal("revocation must kill an attestation issued in the same second")
+		t.Fatal("revocation must kill an admission issued in the same second")
 	}
-	readmitted, _ := Attest(cpriv, dpub, t0.Add(time.Second))
+	readmitted, _ := Admit(cpriv, dpub, t0.Add(time.Second))
 	if back.Kills(readmitted) {
-		t.Fatal("an attestation issued after the revocation is a re-admission and must stand")
+		t.Fatal("an admission issued after the revocation is a re-admission and must stand")
 	}
-	otherDev, _ := Attest(cpriv, other, t0.Add(-time.Hour))
+	otherDev, _ := Admit(cpriv, other, t0.Add(-time.Hour))
 	if back.Kills(otherDev) {
 		t.Fatal("revocation killed a different device")
 	}
@@ -83,9 +83,9 @@ func TestRevocationStorage(t *testing.T) {
 	if rs, err := c.Revocations(now); err != nil || len(rs) != 0 {
 		t.Fatalf("fresh circle has revocations %v %v", rs, err)
 	}
-	a, _ := Attest(priv, dpub, now.Add(-time.Minute))
+	a, _ := Admit(priv, dpub, now.Add(-time.Minute))
 	if c.Revoked(a, now) {
-		t.Fatal("unrevoked attestation reported revoked")
+		t.Fatal("unrevoked admission reported revoked")
 	}
 
 	r, _ := Revoke(priv, cert.DIDForKey(dpub), now)
@@ -94,7 +94,7 @@ func TestRevocationStorage(t *testing.T) {
 		t.Fatalf("AddRevocations: %v %v", added, err)
 	}
 	if !c.Revoked(a, now) {
-		t.Fatal("attestation not dead after revocation")
+		t.Fatal("admission not dead after revocation")
 	}
 	// Idempotent; a second copy (re-decoded) is not new.
 	wire, _ := r.Marshal()
@@ -108,7 +108,7 @@ func TestRevocationStorage(t *testing.T) {
 	}
 
 	// Re-admission after revocation stands.
-	readmit, _ := Attest(priv, dpub, now.Add(time.Second))
+	readmit, _ := Admit(priv, dpub, now.Add(time.Second))
 	if c.Revoked(readmit, now.Add(time.Second)) {
 		t.Fatal("re-admission after revocation reported revoked")
 	}
@@ -130,8 +130,8 @@ func TestRevocationStorage(t *testing.T) {
 	}
 
 	// A by-id revocation kills exactly that statement; the device's next
-	// attestation stands.
-	victim, _ := Attest(priv, dpub, now.Add(2*time.Second))
+	// admission stands.
+	victim, _ := Admit(priv, dpub, now.Add(2*time.Second))
 	vid := victim.Stmt.ID()
 	byID, err := RevokeAs(priv, nil, c.Config.DID, statement.Target{ID: vid[:]}, now.Add(3*time.Second))
 	if err != nil {
@@ -143,15 +143,15 @@ func TestRevocationStorage(t *testing.T) {
 	if !c.Revoked(victim, now.Add(3*time.Second)) {
 		t.Fatal("by-id revocation did not kill its target")
 	}
-	next, _ := Attest(priv, dpub, now.Add(4*time.Second))
+	next, _ := Admit(priv, dpub, now.Add(4*time.Second))
 	if c.Revoked(next, now.Add(4*time.Second)) {
 		t.Fatal("by-id revocation killed a different statement")
 	}
 }
 
-// A desk holding an admin assert attests devices under it and revokes them
-// under it; its revocation does not reach a device the root attested.
-func TestDelegatedAttestAndRevoke(t *testing.T) {
+// A desk holding an admin admission admits devices under it and revokes them
+// under it; its revocation does not reach a device the root admitted.
+func TestDelegatedAdmitAndRevoke(t *testing.T) {
 	dir := t.TempDir()
 	c, err := Init(dir, "alex", "pw")
 	if err != nil {
@@ -170,17 +170,17 @@ func TestDelegatedAttestAndRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	byDesk, err := AttestAs(deskPriv, deskA, c.Config.DID, dpub, now, DefaultValidity)
+	byDesk, err := AdmitAs(deskPriv, deskA, c.Config.DID, dpub, now, DefaultValidity)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := byDesk.Verify(dpub, now); err != nil {
-		t.Fatalf("desk-issued attestation: %v", err)
+		t.Fatalf("desk-issued admission: %v", err)
 	}
-	byRoot, _ := Attest(root, dpub, now)
+	byRoot, _ := Admit(root, dpub, now)
 
-	// The desk sweeps the device under its assert: kills its own
-	// attestation of it, not the root's.
+	// The desk sweeps the device under its admission: kills its own
+	// admission of it, not the root's.
 	r, err := RevokeAs(deskPriv, deskA, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub), Before: now.Unix()}, now)
 	if err != nil {
 		t.Fatal(err)
@@ -189,12 +189,12 @@ func TestDelegatedAttestAndRevoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !c.Revoked(byDesk, now) {
-		t.Fatal("desk's revocation did not reach the device it attested")
+		t.Fatal("desk's revocation did not reach the device it admitted")
 	}
 	if c.Revoked(byRoot, now) {
-		t.Fatal("desk's revocation reached a root-attested device")
+		t.Fatal("desk's revocation reached a root-admitted device")
 	}
-	// The root revoking the desk's assert kills the desk-issued attestation.
+	// The root revoking the desk's admission kills the desk-issued admission.
 	deskID := deskA.ID()
 	rr, _ := RevokeAs(root, nil, c.Config.DID, statement.Target{ID: deskID[:]}, now)
 	c.AddRevocations(now, rr)
@@ -208,7 +208,7 @@ func TestDelegatedAttestAndRevoke(t *testing.T) {
 	}
 
 	// With the root's revocation of the desk alone — no delegated one in
-	// the file — the desk-issued attestation is dead too (the chain check
+	// the file — the desk-issued admission is dead too (the chain check
 	// must not depend on a delegated revocation being present).
 	c2, _ := Init(t.TempDir(), "alex2", "pw")
 	root2, _ := c2.Unlock("pw")
@@ -218,9 +218,9 @@ func TestDelegatedAttestAndRevoke(t *testing.T) {
 		Verbs: append(append([]string{}, DeviceVerbs...), statement.VerbAdmin),
 		Del:   3, Iat: now.Unix(), Nbf: now.Unix(), Exp: now.Add(DefaultValidity).Unix(),
 	}, nil)
-	byDesk2, _ := AttestAs(deskPriv, deskA2, c2.Config.DID, dpub, now, DefaultValidity)
+	byDesk2, _ := AdmitAs(deskPriv, deskA2, c2.Config.DID, dpub, now, DefaultValidity)
 	if c2.Revoked(byDesk2, now) {
-		t.Fatal("fresh desk-issued attestation reported revoked")
+		t.Fatal("fresh desk-issued admission reported revoked")
 	}
 	desk2ID := deskA2.ID()
 	rootOnly, _ := RevokeAs(root2, nil, c2.Config.DID, statement.Target{ID: desk2ID[:]}, now)
@@ -257,7 +257,7 @@ func TestDelegatedAttestAndRevoke(t *testing.T) {
 	// A sub-key (del 0) has nothing beneath it: its revocations are refused too.
 	lPub, lPriv, _ := ed25519.GenerateKey(rand.Reader)
 	sPub, sPriv, _ := ed25519.GenerateKey(rand.Reader)
-	devA, _ := Attest(root, lPub, now)
+	devA, _ := Admit(root, lPub, now)
 	subA, err := statement.Sign(lPriv, statement.Payload{
 		Aud: cert.DIDForKey(sPub), Sub: c.Config.DID,
 		Res:   []statement.Resource{{Kind: statement.KindSubject, Name: "jobs/*"}},

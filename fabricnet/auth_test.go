@@ -203,9 +203,9 @@ func TestStrangerIsRejectedAndDisconnected(t *testing.T) {
 	t.Fatal("stranger still connected after grace period")
 }
 
-// A cert issued under another cert (an admin desk's assert) is accepted on
+// A cert issued under another cert (an admin desk's admission) is accepted on
 // transport since step 5: the peer table re-checks revocations along the
-// whole chain, so the root revoking the desk's assert kills what the desk
+// whole chain, so the root revoking the desk's admission kills what the desk
 // issued — the cascade that used to be the reason for refusing delegation.
 func TestDelegatedCertAcceptedAndCascades(t *testing.T) {
 	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
@@ -238,7 +238,7 @@ func TestDelegatedCertAcceptedAndCascades(t *testing.T) {
 		t.Fatal("device under a delegated cert is not a member")
 	}
 
-	// The root revokes the desk's assert by ID: everything the desk issued
+	// The root revokes the desk's admission by ID: everything the desk issued
 	// dies with it, and the device cannot re-present the same cert.
 	deskID := desk.Stmt.ID()
 	revoke, err := statement.Revoke(nsPriv, circleDID, nil, statement.Target{ID: deskID[:]}, time.Now())
@@ -430,12 +430,12 @@ func TestOwnScopeSpansCircles(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := echoOn(a, b.host.ID(), vaultEchoProtocol, "x"); err == nil {
-		t.Fatal("a mesh-only own cert served a vault protocol with no other assert")
+		t.Fatal("a mesh-only own cert served a vault protocol with no other admission")
 	}
-	// Another circle attested b as a full device: its view spans both.
+	// Another circle renewed b as a full device: its view spans both.
 	b.auth.SetOwnAllows(func(family string) bool { return true })
 	if got, err := echoOn(a, b.host.ID(), vaultEchoProtocol, "x"); err != nil || got != "x" {
-		t.Fatalf("vault echo with a full assert in another circle: %v %q", err, got)
+		t.Fatalf("vault echo with a full admission in another circle: %v %q", err, got)
 	}
 }
 

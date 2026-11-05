@@ -36,10 +36,10 @@ type circleTestNode struct {
 
 // newCircleTestNode is a mesh member (cert from root) holding the given
 // circles under its own circle root — joined from bundles, as a second
-// device would — and attested into each when attest is true. It carries
+// device would — and admitted into each when admit is true. It carries
 // the daemon's gossip wiring (event log, /fabric/sync, exchange on auth)
 // so per-circle rosters fill the way they do in the field.
-func newCircleTestNode(t *testing.T, nsPub ed25519.PublicKey, nsRoot ed25519.PrivateKey, name string, circles []*circle.Bundle, attest bool) *circleTestNode {
+func newCircleTestNode(t *testing.T, nsPub ed25519.PublicKey, nsRoot ed25519.PrivateKey, name string, circles []*circle.Bundle, admit bool) *circleTestNode {
 	t.Helper()
 	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
 	if err != nil {
@@ -88,16 +88,16 @@ func newCircleTestNode(t *testing.T, nsPub ed25519.PublicKey, nsRoot ed25519.Pri
 		if err != nil {
 			t.Fatal(err)
 		}
-		if attest {
+		if admit {
 			priv, err := c.Unlock("pw")
 			if err != nil {
 				t.Fatal(err)
 			}
-			a, err := circle.Attest(priv, n.devPub, time.Now())
+			a, err := circle.Admit(priv, n.devPub, time.Now())
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := c.SaveAttestation(a); err != nil {
+			if err := c.SaveAdmission(a); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -109,15 +109,15 @@ func newCircleTestNode(t *testing.T, nsPub ed25519.PublicKey, nsRoot ed25519.Pri
 }
 
 // admit is what `circle admit` on an owner does to its roster (slice D):
-// the device's attestation enters the owner's roster for the circle, and
-// gossip carries it — and the owner's own assert — to the circle's devices.
+// the device's admission enters the owner's roster for the circle, and
+// gossip carries it — and the owner's own admission — to the circle's devices.
 func admit(t *testing.T, owner, device *circleTestNode, circleDID string) {
 	t.Helper()
 	c, err := circle.ByDID(device.root, circleDID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := c.LoadAttestation()
+	a, err := c.LoadAdmission()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,14 +186,14 @@ func TestCircleServiceVerifiesDevicesPerCircle(t *testing.T) {
 	desk := newCircleTestNode(t, nsPub, nsRoot, "desk", []*circle.Bundle{alex, family}, true)
 	nas := newCircleTestNode(t, nsPub, nsRoot, "nas", []*circle.Bundle{alex}, true)
 	hers := newCircleTestNode(t, nsPub, nsRoot, "her-pc", []*circle.Bundle{family}, true)
-	unattested := newCircleTestNode(t, nsPub, nsRoot, "laptop", []*circle.Bundle{alex}, false)
+	unadmitted := newCircleTestNode(t, nsPub, nsRoot, "laptop", []*circle.Bundle{alex}, false)
 	gate := newCircleTestNode(t, nsPub, nsRoot, "gate", nil, false)
 
 	// The owner admitted nas into alex and her PC into family; nothing
 	// else is known anywhere before the first connection.
 	admit(t, desk, nas, alexDID)
 	admit(t, desk, hers, familyDID)
-	for _, n := range []*circleTestNode{nas, hers, unattested, gate} {
+	for _, n := range []*circleTestNode{nas, hers, unadmitted, gate} {
 		meshConnect(t, n, desk)
 	}
 	meshConnect(t, hers, nas)
@@ -201,7 +201,7 @@ func TestCircleServiceVerifiesDevicesPerCircle(t *testing.T) {
 	defer cancel()
 
 	// The desk knows from its rosters; the others learn the desk's own
-	// asserts by per-circle gossip after the handshake.
+	// admissions by per-circle gossip after the handshake.
 	waitShared(t, desk, nas, []string{alexDID})
 	waitShared(t, desk, hers, []string{familyDID})
 	waitShared(t, nas, desk, []string{alexDID})
@@ -218,7 +218,7 @@ func TestCircleServiceVerifiesDevicesPerCircle(t *testing.T) {
 		t.Fatalf("her PC learned %v for the desk — alex's DID must never reach a device outside alex", got)
 	}
 	waitShared(t, nas, hers, nil)
-	if got := desk.svc.Shared(ctx, unattested.h.ID()); len(got) != 0 {
+	if got := desk.svc.Shared(ctx, unadmitted.h.ID()); len(got) != 0 {
 		t.Fatal("a device holding the circle key but never admitted must not pass — the roster is the proof peers see")
 	}
 	if got := desk.svc.Shared(ctx, gate.h.ID()); len(got) != 0 {
@@ -228,18 +228,18 @@ func TestCircleServiceVerifiesDevicesPerCircle(t *testing.T) {
 		t.Fatalf("gate's circles from the handshake: %v %v, want known and no circle of the desk's", dids, known)
 	}
 
-	// Forged: an assert minted for *another* device of the circle is
+	// Forged: an admission minted for *another* device of the circle is
 	// refused at the verifier whatever connection carries it, and a device
 	// presenting it shares nothing.
 	forger := newCircleTestNode(t, nsPub, nsRoot, "forger", []*circle.Bundle{alex, family}, true)
 	fc, _ := circle.ByDID(forger.root, alexDID)
 	priv, _ := fc.Unlock("pw")
-	stolen, _ := circle.Attest(priv, nas.devPub, time.Now()) // nas's attestation, not forger's
-	if err := fc.SaveAttestation(stolen); err != nil {
+	stolen, _ := circle.Admit(priv, nas.devPub, time.Now()) // nas's admission, not forger's
+	if err := fc.SaveAdmission(stolen); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, err := desk.store.Verify(forger.h.ID(), stolen.Stmt); err == nil {
-		t.Fatal("an assert about another device verified for the presenting peer")
+		t.Fatal("an admission about another device verified for the presenting peer")
 	}
 	meshConnect(t, forger, desk)
 	if got := desk.svc.Shared(ctx, forger.h.ID()); len(got) != 0 {
@@ -280,15 +280,15 @@ func tryStream(ctx context.Context, from host.Host, to peer.ID, proto string) er
 }
 
 // Lifecycle: a revocation signed on an owner device kills the device's
-// attestation everywhere the circle's devices talk (pushed by Refresh to the
+// admission everywhere the circle's devices talk (pushed by Refresh to the
 // ones online, carried on every later exchange), a re-admission issued after
-// it stands, and an expired attestation is worth nothing.
-// Statement-form attestations and revocations are presented only on the v4
+// it stands, and an expired admission is worth nothing.
+// Statement-form admissions and revocations are presented only on the v4
 // exchange; older peers get the legacy forms they can parse.
 // The legacy exchange follows the v2 rule: the dialer names the circles
 // it knows the peer in (its first circle when none), the responder answers
 // with exactly those the dialer proved itself in. A device of family alone
-// never reads the desk's alex attestation or alex's revocations off the
+// never reads the desk's alex admission or alex's revocations off the
 // legacy stream (Codex review, 2026-11-05).
 func TestLegacyExchangeNamesOnlySharedCircles(t *testing.T) {
 	nsPub, nsRoot, err := ed25519.GenerateKey(rand.Reader)
@@ -346,11 +346,11 @@ func TestOlderExchangeVersionsSeeOnlyLegacyForms(t *testing.T) {
 	b, _ := owner.Export()
 	n := newCircleTestNode(t, nsPub, nsPriv, "nas", []*circle.Bundle{b}, true)
 	now := time.Now()
-	if own, _ := n.svc.ownAttestations(now, true, n.svc.heldDIDs()); len(own) != 1 {
-		t.Fatalf("v4 presents %d attestations, want 1", len(own))
+	if own, _ := n.svc.ownAdmissionsWire(now, true, n.svc.heldDIDs()); len(own) != 1 {
+		t.Fatalf("v4 presents %d admissions, want 1", len(own))
 	}
-	if own, _ := n.svc.ownAttestations(now, false, n.svc.heldDIDs()); len(own) != 0 {
-		t.Fatalf("v3 presents %d statement attestations, want 0", len(own))
+	if own, _ := n.svc.ownAdmissionsWire(now, false, n.svc.heldDIDs()); len(own) != 0 {
+		t.Fatalf("v3 presents %d statement admissions, want 0", len(own))
 	}
 	priv, _ := owner.Unlock("pw")
 	r, _ := circle.Revoke(priv, cert.DIDForKey(n.devPub), now)
@@ -364,9 +364,9 @@ func TestOlderExchangeVersionsSeeOnlyLegacyForms(t *testing.T) {
 	}
 }
 
-// A node's membership cert doubles as its attestation into its home circle
-// (the circle whose DID is the circle DID): no separate `circle attest`.
-func TestHomeCircleAttestedByCert(t *testing.T) {
+// A node's membership cert doubles as its admission into its home circle
+// (the circle whose DID is the circle DID): no separate `circle renew`.
+func TestHomeCircleAdmittedByCert(t *testing.T) {
 	owner, err := circle.Init(t.TempDir(), "home", "pw")
 	if err != nil {
 		t.Fatal(err)
@@ -376,22 +376,22 @@ func TestHomeCircleAttestedByCert(t *testing.T) {
 	b, _ := owner.Export()
 	n := newCircleTestNode(t, rootPub, rootPriv, "desk", []*circle.Bundle{b}, false)
 	c, _ := circle.ByDID(n.root, owner.Config.DID)
-	if n.svc.Attested(c) {
-		t.Fatal("attested without cert or attestation")
+	if n.svc.Admitted(c) {
+		t.Fatal("admitted without cert or admission")
 	}
 	own, err := cert.Issue(rootPriv, n.devPub, cert.CmdAdmin, cert.Meta{Name: "desk"}, time.Now(), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
 	n.svc.SetOwnCert(func() *cert.Cert { return own })
-	if !n.svc.Attested(c) {
-		t.Fatal("home-circle cert not accepted as attestation")
+	if !n.svc.Admitted(c) {
+		t.Fatal("home-circle cert not accepted as admission")
 	}
-	if own, _ := n.svc.ownAttestations(time.Now(), true, n.svc.heldDIDs()); len(own) != 1 {
-		t.Fatalf("presents %d attestations, want the cert", len(own))
+	if own, _ := n.svc.ownAdmissionsWire(time.Now(), true, n.svc.heldDIDs()); len(own) != 1 {
+		t.Fatalf("presents %d admissions, want the cert", len(own))
 	}
 	info := n.svc.Info(time.Now())
-	if len(info) != 1 || !info[0].Attested {
+	if len(info) != 1 || !info[0].Admitted {
 		t.Fatalf("Info: %+v", info)
 	}
 }
@@ -453,51 +453,51 @@ func TestCircleRevocationAndExpiry(t *testing.T) {
 		t.Fatalf("desk∩nas = %v after revoking a third device", got)
 	}
 	// The laptop itself learned it is revoked (the desk pushed to it too)
-	// and no longer counts itself attested.
+	// and no longer counts itself admitted.
 	lc, _ := circle.ByDID(laptop.root, alexDID)
-	if laptop.svc.Attested(lc) {
-		t.Fatal("the revoked laptop still considers itself attested")
+	if laptop.svc.Admitted(lc) {
+		t.Fatal("the revoked laptop still considers itself admitted")
 	}
 
-	// Re-admission: an attestation issued after the revocation stands.
-	// Attestation times are whole seconds, so step past the revocation's.
+	// Re-admission: an admission issued after the revocation stands.
+	// Admission times are whole seconds, so step past the revocation's.
 	time.Sleep(1100 * time.Millisecond)
-	a, err := circle.Attest(priv, laptop.devPub, time.Now())
+	a, err := circle.Admit(priv, laptop.devPub, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := lc.SaveAttestation(a); err != nil {
+	if err := lc.SaveAdmission(a); err != nil {
 		t.Fatal(err)
 	}
-	if !laptop.svc.Attested(lc) {
-		t.Fatal("re-admitted laptop does not consider itself attested")
+	if !laptop.svc.Admitted(lc) {
+		t.Fatal("re-admitted laptop does not consider itself admitted")
 	}
 	desk.svc.Refresh(ctx)
 	waitShared(t, desk, laptop, []string{alexDID})
 
-	// Expired: a device whose attestation ran out is in no circle.
+	// Expired: a device whose admission ran out is in no circle.
 	stale := newCircleTestNode(t, nsPub, nsRoot, "stale", []*circle.Bundle{alex}, false)
 	sc, _ := circle.ByDID(stale.root, alexDID)
-	old, err := circle.AttestFor(priv, stale.devPub, time.Now().Add(-2*time.Hour), time.Hour)
+	old, err := circle.AdmitFor(priv, stale.devPub, time.Now().Add(-2*time.Hour), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sc.SaveAttestation(old); err != nil {
+	if err := sc.SaveAdmission(old); err != nil {
 		t.Fatal(err)
 	}
-	if stale.svc.Attested(sc) {
-		t.Fatal("expired attestation counted as attested")
+	if stale.svc.Admitted(sc) {
+		t.Fatal("expired admission counted as admitted")
 	}
 	meshConnect(t, stale, desk)
 	if got := desk.svc.Shared(ctx, stale.h.ID()); len(got) != 0 {
-		t.Fatalf("desk shares %v with a device holding only an expired attestation", got)
+		t.Fatalf("desk shares %v with a device holding only an expired admission", got)
 	}
-	if info := desk.svc.Info(time.Now()); len(info) != 1 || !info[0].Attested || info[0].Revocations != 1 {
+	if info := desk.svc.Info(time.Now()); len(info) != 1 || !info[0].Admitted || info[0].Revocations != 1 {
 		t.Fatalf("desk Info = %+v", info)
 	}
 }
 
-// The v2 handshake presents one assert per circle the dialer knows the
+// The v2 handshake presents one admission per circle the dialer knows the
 // peer in and the responder answers for exactly those (memo §17: one chain
 // per circle, shared circles only). Rosters are what gossip delivers;
 // seeded here. A node outside `family` is shown nothing of it.
@@ -512,19 +512,19 @@ func TestHandshakeV2PresentsOnlySharedCircles(t *testing.T) {
 		n.svc.SetPeerTable(n.store)
 	}
 	// Gossip delivered both rosters to desk and nas: each knows the
-	// other's cert (main's event log) and attestation (family).
+	// other's cert (main's event log) and admission (family).
 	seed := func(into, who *circleTestNode) {
 		t.Helper()
 		into.store.AddMember(who.h.ID(), who.own)
 		c, _ := circle.ByDID(who.root, familyDID)
-		a, err := c.LoadAttestation()
+		a, err := c.LoadAdmission()
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, ok := into.store.RosterFor(familyDID); !ok {
 			t.Fatal("no family roster")
 		}
-		if _, err := into.store.AddAssert(a.Stmt, time.Now()); err != nil {
+		if _, err := into.store.AddAdmission(a.Stmt, time.Now()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -551,19 +551,19 @@ func TestHandshakeV2PresentsOnlySharedCircles(t *testing.T) {
 
 	// gate → desk: the gate is in no family roster, so desk's hello to it
 	// names main only, and the gate verifies desk in main only.
-	if h := desk.svc.hello(gate.h.ID(), nil); len(h.Asserts) != 0 {
-		t.Fatalf("desk's presenter chose %d asserts for a peer known from no roster, want 0 (fabricnet adds the cert)", len(h.Asserts))
+	if h := desk.svc.hello(gate.h.ID(), nil); len(h.Admissions) != 0 {
+		t.Fatalf("desk's presenter chose %d admissions for a peer known from no roster, want 0 (fabricnet adds the cert)", len(h.Admissions))
 	}
 	meshConnect(t, gate, desk)
 	hs, _ := gate.auth.Handshake(desk.h.ID())
 	if !slices.Equal(hs.Circles, []string{mainDID}) {
 		t.Fatalf("gate verified desk in %v, want main only", hs.Circles)
 	}
-	if h := desk.svc.hello(gate.h.ID(), []string{mainDID}); len(h.Asserts) != 1 || subOf(t, h.Asserts[0]) != mainDID {
-		t.Fatalf("responder presenter chose %d asserts for [main], want the main cert alone", len(h.Asserts))
+	if h := desk.svc.hello(gate.h.ID(), []string{mainDID}); len(h.Admissions) != 1 || subOf(t, h.Admissions[0]) != mainDID {
+		t.Fatalf("responder presenter chose %d admissions for [main], want the main cert alone", len(h.Admissions))
 	}
-	if h := desk.svc.hello(nas.h.ID(), []string{familyDID}); len(h.Asserts) != 1 {
-		t.Fatalf("responder presenter chose %d asserts for [family], want the family attestation", len(h.Asserts))
+	if h := desk.svc.hello(nas.h.ID(), []string{familyDID}); len(h.Admissions) != 1 {
+		t.Fatalf("responder presenter chose %d admissions for [family], want the family admission", len(h.Admissions))
 	}
 }
 
@@ -578,7 +578,7 @@ func subOf(t *testing.T, raw []byte) string {
 
 // A gate (`member, host`) of family shares family — it is in the roster,
 // it relays and hosts subjects — but Vault must not hand it the circle's
-// state: SharedWith asks the verbs on the device's assert in each circle
+// state: SharedWith asks the verbs on the device's admission in each circle
 // (Codex review, 2026-11-05).
 func TestGateSharesCircleButNotItsBuckets(t *testing.T) {
 	nsPub, nsRoot, _ := ed25519.GenerateKey(rand.Reader)
@@ -588,7 +588,7 @@ func TestGateSharesCircleButNotItsBuckets(t *testing.T) {
 	fc, _ := circle.ByDID(desk.root, familyDID)
 	priv, _ := fc.Unlock("pw")
 	verbs, _ := circle.VerbsForRole(circle.RoleGate)
-	att, err := circle.AttestWith(priv, nil, familyDID, gate.devPub, time.Now(), time.Hour, verbs, &statement.Meta{Name: "gate"})
+	att, err := circle.AdmitWith(priv, nil, familyDID, gate.devPub, time.Now(), time.Hour, verbs, &statement.Meta{Name: "gate"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -630,7 +630,7 @@ func TestGateReplaysStoredRevocationsIntoTheTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, _ := fabricnet.PeerOfDID(cert.DIDForKey(devPub))
-	if _, err := gate.store.AddAssert(devCert.Stmt, time.Now()); err != nil {
+	if _, err := gate.store.AddAdmission(devCert.Stmt, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	rev, err := circle.Revoke(nsRoot, cert.DIDForKey(devPub), time.Now().Add(time.Second))
@@ -648,7 +648,7 @@ func TestGateReplaysStoredRevocationsIntoTheTable(t *testing.T) {
 	// Restart: a fresh table from the log (device live), a fresh service
 	// over the same root (revocations loaded from disk).
 	store2 := fabricnet.NewMemberStore(statement.NewDIDRoot(nsDID))
-	if _, err := store2.AddAssert(devCert.Stmt, time.Now()); err != nil {
+	if _, err := store2.AddAdmission(devCert.Stmt, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if !store2.IsMember(p, at) {

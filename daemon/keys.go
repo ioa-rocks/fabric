@@ -21,11 +21,11 @@ import (
 
 // Sub-keys (build queue step 4, slice D; ADR 0017 phase 1): a device hands
 // an agent or worker on it a key of its own, with a statement chained under
-// the device's own assert in one circle — root → device → sub-key — that
+// the device's own admission in one circle — root → device → sub-key — that
 // names the subjects it may touch and the verbs it holds. The daemon signs
 // with the hot device key (every member cert is `del 1`; the leaf is `del
 // 0`), keeps a record per key, and revokes by statement ID under the same
-// assert. Nothing here ever holds the sub-key's seed after issuance: it is
+// admission. Nothing here ever holds the sub-key's seed after issuance: it is
 // returned once and written by the caller.
 
 // KeyRecord is what the daemon remembers about an issued sub-key.
@@ -47,7 +47,7 @@ type KeyRecord struct {
 type IssuedKey struct {
 	KeyRecord
 	Seed  []byte `json:"seed"`  // ed25519 seed
-	Chain []byte `json:"chain"` // the sub-key assert, wire bytes, parents embedded
+	Chain []byte `json:"chain"` // the sub-key admission, wire bytes, parents embedded
 }
 
 const keysFile = "keys.json"
@@ -103,10 +103,10 @@ func (d *Daemon) devicePriv() (ed25519.PrivateKey, error) {
 	return ed25519.PrivateKey(raw), nil
 }
 
-// ownAssert is this device's assert in a circle: its membership cert for
-// the home circle, its attestation otherwise. Only statement-form asserts
+// ownAdmission is this device's admission in a circle: its membership cert for
+// the home circle, its admission otherwise. Only statement-form admissions
 // can parent a sub-key.
-func (d *Daemon) ownAssert(circleDID string) (*statement.Statement, error) {
+func (d *Daemon) ownAdmission(circleDID string) (*statement.Statement, error) {
 	if circleDID == d.CircleDID() {
 		c := d.OwnCert()
 		if c == nil || c.Stmt == nil {
@@ -121,12 +121,12 @@ func (d *Daemon) ownAssert(circleDID string) (*statement.Statement, error) {
 	if c == nil {
 		return nil, fmt.Errorf("this node holds no circle %s", shortDID(circleDID))
 	}
-	a := d.Circle.liveAttestation(c, time.Now())
+	a := d.Circle.liveAdmission(c, time.Now())
 	if a == nil {
-		return nil, fmt.Errorf("this device has no live attestation in circle %q", c.Config.Name)
+		return nil, fmt.Errorf("this device has no live admission in circle %q", c.Config.Name)
 	}
 	if a.Stmt == nil {
-		return nil, fmt.Errorf("this device's attestation in %q predates statements — `fabric circle attest -circle %s` first", c.Config.Name, c.Config.Name)
+		return nil, fmt.Errorf("this device's admission in %q predates statements — `fabric circle renew -circle %s` first", c.Config.Name, c.Config.Name)
 	}
 	return a.Stmt, nil
 }
@@ -139,7 +139,7 @@ func (d *Daemon) rootsFor(circleDID string) statement.Roots {
 	return statement.NewDIDRoot(circleDID)
 }
 
-// IssueKey mints a sub-key under this device's assert in circleDID, allowed
+// IssueKey mints a sub-key under this device's admission in circleDID, allowed
 // verbs on the named subjects (names without a kind are subjects), for
 // validity. The result carries the seed: show it once, never store it here.
 func (d *Daemon) IssueKey(circleDID string, res []string, verbs []string, validity time.Duration, label string) (*IssuedKey, error) {
@@ -160,12 +160,12 @@ func (d *Daemon) IssueKey(circleDID string, res []string, verbs []string, validi
 		return nil, err
 	}
 	verbs = cleanList(verbs)
-	parent, err := d.ownAssert(circleDID)
+	parent, err := d.ownAdmission(circleDID)
 	if err != nil {
 		return nil, err
 	}
 	if parent.Payload.Del < 1 {
-		return nil, errors.New("this device's assert is not delegable (del 0): renew it on the master, which now issues del 1 member certs")
+		return nil, errors.New("this device's admission is not delegable (del 0): renew it on the master, which now issues del 1 member certs")
 	}
 	devPriv, err := d.devicePriv()
 	if err != nil {
@@ -221,7 +221,7 @@ func (d *Daemon) IssueKey(circleDID string, res []string, verbs []string, validi
 }
 
 // RevokeKey signs a by-ID revocation of a sub-key under this device's
-// assert, stores it in the circle's revocation set and pushes it to the
+// admission, stores it in the circle's revocation set and pushes it to the
 // members connected now. The home circle needs its circle directory for
 // the set (the desk has one; a gate revokes nothing).
 func (d *Daemon) RevokeKey(idHex string) error {
@@ -251,7 +251,7 @@ func (d *Daemon) RevokeKey(idHex string) error {
 	if err != nil {
 		return err
 	}
-	parent, err := d.ownAssert(rec.Circle)
+	parent, err := d.ownAdmission(rec.Circle)
 	if err != nil {
 		return err
 	}

@@ -143,9 +143,9 @@ func TestExpiredMemberIsLapsedNotMember(t *testing.T) {
 	}
 }
 
-// Transport is the union of circles (memo §17 item 1): a device attested
+// Transport is the union of circles (memo §17 item 1): a device admitted
 // only into `family` is a member of a node that holds `family`, with the
-// verbs its attestation carries (vault and astral, no tun), and a stranger
+// verbs its admission carries (vault and astral, no tun), and a stranger
 // to a node that holds only `main`. Revoking it in `family` ends that.
 func TestUnionAdmitsDeviceOfAnyHeldCircle(t *testing.T) {
 	mainPub, _, _ := ed25519.GenerateKey(rand.Reader)
@@ -157,7 +157,7 @@ func TestUnionAdmitsDeviceOfAnyHeldCircle(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	attestation, err := circle.Attest(familyPriv, devPub, now)
+	admission, err := circle.Admit(familyPriv, devPub, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestUnionAdmitsDeviceOfAnyHeldCircle(t *testing.T) {
 	both := NewMemberStore(statement.NewDIDRoot(mainDID))
 	family := circle.NewRoster(statement.NewDIDRoot(familyDID))
 	both.AddRoster(family)
-	if _, err := both.AddAssert(attestation.Stmt, now); err != nil {
+	if _, err := both.AddAdmission(admission.Stmt, now); err != nil {
 		t.Fatal(err)
 	}
 	if !both.IsMember(p, now) {
@@ -179,10 +179,10 @@ func TestUnionAdmitsDeviceOfAnyHeldCircle(t *testing.T) {
 		t.Fatal("In: device should be in family and not in main")
 	}
 	if !both.Allows(p, "/vault/sync/1", now) || !both.Allows(p, "/astral/subject/2", now) {
-		t.Fatal("a device attestation carries the vault and astral verbs")
+		t.Fatal("a device admission carries the vault and astral verbs")
 	}
 	if both.Allows(p, "/fabric/tun/1", now) {
-		t.Fatal("a device attestation never carries tun")
+		t.Fatal("a device admission never carries tun")
 	}
 	if c, ok := both.Cert(p); !ok || c.Payload.Sub != familyDID {
 		t.Fatalf("Cert view: ok=%v", ok)
@@ -196,7 +196,7 @@ func TestUnionAdmitsDeviceOfAnyHeldCircle(t *testing.T) {
 
 	// A node holding only main: the same device is a stranger.
 	mainOnly := NewMemberStore(statement.NewDIDRoot(mainDID))
-	mainOnly.AddMember(p, mustView(t, attestation.Stmt))
+	mainOnly.AddMember(p, mustView(t, admission.Stmt))
 	if mainOnly.IsMember(p, now) {
 		t.Fatal("a main-only node admitted a family device")
 	}
@@ -223,7 +223,7 @@ func TestUnionAdmitsDeviceOfAnyHeldCircle(t *testing.T) {
 	}
 }
 
-// A legacy member-revoked sweep kills the asserts issued up to it and
+// A legacy member-revoked sweep kills the admissions issued up to it and
 // nothing after: a cert issued later is a deliberate re-admission.
 func TestSweepThenReadmission(t *testing.T) {
 	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
@@ -259,8 +259,8 @@ func mustView(t *testing.T, st *statement.Statement) *cert.Cert {
 	return c
 }
 
-// An access question about circle A goes by the device's assert in A, not
-// by the summary cert, which prefers whichever circle's assert carries an
+// An access question about circle A goes by the device's admission in A, not
+// by the summary cert, which prefers whichever circle's admission carries an
 // address (Codex review, 2026-11-05).
 func TestCertInIsPerCircle(t *testing.T) {
 	a, _ := circle.Init(t.TempDir(), "a", "pw")
@@ -269,11 +269,11 @@ func TestCertInIsPerCircle(t *testing.T) {
 	bPriv, _ := b.Unlock("pw")
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	now := time.Now()
-	inA, err := circle.AttestWith(aPriv, nil, a.Config.DID, devPub, now, time.Hour, circle.GateVerbs, &statement.Meta{Name: "nas"})
+	inA, err := circle.AdmitWith(aPriv, nil, a.Config.DID, devPub, now, time.Hour, circle.GateVerbs, &statement.Meta{Name: "nas"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	inB, err := circle.AttestWith(bPriv, nil, b.Config.DID, devPub, now, time.Hour,
+	inB, err := circle.AdmitWith(bPriv, nil, b.Config.DID, devPub, now, time.Hour,
 		append(append([]string{}, circle.DeviceVerbs...), statement.VerbTun), &statement.Meta{Name: "nas", IP: "100.64.5.2/24"})
 	if err != nil {
 		t.Fatal(err)
@@ -281,21 +281,21 @@ func TestCertInIsPerCircle(t *testing.T) {
 	table := NewMemberStore(statement.NewDIDRoot(a.Config.DID))
 	rb := circle.NewRoster(statement.NewDIDRoot(b.Config.DID))
 	table.AddRoster(rb)
-	for _, a := range []*circle.Attestation{inA, inB} {
-		if _, err := table.AddAssert(a.Stmt, now); err != nil {
+	for _, a := range []*circle.Admission{inA, inB} {
+		if _, err := table.AddAdmission(a.Stmt, now); err != nil {
 			t.Fatal(err)
 		}
 	}
 	p, _ := PeerOfDID(cert.DIDForKey(devPub))
 	if c, ok := table.Cert(p); !ok || c.Payload.Meta.IP == "" {
-		t.Fatal("the summary should prefer the assert with an address")
+		t.Fatal("the summary should prefer the admission with an address")
 	}
 	c, ok := table.CertIn(p, a.Config.DID)
 	if !ok || c.Payload.Sub != a.Config.DID || c.Payload.Meta.IP != "" {
-		t.Fatalf("CertIn(a) = %+v, want the gate assert in a", c)
+		t.Fatalf("CertIn(a) = %+v, want the gate admission in a", c)
 	}
 	if c, ok := table.CertIn(p, b.Config.DID); !ok || c.Payload.Sub != b.Config.DID {
-		t.Fatalf("CertIn(b) = %+v, want the assert in b", c)
+		t.Fatalf("CertIn(b) = %+v, want the admission in b", c)
 	}
 	if _, ok := table.CertIn(p, "did:key:z6MkunknownCircle"); ok {
 		t.Fatal("CertIn answered for a circle the device is not in")
@@ -305,7 +305,7 @@ func TestCertInIsPerCircle(t *testing.T) {
 // ---- single-writer store ------------------------------------------------------
 
 // A change that cannot be saved changes nothing: the view is as before, the
-// device is not in it, and replaying the same assert once the disk is back
+// device is not in it, and replaying the same admission once the disk is back
 // records it (no duplicate check hides a failed write).
 func TestOwnerSaveFailureChangesNothing(t *testing.T) {
 	c, _ := circle.Init(t.TempDir(), "p", "pw")
@@ -316,10 +316,10 @@ func TestOwnerSaveFailureChangesNothing(t *testing.T) {
 	r, _ := circle.NewRoster(statement.NewDIDRoot(c.Config.DID)).WithPath(circle.DevicesPath(c), time.Now())
 	table.AddRoster(r)
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	a, _ := circle.Attest(priv, devPub, time.Now())
+	a, _ := circle.Admit(priv, devPub, time.Now())
 	before := table.View().Version()
-	if _, err := table.AddAssert(a.Stmt, time.Now()); err == nil {
-		t.Fatal("AddAssert reported success although devices.cbor could not be written")
+	if _, err := table.AddAdmission(a.Stmt, time.Now()); err == nil {
+		t.Fatal("AddAdmission reported success although devices.cbor could not be written")
 	}
 	p, _ := PeerOfDID(cert.DIDForKey(devPub))
 	if table.IsMember(p, time.Now()) || table.View().Version() != before {
@@ -328,19 +328,19 @@ func TestOwnerSaveFailureChangesNothing(t *testing.T) {
 	if err := os.MkdirAll(c.Path, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	fresh, err := table.AddAssert(a.Stmt, time.Now())
+	fresh, err := table.AddAdmission(a.Stmt, time.Now())
 	if err != nil || !fresh {
 		t.Fatalf("replay after the disk came back: fresh=%v err=%v", fresh, err)
 	}
 	if !table.IsMember(p, time.Now()) {
-		t.Fatal("replayed assert not in the view")
+		t.Fatal("replayed admission not in the view")
 	}
 	if _, err := os.Stat(circle.DevicesPath(c)); err != nil {
 		t.Fatalf("devices.cbor not written on replay: %v", err)
 	}
 }
 
-// The ledger is order-independent: the same asserts and revocations in
+// The ledger is order-independent: the same admissions and revocations in
 // every order give the same view (later expiry wins, revocations only grow).
 func TestViewIsOrderIndependent(t *testing.T) {
 	c, _ := circle.Init(t.TempDir(), "p", "pw")
@@ -348,22 +348,22 @@ func TestViewIsOrderIndependent(t *testing.T) {
 	now := time.Now()
 	devA, _, _ := ed25519.GenerateKey(rand.Reader)
 	devB, _, _ := ed25519.GenerateKey(rand.Reader)
-	aShort, _ := circle.AttestFor(priv, devA, now, time.Hour)
-	aLong, _ := circle.AttestFor(priv, devA, now, 2*time.Hour)
-	b, _ := circle.AttestFor(priv, devB, now, time.Hour)
+	aShort, _ := circle.AdmitFor(priv, devA, now, time.Hour)
+	aLong, _ := circle.AdmitFor(priv, devA, now, 2*time.Hour)
+	b, _ := circle.AdmitFor(priv, devB, now, time.Hour)
 	revokeB, _ := circle.Revoke(priv, cert.DIDForKey(devB), now.Add(time.Second))
-	// Device C: two asserts with the same window (same second) and
+	// Device C: two admissions with the same window (same second) and
 	// different labels — an expiry tie, broken by statement ID.
 	devC, _, _ := ed25519.GenerateKey(rand.Reader)
-	c1, _ := circle.AttestWith(priv, nil, c.Config.DID, devC, now, time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "c-one"})
-	c2, _ := circle.AttestWith(priv, nil, c.Config.DID, devC, now, time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "c-two"})
+	c1, _ := circle.AdmitWith(priv, nil, c.Config.DID, devC, now, time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "c-one"})
+	c2, _ := circle.AdmitWith(priv, nil, c.Config.DID, devC, now, time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "c-two"})
 	ops := []func(t *PeerTable){
-		func(t *PeerTable) { t.AddAssert(aShort.Stmt, now) },
-		func(t *PeerTable) { t.AddAssert(aLong.Stmt, now) },
-		func(t *PeerTable) { t.AddAssert(b.Stmt, now) },
+		func(t *PeerTable) { t.AddAdmission(aShort.Stmt, now) },
+		func(t *PeerTable) { t.AddAdmission(aLong.Stmt, now) },
+		func(t *PeerTable) { t.AddAdmission(b.Stmt, now) },
 		func(t *PeerTable) { t.AddRevocation(c.Config.DID, revokeB.Stmt) },
-		func(t *PeerTable) { t.AddAssert(c1.Stmt, now) },
-		func(t *PeerTable) { t.AddAssert(c2.Stmt, now) },
+		func(t *PeerTable) { t.AddAdmission(c1.Stmt, now) },
+		func(t *PeerTable) { t.AddAdmission(c2.Stmt, now) },
 	}
 	pA, _ := PeerOfDID(cert.DIDForKey(devA))
 	pB, _ := PeerOfDID(cert.DIDForKey(devB))
@@ -390,7 +390,7 @@ func TestViewIsOrderIndependent(t *testing.T) {
 		}
 		cA, ok := table.Cert(pA)
 		if !ok || cA.Stmt.ID() != aLong.Stmt.ID() {
-			t.Fatalf("order %v: device A summarised by %v, want the longer assert", perm, ok)
+			t.Fatalf("order %v: device A summarised by %v, want the longer admission", perm, ok)
 		}
 		if table.IsMember(pB, at) || !table.IsRevoked(pB, at) {
 			t.Fatalf("order %v: revoked device B is member=%v revoked=%v", perm, table.IsMember(pB, at), table.IsRevoked(pB, at))
@@ -407,8 +407,8 @@ func TestViewIsOrderIndependent(t *testing.T) {
 	}
 }
 
-// Routes and the zone are in the view: only the overlay circle's asserts,
-// inside its range, by each device's assert in that circle; a device of an
+// Routes and the zone are in the view: only the overlay circle's admissions,
+// inside its range, by each device's admission in that circle; a device of an
 // overlapping circle never becomes a route; a revocation removes the route
 // with the publish, nothing is rebuilt.
 func TestViewRoutesFollowTheOverlayCircle(t *testing.T) {
@@ -420,14 +420,14 @@ func TestViewRoutesFollowTheOverlayCircle(t *testing.T) {
 	tunVerbs := append(append([]string{}, circle.DeviceVerbs...), statement.VerbTun)
 	nasPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	herPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	nasMain, _ := circle.AttestWith(fPriv, nil, first.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
-	nasFamily, _ := circle.AttestWith(oPriv, nil, other.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.7/24"})
-	herFamily, _ := circle.AttestWith(oPriv, nil, other.Config.DID, herPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "her-pc", IP: "100.64.0.9/24"})
+	nasMain, _ := circle.AdmitWith(fPriv, nil, first.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	nasFamily, _ := circle.AdmitWith(oPriv, nil, other.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.7/24"})
+	herFamily, _ := circle.AdmitWith(oPriv, nil, other.Config.DID, herPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "her-pc", IP: "100.64.0.9/24"})
 
 	table := NewMemberStore(statement.NewDIDRoot(first.Config.DID))
 	table.AddRoster(circle.NewRoster(statement.NewDIDRoot(other.Config.DID)))
-	for _, a := range []*circle.Attestation{nasMain, nasFamily, herFamily} {
-		if _, err := table.AddAssert(a.Stmt, now); err != nil {
+	for _, a := range []*circle.Admission{nasMain, nasFamily, herFamily} {
+		if _, err := table.AddAdmission(a.Stmt, now); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -444,7 +444,7 @@ func TestViewRoutesFollowTheOverlayCircle(t *testing.T) {
 	}
 	for _, dst := range []string{"100.64.0.7", "100.64.0.9"} {
 		if _, ok := table.Route(netip.MustParseAddr(dst)); ok {
-			t.Fatalf("%s is routable: another circle's assert for a device of this circle, or an overlapping circle's device", dst)
+			t.Fatalf("%s is routable: another circle's admission for a device of this circle, or an overlapping circle's device", dst)
 		}
 	}
 	if a, ok := table.Resolve("NAS"); !ok || a != netip.MustParseAddr("100.64.0.2") {
@@ -474,10 +474,10 @@ func TestOwnerUnderConcurrentWritersAndReaders(t *testing.T) {
 	table := NewMemberStore(statement.NewDIDRoot(c.Config.DID))
 	now := time.Now()
 	const n = 24
-	asserts := make([]*circle.Attestation, n)
-	for i := range asserts {
+	admissions := make([]*circle.Admission, n)
+	for i := range admissions {
 		pub, _, _ := ed25519.GenerateKey(rand.Reader)
-		asserts[i], _ = circle.AttestFor(priv, pub, now, time.Hour)
+		admissions[i], _ = circle.AdmitFor(priv, pub, now, time.Hour)
 	}
 	ch := table.Watch()
 	stop := make(chan struct{})
@@ -507,11 +507,11 @@ func TestOwnerUnderConcurrentWritersAndReaders(t *testing.T) {
 		}
 	}()
 	var wg sync.WaitGroup
-	for _, a := range asserts {
+	for _, a := range admissions {
 		wg.Add(1)
-		go func(a *circle.Attestation) {
+		go func(a *circle.Admission) {
 			defer wg.Done()
-			if _, err := table.AddAssert(a.Stmt, now); err != nil {
+			if _, err := table.AddAdmission(a.Stmt, now); err != nil {
 				t.Error(err)
 			}
 		}(a)
@@ -541,7 +541,7 @@ func TestAttachLoadsTheCircleRevocations(t *testing.T) {
 	// Before the restart: the device was admitted into family and then
 	// revoked; both are on disk in family's directory.
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	a, _ := circle.Attest(famPriv, devPub, now)
+	a, _ := circle.Admit(famPriv, devPub, now)
 	r, _ := circle.OpenRoster(fam, now)
 	r, _, _ = r.Add(a.Stmt, now)
 	if err := r.Save(); err != nil {
@@ -566,8 +566,8 @@ func TestAttachLoadsTheCircleRevocations(t *testing.T) {
 	}
 }
 
-// The handshake judges the assert the peer presented, on its own: an older
-// assert revoked by ID is refused although a newer one of the same device
+// The handshake judges the admission the peer presented, on its own: an older
+// admission revoked by ID is refused although a newer one of the same device
 // under the same root is live (Codex review, 2026-11-05).
 func TestPresentedRevokedAssertIsRefused(t *testing.T) {
 	c, _ := circle.Init(t.TempDir(), "p", "pw")
@@ -575,34 +575,34 @@ func TestPresentedRevokedAssertIsRefused(t *testing.T) {
 	now := time.Now()
 	nasPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	nas, _ := PeerOfDID(cert.DIDForKey(nasPub))
-	older, _ := circle.AttestFor(priv, nasPub, now, time.Hour)
-	newer, _ := circle.AttestFor(priv, nasPub, now, 2*time.Hour)
+	older, _ := circle.AdmitFor(priv, nasPub, now, time.Hour)
+	newer, _ := circle.AdmitFor(priv, nasPub, now, 2*time.Hour)
 	id := older.Stmt.ID()
 	rev, _ := circle.RevokeAs(priv, nil, c.Config.DID, statement.Target{ID: id[:]}, now.Add(time.Second))
 	table := NewMemberStore(statement.NewDIDRoot(c.Config.DID))
-	if _, err := table.AddAssert(newer.Stmt, now); err != nil {
+	if _, err := table.AddAdmission(newer.Stmt, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := table.AddRevocation(c.Config.DID, rev.Stmt); err != nil {
 		t.Fatal(err)
 	}
 	if !table.IsMember(nas, now) {
-		t.Fatal("nas is not a member through its newer assert")
+		t.Fatal("nas is not a member through its newer admission")
 	}
 	if _, held, live, err := table.Verify(nas, older.Stmt); err != nil || !held || live {
-		t.Fatalf("Verify of the revoked older assert: held=%v live=%v err=%v (want held, not live)", held, live, err)
+		t.Fatalf("Verify of the revoked older admission: held=%v live=%v err=%v (want held, not live)", held, live, err)
 	}
 	if oc, _ := cert.FromStatement(older.Stmt); table.Admit(nas, oc) == nil {
-		t.Fatal("Admit accepted a revoked assert because a newer one is live")
+		t.Fatal("Admit accepted a revoked admission because a newer one is live")
 	}
 	if _, _, live, err := table.Verify(nas, newer.Stmt); err != nil || !live {
-		t.Fatalf("Verify of the live newer assert: live=%v err=%v", live, err)
+		t.Fatalf("Verify of the live newer admission: live=%v err=%v", live, err)
 	}
 	if nc, _ := cert.FromStatement(newer.Stmt); table.Admit(nas, nc) != nil {
-		t.Fatal("Admit refused the live newer assert")
+		t.Fatal("Admit refused the live newer admission")
 	}
 	if !table.IsMember(nas, now) {
-		t.Fatal("presenting a revoked assert cost nas its membership")
+		t.Fatal("presenting a revoked admission cost nas its membership")
 	}
 }
 
@@ -617,10 +617,10 @@ func TestExpiredEntryStopsRoutingAtOnce(t *testing.T) {
 	nasPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	nas, _ := PeerOfDID(cert.DIDForKey(nasPub))
 	dot2 := netip.MustParseAddr("100.64.0.2")
-	a, _ := circle.AttestWith(priv, nil, c.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	a, _ := circle.AdmitWith(priv, nil, c.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
 	table := NewMemberStore(statement.NewDIDRoot(c.Config.DID))
 	table.SetOverlay(netip.MustParsePrefix("100.64.0.1/24"))
-	if _, err := table.AddAssert(a.Stmt, now); err != nil {
+	if _, err := table.AddAdmission(a.Stmt, now); err != nil {
 		t.Fatal(err)
 	}
 	v := table.View()

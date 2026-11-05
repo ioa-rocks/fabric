@@ -100,7 +100,7 @@ func TestExportJoinAndMigrate(t *testing.T) {
 		t.Fatal("joined a different circle under an already-used name")
 	}
 
-	// Legacy layouts: the single <state>/circle dir (with an attestation),
+	// Legacy layouts: the single <state>/circle dir (with an admission),
 	// or the two files inside a vault state dir. Both are copied into the
 	// root; the originals stay.
 	legacy := t.TempDir()
@@ -108,7 +108,7 @@ func TestExportJoinAndMigrate(t *testing.T) {
 		data, _ := os.ReadFile(filepath.Join(c.Path, f))
 		os.WriteFile(filepath.Join(legacy, f), data, 0o600)
 	}
-	os.WriteFile(filepath.Join(legacy, attestationFile), []byte("x"), 0o600)
+	os.WriteFile(filepath.Join(legacy, admissionFile), []byte("x"), 0o600)
 	dst := filepath.Join(t.TempDir(), "circles")
 	did, err := Migrate(dst, legacy)
 	if err != nil || !did {
@@ -118,8 +118,8 @@ func TestExportJoinAndMigrate(t *testing.T) {
 	if err != nil || m.Config.Name != c.Config.Name || m.Config.DID != c.Config.DID {
 		t.Fatalf("migrated: %+v %v", m, err)
 	}
-	if _, err := os.Stat(m.AttestationPath()); err != nil {
-		t.Fatal("attestation did not move with the circle")
+	if _, err := os.Stat(m.AdmissionPath()); err != nil {
+		t.Fatal("admission did not move with the circle")
 	}
 	if !Exists(legacy) {
 		t.Fatal("legacy files were removed")

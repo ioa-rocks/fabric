@@ -135,7 +135,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
 	if ast, err := astraldaemon.NewClient(s.astralPath).Status(); err == nil {
 		o.Astral = &AstralOverview{
 			Status:     ast,
-			Capability: "per circle: every verb is checked against the caller's device assert in the subject's circle",
+			Capability: "per circle: every verb is checked against the caller's admission in the subject's circle",
 		}
 	}
 	if st.Master {

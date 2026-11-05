@@ -266,7 +266,7 @@ func (d *Daemon) monitorLoop() {
 // reply slot). A key holder is checked from the chain stored with the
 // hold, connected or not, without touching presence state; a device
 // holder is checked through the circle service while connected and, when
-// not, against member-level revocation and the attestation stored with
+// not, against member-level revocation and the admission stored with
 // the hold.
 func (d *Daemon) stillHolds(h astral.Hold, ref astral.Ref, verb string) error {
 	if d.Fabric == nil || d.Fabric.Circle == nil {
@@ -294,7 +294,7 @@ func (d *Daemon) stillHolds(h astral.Hold, ref astral.Ref, verb string) error {
 			return errors.New("device revoked")
 		}
 		if len(h.Chain) > 0 {
-			// Its attestation in the ref's circle, as it stood when the
+			// Its admission in the ref's circle, as it stood when the
 			// hold was taken: window and circle revocations still apply
 			// while the device is away (Codex review, 2026-11-03).
 			want := statement.Want{Verb: verb, Now: time.Now()}

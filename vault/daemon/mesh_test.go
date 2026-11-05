@@ -24,12 +24,12 @@ type meshNode struct {
 	cert      *cert.Cert
 	event     *event.Event
 	bundle    *circle.Bundle    // this node's circle, for a second device to join
-	devPub    ed25519.PublicKey // the fabric device key (for attesting later circles)
+	devPub    ed25519.PublicKey // the fabric device key (for admitting later circles)
 }
 
 // newMeshNode: shared == nil mints a fresh circle named circleName (the
 // node is its first device); otherwise the node joins that circle. Either
-// way the device is attested into the circle, as `fabric circle init|join`
+// way the device is admitted into the circle, as `fabric circle init|join`
 // do — without that, no peer syncs with it.
 func newMeshNode(t *testing.T, root ed25519.PrivateKey, shared *circle.Bundle, circleName, memberName string) *meshNode {
 	t.Helper()
@@ -51,7 +51,7 @@ func newMeshNode(t *testing.T, root ed25519.PrivateKey, shared *circle.Bundle, c
 	if err != nil {
 		t.Fatalf("device pub: %v", err)
 	}
-	attestDevice(t, statePath, ed25519.PublicKey(pubRaw))
+	admitSelf(t, statePath, ed25519.PublicKey(pubRaw))
 	bundle := exportCircle(t, statePath, circleName)
 	c, err := cert.Issue(root, ed25519.PublicKey(pubRaw), cert.CmdMember,
 		cert.Meta{Name: memberName}, time.Now().Add(-time.Minute), 365*24*time.Hour)
@@ -68,11 +68,11 @@ func newMeshNode(t *testing.T, root ed25519.PrivateKey, shared *circle.Bundle, c
 	return &meshNode{statePath: statePath, dir: dir, cert: c, event: ev, bundle: bundle, devPub: ed25519.PublicKey(pubRaw)}
 }
 
-// admits seeds this node's roster of the circle with other's attestation —
+// admits seeds this node's roster of the circle with other's admission —
 // what `fabric circle admit` does on the owner's desk. Since the legacy
 // exchange stopped naming circles the peer is not known in (2026-11-05),
 // two devices holding the same circle key learn of each other only
-// through an admission or the gossip it starts; self-attestation alone is
+// through an admission or the gossip it starts; self-admission alone is
 // not discovery.
 func (n *meshNode) admits(t *testing.T, other *meshNode, circleName string) {
 	t.Helper()
@@ -80,9 +80,9 @@ func (n *meshNode) admits(t *testing.T, other *meshNode, circleName string) {
 	if err != nil {
 		t.Fatalf("circle.ByName: %v", err)
 	}
-	a, err := theirs.LoadAttestation()
+	a, err := theirs.LoadAdmission()
 	if err != nil {
-		t.Fatalf("LoadAttestation: %v", err)
+		t.Fatalf("LoadAdmission: %v", err)
 	}
 	mine, err := circle.ByName(circle.Root(n.statePath), circleName)
 	if err != nil {
@@ -102,12 +102,12 @@ func (n *meshNode) admits(t *testing.T, other *meshNode, circleName string) {
 }
 
 // initAlso mints a second circle on this node (the shared "family" circle
-// beside the personal one), attests the device into it, and returns its
+// beside the personal one), admits the device into it, and returns its
 // bundle for another device.
 func (n *meshNode) initAlso(t *testing.T, name string) *circle.Bundle {
 	t.Helper()
 	initCircle(t, n.statePath, name)
-	attestDevice(t, n.statePath, n.devPub)
+	admitSelf(t, n.statePath, n.devPub)
 	return exportCircle(t, n.statePath, name)
 }
 
@@ -127,7 +127,7 @@ func (n *meshNode) writeConfig(t *testing.T, root ed25519.PrivateKey, name strin
 }
 
 // TestTwoNodeMesh runs two vault daemons whose fabric nodes share a
-// circle but serve *different* circles, lets B dial A, and asserts B's
+// circle but serve *different* circles, lets B dial A, and admissions B's
 // status shows A as a vault peer claiming alex's circle — and not as a
 // device of B's own circle: member auth, the hello card, vault-peer
 // discovery and the circle exchange all work over a real transport.

@@ -311,7 +311,7 @@ func TestNewerAddressRecordReplacesWithdrawnEndpoints(t *testing.T) {
 
 // /fabric/sync/2 carries one set per circle both peers are verified in: a
 // node outside `family` is sent main's set alone, a device of family
-// learns the circle's roster — including the sender's own assert — by
+// learns the circle's roster — including the sender's own admission — by
 // gossip after a handshake that only covered main.
 func TestSyncV2SendsOnlySharedCircleSets(t *testing.T) {
 	nsPub, nsPriv, err := ed25519.GenerateKey(rand.Reader)
@@ -332,17 +332,17 @@ func TestSyncV2SendsOnlySharedCircleSets(t *testing.T) {
 	famDID := fam.Config.DID
 	aPub, _ := a.host.Peerstore().PubKey(a.host.ID()).Raw()
 	bPub, _ := b.host.Peerstore().PubKey(b.host.ID()).Raw()
-	attA, _ := circle.Attest(famPriv, aPub, time.Now())
-	attB, _ := circle.Attest(famPriv, bPub, time.Now())
+	attA, _ := circle.Admit(famPriv, aPub, time.Now())
+	attB, _ := circle.Admit(famPriv, bPub, time.Now())
 	rawA, _ := attA.Stmt.Bytes()
 	for _, n := range []*syncNode{a, b} {
 		n.store.AddRoster(circle.NewRoster(statement.NewDIDRoot(famDID)))
 	}
-	// The owner admitted the device: its assert is in the owner's roster.
-	if _, err := a.store.AddAssert(attB.Stmt, time.Now()); err != nil {
+	// The owner admitted the device: its admission is in the owner's roster.
+	if _, err := a.store.AddAdmission(attB.Stmt, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	a.sync.SetCircleHooks(CircleHooks{OwnAsserts: func(did string) [][]byte {
+	a.sync.SetCircleHooks(CircleHooks{OwnAdmissions: func(did string) [][]byte {
 		if did == famDID {
 			return [][]byte{rawA}
 		}
@@ -361,18 +361,18 @@ func TestSyncV2SendsOnlySharedCircleSets(t *testing.T) {
 			famSet = &sets[i]
 		}
 	}
-	if famSet == nil || len(famSet.Asserts) != 2 {
-		t.Fatalf("sets for a family device: %+v; want family with the device's and the owner's asserts", sets)
+	if famSet == nil || len(famSet.Admissions) != 2 {
+		t.Fatalf("sets for a family device: %+v; want family with the device's and the owner's admissions", sets)
 	}
 
 	// Live: the device dials the owner (main handshake), gossip brings it
-	// the owner's family assert; the master, connected too, has no roster
+	// the owner's family admission; the master, connected too, has no roster
 	// to receive one and is sent none.
 	authenticate(t, b, a)
 	authenticate(t, m, a)
 	rb, _ := b.store.RosterFor(famDID)
 	ownerDID, _ := DeviceDID(a.host.ID())
-	waitFor(t, "device to learn the owner's family assert by gossip", func() bool {
+	waitFor(t, "device to learn the owner's family admission by gossip", func() bool {
 		_, live := rb.Live(ownerDID, time.Now())
 		return live
 	})
@@ -384,7 +384,7 @@ func TestSyncV2SendsOnlySharedCircleSets(t *testing.T) {
 	}
 }
 
-// An assert about another device is refused for the presenting peer,
+// An admission about another device is refused for the presenting peer,
 // whatever the connection it arrives on.
 func TestVerifyRejectsAssertForAnotherDevice(t *testing.T) {
 	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
@@ -394,10 +394,10 @@ func TestVerifyRejectsAssertForAnotherDevice(t *testing.T) {
 	s := NewMemberStore(statement.NewDIDRoot(cert.DIDForKey(nsPub)))
 	c, _ := cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, time.Now(), time.Hour)
 	if _, _, _, err := s.Verify(other, c.Stmt); err == nil {
-		t.Fatal("assert for another device verified for the presenting peer")
+		t.Fatal("admission for another device verified for the presenting peer")
 	}
 	if s.IsMember(other, time.Now()) {
-		t.Fatal("presenting peer became a member on a forged assert")
+		t.Fatal("presenting peer became a member on a forged admission")
 	}
 }
 
@@ -412,20 +412,20 @@ func TestLegacyProtocolsServeFirstCircleOnly(t *testing.T) {
 	famPriv, _ := fam.Unlock("pw")
 	famDID := fam.Config.DID
 	aPub, _ := a.host.Peerstore().PubKey(a.host.ID()).Raw()
-	attA, _ := circle.Attest(famPriv, aPub, time.Now())
+	attA, _ := circle.Admit(famPriv, aPub, time.Now())
 	rawA, _ := attA.Stmt.Bytes()
 	a.store.AddRoster(circle.NewRoster(statement.NewDIDRoot(famDID)))
 	a.auth.SetPresenter(func(_ peer.ID, verified []string) Hello {
 		for _, c := range verified {
 			if c == famDID {
-				return Hello{Asserts: [][]byte{rawA}}
+				return Hello{Admissions: [][]byte{rawA}}
 			}
 		}
 		return Hello{}
 	})
 
-	// B is a device of family only: no main roster, its own assert is its
-	// family attestation.
+	// B is a device of family only: no main roster, its own admission is its
+	// family admission.
 	bPriv, _, _ := crypto.GenerateEd25519Key(rand.Reader)
 	bStore := NewPeerTable()
 	bStore.AddRoster(circle.NewRoster(statement.NewDIDRoot(famDID)))
@@ -437,12 +437,12 @@ func TestLegacyProtocolsServeFirstCircleOnly(t *testing.T) {
 	}
 	t.Cleanup(func() { bHost.Close() })
 	bPub, _ := bPriv.GetPublic().Raw()
-	attB, _ := circle.Attest(famPriv, bPub, time.Now())
+	attB, _ := circle.Admit(famPriv, bPub, time.Now())
 	bOwn, _ := cert.FromStatement(attB.Stmt)
 	bAuth := NewAuthService(bHost, bStore, bOwn, 5*time.Second, nil)
 	// Both know each other in family (admitted / gossiped).
-	a.store.AddAssert(attB.Stmt, time.Now())
-	bStore.AddAssert(attA.Stmt, time.Now())
+	a.store.AddAdmission(attB.Stmt, time.Now())
+	bStore.AddAdmission(attA.Stmt, time.Now())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -16,20 +16,20 @@ import (
 
 // Roster is one circle's view of its own devices — the per-circle instance
 // of the namespace engine (ADR 0014; task circle-member-devices, slice A).
-// It holds the device asserts the circle has issued — one entry per device,
+// It holds the admissions the circle has issued — one entry per device,
 // each compiled once against the circle's root; the circle's revocation
 // set; and the verdict on every device: live, lapsed (expired within
 // LapsedRetention, kept as roster memory so a returning device is known by
 // name and address), or dead (revoked along its chain or swept). Revocation
 // is ancestor-aware through statement.Compiled.Check, so a chain through a
-// revoked issuer dies with it — what lets delegated asserts onto transport.
+// revoked issuer dies with it — what lets delegated admissions onto transport.
 //
 // A roster is a value (task single-writer-store): it has no lock and no
 // hooks, and a mutation returns a new roster — the old one is unchanged and
 // stays valid for anyone still reading it. Exactly one goroutine applies
 // mutations (fabricnet.PeerTable's owner; the CLI when no daemon runs) and
 // decides when the result is saved and published. The ledger has four
-// rules and they are order-independent: a later-expiring assert for a
+// rules and they are order-independent: a later-expiring admission for a
 // device wins whichever arrived first, a revocation set only grows, a sweep
 // is a monotone cut-off, GC drops the expired.
 //
@@ -37,14 +37,14 @@ import (
 // builds the union over a node's rosters.
 type Roster struct {
 	roots *statement.DIDRoot // the circle's root
-	path  string             // devices.cbor the asserts are saved to; "" = memory only
+	path  string             // devices.cbor the admissions are saved to; "" = memory only
 
 	devices map[string]*Device // by device DID; never mutated in place
 	revs    *statement.RevocationSet
-	sweeps  map[string]int64 // device DID -> cut-off (unix s): asserts issued up to it are dead
+	sweeps  map[string]int64 // device DID -> cut-off (unix s): admissions issued up to it are dead
 }
 
-// Device is one device assert in a roster with its verdict.
+// Device is one admission in a roster with its verdict.
 type Device struct {
 	DID   string
 	Stmt  *statement.Statement
@@ -56,10 +56,10 @@ type Device struct {
 	dead   error // revoked or swept
 }
 
-// Sub is the circle DID the assert is in.
+// Sub is the circle DID the admission is in.
 func (d *Device) Sub() string { return d.Stmt.Payload.Sub }
 
-// Issued is the assert's own issue time.
+// Issued is the admission's own issue time.
 func (d *Device) Issued() time.Time { return time.Unix(d.Stmt.Payload.Iat, 0) }
 
 // Dead explains why the device is not admitted even inside its window; nil
@@ -67,9 +67,9 @@ func (d *Device) Issued() time.Time { return time.Unix(d.Stmt.Payload.Iat, 0) }
 func (d *Device) Dead() error { return d.dead }
 
 // Admits reports whether this entry admits its device right now: inside
-// its window, not lapsed, not dead. The verdict of one assert — a reader
+// its window, not lapsed, not dead. The verdict of one admission — a reader
 // holding an entry judges that entry, never "any entry of the device",
-// or a revoked assert would borrow a live one's standing (Codex review,
+// or a revoked admission would borrow a live one's standing (Codex review,
 // 2026-11-05).
 func (d *Device) Admits(now time.Time) bool {
 	return !d.lapsed && d.dead == nil && !now.Before(d.Nbf) && now.Before(d.Exp)
@@ -89,11 +89,11 @@ func (d *Device) Standing() bool { return d.dead == nil && !d.lapsed }
 // roster as "expired": no peer admits it, but it is still known by name and
 // address, so a node that was off for a season comes back as "nas —
 // expired" rather than as an anonymous stranger, and its overlay address is
-// held for it. Re-admission (a fresh assert) or revocation ends it early.
+// held for it. Re-admission (a fresh admission) or revocation ends it early.
 const LapsedRetention = DefaultValidity
 
 // sweepTombstone is how long a sweep of a device the roster never saw an
-// assert for is reported as a revocation (the gater refuses it meanwhile).
+// admission for is reported as a revocation (the gater refuses it meanwhile).
 const sweepTombstone = 24 * time.Hour
 
 const devicesFile = "devices.cbor"
@@ -158,7 +158,7 @@ func (r *Roster) Attach(c *Circle, now time.Time) (*Roster, error) {
 // DevicesPath is the circle directory's devices.cbor.
 func DevicesPath(c *Circle) string { return filepath.Join(c.Path, devicesFile) }
 
-// WithPath returns the roster with the asserts already in path merged in
+// WithPath returns the roster with the admissions already in path merged in
 // and path as the place Save writes to. Stale or unverifiable entries in
 // the file drop out. Attach is the caller: a devices.cbor is read only
 // with its circle's revocations.
@@ -195,7 +195,7 @@ func (r *Roster) Roots() *statement.DIDRoot { return r.roots }
 // CircleDID is the DID of the circle the roster belongs to.
 func (r *Roster) CircleDID() string { return r.roots.DID() }
 
-// Honours reports whether asserts in circleDID belong to this roster.
+// Honours reports whether admissions in circleDID belong to this roster.
 func (r *Roster) Honours(circleDID string) bool { return r.roots.Honours(circleDID) }
 
 // Revocations is the roster's revocation set (the verifier's view). Read
@@ -217,15 +217,15 @@ func (r *Roster) clone() *Roster {
 	return nr
 }
 
-// Add verifies a device assert against the circle's root and returns the
+// Add verifies a admission against the circle's root and returns the
 // roster with it recorded, and whether that changed anything. A device has
-// one entry: a later-expiring assert for the device wins whatever order
+// one entry: a later-expiring admission for the device wins whatever order
 // they arrive in (gossip, anti-entropy, handshakes) — a renewal replaces
-// the grant, so `renew -scope` demotes as the README says; a live assert
-// is never demoted by a stale expired one; an expired assert within
+// the grant, so `renew -scope` demotes as the README says; a live admission
+// is never demoted by a stale expired one; an expired admission within
 // LapsedRetention is kept as roster memory; older ones are refused. A
-// revoked or swept assert is recorded with its verdict (the device is then
-// reported revoked until the assert expires), so a later assert — a
+// revoked or swept admission is recorded with its verdict (the device is then
+// reported revoked until the admission expires), so a later admission — a
 // deliberate re-admission — stands.
 func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, error) {
 	dev, err := r.judge(st, now)
@@ -241,10 +241,10 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, err
 	return nr, true, nil
 }
 
-// Judge answers for one assert on its own — the one a peer presented: nil
+// Judge answers for one admission on its own — the one a peer presented: nil
 // when that statement admits its device right now, else why not. Add
 // records; Judge never consults the roster's entry for the device (which
-// may be a newer, live assert), so a revoked assert presented on the
+// may be a newer, live admission), so a revoked admission presented on the
 // handshake is refused whatever else the device holds (Codex review,
 // 2026-11-05).
 func (r *Roster) Judge(st *statement.Statement, now time.Time) error {
@@ -256,12 +256,12 @@ func (r *Roster) Judge(st *statement.Statement, now time.Time) error {
 		return dev.dead
 	}
 	if !dev.Admits(now) {
-		return errors.New("assert is not in its validity window")
+		return errors.New("admission is not in its validity window")
 	}
 	return nil
 }
 
-// judge compiles an assert against the circle's root and gives it its
+// judge compiles an admission against the circle's root and gives it its
 // verdict as an entry, without recording it.
 func (r *Roster) judge(st *statement.Statement, now time.Time) (*Device, error) {
 	if st == nil {
@@ -281,7 +281,7 @@ func (r *Roster) judge(st *statement.Statement, now time.Time) (*Device, error) 
 	dev := &Device{DID: st.Payload.Aud, Stmt: st, Chain: chain, Nbf: chain.Nbf, Exp: chain.Exp}
 	if !now.Before(dev.Exp) {
 		if !now.Before(dev.Exp.Add(LapsedRetention)) {
-			return nil, errors.New("roster: assert expired past retention")
+			return nil, errors.New("roster: admission expired past retention")
 		}
 		dev.lapsed = true
 	}
@@ -296,15 +296,15 @@ func (r *Roster) judge(st *statement.Statement, now time.Time) (*Device, error) 
 // wider grant wins", can cycle: Codex review, 2026-11-05).
 func prefer(cur, next *Device) bool {
 	if (cur.dead != nil) != (next.dead != nil) {
-		return cur.dead != nil // a verifying assert lifts a dead one (re-admission); a dead one never demotes
+		return cur.dead != nil // a verifying admission lifts a dead one (re-admission); a dead one never demotes
 	}
 	if cur.lapsed != next.lapsed {
-		return cur.lapsed // a live assert lifts a lapsed one; a stale one never demotes
+		return cur.lapsed // a live admission lifts a lapsed one; a stale one never demotes
 	}
 	if !next.Exp.Equal(cur.Exp) {
 		return next.Exp.After(cur.Exp)
 	}
-	// Equal expiry (asserts issued within the same second carry the same
+	// Equal expiry (admissions issued within the same second carry the same
 	// unix-second window): the later-issued wins, then the greater
 	// statement ID.
 	if ni, ci := next.Stmt.Payload.Iat, cur.Stmt.Payload.Iat; ni != ci {
@@ -361,7 +361,7 @@ func (r *Roster) AddRevocation(st *statement.Statement) (*Roster, bool, error) {
 	return nr, true, nil
 }
 
-// Sweep kills every assert of a device issued up to at — the legacy
+// Sweep kills every admission of a device issued up to at — the legacy
 // member-revoked event, and the circle's legacy device revocation. A
 // device the roster never saw is remembered as a tombstone for
 // sweepTombstone so the gater refuses it meanwhile.
@@ -386,7 +386,7 @@ func (r *Roster) Live(deviceDID string, now time.Time) (*Device, bool) {
 	return dev, true
 }
 
-// Lapsed returns the device's entry if its assert ran out unrenewed within
+// Lapsed returns the device's entry if its admission ran out unrenewed within
 // LapsedRetention: no member, but remembered.
 func (r *Roster) Lapsed(deviceDID string, now time.Time) (*Device, bool) {
 	dev := r.devices[deviceDID]
@@ -397,7 +397,7 @@ func (r *Roster) Lapsed(deviceDID string, now time.Time) (*Device, bool) {
 }
 
 // Revoked reports whether the device is refused as revoked right now, and
-// until when: a dead assert until it would have expired, or a bare sweep
+// until when: a dead admission until it would have expired, or a bare sweep
 // for sweepTombstone. An entry that is not dead — live or merely lapsed —
 // means not revoked.
 func (r *Roster) Revoked(deviceDID string, now time.Time) (time.Time, bool) {
@@ -476,7 +476,7 @@ func (r *Roster) LapsedDevices(now time.Time) []*Device {
 	return out
 }
 
-// UsedIPs lists the overlay addresses the roster's asserts carry, live and
+// UsedIPs lists the overlay addresses the roster's admissions carry, live and
 // lapsed alike (a lapsed device keeps its address until it is back or
 // revoked), for the owner's allocation.
 func (r *Roster) UsedIPs() []string {
@@ -525,7 +525,7 @@ func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
 	return nr, true, dropped
 }
 
-// Encode is the saved form: every assert (lapsed included) as statement
+// Encode is the saved form: every admission (lapsed included) as statement
 // bytes, in DID order.
 func (r *Roster) Encode() ([]byte, error) {
 	list := make([][]byte, 0, len(r.devices))

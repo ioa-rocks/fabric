@@ -38,7 +38,7 @@ const usage = `usage: fabric astral <command> [flags] [args]
   set <register:entity/key> <value>
   get <register:entity/key>
   key new -res subject:a[,subject:b|*] -verbs claim[,publish,…] [-exp 720h] [-label worker] -out agent.key
-                                       mint a sub-key under this device's assert in -circle
+                                       mint a sub-key under this device's admission in -circle
   key list                             sub-keys this device issued
   key revoke <id-prefix>               revoke an issued sub-key (reaches members online now)
   worker claim|wait|append|ack|heartbeat -key worker.key [-gate addr] <name> …

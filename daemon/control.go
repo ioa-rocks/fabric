@@ -48,7 +48,7 @@ type StatusPeer struct {
 	Scope []string `json:"scope,omitempty"`
 	// Circles this node verifiably shares with the peer, as DIDs: the home
 	// circle for every member, plus every held circle the peer's last
-	// exchange attested it into. Only shared circles are ever listed — a
+	// exchange admitted it into. Only shared circles are ever listed — a
 	// peer's other circles are not this node's business (memo §17). For a
 	// grantee, the circle(s) of the chain(s) it presented.
 	Circles []string `json:"circles,omitempty"`
@@ -123,7 +123,7 @@ type StatusReply struct {
 	Addrs            []string     `json:"addrs"`
 	Peers            []StatusPeer `json:"peers"`
 	// Circles this node holds, with the lifecycle state of its own
-	// attestation in each (daemon.CircleService.Info); absent when the node
+	// admission in each (daemon.CircleService.Info); absent when the node
 	// serves no circle.
 	Circles []CircleInfo `json:"circles,omitempty"`
 }
@@ -267,7 +267,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		seen[sp.ID] = true
 	}
 	// The rosters make offline members part of the picture too. This node
-	// is in them as well (its own asserts travel the same way) and is
+	// is in them as well (its own admissions travel the same way) and is
 	// never an offline peer of itself.
 	seen[d.Host.ID().String()] = true
 	for p, c := range members {
@@ -356,7 +356,7 @@ func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
 		out = append(out, info)
 	}
 	// This node is listed once, by the cert it holds (cert.cbor): the
-	// roster's own entry for it may be a bare attestation without a name.
+	// roster's own entry for it may be a bare admission without a name.
 	add(d.Host.ID(), d.OwnCert(), true, false)
 	for p, c := range members {
 		if p != d.Host.ID() {
@@ -823,7 +823,7 @@ func (c *Client) Deny(fingerprint string) error {
 
 // handleCircleRefresh re-runs the circle exchange with every connected
 // member: the CLI calls it after signing a revocation (or a fresh
-// attestation) into the circle directory, so the change reaches the devices
+// admission) into the circle directory, so the change reaches the devices
 // online now. The daemon reads the circle directory itself — nothing on the
 // socket can add or remove a revocation.
 func (d *Daemon) handleCircleRefresh(w http.ResponseWriter, r *http.Request) {
@@ -842,14 +842,14 @@ type circleRefreshReply struct {
 }
 
 type circleAdmitBody struct {
-	AttestationB64 string `json:"attestation_b64"`
+	AdmissionB64 string `json:"attestation_b64"`
 }
 
 type circleAdmitReply struct {
-	Fresh bool `json:"fresh"` // the roster did not hold this assert yet
+	Fresh bool `json:"fresh"` // the roster did not hold this admission yet
 }
 
-// handleCircleAdmit records an attestation the owner CLI just signed in
+// handleCircleAdmit records an admission the owner CLI just signed in
 // the circle's roster (CircleService.Admit): verified against the
 // circle's root, never trusted because it came over the socket.
 func (d *Daemon) handleCircleAdmit(w http.ResponseWriter, r *http.Request) {
@@ -862,9 +862,9 @@ func (d *Daemon) handleCircleAdmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	raw, err := base64.StdEncoding.DecodeString(body.AttestationB64)
+	raw, err := base64.StdEncoding.DecodeString(body.AdmissionB64)
 	if err != nil {
-		http.Error(w, "attestation_b64: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "admission_b64: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	fresh, err := d.Circle.Admit(raw)
@@ -875,11 +875,11 @@ func (d *Daemon) handleCircleAdmit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, circleAdmitReply{Fresh: fresh})
 }
 
-// CircleAdmit hands the daemon a device attestation signed here so the
+// CircleAdmit hands the daemon a device admission signed here so the
 // roster and the circle's devices learn it at once.
-func (c *Client) CircleAdmit(attestation []byte) (bool, error) {
+func (c *Client) CircleAdmit(admission []byte) (bool, error) {
 	var out circleAdmitReply
-	if err := c.post("/v0/circle/admit", circleAdmitBody{AttestationB64: base64.StdEncoding.EncodeToString(attestation)}, &out); err != nil {
+	if err := c.post("/v0/circle/admit", circleAdmitBody{AdmissionB64: base64.StdEncoding.EncodeToString(admission)}, &out); err != nil {
 		return false, err
 	}
 	return out.Fresh, nil
@@ -956,7 +956,7 @@ func (c *Client) Keys() ([]KeyRecord, error) {
 	return out, err
 }
 
-// IssueKey mints a sub-key under this device's assert (see Daemon.IssueKey).
+// IssueKey mints a sub-key under this device's admission (see Daemon.IssueKey).
 func (c *Client) IssueKey(body IssueKeyBody) (*IssuedKey, error) {
 	var out IssuedKey
 	if err := c.post("/v0/keys/issue", body, &out); err != nil {

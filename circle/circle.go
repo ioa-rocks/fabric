@@ -49,7 +49,7 @@ type Config struct {
 	// Prefix is the circle's overlay range (CIDR), when it has one: the
 	// overlay is a circle resource (memo §5, decided 2026-11-04). A device
 	// admitted with `tun` gets an address inside it, signed into its
-	// assert; the owner allocates against the roster.
+	// admission; the owner allocates against the roster.
 	Prefix string `json:"prefix,omitempty"`
 }
 
@@ -250,40 +250,40 @@ func (c *Circle) Rekey(oldPass, newPass string) error {
 // Bundle is the portable form of a circle for a device joining it. Two
 // kinds, one format: an **owner bundle** carries the key container (a key
 // copy makes the device a co-owner — a one-way door, memo §14: revoking
-// its assert later cannot remove root authority; the passphrase travels
-// separately), a **device bundle** carries the device's attestation signed
+// its admission later cannot remove root authority; the passphrase travels
+// separately), a **device bundle** carries the device's admission signed
 // by an owner (`circle admit`) and no key. Both carry the config with the
 // circle's gate hints, so a device that knows the circle from nowhere else
 // can find a gate and present itself there.
 type Bundle struct {
-	Config      Config `json:"config"`
-	Key         []byte `json:"key,omitempty"`         // the age container, verbatim (owner bundle)
-	Attestation []byte `json:"attestation,omitempty"` // this device's assert, wire bytes (device bundle)
+	Config    Config `json:"config"`
+	Key       []byte `json:"key,omitempty"`         // the age container, verbatim (owner bundle)
+	Admission []byte `json:"attestation,omitempty"` // this device's admission, wire bytes (device bundle)
 }
 
 // HasKey reports whether the bundle carries the circle key (co-ownership).
 func (b *Bundle) HasKey() bool { return len(b.Key) > 0 }
 
-// DeviceAttestation decodes the bundle's attestation, if it carries one.
-func (b *Bundle) DeviceAttestation() (*Attestation, error) {
-	if len(b.Attestation) == 0 {
+// DeviceAdmission decodes the bundle's admission, if it carries one.
+func (b *Bundle) DeviceAdmission() (*Admission, error) {
+	if len(b.Admission) == 0 {
 		return nil, nil
 	}
-	a, err := UnmarshalAttestation(b.Attestation)
+	a, err := UnmarshalAdmission(b.Admission)
 	if err != nil {
-		return nil, fmt.Errorf("bundle attestation: %w", err)
+		return nil, fmt.Errorf("bundle admission: %w", err)
 	}
 	if a.Circle != b.Config.DID {
-		return nil, errors.New("bundle attestation is for a different circle")
+		return nil, errors.New("bundle admission is for a different circle")
 	}
 	return a, nil
 }
 
 // NewDeviceBundle packs what an admitted device needs: the circle's
-// config (name, DID, gate hints, prefix) and its own attestation.
-func NewDeviceBundle(c *Circle, a *Attestation, gates []string) (*Bundle, error) {
+// config (name, DID, gate hints, prefix) and its own admission.
+func NewDeviceBundle(c *Circle, a *Admission, gates []string) (*Bundle, error) {
 	if a.Circle != c.Config.DID {
-		return nil, errors.New("attestation is for a different circle")
+		return nil, errors.New("admission is for a different circle")
 	}
 	raw, err := a.Marshal()
 	if err != nil {
@@ -291,7 +291,7 @@ func NewDeviceBundle(c *Circle, a *Attestation, gates []string) (*Bundle, error)
 	}
 	cfg := c.Config
 	cfg.Gates = gates
-	return &Bundle{Config: cfg, Attestation: raw}, nil
+	return &Bundle{Config: cfg, Admission: raw}, nil
 }
 
 // HasKey reports whether this device holds the circle key — whether it is
@@ -361,14 +361,14 @@ func ReadBundle(src string) (*Bundle, error) {
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return nil, fmt.Errorf("%s is not a circle bundle: %w", src, err)
 	}
-	if b.Config.DID == "" || (len(b.Key) == 0 && len(b.Attestation) == 0) {
+	if b.Config.DID == "" || (len(b.Key) == 0 && len(b.Admission) == 0) {
 		return nil, fmt.Errorf("%s is not a circle bundle", src)
 	}
 	return &b, nil
 }
 
 // Join installs a bundle as a circle this node holds: the key when the
-// bundle carries one (an owner device), the attestation when it carries
+// bundle carries one (an owner device), the admission when it carries
 // that (a device without the key), the config with its gate hints either
 // way. Refuses to replace a circle already held — swapping identities
 // under live buckets is not a thing to do by accident.
@@ -376,10 +376,10 @@ func Join(root string, b *Bundle) (*Circle, error) {
 	if err := validName(b.Config.Name); err != nil {
 		return nil, fmt.Errorf("bundle: %w", err)
 	}
-	if !b.HasKey() && len(b.Attestation) == 0 {
-		return nil, errors.New("bundle carries neither a key nor an attestation")
+	if !b.HasKey() && len(b.Admission) == 0 {
+		return nil, errors.New("bundle carries neither a key nor an admission")
 	}
-	attestation, err := b.DeviceAttestation()
+	admission, err := b.DeviceAdmission()
 	if err != nil {
 		return nil, err
 	}
@@ -405,8 +405,8 @@ func Join(root string, b *Bundle) (*Circle, error) {
 	if err != nil {
 		return nil, err
 	}
-	if attestation != nil {
-		if err := c.SaveAttestation(attestation); err != nil {
+	if admission != nil {
+		if err := c.SaveAdmission(admission); err != nil {
 			return nil, err
 		}
 	}
@@ -435,9 +435,9 @@ func Migrate(root, legacyDir string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	// The device attestation (if the legacy dir had one) moves with it.
-	if raw, err := os.ReadFile(filepath.Join(legacyDir, attestationFile)); err == nil {
-		if err := os.WriteFile(c.AttestationPath(), raw, 0o600); err != nil {
+	// The device admission (if the legacy dir had one) moves with it.
+	if raw, err := os.ReadFile(filepath.Join(legacyDir, admissionFile)); err == nil {
+		if err := os.WriteFile(c.AdmissionPath(), raw, 0o600); err != nil {
 			return true, err
 		}
 	}

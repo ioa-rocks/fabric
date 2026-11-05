@@ -872,7 +872,7 @@ function renderSelf(d, box) {
   add(kv, "role", d.status.master ? "master (holds the root key)" : "member");
   for (const c of heldCircles(d)) {
     const dd = add(kv, c === heldCircles(d)[0] ? "circles" : "", circleChips(d, [c.did]));
-    dd.append(` ${c.role || "device"}${c.prefix ? " · overlay " + c.prefix : ""}${c.attested === false ? " · NOT attested" : ""}`);
+    dd.append(` ${c.role || "device"}${c.prefix ? " · overlay " + c.prefix : ""}${c.attested === false ? " · NOT admitted" : ""}`);
   }
   if (d.status.overlay_ip) {
     add(kv, "overlay IP", mono(overlayIP));

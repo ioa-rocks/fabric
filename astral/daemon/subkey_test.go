@@ -54,7 +54,7 @@ func TestSubKeyActsWithinItsVerbs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attestInto(t, nas, x)
+	admitInto(t, nas, x)
 	joinCircle(t, desk, bundle, true)
 	admits(t, nas, x, desk)
 	xDID := x.Config.DID
@@ -179,7 +179,7 @@ func TestRevocationPushesLeasesAndWaits(t *testing.T) {
 		t.Fatal(err)
 	}
 	bundle, _ := x.Export()
-	attestInto(t, nas, x)
+	admitInto(t, nas, x)
 	joinCircle(t, desk, bundle, true)
 	admits(t, nas, x, desk)
 	xDID := x.Config.DID
@@ -255,9 +255,9 @@ func TestRevocationPushesLeasesAndWaits(t *testing.T) {
 }
 
 // TestOfflineDeviceHoldRecheckedAgainstCircle: desk, a device of X, holds a
-// long lease on nas and goes away; revoking desk's attestation in X on nas
+// long lease on nas and goes away; revoking desk's admission in X on nas
 // releases the lease while desk is offline. The re-check runs from the
-// attestation stored with the hold, not from presence (Codex review,
+// admission stored with the hold, not from presence (Codex review,
 // 2026-11-03).
 func TestOfflineDeviceHoldRecheckedAgainstCircle(t *testing.T) {
 	daemon.OutboxInterval = 300 * time.Millisecond
@@ -276,7 +276,7 @@ func TestOfflineDeviceHoldRecheckedAgainstCircle(t *testing.T) {
 		t.Fatal(err)
 	}
 	bundle, _ := x.Export()
-	attestInto(t, nas, x)
+	admitInto(t, nas, x)
 	joinCircle(t, desk, bundle, true)
 	admits(t, nas, x, desk)
 	xDID := x.Config.DID

@@ -32,10 +32,10 @@ import (
 //
 // Transport is the union of the circles (memo §17): a peer is a member when
 // it is a live device of any roster here; what it may do is what its
-// asserts say, per circle. The pre-step-5 MemberStore API (certs by peer)
-// survives as views over the union: Cert(p) is the peer's assert with an
+// admissions say, per circle. The pre-step-5 MemberStore API (certs by peer)
+// survives as views over the union: Cert(p) is the peer's admission with an
 // overlay address when it has one, else its first; CertIn(p, circle) the
-// assert in one circle, which is what an access question goes by.
+// admission in one circle, which is what an access question goes by.
 type PeerTable struct {
 	ops  chan func()
 	stop chan struct{}
@@ -53,7 +53,7 @@ type MemberStore = PeerTable
 
 type state struct {
 	rosters       []*circle.Roster // insertion order: the first circle's (log-fed) roster first
-	overlay       bool             // the first roster's asserts route on this node's interface
+	overlay       bool             // the first roster's admissions route on this node's interface
 	overlayPrefix netip.Prefix     // and the range they must lie in
 	version       uint64
 	dirty         bool
@@ -123,7 +123,7 @@ func (t *PeerTable) apply(fn func(s *state) error) error {
 
 // replace commits a mutated roster: saved first, swapped in only when the
 // save succeeded, so memory and disk change together or neither. persist
-// is false for verdict-only changes (the saved form holds asserts alone).
+// is false for verdict-only changes (the saved form holds admissions alone).
 func (s *state) replace(i int, nr *circle.Roster, persist bool) error {
 	if nr == s.rosters[i] {
 		return nil
@@ -258,7 +258,7 @@ func (t *PeerTable) AddRoster(r *circle.Roster) {
 // Attach folds the first roster's circle directory into it: the circle's
 // revocations and sweeps, then its devices.cbor, which the roster persists
 // to from then on. The circle the membership-event log feeds thus keeps
-// the asserts the log never carries (a `circle admit` into it) across a
+// the admissions the log never carries (a `circle admit` into it) across a
 // restart (Codex review, 2026-11-04), read with its revocations, so a
 // device revoked before the restart stays revoked (Codex review,
 // 2026-11-05).
@@ -277,7 +277,7 @@ func (t *PeerTable) Attach(c *circle.Circle, now time.Time) error {
 	})
 }
 
-// SetOverlay makes the first circle's asserts route on this node's
+// SetOverlay makes the first circle's admissions route on this node's
 // interface, inside the given range — set once when the bridge comes up;
 // the view's routes and zone are empty before that. One interface per
 // overlay circle is slice H's.
@@ -289,10 +289,10 @@ func (t *PeerTable) SetOverlay(within netip.Prefix) {
 	})
 }
 
-// AddAssert records a device assert in the roster of its circle; fresh says
+// AddAdmission records a admission in the roster of its circle; fresh says
 // whether the roster changed. The circle must be held here. A save failure
 // is an error and changes nothing.
-func (t *PeerTable) AddAssert(st *statement.Statement, now time.Time) (fresh bool, err error) {
+func (t *PeerTable) AddAdmission(st *statement.Statement, now time.Time) (fresh bool, err error) {
 	if st == nil {
 		return false, errors.New("roster: nil statement")
 	}
@@ -338,7 +338,7 @@ func (t *PeerTable) AddRevocation(circleDID string, st *statement.Statement) (fr
 	return fresh, err
 }
 
-// SweepIn kills a device's asserts issued up to at in one circle (a legacy
+// SweepIn kills a device's admissions issued up to at in one circle (a legacy
 // device revocation).
 func (t *PeerTable) SweepIn(circleDID, deviceDID string, at time.Time) {
 	_ = t.apply(func(s *state) error {
@@ -366,7 +366,7 @@ func (t *PeerTable) Admit(p peer.ID, c *cert.Cert) error {
 		return fmt.Errorf("cert is issued to %s, not to connected peer %s", c.Payload.Aud, p)
 	}
 	now := time.Now()
-	if _, err := t.AddAssert(c.Stmt, now); err != nil {
+	if _, err := t.AddAdmission(c.Stmt, now); err != nil {
 		if strings.Contains(err.Error(), "not honoured") {
 			return fmt.Errorf("certificate circle %s is not honoured here", c.Payload.Sub)
 		}
@@ -377,7 +377,7 @@ func (t *PeerTable) Admit(p peer.ID, c *cert.Cert) error {
 		return fmt.Errorf("certificate circle %s is not honoured here", c.Payload.Sub)
 	}
 	// The presented cert is judged on its own — not the device's entry (a
-	// newer, live assert) — so a revoked cert is refused whatever else the
+	// newer, live admission) — so a revoked cert is refused whatever else the
 	// device holds.
 	if err := r.Judge(c.Stmt, now); err != nil {
 		return fmt.Errorf("device is not admitted: %w", err)
@@ -385,11 +385,11 @@ func (t *PeerTable) Admit(p peer.ID, c *cert.Cert) error {
 	return nil
 }
 
-// Verify judges one assert a peer presented on the v2 handshake: it must
-// be a member assert naming the connected peer (else err — a forgery); its
+// Verify judges one admission a peer presented on the v2 handshake: it must
+// be a member admission naming the connected peer (else err — a forgery); its
 // circle must be held here (else held = false — skipped, the peer guessed);
 // it enters that circle's roster and live says whether the device is
-// admitted there now (a revoked or expired assert is recorded with its
+// admitted there now (a revoked or expired admission is recorded with its
 // verdict and skipped). circleDID is the circle's DID.
 func (t *PeerTable) Verify(p peer.ID, st *statement.Statement) (circleDID string, held, live bool, err error) {
 	c, err := cert.FromStatement(st)
@@ -401,20 +401,20 @@ func (t *PeerTable) Verify(p peer.ID, st *statement.Statement) (circleDID string
 		return "", false, false, err
 	}
 	if c.Payload.Aud != deviceDID {
-		return "", false, false, fmt.Errorf("assert is issued to %s, not to connected peer %s", c.Payload.Aud, p)
+		return "", false, false, fmt.Errorf("admission is issued to %s, not to connected peer %s", c.Payload.Aud, p)
 	}
 	if _, ok := t.View().RosterFor(c.Payload.Sub); !ok {
 		return "", false, false, nil
 	}
 	now := time.Now()
-	if _, err := t.AddAssert(st, now); err != nil {
+	if _, err := t.AddAdmission(st, now); err != nil {
 		return "", true, false, err
 	}
 	r, ok := t.View().RosterFor(c.Payload.Sub)
 	if !ok {
 		return "", false, false, nil
 	}
-	return r.CircleDID(), true, r.Judge(st, now) == nil, nil // the presented assert itself, see Admit
+	return r.CircleDID(), true, r.Judge(st, now) == nil, nil // the presented admission itself, see Admit
 }
 
 // AddMember records a verified certificate learned from the event log or
@@ -426,7 +426,7 @@ func (t *PeerTable) AddMember(p peer.ID, c *cert.Cert) {
 	if c.Stmt == nil {
 		return
 	}
-	_, _ = t.AddAssert(c.Stmt, time.Now())
+	_, _ = t.AddAdmission(c.Stmt, time.Now())
 }
 
 // Revoke sweeps the peer out of every circle held here as of now: the
@@ -562,7 +562,7 @@ func (v *View) In(p peer.ID, circleDID string, now time.Time) bool {
 	return false
 }
 
-// Chain returns the peer's compiled device assert in a circle, when live.
+// Chain returns the peer's compiled admission in a circle, when live.
 func (v *View) Chain(p peer.ID, circleDID string, now time.Time) (*statement.Compiled, bool) {
 	for _, d := range v.live(p, now) {
 		if d.roster.Honours(circleDID) {
@@ -572,9 +572,9 @@ func (v *View) Chain(p peer.ID, circleDID string, now time.Time) (*statement.Com
 	return nil, false
 }
 
-// Allows reports whether the peer is a live device whose assert in some
+// Allows reports whether the peer is a live device whose admission in some
 // shared circle admits the protocol (fabric ADR 0005): control-plane
-// protocols for every member, data-plane families only when an assert
+// protocols for every member, data-plane families only when an admission
 // carries a verb of that family.
 func (v *View) Allows(p peer.ID, protocolID string, now time.Time) bool {
 	family := cert.ScopeFamily(protocolID)
@@ -587,14 +587,14 @@ func (v *View) Allows(p peer.ID, protocolID string, now time.Time) bool {
 }
 
 // Cert returns the peer's membership cert view, if it is a member: the
-// assert carrying an overlay address when it has one, else the first
+// admission carrying an overlay address when it has one, else the first
 // roster's. A summary for display; an access question goes by CertIn.
 func (v *View) Cert(p peer.ID) (*cert.Cert, bool) {
 	c := pick(v.live(p, time.Now()))
 	return c, c != nil
 }
 
-// CertIn is the cert view of the peer's live device assert in one circle —
+// CertIn is the cert view of the peer's live admission in one circle —
 // what an authorization question about that circle goes by (Codex review,
 // 2026-11-05: the summary must not decide access in another circle).
 func (v *View) CertIn(p peer.ID, circleDID string) (*cert.Cert, bool) {
@@ -650,7 +650,7 @@ func (v *View) Snapshot() (members map[peer.ID]*cert.Cert, revoked map[peer.ID]t
 	return members, revoked
 }
 
-// Lapsed returns the former members whose assert expired unrenewed and who
+// Lapsed returns the former members whose admission expired unrenewed and who
 // are live nowhere, remembered for circle.LapsedRetention so the roster can
 // name them and hold their overlay address until they re-join or are
 // revoked.
@@ -712,7 +712,7 @@ func (v *View) addrEntry(p peer.ID, now time.Time) (deviceIn, bool) {
 
 // Route answers the bridge: which live device of the overlay circle holds
 // the destination address right now. The candidates are in the view and
-// the choice is made here, so a revocation, a new assert or an expiry
+// the choice is made here, so a revocation, a new admission or an expiry
 // changes the answer at once and nothing is ever rebuilt or installed
 // (Codex reviews, 2026-11-05).
 func (v *View) Route(dst netip.Addr, now time.Time) (peer.ID, bool) {
@@ -745,7 +745,7 @@ func (v *View) Resolve(name string, now time.Time) (netip.Addr, bool) {
 
 // ---- helpers ------------------------------------------------------------------
 
-// view reads a device assert as a cert (name, IP, scope, expiry).
+// view reads a admission as a cert (name, IP, scope, expiry).
 func view(dev *circle.Device) *cert.Cert {
 	c, err := cert.FromStatement(dev.Stmt)
 	if err != nil {
@@ -754,7 +754,7 @@ func view(dev *circle.Device) *cert.Cert {
 	return c
 }
 
-// pick is the cert view a peer is summarised by: the assert carrying an
+// pick is the cert view a peer is summarised by: the admission carrying an
 // overlay address when it has one (TUN routes, `.fabric` names), else the
 // first roster's.
 func pick(devs []deviceIn) *cert.Cert {

@@ -47,7 +47,7 @@ import (
 // owns it — mesh membership alone grants nothing.
 func cmdCircle(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: fabric circle init|admit|join|export|attest|revoke|passphrase|grant|status")
+		return fmt.Errorf("usage: fabric circle init|admit|join|export|renew|revoke|passphrase|grant|status")
 	}
 	rest := args[1:]
 	switch args[0] {
@@ -59,8 +59,8 @@ func cmdCircle(args []string) error {
 		return cmdCircleJoin(rest)
 	case "export":
 		return cmdCircleExport(rest)
-	case "attest":
-		return cmdCircleAttest(rest)
+	case "renew", "attest": // "attest": the name before 2026-11-05
+		return cmdCircleRenew(rest)
 	case "revoke":
 		return cmdCircleRevoke(rest)
 	case "passphrase":
@@ -70,7 +70,7 @@ func cmdCircle(args []string) error {
 	case "status":
 		return cmdCircleStatus(rest)
 	default:
-		return fmt.Errorf("usage: fabric circle init|admit|join|export|attest|revoke|passphrase|grant|status")
+		return fmt.Errorf("usage: fabric circle init|admit|join|export|renew|revoke|passphrase|grant|status")
 	}
 }
 
@@ -145,7 +145,7 @@ func cmdCircleInit(args []string) error {
 		fmt.Printf("overlay range %s (devices admitted with -tun get an address in it)\n", prefix)
 	}
 	fmt.Printf("user-key container: %s — back it up\n", c.KeyPath())
-	if err := attestDevice(*statePath, c, pass); err != nil {
+	if err := admitSelf(*statePath, c, pass); err != nil {
 		return err
 	}
 	fmt.Println("admit a device with: fabric circle admit <member> -circle " + c.Config.Name + " -out <file>, then fabric circle join <file> there (no key copy)")
@@ -171,8 +171,8 @@ func cmdCircleJoin(args []string) error {
 		return err
 	}
 	if !b.HasKey() {
-		// A device bundle: the attestation must be for this very device.
-		a, err := b.DeviceAttestation()
+		// A device bundle: the admission must be for this very device.
+		a, err := b.DeviceAdmission()
 		if err != nil {
 			return err
 		}
@@ -189,14 +189,14 @@ func cmdCircleJoin(args []string) error {
 			return err
 		}
 		if err := a.Verify(ed25519.PublicKey(raw), time.Now()); err != nil {
-			return fmt.Errorf("the bundle's attestation is not for this device: %w (the owner must admit this device's key: %s)", err, did.ForKey(ed25519.PublicKey(raw)))
+			return fmt.Errorf("the bundle's admission is not for this device: %w (the owner must admit this device's key: %s)", err, did.ForKey(ed25519.PublicKey(raw)))
 		}
 		c, err := circle.Join(root, b)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("joined circle %q  %s as a %s (no key on this device)\n", c.Config.Name, c.Config.DID, a.Role())
-		fmt.Printf("attested until %s; gate hints: %s\n", a.Expiry().Format("2006-01-02"), strings.Join(c.Config.Gates, " "))
+		fmt.Printf("admitted until %s; gate hints: %s\n", a.Expiry().Format("2006-01-02"), strings.Join(c.Config.Gates, " "))
 		if cl := vaultdaemon.TryClient(*vaultState); cl == nil {
 			fmt.Println("start the node daemon ('fabric up') if it is not running; a running one picks the circle up")
 		} else {
@@ -205,7 +205,7 @@ func cmdCircleJoin(args []string) error {
 		return nil
 	}
 	fmt.Fprintln(os.Stderr, "this bundle carries the circle KEY: joining makes this device a co-owner — it can mint buckets, admit and revoke devices, and revoking it later cannot take that back (a one-way door). For a device that should not own the circle, ask an owner for 'fabric circle admit' instead.")
-	fmt.Fprintf(os.Stderr, "joining circle %q — its passphrase is needed to attest this device: ", b.Config.Name)
+	fmt.Fprintf(os.Stderr, "joining circle %q — its passphrase is needed to admit this device: ", b.Config.Name)
 	pass, err := vaultcli.Passphrase()
 	if err != nil {
 		return err
@@ -215,7 +215,7 @@ func cmdCircleJoin(args []string) error {
 		return err
 	}
 	fmt.Printf("joined circle %q  %s as an owner (holds the key)\n", c.Config.Name, c.Config.DID)
-	if err := attestDevice(*statePath, c, pass); err != nil {
+	if err := admitSelf(*statePath, c, pass); err != nil {
 		return err
 	}
 	if cl := vaultdaemon.TryClient(*vaultState); cl == nil {
@@ -257,17 +257,17 @@ func cmdCircleExport(args []string) error {
 	return nil
 }
 
-// attestDevice signs this node's fabric device key into the circle
-// (circle.Attest) — the statement peers verify before they sync with it.
+// admitSelf signs this node's fabric device key into the circle
+// (circle.Admit) — the statement peers verify before they sync with it.
 // Needs the fabric identity; before 'fabric join' it only says what to run.
-func attestDevice(statePath string, c *circle.Circle, pass string) error {
+func admitSelf(statePath string, c *circle.Circle, pass string) error {
 	dir, err := state.Open(statePath)
 	if err != nil {
 		return err
 	}
 	devPriv, err := dir.LoadDeviceKey()
 	if err != nil {
-		fmt.Println("no fabric identity on this node yet — after 'fabric join', run 'fabric circle attest' so the circle's other devices serve this one")
+		fmt.Println("no fabric identity on this node yet — after 'fabric join', run 'fabric circle renew' so the circle's other devices serve this one")
 		return nil
 	}
 	raw, err := devPriv.GetPublic().Raw()
@@ -281,38 +281,38 @@ func attestDevice(statePath string, c *circle.Circle, pass string) error {
 	if err != nil {
 		return err
 	}
-	// Carry the device's current assert in this circle forward: the
+	// Carry the device's current admission in this circle forward: the
 	// membership cert when the circle is the one it was joined in (name,
-	// overlay address, owner verbs), else the attestation on disk. A bare
-	// re-attestation would outrank the named one by expiry in every
+	// overlay address, owner verbs), else the admission on disk. A bare
+	// re-admission would outrank the named one by expiry in every
 	// roster and strip the device of its address.
 	var prev *statement.Statement
 	firstCircle := false
 	if own, err := dir.LoadCert(); err == nil && own.Stmt != nil && own.Payload.Sub == c.Config.DID {
 		prev, firstCircle = own.Stmt, true
-	} else if cur, err := c.LoadAttestation(); err == nil && cur.Stmt != nil {
+	} else if cur, err := c.LoadAdmission(); err == nil && cur.Stmt != nil {
 		prev = cur.Stmt
 	}
 	now := time.Now()
-	a, err := circle.Reattest(priv, prev, c.Config.DID, ed25519.PublicKey(raw), now, circle.DefaultValidity)
+	a, err := circle.Renew(priv, prev, c.Config.DID, ed25519.PublicKey(raw), now, circle.DefaultValidity)
 	if err != nil {
 		return err
 	}
-	if err := c.SaveAttestation(a); err != nil {
+	if err := c.SaveAdmission(a); err != nil {
 		return err
 	}
 	kept := ""
 	if a.Name != "" || a.IP != "" {
 		kept = fmt.Sprintf(" as %s", strings.TrimSpace(a.Name+" "+a.IP))
 	}
-	fmt.Printf("device attested into circle %q%s until %s (%s) — a running daemon picks it up without restart\n", c.Config.Name, kept, a.Expiry().Format("2006-01-02"), c.AttestationPath())
+	fmt.Printf("device admitted into circle %q%s until %s (%s) — a running daemon picks it up without restart\n", c.Config.Name, kept, a.Expiry().Format("2006-01-02"), c.AdmissionPath())
 	if firstCircle {
-		// The circle is the one the device was joined in: the attestation
+		// The circle is the one the device was joined in: the admission
 		// *is* its membership cert there (same root, same statement
 		// shape), so the transport cert follows — through the daemon when
 		// it runs (spec §5 renewal: adopted and gossiped as a MemberAdded
 		// event), else written to cert.cbor (Codex review, 2026-11-05:
-		// the stored attestation changed while the handshake kept
+		// the stored admission changed while the handshake kept
 		// presenting the old cert).
 		return renewOwnCertFrom(dir, priv, a, now)
 	}
@@ -329,12 +329,12 @@ func certDue(own *cert.Cert, now time.Time, expiring bool) bool {
 	return expiring && now.After(nbf.Add(exp.Sub(nbf)/2))
 }
 
-// renewOwnCertFrom adopts a first-circle attestation as this device's
+// renewOwnCertFrom adopts a first-circle admission as this device's
 // membership cert.
-func renewOwnCertFrom(dir state.Dir, root ed25519.PrivateKey, a *circle.Attestation, now time.Time) error {
+func renewOwnCertFrom(dir state.Dir, root ed25519.PrivateKey, a *circle.Admission, now time.Time) error {
 	view, err := cert.FromStatement(a.Stmt)
 	if err != nil {
-		return fmt.Errorf("attestation as membership cert: %w", err)
+		return fmt.Errorf("admission as membership cert: %w", err)
 	}
 	client := daemon.NewClient(dir)
 	if _, err := client.Status(); err == nil {
@@ -359,16 +359,16 @@ func renewOwnCertFrom(dir state.Dir, root ed25519.PrivateKey, a *circle.Attestat
 	return nil
 }
 
-// cmdCircleAttest (re)signs this device into its circles: for nodes that
-// joined a circle before attestations existed, or that joined the mesh
+// cmdCircleRenew (re)signs this device into its circles: for nodes that
+// joined a circle before admissions existed, or that joined the mesh
 // after the circle, and for renewal. Without -circle, every circle lacking
-// a live attestation; with -expiring, also every one past half-life (the
+// a live admission; with -expiring, also every one past half-life (the
 // mesh's `renew -expiring` rule). Needs the circle key on this device.
-func cmdCircleAttest(args []string) error {
-	fs := flag.NewFlagSet("circle attest", flag.ExitOnError)
+func cmdCircleRenew(args []string) error {
+	fs := flag.NewFlagSet("circle renew", flag.ExitOnError)
 	statePath, vaultState := circleFlags(fs)
-	name := fs.String("circle", "", "attest into this circle only (default: every circle without a live attestation)")
-	expiring := fs.Bool("expiring", false, "also renew every attestation past half-life")
+	name := fs.String("circle", "", "admit into this circle only (default: every circle without a live admission)")
+	expiring := fs.Bool("expiring", false, "also renew every admission past half-life")
 	fs.Parse(args)
 	root, err := circleRoot(*statePath, *vaultState)
 	if err != nil {
@@ -388,14 +388,14 @@ func cmdCircleAttest(args []string) error {
 		}
 		now := time.Now()
 		// For the circle the device was joined in, the membership cert is
-		// the transport assert: it is due when it is, whatever the
-		// attestation file says (Codex review, 2026-11-05).
+		// the transport admission: it is due when it is, whatever the
+		// admission file says (Codex review, 2026-11-05).
 		var own *cert.Cert
 		if dir, err := state.Open(*statePath); err == nil {
 			own, _ = dir.LoadCert()
 		}
 		for _, c := range all {
-			a, err := c.LoadAttestation()
+			a, err := c.LoadAdmission()
 			switch {
 			case err != nil, a.Valid(now) != nil, c.Revoked(a, now):
 				targets = append(targets, c)
@@ -407,9 +407,9 @@ func cmdCircleAttest(args []string) error {
 		}
 		if len(targets) == 0 {
 			if *expiring {
-				fmt.Println("this device holds a live attestation in every circle it holds, none past half-life")
+				fmt.Println("this device holds a live admission in every circle it holds, none past half-life")
 			} else {
-				fmt.Println("this device holds a live attestation in every circle it holds ('-expiring' renews those past half-life)")
+				fmt.Println("this device holds a live admission in every circle it holds ('-expiring' renews those past half-life)")
 			}
 			return nil
 		}
@@ -423,7 +423,7 @@ func cmdCircleAttest(args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := attestDevice(*statePath, c, pass); err != nil {
+		if err := admitSelf(*statePath, c, pass); err != nil {
 			return fmt.Errorf("circle %q: %w", c.Config.Name, err)
 		}
 	}
@@ -506,8 +506,8 @@ func cmdCircleStatus(args []string) error {
 		return nil
 	}
 	now := time.Now()
-	// The membership cert doubles as the attestation into the circle that
-	// issued it (one assert per device since the mesh-root merge).
+	// The membership cert doubles as the admission into the circle that
+	// issued it (one admission per device since the mesh-root merge).
 	var ownCert *cert.Cert
 	if dir, err := state.Open(*statePath); err == nil {
 		ownCert, _ = dir.LoadCert()
@@ -521,10 +521,10 @@ func cmdCircleStatus(args []string) error {
 		if len(c.Config.Gates) > 0 {
 			fmt.Printf("  gates: %s\n", strings.Join(c.Config.Gates, " "))
 		}
-		a, err := c.LoadAttestation()
+		a, err := c.LoadAdmission()
 		if (err != nil || a.Valid(now) != nil) && ownCert != nil && ownCert.Stmt != nil && ownCert.Payload.Sub == c.Config.DID {
 			if raw, merr := ownCert.Marshal(); merr == nil {
-				if fromCert, uerr := circle.UnmarshalAttestation(raw); uerr == nil {
+				if fromCert, uerr := circle.UnmarshalAdmission(raw); uerr == nil {
 					a, err = fromCert, nil
 				}
 			}
@@ -537,31 +537,31 @@ func cmdCircleStatus(args []string) error {
 		default:
 			fmt.Println("  role: device (no key on this device)")
 		}
-		renew := fmt.Sprintf("run 'fabric circle attest -circle %s'", c.Config.Name)
+		renew := fmt.Sprintf("run 'fabric circle renew -circle %s'", c.Config.Name)
 		if !c.HasKey() {
 			renew = "an owner device re-admits it with 'fabric circle admit'"
 		}
 		switch {
 		case err != nil:
-			fmt.Printf("  device: NOT attested — %s; until then no peer serves this circle to this device\n", renew)
+			fmt.Printf("  device: NOT admitted — %s; until then no peer serves this circle to this device\n", renew)
 		case c.Revoked(a, now):
 			fmt.Printf("  device: REVOKED by the circle (as of its revocation list) — peers refuse this device; an owner device re-admits it\n")
 		case a.Valid(now) != nil:
-			fmt.Printf("  device: attestation EXPIRED %s — %s\n", a.Expiry().Format("2006-01-02"), renew)
+			fmt.Printf("  device: admission EXPIRED %s — %s\n", a.Expiry().Format("2006-01-02"), renew)
 		default:
 			left := int(a.Expiry().Sub(now).Hours() / 24)
 			note := ""
 			if a.Legacy() {
-				note = "; legacy attestation, window implied from issue date"
+				note = "; legacy admission, window implied from issue date"
 			}
 			if a.PastHalfLife(now) {
 				if c.HasKey() {
-					note += "; past half-life — renew with 'fabric circle attest -expiring'"
+					note += "; past half-life — renew with 'fabric circle renew -expiring'"
 				} else {
 					note += "; past half-life — an owner device re-admits it"
 				}
 			}
-			fmt.Printf("  device: attested until %s (%dd left%s)\n", a.Expiry().Format("2006-01-02"), left, note)
+			fmt.Printf("  device: admitted until %s (%dd left%s)\n", a.Expiry().Format("2006-01-02"), left, note)
 		}
 		if rs, err := c.Revocations(now); err == nil && len(rs) > 0 {
 			fmt.Printf("  revocations: %d held (latest %s)\n", len(rs), rs[len(rs)-1].Time().Format("2006-01-02"))
@@ -605,7 +605,7 @@ func cmdCircleStatus(args []string) error {
 			for _, hc := range p.Circles {
 				claims = append(claims, hc.Name)
 			}
-			fmt.Printf("  %-16s vault %s  claims %s — shares nothing verified with this device (attest, or no circle in common)\n", p.Name, p.Version, strings.Join(claims, ", "))
+			fmt.Printf("  %-16s vault %s  claims %s — shares nothing verified with this device (admit, or no circle in common)\n", p.Name, p.Version, strings.Join(claims, ", "))
 		case p.Vault:
 			fmt.Printf("  %-16s vault %s  no circle\n", p.Name, p.Version)
 		default:
@@ -615,11 +615,11 @@ func cmdCircleStatus(args []string) error {
 	return nil
 }
 
-// cmdCircleRevoke signs a device out of a circle: every attestation it holds
+// cmdCircleRevoke signs a device out of a circle: every admission it holds
 // for the circle, issued up to now, is dead; devices of the circle learn it
 // on their next circle exchange, and the running daemon here pushes it to
 // the ones connected now. Needs the circle key — an owner device. A later
-// attestation (an owner re-attesting the device) is a re-admission and
+// admission (an owner re-admitting the device) is a re-admission and
 // stands.
 func cmdCircleRevoke(args []string) error {
 	fs := flag.NewFlagSet("circle revoke", flag.ExitOnError)
@@ -679,7 +679,7 @@ func cmdCircleRevoke(args []string) error {
 			fmt.Println("no running node daemon here — connected devices learn it at their next circle exchange ('fabric up' pushes it)")
 		}
 	}
-	fmt.Println("to re-admit the device later, attest it again on an owner device (an attestation issued after the revocation stands)")
+	fmt.Println("to re-admit the device later, admit it again on an owner device (an admission issued after the revocation stands)")
 	return nil
 }
 
@@ -750,9 +750,9 @@ func circlePrefix(root string, c *circle.Circle, subnet string) (string, error) 
 	return prefix, nil
 }
 
-// recordOnDisk adds the attestation to the roster file directly — the CLI
+// recordOnDisk adds the admission to the roster file directly — the CLI
 // is the only writer when no daemon runs here.
-func recordOnDisk(roster *circle.Roster, a *circle.Attestation, now time.Time) error {
+func recordOnDisk(roster *circle.Roster, a *circle.Admission, now time.Time) error {
 	nr, _, err := roster.Add(a.Stmt, now)
 	if err != nil {
 		return err
@@ -830,7 +830,7 @@ func listedGateHints(statePath string) []string {
 
 // cmdCircleAdmit signs a device into a circle without copying the key
 // (task circle-member-devices, slice D): an owner device resolves the
-// device's key, signs a device assert with the role's verbs — `device`
+// device's key, signs a admission with the role's verbs — `device`
 // (sync, blob, subjects) or `gate` (`member, host` only: a public hop that
 // reads nothing) — plus `tun` and an address in the circle's range when
 // asked, records it in the circle's roster through the running daemon (so
@@ -842,9 +842,9 @@ func cmdCircleAdmit(args []string) error {
 	statePath, vaultState := circleFlags(fs)
 	name := fs.String("circle", "", "which circle (required when the node holds several)")
 	role := fs.String("role", circle.RoleDevice, "device (sync, blob, subjects) or gate (member, host only)")
-	label := fs.String("name", "", "human label signed into the attestation (default: the member's name)")
+	label := fs.String("name", "", "human label signed into the admission (default: the member's name)")
 	tun := fs.Bool("tun", false, "also sign tun and an address in the circle's overlay range")
-	validity := fs.Duration("validity", circle.DefaultValidity, "attestation lifetime")
+	validity := fs.Duration("validity", circle.DefaultValidity, "admission lifetime")
 	out := fs.String("out", "", "bundle file to write for the device (required)")
 	var gates stringList
 	fs.Var(&gates, "gate", "gate hint for the device: a listed device of the circle, multiaddr with /p2p/ (repeatable; default: the circle's recorded hints plus this node's own when listed)")
@@ -923,12 +923,12 @@ func cmdCircleAdmit(args []string) error {
 			return fmt.Errorf("circle %q has no overlay range — 'fabric circle init -subnet' set one at minting; this circle was minted without", c.Config.Name)
 		}
 		// Every address anyone holds in this circle: the roster file, this
-		// device's own assert (attestation or cert) and, when the daemon
+		// device's own admission (admission or cert) and, when the daemon
 		// runs, its union view including lapsed devices (the first circle's
 		// addresses live in certs and the event log, not in devices.cbor;
 		// Codex review, 2026-11-04).
 		taken := roster.UsedIPs()
-		if own, err := c.LoadAttestation(); err == nil && own.IP != "" {
+		if own, err := c.LoadAdmission(); err == nil && own.IP != "" {
 			taken = append(taken, own.IP)
 		}
 		if own, err := dir.LoadCert(); err == nil && own != nil && own.Payload.Sub == c.Config.DID && own.Payload.Meta.IP != "" {
@@ -989,7 +989,7 @@ func cmdCircleAdmit(args []string) error {
 	if err != nil {
 		return err
 	}
-	a, err := circle.AttestWith(priv, nil, c.Config.DID, devicePub, now, *validity, verbs, meta)
+	a, err := circle.AdmitWith(priv, nil, c.Config.DID, devicePub, now, *validity, verbs, meta)
 	if err != nil {
 		return err
 	}

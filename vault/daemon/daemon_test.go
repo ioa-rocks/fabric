@@ -136,28 +136,28 @@ func exportCircle(t *testing.T, statePath, name string) *circle.Bundle {
 	return b
 }
 
-// attestDevice signs the node's device key into every circle it holds, as
-// the CLI does at init/join/attest.
-func attestDevice(t *testing.T, statePath string, devicePub ed25519.PublicKey) {
+// admitSelf signs the node's device key into every circle it holds, as
+// the CLI does at init/join/admit.
+func admitSelf(t *testing.T, statePath string, devicePub ed25519.PublicKey) {
 	t.Helper()
 	cs, err := circle.List(circle.Root(statePath))
 	if err != nil {
 		t.Fatalf("circle.List: %v", err)
 	}
 	for _, c := range cs {
-		if _, err := c.LoadAttestation(); err == nil {
+		if _, err := c.LoadAdmission(); err == nil {
 			continue
 		}
 		priv, err := c.Unlock("pw")
 		if err != nil {
 			t.Fatalf("Unlock: %v", err)
 		}
-		a, err := circle.Attest(priv, devicePub, time.Now())
+		a, err := circle.Admit(priv, devicePub, time.Now())
 		if err != nil {
-			t.Fatalf("Attest: %v", err)
+			t.Fatalf("Admit: %v", err)
 		}
-		if err := c.SaveAttestation(a); err != nil {
-			t.Fatalf("SaveAttestation: %v", err)
+		if err := c.SaveAdmission(a); err != nil {
+			t.Fatalf("SaveAdmission: %v", err)
 		}
 	}
 }

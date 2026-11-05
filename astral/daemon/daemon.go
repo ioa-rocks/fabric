@@ -103,7 +103,7 @@ type request struct {
 
 	// Principal is set when the connection peer acts for a sub-key (or a
 	// grantee): the host verifies the envelope and checks that chain, not
-	// the peer's own assert.
+	// the peer's own admission.
 	Principal *astral.Principal `cbor:"principal,omitempty"`
 	// Reply asks the host to allocate a reply slot for this append.
 	Reply bool `cbor:"reply,omitempty"`
@@ -805,7 +805,7 @@ func (d *Daemon) authorizePrincipal(p peer.ID, pr *astral.Principal, op Op, ref 
 func (d *Daemon) gateStream(next network.StreamHandler) network.StreamHandler {
 	return func(s network.Stream) {
 		p := s.Conn().RemotePeer()
-		// Any of this node's own asserts may admit astral, not only the
+		// Any of this node's own admissions may admit astral, not only the
 		// first circle's cert (Codex review, 2026-11-05).
 		if !d.Fabric.Auth.OwnScopeAllows("astral") {
 			s.Reset()
@@ -927,9 +927,9 @@ func (d *Daemon) bareNames(refs []astral.Ref) []string {
 var ErrDenied = errors.New("astral: denied")
 
 // authorize asks the circle service whether the connection peer may do
-// verb on ref: its device attestation in ref's circle (or its membership
+// verb on ref: its device admission in ref's circle (or its membership
 // cert for the home circle), checked at every call — window, scope, roots,
-// revocations (memo §17 item 3: honoured up to the verbs on the assert).
+// revocations (memo §17 item 3: honoured up to the verbs on the admission).
 // Solo nodes have no peers; a mesh node without a circle service fails
 // closed.
 func (d *Daemon) authorize(p peer.ID, ref astral.Ref, verb string) error {
@@ -952,7 +952,7 @@ func (d *Daemon) authorize(p peer.ID, ref astral.Ref, verb string) error {
 }
 
 // authorizeMember checks that the connection peer is a live device of a
-// circle (its assert there is still valid), asking for no verb beyond
+// circle (its admission there is still valid), asking for no verb beyond
 // member: what a reply slot's reader or appender must at least be.
 func (d *Daemon) authorizeMember(p peer.ID, circle string) error {
 	if d.Fabric == nil {
@@ -1161,7 +1161,7 @@ func (d *Daemon) serve(ctx context.Context, req request, remote peer.ID) (resp r
 		// bytes with the hold so a re-check never depends on the peer.
 		hold.Chain, _ = d.Fabric.Circle.PresentedChain(remote, req.Principal.AuthID(), req.Principal.Key)
 	} else if req.Principal == nil && d.Fabric != nil && d.Fabric.Circle != nil {
-		// Likewise the device's own attestation in the ref's circle: a
+		// Likewise the device's own admission in the ref's circle: a
 		// holder that goes offline is still checked against its circle's
 		// window and revocations (Codex review, 2026-11-03).
 		hold.Chain, _ = d.Fabric.Circle.DeviceChain(remote, ref.Circle)
@@ -1267,7 +1267,7 @@ func (d *Daemon) learnRegistry(from peer.ID, refs []astral.Ref) error {
 }
 
 // hostable keeps the announced refs the peer's chain lets it host (memo
-// §12.4: announcements accepted only from attested holders of that
+// §12.4: announcements accepted only from admitted holders of that
 // circle); the rest are dropped and logged.
 func (d *Daemon) hostable(p peer.ID, refs []astral.Ref) []astral.Ref {
 	out := make([]astral.Ref, 0, len(refs))

@@ -10,9 +10,9 @@ import (
 	"ioa.rocks/fabric/statement"
 )
 
-// A roster records a circle's device asserts with their verdicts: live
+// A roster records a circle's admissions with their verdicts: live
 // inside the window, lapsed after it (memory), dead when revoked by ID or
-// swept; a later-expiring assert wins whatever the order; it persists as
+// swept; a later-expiring admission wins whatever the order; it persists as
 // statement bytes and reloads with the same verdicts.
 func TestRosterLifecycle(t *testing.T) {
 	root, err := Init(t.TempDir(), "family", "pw")
@@ -31,8 +31,8 @@ func TestRosterLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	short, _ := AttestFor(priv, devPub, now, time.Hour)
-	long, _ := AttestFor(priv, devPub, now, 2*time.Hour)
+	short, _ := AdmitFor(priv, devPub, now, time.Hour)
+	long, _ := AdmitFor(priv, devPub, now, 2*time.Hour)
 	before := roster
 	roster, fresh, err := roster.Add(long.Stmt, now)
 	if err != nil || !fresh {
@@ -42,10 +42,10 @@ func TestRosterLifecycle(t *testing.T) {
 		t.Fatal("Add mutated the roster it was called on — a roster is a value")
 	}
 	if _, fresh, _ := roster.Add(short.Stmt, now); fresh {
-		t.Fatal("a shorter assert replaced a longer one")
+		t.Fatal("a shorter admission replaced a longer one")
 	}
 	if _, fresh, _ := roster.Add(long.Stmt, now); fresh {
-		t.Fatal("the same assert counted as fresh twice")
+		t.Fatal("the same admission counted as fresh twice")
 	}
 	if err := roster.Save(); err != nil {
 		t.Fatal(err)
@@ -72,11 +72,11 @@ func TestRosterLifecycle(t *testing.T) {
 		t.Fatalf("reloaded roster has %d entries, want 1", again.Len())
 	}
 	if dev, ok := again.Live(devDID, now); !ok || dev.Stmt.ID() != long.Stmt.ID() {
-		t.Fatal("reloaded roster lost the live assert")
+		t.Fatal("reloaded roster lost the live admission")
 	}
 
-	// Revocation by ID kills that assert; the device is reported revoked
-	// until it would have expired; a fresh assert re-admits.
+	// Revocation by ID kills that admission; the device is reported revoked
+	// until it would have expired; a fresh admission re-admits.
 	id := long.Stmt.ID()
 	byID, err := RevokeAs(priv, nil, root.Config.DID, statement.Target{ID: id[:]}, now)
 	if err != nil {
@@ -91,12 +91,12 @@ func TestRosterLifecycle(t *testing.T) {
 		t.Fatal("the pre-revocation roster changed under a reader")
 	}
 	if _, ok := roster.Live(devDID, now); ok {
-		t.Fatal("revoked assert still live")
+		t.Fatal("revoked admission still live")
 	}
 	if until, ok := roster.Revoked(devDID, now); !ok || !until.Equal(long.Expiry()) {
-		t.Fatalf("Revoked = %v, %v; want until the assert's expiry", until, ok)
+		t.Fatalf("Revoked = %v, %v; want until the admission's expiry", until, ok)
 	}
-	renewed, _ := AttestFor(priv, devPub, now.Add(time.Second), time.Hour)
+	renewed, _ := AdmitFor(priv, devPub, now.Add(time.Second), time.Hour)
 	if roster, _, err = roster.Add(renewed.Stmt, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -104,11 +104,11 @@ func TestRosterLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, ok := roster.Live(devDID, now.Add(time.Second)); !ok {
-		t.Fatal("re-attested device not live")
+		t.Fatal("re-admitted device not live")
 	}
 
 	// Revocations persist with the circle: a reload sees the by-ID
-	// revocation but the renewed assert stands.
+	// revocation but the renewed admission stands.
 	if _, err := root.AddRevocations(now, byID); err != nil {
 		t.Fatal(err)
 	}
@@ -117,11 +117,11 @@ func TestRosterLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	if dev, ok := reloaded.Live(devDID, now.Add(time.Second)); !ok || dev.Stmt.ID() != renewed.Stmt.ID() {
-		t.Fatal("reload did not keep the renewed assert live under the by-ID revocation")
+		t.Fatal("reload did not keep the renewed admission live under the by-ID revocation")
 	}
 }
 
-// A sweep (device, before) kills asserts issued up to it, leaves later
+// A sweep (device, before) kills admissions issued up to it, leaves later
 // ones, and tombstones an unknown device for a day.
 func TestRosterSweep(t *testing.T) {
 	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
@@ -129,24 +129,24 @@ func TestRosterSweep(t *testing.T) {
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	devDID := did.ForKey(devPub)
 	then := time.Now().Add(-time.Hour)
-	old, _ := AttestFor(rootPriv, devPub, then, 2*time.Hour)
+	old, _ := AdmitFor(rootPriv, devPub, then, 2*time.Hour)
 	roster, _, err := roster.Add(old.Stmt, then)
 	if err != nil {
 		t.Fatal(err)
 	}
 	roster, _ = roster.Sweep(devDID, then.Add(time.Minute))
 	if _, ok := roster.Live(devDID, time.Now()); ok {
-		t.Fatal("swept assert still live")
+		t.Fatal("swept admission still live")
 	}
 	if _, ok := roster.Revoked(devDID, time.Now()); !ok {
 		t.Fatal("swept device not reported revoked")
 	}
-	fresh, _ := AttestFor(rootPriv, devPub, time.Now(), time.Hour)
+	fresh, _ := AdmitFor(rootPriv, devPub, time.Now(), time.Hour)
 	if roster, _, err = roster.Add(fresh.Stmt, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := roster.Live(devDID, time.Now()); !ok {
-		t.Fatal("assert issued after the sweep not live")
+		t.Fatal("admission issued after the sweep not live")
 	}
 	if _, ok := roster.Revoked(devDID, time.Now()); ok {
 		t.Fatal("re-admitted device still reported revoked")
@@ -169,7 +169,7 @@ func must(pub ed25519.PublicKey, _ ed25519.PrivateKey, err error) ed25519.Public
 	return pub
 }
 
-// Two asserts for one device with the same window (issued within the same
+// Two admissions for one device with the same window (issued within the same
 // second) are ordered by statement ID, not by arrival: both orders keep
 // the same one.
 func TestRosterTieBreakIsDeterministic(t *testing.T) {
@@ -177,8 +177,8 @@ func TestRosterTieBreakIsDeterministic(t *testing.T) {
 	priv, _ := root.Unlock("pw")
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	now := time.Now()
-	a, _ := AttestWith(priv, nil, root.Config.DID, devPub, now, time.Hour, DeviceVerbs, &statement.Meta{Name: "a"})
-	b, _ := AttestWith(priv, nil, root.Config.DID, devPub, now, time.Hour, DeviceVerbs, &statement.Meta{Name: "b"})
+	a, _ := AdmitWith(priv, nil, root.Config.DID, devPub, now, time.Hour, DeviceVerbs, &statement.Meta{Name: "a"})
+	b, _ := AdmitWith(priv, nil, root.Config.DID, devPub, now, time.Hour, DeviceVerbs, &statement.Meta{Name: "b"})
 	if a.Expiry() != b.Expiry() {
 		t.Skip("windows differ (second boundary crossed)")
 	}
@@ -206,9 +206,9 @@ func TestRenewalWithFewerVerbsDemotes(t *testing.T) {
 	dev := did.ForKey(devPub)
 	now := time.Now()
 	tunVerbs := append(append([]string{}, DeviceVerbs...), statement.VerbTun)
-	withIP, _ := AttestWith(priv, nil, c.Config.DID, devPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
-	plain, _ := AttestFor(priv, devPub, now, 2*time.Hour)
-	for _, order := range [][]*Attestation{{withIP, plain}, {plain, withIP}} {
+	withIP, _ := AdmitWith(priv, nil, c.Config.DID, devPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	plain, _ := AdmitFor(priv, devPub, now, 2*time.Hour)
+	for _, order := range [][]*Admission{{withIP, plain}, {plain, withIP}} {
 		r := NewRoster(statement.NewDIDRoot(c.Config.DID))
 		for _, a := range order {
 			r, _, _ = r.Add(a.Stmt, now)
@@ -220,7 +220,7 @@ func TestRenewalWithFewerVerbsDemotes(t *testing.T) {
 	}
 }
 
-// Three asserts for one device under one root with unrelated grants and
+// Three admissions for one device under one root with unrelated grants and
 // different expiries: every arrival order selects the same one. (A rule
 // that is not a total order over the entries — "the wider grant wins",
 // then expiry — cycles over such a triple: Codex review, 2026-11-05.)
@@ -231,10 +231,10 @@ func TestRosterConvergesOverThreeAsserts(t *testing.T) {
 	dev := did.ForKey(devPub)
 	now := time.Now()
 	m := statement.VerbMember
-	a, _ := AttestWith(priv, nil, c.Config.DID, devPub, now, time.Hour, []string{m, statement.VerbHost, statement.VerbSync}, nil)
-	b, _ := AttestWith(priv, nil, c.Config.DID, devPub, now, 3*time.Hour, []string{m, statement.VerbHost}, nil)
-	d, _ := AttestWith(priv, nil, c.Config.DID, devPub, now, 2*time.Hour, []string{m, statement.VerbSync, statement.VerbBlob}, nil)
-	all := []*Attestation{a, b, d}
+	a, _ := AdmitWith(priv, nil, c.Config.DID, devPub, now, time.Hour, []string{m, statement.VerbHost, statement.VerbSync}, nil)
+	b, _ := AdmitWith(priv, nil, c.Config.DID, devPub, now, 3*time.Hour, []string{m, statement.VerbHost}, nil)
+	d, _ := AdmitWith(priv, nil, c.Config.DID, devPub, now, 2*time.Hour, []string{m, statement.VerbSync, statement.VerbBlob}, nil)
+	all := []*Admission{a, b, d}
 	orders := [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
 	want := [32]byte{}
 	for i, order := range orders {
@@ -246,10 +246,10 @@ func TestRosterConvergesOverThreeAsserts(t *testing.T) {
 		if i == 0 {
 			want = got.Stmt.ID()
 			if want != b.Stmt.ID() {
-				t.Fatal("the latest-expiring assert did not win")
+				t.Fatal("the latest-expiring admission did not win")
 			}
 		} else if got.Stmt.ID() != want {
-			t.Fatalf("order %v selects a different assert", order)
+			t.Fatalf("order %v selects a different admission", order)
 		}
 	}
 }

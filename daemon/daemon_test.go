@@ -299,9 +299,9 @@ func containsStr(s, sub string) bool {
 }
 
 // Cold start (slice E): a machine with no circle installs a device bundle
-// — the attestation an owner signed for its key, the circle's config and
+// — the admission an owner signed for its key, the circle's config and
 // gate hints — and is thereby a device of exactly that circle. It dials
-// the gate the bundle names, presents its assert for that circle alone,
+// the gate the bundle names, presents its admission for that circle alone,
 // learns the circle's roster by gossip through the gate, and never holds a
 // roster for the owner's other circle.
 func TestColdStartDeviceJoinsOneCircleThroughGate(t *testing.T) {
@@ -327,8 +327,8 @@ func TestColdStartDeviceJoinsOneCircleThroughGate(t *testing.T) {
 	}
 	famPriv, _ := fam.Unlock("pw")
 	famDID := fam.Config.DID
-	own, _ := circle.Attest(famPriv, mustDevicePub(t, desk), time.Now())
-	if err := fam.SaveAttestation(own); err != nil {
+	own, _ := circle.Admit(famPriv, mustDevicePub(t, desk), time.Now())
+	if err := fam.SaveAdmission(own); err != nil {
 		t.Fatal(err)
 	}
 	desk.Circle.Circles()
@@ -336,7 +336,7 @@ func TestColdStartDeviceJoinsOneCircleThroughGate(t *testing.T) {
 
 	// The gate is admitted as a gate (member, host) and installs its bundle.
 	gateVerbs, _ := circle.VerbsForRole(circle.RoleGate)
-	gateAtt, err := circle.AttestWith(famPriv, nil, famDID, mustDevicePub(t, gate), time.Now(), time.Hour, gateVerbs, &statement.Meta{Name: "gate"})
+	gateAtt, err := circle.AdmitWith(famPriv, nil, famDID, mustDevicePub(t, gate), time.Now(), time.Hour, gateVerbs, &statement.Meta{Name: "gate"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +360,7 @@ func TestColdStartDeviceJoinsOneCircleThroughGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	coldRaw, _ := coldPriv.GetPublic().Raw()
-	coldAtt, err := circle.AttestWith(famPriv, nil, famDID, ed25519.PublicKey(coldRaw), time.Now(), time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "her-pc"})
+	coldAtt, err := circle.AdmitWith(famPriv, nil, famDID, ed25519.PublicKey(coldRaw), time.Now(), time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "her-pc"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +387,7 @@ func TestColdStartDeviceJoinsOneCircleThroughGate(t *testing.T) {
 		t.Fatalf("cold device's first circle = %s, want family", cold.CircleDID())
 	}
 	if c := cold.OwnCert(); c == nil || c.Payload.Sub != famDID || c.Payload.Meta.Name != "her-pc" {
-		t.Fatalf("cold device's own assert view: %+v", c)
+		t.Fatalf("cold device's own admission view: %+v", c)
 	}
 	coldRawAtt, _ := coldAtt.Marshal()
 	if _, err := desk.Circle.Admit(coldRawAtt); err != nil {
@@ -429,10 +429,10 @@ func TestColdStartDeviceJoinsOneCircleThroughGate(t *testing.T) {
 	if _, ok := cold.Store.RosterFor(mainDID); ok {
 		t.Fatal("her PC holds a roster for the desk's other circle")
 	}
-	// Gossip through the gate brings her the owner's own assert.
+	// Gossip through the gate brings her the owner's own admission.
 	deskDID, _ := fabricnet.DeviceDID(desk.Host.ID())
 	coldFam, _ := cold.Store.RosterFor(famDID)
-	waitFor("her PC to learn the desk's family assert through the gate", func() bool {
+	waitFor("her PC to learn the desk's family admission through the gate", func() bool {
 		_, live := coldFam.Live(deskDID, time.Now())
 		return live
 	})
@@ -469,7 +469,7 @@ func TestFirstCircleAdmissionSurvivesRestart(t *testing.T) {
 	}
 	attachCircles(d)
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	att, _ := circle.AttestWith(nsPriv, nil, cert.DIDForKey(nsPriv.Public().(ed25519.PublicKey)), devPub, time.Now(), time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "nas"})
+	att, _ := circle.AdmitWith(nsPriv, nil, cert.DIDForKey(nsPriv.Public().(ed25519.PublicKey)), devPub, time.Now(), time.Hour, circle.DeviceVerbs, &statement.Meta{Name: "nas"})
 	raw, _ := att.Marshal()
 	if fresh, err := d.Circle.Admit(raw); err != nil || !fresh {
 		t.Fatalf("Admit: %v %v", fresh, err)

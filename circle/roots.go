@@ -46,7 +46,7 @@ func (h HeldRoots) RootKeys(circleDID string) []ed25519.PublicKey {
 }
 
 // didKeyRoots resolves a circle DID that is a did:key straight to its key:
-// what a verifier does for a circle it does not hold (an attestation's own
+// what a verifier does for a circle it does not hold (an admission's own
 // circle, a foreign grant's issuer).
 type didKeyRoots struct{}
 

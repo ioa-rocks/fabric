@@ -30,13 +30,13 @@ go build -o fabric ./cmd/fabric
 
 ## Quickstart: a two-device mesh
 
-Fabric has no accounts and no cloud: a *namespace* is an ed25519 root
+Fabric has no accounts and no cloud: a *circle* is an ed25519 root
 key, membership is a certificate signed by it, and admission is a human
-clicking approve. The first device mints the namespace and becomes the
+clicking approve. The first device mints the circle and becomes the
 **master** (it holds the root key; keep it on the machine you actually
 sit at — it does not need to be always-on or publicly reachable).
 
-**1. On the first device — create the namespace and start the node:**
+**1. On the first device — create the circle and start the node:**
 
 ```sh
 fabric init -name work-pc
@@ -46,10 +46,10 @@ fabric up
 `init` asks for a passphrase; the root key is stored encrypted (age,
 scrypt) at `<state>/namespace.key.age`. **Back that file up and test the
 restore** — losing it means re-keying the mesh. The same key is minted as
-the node's *home circle* (`-circle`, default `home`): the namespace DID is
-the circle DID, and a device's membership cert is also its attestation
+the node's *home circle* (`-circle`, default `home`): the circle DID is
+the circle DID, and a device's membership cert is also its admission
 into that circle, so buckets and queues of the home circle need no extra
-`circle attest`. `up` logs the node's addresses:
+`circle renew`. `up` logs the node's addresses:
 
 ```
 listening on /ip4/…/tcp/4517/p2p/12D3KooW…
@@ -248,7 +248,7 @@ Or skip the multiaddr entirely: publish the DNS record that `fabric
 announce txt` prints on the lighthouse —
 
 ```
-_fabric.gate.example.com. 300 IN TXT "v=fabric1; peer=<peer-id>; ns=<namespace-did>"
+_fabric.gate.example.com. 300 IN TXT "v=fabric1; peer=<peer-id>; ns=<circle-did>"
 ```
 
 — and every future device joins with just:
@@ -258,13 +258,13 @@ fabric join -name laptop gate.example.com
 ```
 
 The TXT record supplies the peer-ID pin, and its `ns=` entry pre-pins
-the namespace: the join hard-fails if the queue host serves a
+the circle: the join hard-fails if the queue host serves a
 different one. Without `ns=` (or when joining by multiaddr), the
-joiner prints the namespace DID it is about to trust — compare it with
+joiner prints the circle DID it is about to trust — compare it with
 the master's UI header in the same glance that compares the joiner's
 fingerprint. Both checks exist because DNS alone is spoofable: a
 hijacked name must not be able to usher your device into an impostor
-namespace.
+circle.
 
 The request waits in cloud-a's queue; `fabric pending` / the UI on the
 master shows it (pulled remotely over the queue protocol, which answers only the master's device),
@@ -375,7 +375,7 @@ follow-up.
 To re-join an expired device that still has its state directory: stop
 the daemon, move `config.json` and `cert.cbor` aside, run `fabric join
 -name <its name> -bootstrap <a queue host>`, approve on the master, put
-the old `config.json` back (same namespace; it carries `queue_host`,
+the old `config.json` back (same circle; it carries `queue_host`,
 `announce_addrs`, bootstrap pins) and start the daemon.
 
 ## Kicking a device out
@@ -397,9 +397,9 @@ revocation records self-delete once the cert they kill would have
 expired anyway. Re-admitting a revoked device means a fresh
 `fabric join`.
 
-### Circle attestations: the same lifecycle, one layer up
+### Circle admissions: the same lifecycle, one layer up
 
-A device's *circle attestation* (what makes peers of a circle serve it)
+A device's *circle admission* (what makes peers of a circle serve it)
 lives one year like a cert. An **owner** (a device holding the circle
 key) admits a device without copying the key:
 
@@ -413,19 +413,19 @@ fabric circle join her.bundle
 ```
 
 The bundle carries the circle's config, gate hints and the device's
-attestation; the owner's running daemon records the device in the
+admission; the owner's running daemon records the device in the
 circle's roster at once and gossips it to the circle's devices, so the
 device is admitted the moment it connects (`-tun` also signs an address
 in the circle's overlay range). `circle status` names the role: owner /
-device / gate. A device's attestation is renewed by the owner admitting
-it again; an owner's own with `fabric circle attest -expiring` (a renewal
+device / gate. A device's admission is renewed by the owner admitting
+it again; an owner's own with `fabric circle renew -expiring` (a renewal
 keeps the device's name, overlay address and verbs). A key
 copy (`circle export` / `circle join` of a bundle with the key) makes a
-co-owner — a one-way door, since revoking that device's attestation
+co-owner — a one-way door, since revoking that device's admission
 later cannot take root authority back.
 
 ```sh
-fabric circle attest -expiring            # renew this owner device's attestation past half-life
+fabric circle renew -expiring            # renew this owner device's admission past half-life
 fabric circle revoke her-pc -circle family # an owner device signs a device out
 ```
 
@@ -435,13 +435,13 @@ revocation sets on every circle exchange (`/fabric/circle/3`), and the
 daemon on the revoking node pushes the new one to every member connected
 right now, so the revoked device drops out of that circle's sync at
 once wherever the news reaches, and at the next connect elsewhere.
-Expiry is the backstop. A revocation kills the device's attestations
-issued up to that moment; attesting the device again afterwards is a
+Expiry is the backstop. A revocation kills the device's admissions
+issued up to that moment; admitting the device again afterwards is a
 deliberate re-admission and stands. `fabric status` warns loudly about
-expired, expiring and revoked attestations, as it does for certs.
-Attestations minted before 2026-10-31 carry no window and count as
+expired, expiring and revoked admissions, as it does for certs.
+Admissions minted before 2026-10-31 carry no window and count as
 valid for one year from issue; nodes older than that verify newer
-attestations but enforce neither expiry nor revocation until upgraded.
+admissions but enforce neither expiry nor revocation until upgraded.
 
 ## The TUN bridge — plain IP over the mesh
 
@@ -469,7 +469,7 @@ listen on QUIC (UDP) and TCP, IPv4 and IPv6, so the bridge rides a UDP
 underlay whenever both ends support it.
 
 Certs issued before the bridge existed carry no overlay IP — re-join
-(or re-init a young namespace) to get addressed.
+(or re-init a young circle) to get addressed.
 
 ## Run it as a service
 
@@ -538,7 +538,7 @@ binary you intend to distribute. Release artifacts and mixed-architecture
 fleets remain future deployment work.
 
 The web UI is deliberately *not* a service: `fabric ui` holds the
-namespace root key (signs approvals, revocations, renewals) and should
+root key (signs approvals, revocations, renewals) and should
 only run interactively on the master, unlocked when you need it —
 that's the cold-key custody model, not an oversight.
 
@@ -624,7 +624,7 @@ and inspection.
 (overlapping-circles memo §12.4, §17): two circles may both have a
 `subject:jobs`, and a node hosting for several keeps them apart. Every
 `fabric astral` command takes `-circle <did>`; without it a name is in this
-node's *home circle* (the namespace DID), which is also what a journal
+node's *home circle* (the circle DID), which is also what a journal
 written before this change migrates into on first start.
 
 Subject placement is discovered between authenticated Fabric members. A node
@@ -638,7 +638,7 @@ served and dialed for one release, with bare names meaning the home circle.
 
 **Every verb is checked against the caller's chain.** The host asks the
 circle service whether the connection peer may do the verb on that
-`(circle, name)`: its device attestation in that circle (from the circle
+`(circle, name)`: its device admission in that circle (from the circle
 exchange), or its membership cert for the home circle, checked on every
 call for window, scope, honoured roots and revocations (overlapping-circles
 memo §17: honoured *up to the verbs on the device assert*). `append` needs
@@ -649,7 +649,7 @@ only for refs the announcer may `host`, and a node tells a peer only about
 the subjects of circles that peer is a live device of (a subject's name is
 the circle's business). A member outside the circle is refused, not
 parked; so is a sub-key's publish to a host that is unreachable — the
-outbox retries as the device, so a signed operation is never parked. Pre-statement certs and attestations carry no verbs
+outbox retries as the device, so a signed operation is never parked. Pre-statement certs and admissions carry no verbs
 and count as the full device set. Consumer-name strings are still not
 authorization.
 
@@ -677,7 +677,7 @@ same way (next slices, `tasks/open/astral-per-circle.md`).
 **Revocation reaches live state at once.** Every lease, watch and parked
 wait records who holds it (principal key, connection peer, and the chain
 it acted under — a sub-key's or grantee's presented chain, or the
-device's own attestation in that circle). When a revocation lands — or a
+device's own admission in that circle). When a revocation lands — or a
 device is forgotten — the host re-checks each holder from that stored
 chain, connected or not: a lease whose authority died is released so
 another worker reclaims the job immediately, its watches are dropped, and
@@ -742,7 +742,7 @@ the UI and daemon use a non-default Astral state directory.
 
 | Command | Where | What |
 |---|---|---|
-| `fabric init -name <label> [-circle <name>]` | first device | mint the namespace, become master; the root key is also the home circle (default `home`) |
+| `fabric init -name <label> [-circle <name>]` | first device | mint the circle, become master; its key is the root key (`-circle`, default `home`) |
 | `fabric up` | any member | run the node daemon (serves buckets when the node has a circle; `-no-vault` / `-vault-state <dir>`) |
 | `fabric status` | any member | node, membership, and connection state |
 | `fabric graph [-json]` | any member | whole-mesh link map, human or machine readable |
@@ -757,12 +757,12 @@ the UI and daemon use a non-default Astral state directory.
 | `fabric announce add <hostname\|ip\|multiaddr>` | cloud/1:1-NAT nodes | also advertise an address no local interface carries; ports, transports, and resolved IPs derived automatically |
 | `fabric announce txt` | lighthouse | print the DNS TXT record enabling hostname joins |
 | `fabric circle init -name <name>` | any device | mint a circle — a user key that buckets (and next, subjects) belong to. A node holds any number of circles under `<state>/circles/<name>`: the owner's personal one, a shared `family` one, … |
-| `fabric circle attest [-expiring]` | each device of a circle | sign this device into the circle (done automatically by `circle init`/`join` when the node already has a fabric identity), or renew: attestations live one year like certs; `-expiring` re-signs every one past half-life. Peers sync buckets and serve blobs only to attested devices of their own circle — mesh membership alone no longer grants vault access |
-| `fabric circle revoke [-circle <name>] <member \| did:key>` | an owner device of the circle | sign a device out of the circle; devices of the circle learn it on their next circle exchange, the running daemon pushes it to those connected now (see *Circle attestations*) |
-| `fabric circle export [-circle <name>] <file>` / `fabric circle join <file>` | another device | carry a circle to another device, which then holds its key and is attested into it (interim until sub-key grants). A shared circle is how two people share buckets: both devices hold it, neither holds the other's personal circle |
+| `fabric circle renew [-expiring]` | each device of a circle | sign this device into the circle (done automatically by `circle init`/`join` when the node already has a fabric identity), or renew its admission: admissions live one year like certs; `-expiring` re-signs every one past half-life. `circle attest` is the pre-2026-11-05 spelling and still accepted. Peers sync buckets and serve blobs only to admitted devices of their own circle — mesh membership alone no longer grants vault access |
+| `fabric circle revoke [-circle <name>] <member \| did:key>` | an owner device of the circle | sign a device out of the circle; devices of the circle learn it on their next circle exchange, the running daemon pushes it to those connected now (see *Circle admissions*) |
+| `fabric circle export [-circle <name>] <file>` / `fabric circle join <file>` | another device | carry a circle to another device, which then holds its key and is admitted into it (interim until sub-key grants). A shared circle is how two people share buckets: both devices hold it, neither holds the other's personal circle |
 | `fabric circle passphrase [-circle <name>]` | each device holding the circle | re-encrypt the circle's key container under a new passphrase. The key does not change, so nothing is re-signed or re-sent; when the circle's key is the root (circle `main` since the 2026-11-02 migration) the root key container is rewritten with it. Other devices holding the circle keep the old passphrase until the same is run there (or they re-join from a fresh `export`). There is no recovery for a forgotten passphrase: back up the container (`circles/<name>/user.key.age`) and the passphrase off the device |
 | `fabric circle grant new -res <subjects> [-verbs claim] [-exp 2160h] -out worker.key [-gate addr]…` / `grant list` / `grant revoke <id>` | an owner device of the circle | hand a new key a root-signed grant on named subjects, written as one key file with gate hints (the grantee's only credential); list them; revoke one by ID (stored, pushed to connected members) |
-| `fabric circle status` | any member | circles held, this device's role and attestation (expiry, revoked), revocations held, buckets per circle, mounts, folders, mesh, and which circles each vault peer verifiably shares |
+| `fabric circle status` | any member | circles held, this device's role and admission (expiry, revoked), revocations held, buckets per circle, mounts, folders, mesh, and which circles each vault peer verifiably shares |
 | `fabric bucket ...` | any member | the circle's buckets: `create`, `list`, `place <b> full\|cache\|none\|folder <dir>`, `mount`, `put/ls/get/rm/…` (`fabric bucket -h`; a `vault` symlink means the same) |
 | `fabric astral ...` | any member | inspect and use the coordination plane (`fabric astral -h`) |
 
@@ -771,7 +771,7 @@ All commands take `-state <dir>` (default `~/.config/fabric`; for the
 `-circle-state` for the circle), so several nodes can run on one machine
 for testing. Flags go **before** positional arguments (`fabric approve
 -state DIR FP`; the bucket group also accepts them after). Set
-`FABRIC_PASSPHRASE` (namespace root key) and `CIRCLE_PASSPHRASE` (circle
+`FABRIC_PASSPHRASE` (root key) and `CIRCLE_PASSPHRASE` (circle
 user key) to skip the interactive prompts (CI, scripts).
 
 ## Packages
@@ -782,7 +782,7 @@ user key) to skip the interactive prompts (CI, scripts).
   wire, id = sha256(payload). `Compile` does signatures, chaining,
   attenuation, delegation depth, overlay metadata and admission authority
   once per chain; `Compiled.Check` is the cheap per-verb step (presenter,
-  window, scope, revocations by statement-ID ancestry). Attestations,
+  window, scope, revocations by statement-ID ancestry). Admissions,
   grants, sub-keys and revocations are instances, not types.
 - `did` — the `did:key` codec for ed25519 keys (30 lines; no DID library),
   shared by `cert`, `circle` and `statement`.
@@ -790,7 +790,7 @@ user key) to skip the interactive prompts (CI, scripts).
   {member (+admin) (+tun) + scope verbs, name, ip}. `Payload` stays the
   view every caller reads; certs minted before 2026-11-02 still decode,
   verify and renew into statements.
-- `keystore` — the namespace root seed at rest: an age-encrypted file
+- `keystore` — the root key seed at rest (`namespace.key.age`, a legacy filename): an age-encrypted file
   (passphrase / scrypt). The seed exists in memory only during a signing
   session — approval happens in the CLI process; the daemon never holds
   the root key.

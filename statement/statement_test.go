@@ -114,7 +114,7 @@ func TestRoundTripAndIDs(t *testing.T) {
 	if back.VerifySignature() == nil {
 		t.Fatal("tampered signature verified")
 	}
-	if h.deskA.Label() != "admin assert" || h.devA.Label() != "device assert" || h.subA.Label() != "sub-key" {
+	if h.deskA.Label() != "admin admission" || h.devA.Label() != "device admission" || h.subA.Label() != "sub-key" {
 		t.Fatalf("labels: %q %q %q", h.deskA.Label(), h.devA.Label(), h.subA.Label())
 	}
 }
@@ -337,7 +337,7 @@ func TestRevocationRule3(t *testing.T) {
 		t.Fatalf("revocation under a sibling assert of the same key applied: %v", err)
 	}
 
-	// The attesting desk, under the assert the device chains through: kills
+	// The admitting desk, under the assert the device chains through: kills
 	// the device and, by cascade, its sub-key.
 	r, _ = Revoke(h.desk.priv, h.did, h.deskA, Target{ID: devID[:]}, t0.Add(time.Minute))
 	if _, err := revs.Add(r); err != nil {

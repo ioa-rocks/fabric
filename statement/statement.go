@@ -3,7 +3,7 @@
 // §12). A statement is an ed25519-signed deterministic-CBOR payload in UCAN
 // field order: iss says something about aud, valid in the resource domain
 // sub (a circle DID), about resources res with verbs, for a window, carrying
-// its parent statement in prf. Attestations, grants, sub-keys, termination
+// its parent statement in prf. Admissions, grants, sub-keys, termination
 // grants and revocations are all instances; they differ only in res/verbs
 // (asserts) or target (revokes). The wire shape is {payload: <raw CBOR
 // bytes>, sig}: the signature covers the bytes as received, never a
@@ -33,11 +33,11 @@ import (
 )
 
 // Version is the format version every statement carries. Legacy cert,
-// attestation and revocation bytes have no `v` and decode on their own
+// admission and revocation bytes have no `v` and decode on their own
 // paths, never through this package.
 const Version = 1
 
-// Statement types. Display labels (attestation, grant, sub-key…) are
+// Statement types. Display labels (admission, grant, sub-key…) are
 // derived from fields and never used for authorization.
 const (
 	TypeAssert = "assert"
@@ -47,7 +47,7 @@ const (
 // MaxDepth is the hard cap on chain length regardless of `del`.
 const MaxDepth = 8
 
-// DefaultValidity is the standard lifetime of an attestation: long, because
+// DefaultValidity is the standard lifetime of an admission: long, because
 // gossiped revocation is the real-time cut-off and short windows would force
 // frequent unlocking of cold root keys.
 const DefaultValidity = 365 * 24 * time.Hour
@@ -355,13 +355,13 @@ func (s *Statement) Label() string {
 		return "revocation"
 	}
 	if hasVerb(s.Payload.Verbs, VerbAdmin) {
-		return "admin assert"
+		return "admin admission"
 	}
 	if hasVerb(s.Payload.Verbs, VerbTun) {
-		return "device assert"
+		return "device admission"
 	}
 	if hasVerb(s.Payload.Verbs, VerbMember) {
-		return "attestation"
+		return "admission"
 	}
 	if s.parent != nil && s.parent.Payload.Aud == s.Payload.Iss && !s.parent.IsRootIssued() {
 		return "sub-key"
