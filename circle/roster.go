@@ -29,9 +29,9 @@ import (
 // stays valid for anyone still reading it. Exactly one goroutine applies
 // mutations (fabricnet.PeerTable's owner; the CLI when no daemon runs) and
 // decides when the result is saved and published. The ledger has four
-// rules and they are order-independent: a later-expiring admission for a
-// device wins whichever arrived first, a revocation set only grows, a sweep
-// is a monotone cut-off, GC drops the expired.
+// rules and they are order-independent: the latest-issued admission for a
+// device is its standing whichever arrived first, a revocation set only
+// grows, a sweep is a monotone cut-off, GC drops the expired.
 //
 // The package is libp2p-free: fabricnet maps device DIDs to peer IDs and
 // builds the union over a node's rosters.
@@ -217,16 +217,16 @@ func (r *Roster) clone() *Roster {
 	return nr
 }
 
-// Add verifies a admission against the circle's root and returns the
+// Add verifies an admission against the circle's root and returns the
 // roster with it recorded, and whether that changed anything. A device has
-// one entry: a later-expiring admission for the device wins whatever order
-// they arrive in (gossip, anti-entropy, handshakes) — a renewal replaces
-// the grant, so `renew -scope` demotes as the README says; a live admission
-// is never demoted by a stale expired one; an expired admission within
-// LapsedRetention is kept as roster memory; older ones are refused. A
-// revoked or swept admission is recorded with its verdict (the device is then
-// reported revoked until the admission expires), so a later admission — a
-// deliberate re-admission — stands.
+// one entry, the circle's latest word on it: the latest-issued admission
+// wins whatever order they arrive in (gossip, anti-entropy, handshakes) — a
+// renewal replaces the grant, so `renew -scope` demotes as the README says;
+// an earlier-issued admission never demotes, stale or not; an expired
+// admission within LapsedRetention is kept as roster memory; older ones are
+// refused. A revoked or swept admission is recorded with its verdict (the
+// device is then reported revoked until the admission expires), so a
+// later-issued admission — a deliberate re-admission — stands.
 func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, error) {
 	dev, err := r.judge(st, now)
 	if err != nil {
@@ -241,12 +241,14 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, err
 	return nr, true, nil
 }
 
-// Judge answers for one admission on its own — the one a peer presented: nil
-// when that statement admits its device right now, else why not. Add
-// records; Judge never consults the roster's entry for the device (which
-// may be a newer, live admission), so a revoked admission presented on the
+// Judge answers for one admission — the one a peer presented: nil when
+// that statement admits its device right now, else why not. Add records;
+// Judge never borrows from the roster's entry for the device (which may be
+// a newer, live admission), so a revoked admission presented on the
 // handshake is refused whatever else the device holds (Codex review,
-// 2026-11-05).
+// 2026-11-05). The entry can only count against the presented statement:
+// an admission superseded by a later-issued one that is revoked is refused
+// too, so the handshake agrees with the roster.
 func (r *Roster) Judge(st *statement.Statement, now time.Time) error {
 	dev, err := r.judge(st, now)
 	if err != nil {
@@ -254,6 +256,9 @@ func (r *Roster) Judge(st *statement.Statement, now time.Time) error {
 	}
 	if dev.dead != nil {
 		return dev.dead
+	}
+	if cur := r.devices[dev.DID]; cur != nil && cur.dead != nil && cur.Stmt.ID() != st.ID() && !prefer(cur, dev) {
+		return fmt.Errorf("superseded by a later admission that is %w", cur.dead)
 	}
 	if !dev.Admits(now) {
 		return errors.New("admission is not in its validity window")
@@ -290,25 +295,24 @@ func (r *Roster) judge(st *statement.Statement, now time.Time) (*Device, error) 
 }
 
 // prefer decides whether next replaces cur, the same device's entry. It is
-// a total order — dead, lapsed, expiry, issue time, statement ID — so two
-// nodes seeing a pair in opposite orders keep the same one, and three or
-// more converge too (a pairwise rule that is not an order, such as "the
-// wider grant wins", can cycle: Codex review, 2026-11-05).
+// a total order over the signed facts alone — issue time, then expiry,
+// then statement ID — so the entry is the circle's latest word on the
+// device, two nodes seeing a pair in opposite orders keep the same one, and
+// three or more converge too (a pairwise rule that is not an order, such
+// as "the wider grant wins", can cycle: Codex review, 2026-11-05).
+// Verdicts stay out of the order: "a live admission lifts a dead one" made
+// the device's standing depend on whether the older admission arrived
+// before or after the newer one was revoked (Codex review, 2026-11-05).
+// Re-admission after a revocation is a later-issued admission, whatever
+// its window.
 func prefer(cur, next *Device) bool {
-	if (cur.dead != nil) != (next.dead != nil) {
-		return cur.dead != nil // a verifying admission lifts a dead one (re-admission); a dead one never demotes
-	}
-	if cur.lapsed != next.lapsed {
-		return cur.lapsed // a live admission lifts a lapsed one; a stale one never demotes
-	}
-	if !next.Exp.Equal(cur.Exp) {
-		return next.Exp.After(cur.Exp)
-	}
-	// Equal expiry (admissions issued within the same second carry the same
-	// unix-second window): the later-issued wins, then the greater
-	// statement ID.
 	if ni, ci := next.Stmt.Payload.Iat, cur.Stmt.Payload.Iat; ni != ci {
 		return ni > ci
+	}
+	// Issued within the same second: the later-expiring wins, then the
+	// greater statement ID.
+	if !next.Exp.Equal(cur.Exp) {
+		return next.Exp.After(cur.Exp)
 	}
 	nid, cid := next.Stmt.ID(), cur.Stmt.ID()
 	return bytes.Compare(nid[:], cid[:]) > 0

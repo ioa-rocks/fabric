@@ -12,7 +12,7 @@ import (
 
 // A roster records a circle's admissions with their verdicts: live
 // inside the window, lapsed after it (memory), dead when revoked by ID or
-// swept; a later-expiring admission wins whatever the order; it persists as
+// swept; the latest-issued admission wins whatever the order; it persists as
 // statement bytes and reloads with the same verdicts.
 func TestRosterLifecycle(t *testing.T) {
 	root, err := Init(t.TempDir(), "family", "pw")
@@ -251,5 +251,67 @@ func TestRosterConvergesOverThreeAsserts(t *testing.T) {
 		} else if got.Stmt.ID() != want {
 			t.Fatalf("order %v selects a different admission", order)
 		}
+	}
+}
+
+// The newer of a device's two admissions is revoked by ID. Whether the older
+// one arrived before or after the revocation, the device is out — the
+// circle's latest word on it is revoked — and the handshake refuses the
+// older admission just as the roster does. Before 2026-11-05 the live older
+// admission lifted the dead newer one when it arrived last, so the same
+// signed facts gave two answers (Codex review).
+func TestRevokedLatestAdmissionConvergesWhateverTheOrder(t *testing.T) {
+	c, _ := Init(t.TempDir(), "p", "pw")
+	priv, _ := c.Unlock("pw")
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	dev := did.ForKey(devPub)
+	now := time.Now()
+	old, _ := AdmitFor(priv, devPub, now, 2*time.Hour)
+	newer, _ := AdmitFor(priv, devPub, now.Add(time.Second), time.Hour) // the later word, a shorter window
+	id := newer.Stmt.ID()
+	rev, err := RevokeAs(priv, nil, c.Config.DID, statement.Target{ID: id[:]}, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := now.Add(3 * time.Second)
+	const o, n, x = "old", "newer", "revoke"
+	orders := [][]string{{o, n, x}, {n, x, o}, {x, o, n}, {x, n, o}, {n, o, x}, {o, x, n}}
+	for _, order := range orders {
+		r := NewRoster(statement.NewDIDRoot(c.Config.DID))
+		for _, step := range order {
+			switch step {
+			case o:
+				r, _, _ = r.Add(old.Stmt, at)
+			case n:
+				r, _, _ = r.Add(newer.Stmt, at)
+			case x:
+				r, _, _ = r.AddRevocation(rev.Stmt)
+			}
+		}
+		if _, ok := r.Live(dev, at); ok {
+			t.Fatalf("order %v: device live although its latest admission is revoked", order)
+		}
+		if until, ok := r.Revoked(dev, at); !ok || !until.Equal(newer.Expiry()) {
+			t.Fatalf("order %v: Revoked = %v, %v; want until the revoked admission expires", order, until, ok)
+		}
+		if err := r.Judge(old.Stmt, at); err == nil {
+			t.Fatalf("order %v: the handshake accepts the superseded admission the roster refuses", order)
+		}
+	}
+	// A re-admission is the circle's next word: issued after the revoked
+	// one, it stands whatever its window.
+	again, _ := AdmitFor(priv, devPub, at, time.Minute)
+	r := NewRoster(statement.NewDIDRoot(c.Config.DID))
+	r, _, _ = r.Add(newer.Stmt, at)
+	r, _, _ = r.AddRevocation(rev.Stmt)
+	r, _, _ = r.Add(again.Stmt, at)
+	if _, ok := r.Live(dev, at); !ok {
+		t.Fatal("re-admission after a by-ID revocation did not stand")
+	}
+	// The device is in again, so its older unrevoked admission admits it on
+	// the handshake once more: the entry counts against a presented
+	// statement only while it is dead.
+	if err := r.Judge(old.Stmt, at); err != nil {
+		t.Fatalf("older admission of a live device refused: %v", err)
 	}
 }

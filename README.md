@@ -346,7 +346,7 @@ fabric renew -ip 100.64.0.2 nas      # renumber: move a member to a free overlay
 
 or the "Renew cert" button on any peer (and on the master's own card)
 in the web UI. The re-signed cert travels as a regular MemberAdded
-event on the existing gossip: every store keeps the later-expiring
+event on the existing gossip: every store keeps the latest-issued
 cert regardless of arrival order, and the renewed node adopts its new
 cert live — persisted and presented in handshakes immediately, no
 restart. Renewals log as `cert renewed`, not as a new member joining,

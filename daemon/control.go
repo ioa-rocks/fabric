@@ -488,7 +488,7 @@ func (d *Daemon) handleRevoke(w http.ResponseWriter, r *http.Request) {
 
 // handleRenew ingests a re-signed cert for an existing member, wrapped in a
 // MemberAdded event (spec §5: renewal reuses the admission event — stores
-// keep the later-expiring cert, the renewed node adopts its own). Like
+// keep the latest-issued cert, the renewed node adopts its own). Like
 // revoke, the daemon only checks the root-key signature; signing happened
 // in the CLI/UI process.
 func (d *Daemon) handleRenew(w http.ResponseWriter, r *http.Request) {

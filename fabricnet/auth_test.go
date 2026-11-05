@@ -211,7 +211,10 @@ func TestDelegatedCertAcceptedAndCascades(t *testing.T) {
 	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
 	deskPub, deskPriv, _ := ed25519.GenerateKey(rand.Reader)
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	now := time.Now()
+	// Issue times have second resolution and the re-admission at the end
+	// must be the later-issued admission, so the delegation is dated a
+	// second back.
+	now := time.Now().Add(-time.Second)
 	circleDID := cert.DIDForKey(nsPub)
 	desk, err := cert.IssueAsDel(nsPriv, nil, circleDID, deskPub, cert.CmdAdmin, cert.Meta{Name: "desk"}, now, time.Hour, 3)
 	if err != nil {
