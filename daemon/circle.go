@@ -197,6 +197,12 @@ func (s *CircleService) SetOwnCert(f func() *cert.Cert) { s.ownCert = f }
 func (s *CircleService) SetPeerTable(t *fabricnet.PeerTable) {
 	s.table = t
 	s.Circles() // rosters for every circle directory
+	// Revocations learned for a circle not held here (a gate's first
+	// circle) were restored from disk into this service; the table's
+	// roster for that circle — rebuilt from the event log, so with the
+	// revoked device live again — needs them too (Codex review,
+	// 2026-11-05).
+	s.replayExtraRevs()
 	if s.auth != nil {
 		s.auth.SetOwnAllows(s.ownAllows)
 		s.auth.SetPresenter(s.hello)
@@ -442,6 +448,28 @@ func (s *CircleService) reloadRevocations() {
 		for _, r := range rs {
 			s.rosterRevoked(r)
 		}
+	}
+	s.replayExtraRevs()
+}
+
+// replayExtraRevs pushes the revocations held for circles without a
+// directory here into the table's rosters.
+func (s *CircleService) replayExtraRevs() {
+	if s.table == nil {
+		return
+	}
+	s.mu.RLock()
+	var revs []*circle.Revocation
+	for _, set := range s.extraRevs {
+		for _, st := range set.All() {
+			if r, err := circle.RevocationFromStatement(st); err == nil {
+				revs = append(revs, r)
+			}
+		}
+	}
+	s.mu.RUnlock()
+	for _, r := range revs {
+		s.rosterRevoked(r)
 	}
 }
 

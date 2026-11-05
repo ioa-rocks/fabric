@@ -610,3 +610,57 @@ func TestGateSharesCircleButNotItsBuckets(t *testing.T) {
 		t.Fatalf("a gate hosts subjects: %v", got)
 	}
 }
+
+// A gate holds no directory for its first circle: a revocation learned
+// from a peer lives in home-revocations.cbor. After a restart the table's
+// roster is rebuilt from the event log with the revoked device live again;
+// wiring the table must replay the stored revocations into it, or the
+// circle service refuses the chain while transport admits the device.
+func TestGateReplaysStoredRevocationsIntoTheTable(t *testing.T) {
+	nsPub, nsRoot, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nsDID := cert.DIDForKey(nsPub)
+	gate := newCircleTestNode(t, nsPub, nsRoot, "gate", nil, false)
+	gate.svc.SetHome(func() string { return nsDID }, statement.NewDIDRoots(nsDID), gate.store.CertIn)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	devCert, err := cert.Issue(nsRoot, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, time.Now(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := fabricnet.PeerOfDID(cert.DIDForKey(devPub))
+	if _, err := gate.store.AddAssert(devCert.Stmt, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	rev, err := circle.Revoke(nsRoot, cert.DIDForKey(devPub), time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := rev.Marshal()
+	if _, err := gate.svc.ingestRevocations([][]byte{raw}, time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().Add(2 * time.Second)
+	if gate.store.IsMember(p, at) {
+		t.Fatal("revoked device still a member before the restart")
+	}
+	// Restart: a fresh table from the log (device live), a fresh service
+	// over the same root (revocations loaded from disk).
+	store2 := fabricnet.NewMemberStore(statement.NewDIDRoots(nsDID))
+	if _, err := store2.AddAssert(devCert.Stmt, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if !store2.IsMember(p, at) {
+		t.Fatal("the rebuilt table should start with the device live")
+	}
+	svc2 := NewCircleService(gate.h, gate.auth, gate.root)
+	svc2.SetHome(func() string { return nsDID }, statement.NewDIDRoots(nsDID), store2.CertIn)
+	svc2.SetPeerTable(store2)
+	if store2.IsMember(p, at) {
+		t.Fatal("after the restart the table admits a device the stored revocation killed")
+	}
+	if !store2.IsRevoked(p, at) {
+		t.Fatal("the device is not reported revoked after the restart")
+	}
+}
