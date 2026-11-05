@@ -182,11 +182,11 @@ func (n *meshNode) fabric(t *testing.T, root ed25519.PrivateKey, name string, bo
 	// service fell back to the legacy exchange, which until 2026-11-05
 	// leaked every circle and so hid the missing wiring.
 	fd.Circle.SetOwnCert(fd.OwnCert)
-	fd.Circle.SetHome(fd.NamespaceDID, fd.Roots, fd.Store.Cert)
+	fd.Circle.SetHome(fd.NamespaceDID, fd.Roots, fd.Store.CertIn)
 	fd.Circle.SetPeerTable(fd.Store)
 	fd.Circle.AttachSync(fd.Sync)
 	fd.Circle.SetOwnCert(fd.OwnCert)
-	fd.Circle.SetHome(fd.NamespaceDID, fd.Roots, fd.Store.Cert)
+	fd.Circle.SetHome(fd.NamespaceDID, fd.Roots, fd.Store.CertIn)
 	return fd
 }
 

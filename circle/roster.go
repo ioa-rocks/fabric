@@ -196,6 +196,12 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (bool, error) {
 		}
 		dev.lapsed = true
 	}
+	// Commit boundary: memory and disk change together, or neither. A
+	// failed save rolls the entry back, so replaying the same assert
+	// retries the write instead of hitting the duplicate check (Codex
+	// review, 2026-11-05).
+	r.saveMu.Lock()
+	defer r.saveMu.Unlock()
 	r.mu.Lock()
 	dev.dead = r.verdictLocked(dev)
 	cur := r.devices[dev.DID]
@@ -205,8 +211,15 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (bool, error) {
 	}
 	r.devices[dev.DID] = dev
 	r.mu.Unlock()
-	if err := r.save(); err != nil {
-		return true, fmt.Errorf("roster: recorded in memory but not on disk: %w", err)
+	if err := r.saveLocked(); err != nil {
+		r.mu.Lock()
+		if cur == nil {
+			delete(r.devices, dev.DID)
+		} else {
+			r.devices[dev.DID] = cur
+		}
+		r.mu.Unlock()
+		return false, fmt.Errorf("roster: not recorded, devices.cbor not written: %w", err)
 	}
 	r.notify()
 	return true, nil
@@ -508,6 +521,11 @@ func (r *Roster) GC(now time.Time) {
 func (r *Roster) save() error {
 	r.saveMu.Lock()
 	defer r.saveMu.Unlock()
+	return r.saveLocked()
+}
+
+// saveLocked is save with saveMu held by the caller.
+func (r *Roster) saveLocked() error {
 	r.mu.RLock()
 	path := r.path
 	if path == "" {

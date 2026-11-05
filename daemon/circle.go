@@ -78,7 +78,7 @@ type CircleService struct {
 	// circle exchange never carries.
 	home   func() string
 	roots  statement.Roots
-	certOf func(peer.ID) (*cert.Cert, bool)
+	certOf func(peer.ID, string) (*cert.Cert, bool) // the peer's assert in a circle
 	// table, when set, is the union peer table: a revocation learned for a
 	// circle reaches that circle's roster too, so transport membership dies
 	// with the circle attestation (one assert per device).
@@ -183,7 +183,7 @@ func (s *CircleService) Root() string { return s.root }
 
 // SetHome names the home circle and wires the member store, so Verify can
 // answer for it from membership certs.
-func (s *CircleService) SetHome(home func() string, roots statement.Roots, certOf func(peer.ID) (*cert.Cert, bool)) {
+func (s *CircleService) SetHome(home func() string, roots statement.Roots, certOf func(peer.ID, string) (*cert.Cert, bool)) {
 	s.home, s.roots, s.certOf = home, roots, certOf
 }
 
@@ -788,9 +788,9 @@ func (s *CircleService) Verify(ctx context.Context, p peer.ID, want statement.Wa
 // verifyHome is Verify for the home circle: the chain is the membership
 // cert the member store holds for the peer.
 func (s *CircleService) verifyHome(p peer.ID, want statement.Want) error {
-	c, ok := s.certOf(p)
+	c, ok := s.certOf(p, want.Sub)
 	if !ok {
-		return fmt.Errorf("%s is not a member", p)
+		return fmt.Errorf("%s is not a member of circle %s", p, shortDID(want.Sub))
 	}
 	if c.Stmt == nil {
 		return legacyAllows(cert.VerbsForScope(c.Payload.Cmd, c.Payload.Meta.Scope), want)
@@ -1095,7 +1095,7 @@ func (s *CircleService) Keep(p peer.ID) {
 // no such form.
 func (s *CircleService) DeviceChain(p peer.ID, circleDID string) ([]byte, bool) {
 	if s.home != nil && circleDID == s.home() && s.certOf != nil {
-		c, ok := s.certOf(p)
+		c, ok := s.certOf(p, circleDID)
 		if !ok || c.Stmt == nil {
 			return nil, false
 		}

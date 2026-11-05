@@ -359,6 +359,20 @@ func (t *PeerTable) Cert(p peer.ID) (*cert.Cert, bool) {
 	return c, c != nil
 }
 
+// CertIn is the cert view of the peer's live device assert in one circle —
+// what an authorization question about that circle goes by. The summary
+// (Cert) prefers whichever circle's assert carries an address and must
+// not decide access in another (Codex review, 2026-11-05).
+func (t *PeerTable) CertIn(p peer.ID, circleDID string) (*cert.Cert, bool) {
+	for _, d := range t.live(p, time.Now()) {
+		if d.roster.Honours(circleDID) {
+			c := view(d.dev)
+			return c, c != nil
+		}
+	}
+	return nil, false
+}
+
 // LapsedCert returns the expired cert a former member is remembered by, if
 // the peer is live nowhere and lapsed somewhere.
 func (t *PeerTable) LapsedCert(p peer.ID) (*cert.Cert, bool) {

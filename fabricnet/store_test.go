@@ -297,3 +297,47 @@ func mustView(t *testing.T, st *statement.Statement) *cert.Cert {
 	}
 	return c
 }
+
+// An access question about circle A goes by the device's assert in A, not
+// by the summary cert, which prefers whichever circle's assert carries an
+// address (Codex review, 2026-11-05).
+func TestCertInIsPerCircle(t *testing.T) {
+	a, _ := circle.Init(t.TempDir(), "a", "pw")
+	b, _ := circle.Init(t.TempDir(), "b", "pw")
+	aPriv, _ := a.Unlock("pw")
+	bPriv, _ := b.Unlock("pw")
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+	inA, err := circle.AttestWith(aPriv, nil, a.Config.DID, devPub, now, time.Hour, circle.GateVerbs, &statement.Meta{Name: "nas"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inB, err := circle.AttestWith(bPriv, nil, b.Config.DID, devPub, now, time.Hour,
+		append(append([]string{}, circle.DeviceVerbs...), statement.VerbTun), &statement.Meta{Name: "nas", IP: "100.64.5.2/24"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := NewMemberStore(statement.NewDIDRoots(a.Config.DID))
+	rb := circle.NewRoster(statement.NewDIDRoots(b.Config.DID))
+	table.AddRoster(rb)
+	if _, err := table.Rosters()[0].Add(inA.Stmt, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rb.Add(inB.Stmt, now); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := PeerOfDID(cert.DIDForKey(devPub))
+	if c, ok := table.Cert(p); !ok || c.Payload.Meta.IP == "" {
+		t.Fatal("the summary should prefer the assert with an address")
+	}
+	c, ok := table.CertIn(p, a.Config.DID)
+	if !ok || c.Payload.Sub != a.Config.DID || c.Payload.Meta.IP != "" {
+		t.Fatalf("CertIn(a) = %+v, want the gate assert in a", c)
+	}
+	if c, ok := table.CertIn(p, b.Config.DID); !ok || c.Payload.Sub != b.Config.DID {
+		t.Fatalf("CertIn(b) = %+v, want the assert in b", c)
+	}
+	if _, ok := table.CertIn(p, "did:key:z6MkunknownCircle"); ok {
+		t.Fatal("CertIn answered for a circle the device is not in")
+	}
+}

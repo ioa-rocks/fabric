@@ -21,7 +21,7 @@ func TestIssueKeyUnderOwnCert(t *testing.T) {
 	d := newTestDaemon(t, nsPriv, "desk", nil)
 	d.Circle = NewCircleService(d.Host, d.Auth, t.TempDir())
 	d.Circle.SetOwnCert(d.OwnCert)
-	d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.Cert)
+	d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.CertIn)
 
 	k, err := d.IssueKey("", []string{"subject:jobs"}, []string{"claim", "read"}, time.Hour, "worker")
 	if err != nil {

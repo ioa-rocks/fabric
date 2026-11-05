@@ -366,7 +366,7 @@ func cmdUp(args []string) error {
 	if !*noVault || !*noAstral {
 		d.Circle = daemon.NewCircleService(d.Host, d.Auth, circlesRoot)
 		d.Circle.SetOwnCert(d.OwnCert)
-		d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.Cert)
+		d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.CertIn)
 		d.Circle.SetPeerTable(d.Store)
 		d.Circle.AttachSync(d.Sync)
 	}

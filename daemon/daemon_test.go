@@ -451,7 +451,7 @@ func TestRemoteQueueDrivenByMasterDevice(t *testing.T) {
 func attachCircles(d *Daemon) {
 	d.Circle = NewCircleService(d.Host, d.Auth, circle.Root(d.Dir.Path))
 	d.Circle.SetOwnCert(d.OwnCert)
-	d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.Cert)
+	d.Circle.SetHome(d.NamespaceDID, d.Roots, d.Store.CertIn)
 	d.Circle.SetPeerTable(d.Store)
 	d.Circle.AttachSync(d.Sync)
 }

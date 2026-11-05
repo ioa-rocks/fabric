@@ -97,11 +97,11 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	// service fell back to the legacy exchange, which until 2026-11-05
 	// leaked every circle and so hid the missing wiring.
 	fgate.Circle.SetOwnCert(fgate.OwnCert)
-	fgate.Circle.SetHome(fgate.NamespaceDID, fgate.Roots, fgate.Store.Cert)
+	fgate.Circle.SetHome(fgate.NamespaceDID, fgate.Roots, fgate.Store.CertIn)
 	fgate.Circle.SetPeerTable(fgate.Store)
 	fgate.Circle.AttachSync(fgate.Sync)
 	fgate.Circle.SetOwnCert(fgate.OwnCert)
-	fgate.Circle.SetHome(fgate.NamespaceDID, fgate.Roots, fgate.Store.Cert)
+	fgate.Circle.SetHome(fgate.NamespaceDID, fgate.Roots, fgate.Store.CertIn)
 	dgate := startDaemon(t, gate.statePath, fgate)
 	clGate := daemon.NewClient(gate.statePath)
 	if err := clGate.Declare("subject:jobs", astral.DeliveryShared, nil); err != nil {

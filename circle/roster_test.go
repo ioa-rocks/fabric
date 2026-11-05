@@ -3,6 +3,7 @@ package circle
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -164,5 +165,20 @@ func TestRosterSaveFailureIsReported(t *testing.T) {
 	a, _ := Attest(priv, devPub, time.Now())
 	if _, err := r.Add(a.Stmt, time.Now()); err == nil {
 		t.Fatal("Add reported success although devices.cbor could not be written")
+	}
+	if _, ok := r.Device(a.Device); ok {
+		t.Fatal("a device whose admission never reached disk is in memory")
+	}
+	// Replaying the same signed assert once the directory exists retries
+	// the write — it is not a duplicate of anything.
+	if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := r.Add(a.Stmt, time.Now())
+	if err != nil || !fresh {
+		t.Fatalf("replay after the disk came back: fresh=%v err=%v, want a fresh admission", fresh, err)
+	}
+	if _, err := os.Stat(r.path); err != nil {
+		t.Fatalf("devices.cbor not written on replay: %v", err)
 	}
 }
