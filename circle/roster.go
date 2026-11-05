@@ -98,38 +98,55 @@ func NewRoster(roots *statement.DIDRoots) *Roster {
 // circle's revocation file (statement revocations into the set, legacy
 // device sweeps as sweeps). Save writes back to devices.cbor.
 func OpenRoster(c *Circle, now time.Time) (*Roster, error) {
-	r := NewRoster(statement.NewDIDRoots(c.Config.DID))
+	return NewRoster(statement.NewDIDRoots(c.Config.DID)).Attach(c, now)
+}
+
+// Attach returns the roster with a circle directory folded in — its
+// revocation file (statement revocations into the set, legacy device
+// sweeps as sweeps), then its devices.cbor, which also becomes the place
+// Save writes to. The roster's roots must honour the circle. OpenRoster
+// is Attach on an empty roster; the first roster attaches the directory of
+// every circle it honours (after a root move, the destination's too), so
+// the devices the file names are judged by that circle's revocations and
+// a device revoked before a restart stays revoked after it (Codex review,
+// 2026-11-05).
+func (r *Roster) Attach(c *Circle, now time.Time) (*Roster, error) {
 	revs, err := c.Revocations(now)
 	if err != nil {
 		return nil, err
 	}
+	nr := r.clone()
+	set := nr.revs.Clone()
 	for _, rv := range revs {
 		switch {
 		case rv.Stmt != nil:
-			if _, err := r.revs.Add(rv.Stmt); err != nil {
+			if _, err := set.Add(rv.Stmt); err != nil {
 				return nil, fmt.Errorf("circle %q revocation: %w", c.Config.Name, err)
 			}
 		case rv.Device != "":
-			if at := rv.Time().Unix(); at > r.sweeps[rv.Device] {
-				r.sweeps[rv.Device] = at
+			if at := rv.Time().Unix(); at > nr.sweeps[rv.Device] {
+				nr.sweeps[rv.Device] = at
 			}
 		}
 	}
-	r, err = r.WithPath(DevicesPath(c), now)
+	nr.revs = set
+	for did := range nr.devices {
+		nr.rejudge(did)
+	}
+	nr, err = nr.WithPath(DevicesPath(c), now)
 	if err != nil {
 		return nil, fmt.Errorf("circle %q: %w", c.Config.Name, err)
 	}
-	return r, nil
+	return nr, nil
 }
 
 // DevicesPath is the circle directory's devices.cbor.
 func DevicesPath(c *Circle) string { return filepath.Join(c.Path, devicesFile) }
 
 // WithPath returns the roster with the asserts already in path merged in
-// and path as the place Save writes to: how the circle the membership-event
-// log feeds also keeps the asserts the log never carries (a `circle admit`
-// into it) across a restart (Codex review, 2026-11-04). Stale or
-// unverifiable entries in the file drop out.
+// and path as the place Save writes to. Stale or unverifiable entries in
+// the file drop out. Attach is the caller: a devices.cbor is read only
+// with its circle's revocations.
 func (r *Roster) WithPath(path string, now time.Time) (*Roster, error) {
 	nr := r.clone()
 	nr.path = path

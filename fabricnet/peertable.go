@@ -302,16 +302,20 @@ func (t *PeerTable) AddRoster(r *circle.Roster) {
 	})
 }
 
-// Attach gives the first roster a devices.cbor to persist to and merges
-// what is already there: the circle the membership-event log feeds also
+// Attach folds a circle directory the first roster honours into it: the
+// circle's revocations and sweeps, then its devices.cbor, which the roster
+// persists to from then on. The circle the membership-event log feeds thus
 // keeps the asserts the log never carries (a `circle admit` into it)
-// across a restart (Codex review, 2026-11-04).
+// across a restart (Codex review, 2026-11-04), and after a root move the
+// destination circle's directory is read with its revocations, so a
+// device revoked there before the restart stays revoked (Codex review,
+// 2026-11-05).
 func (t *PeerTable) Attach(c *circle.Circle, now time.Time) error {
 	return t.apply(func(s *state) error {
 		if len(s.rosters) == 0 {
 			return errors.New("no roster to attach")
 		}
-		nr, err := s.rosters[0].WithPath(circle.DevicesPath(c), now)
+		nr, err := s.rosters[0].Attach(c, now)
 		if err != nil {
 			return err
 		}

@@ -650,3 +650,39 @@ func TestRootMoveMergesDestinationRoster(t *testing.T) {
 		t.Fatal("a destination-circle revocation missed a member held in the absorbed roster")
 	}
 }
+
+// After a root move the first roster attaches the destination circle's
+// directory at startup: its devices come with its revocations, so a device
+// revoked there before the restart is not a member after it.
+func TestAttachLoadsTheCircleRevocations(t *testing.T) {
+	main, _ := circle.Init(t.TempDir(), "main", "pw")
+	fam, _ := circle.Init(t.TempDir(), "family", "pw")
+	famPriv, _ := fam.Unlock("pw")
+	now := time.Now()
+	// Before the restart: the device was admitted into family and then
+	// revoked; both are on disk in family's directory.
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	a, _ := circle.Attest(famPriv, devPub, now)
+	r, _ := circle.OpenRoster(fam, now)
+	r, _, _ = r.Add(a.Stmt, now)
+	if err := r.Save(); err != nil {
+		t.Fatal(err)
+	}
+	rev, _ := circle.Revoke(famPriv, cert.DIDForKey(devPub), now.Add(time.Second))
+	if _, err := fam.AddRevocations(now.Add(time.Second), rev); err != nil {
+		t.Fatal(err)
+	}
+	// After the restart: the root has moved, the first roster honours
+	// family, and startup attaches family's directory to it.
+	table := NewMemberStore(statement.NewDIDRoots(fam.Config.DID, main.Config.DID))
+	if err := table.Attach(fam, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := PeerOfDID(cert.DIDForKey(devPub))
+	if table.IsMember(p, now.Add(2*time.Second)) {
+		t.Fatal("a device revoked before the restart is a member after it")
+	}
+	if !table.IsRevoked(p, now.Add(2*time.Second)) {
+		t.Fatal("the revoked device is not reported revoked")
+	}
+}
