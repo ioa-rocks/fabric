@@ -521,11 +521,10 @@ func TestHandshakeV2PresentsOnlySharedCircles(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		r, ok := into.store.RosterFor(familyDID)
-		if !ok {
+		if _, ok := into.store.RosterFor(familyDID); !ok {
 			t.Fatal("no family roster")
 		}
-		if _, err := r.Add(a.Stmt, time.Now()); err != nil {
+		if _, err := into.store.AddAssert(a.Stmt, time.Now()); err != nil {
 			t.Fatal(err)
 		}
 	}

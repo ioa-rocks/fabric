@@ -52,7 +52,11 @@ func admits(t *testing.T, owner *meshNode, c *circle.Circle, device *meshNode) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Add(a.Stmt, time.Now()); err != nil {
+	nr, _, err := r.Add(a.Stmt, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nr.Save(); err != nil {
 		t.Fatal(err)
 	}
 }

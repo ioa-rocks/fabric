@@ -413,11 +413,10 @@ func (s *CircleService) Admit(raw []byte) (bool, error) {
 	if s.circleByDID(a.Circle) == nil {
 		return false, fmt.Errorf("circle %s is not held by this node", shortDID(a.Circle))
 	}
-	roster, ok := s.table.RosterFor(a.Circle)
-	if !ok {
+	if _, ok := s.table.RosterFor(a.Circle); !ok {
 		return false, fmt.Errorf("no roster for circle %s", shortDID(a.Circle))
 	}
-	fresh, err := roster.Add(a.Stmt, time.Now())
+	fresh, err := s.table.AddAssert(a.Stmt, time.Now())
 	if err != nil {
 		return false, err
 	}
@@ -452,15 +451,14 @@ func (s *CircleService) rosterRevoked(r *circle.Revocation) {
 	if s.table == nil {
 		return
 	}
-	roster, ok := s.table.RosterFor(r.Circle)
-	if !ok {
+	if _, ok := s.table.RosterFor(r.Circle); !ok {
 		return
 	}
 	switch {
 	case r.Stmt != nil:
-		_, _ = roster.AddRevocation(r.Stmt)
+		_, _ = s.table.AddRevocation(r.Circle, r.Stmt)
 	case r.Device != "":
-		roster.Sweep(r.Device, r.Time())
+		s.table.SweepIn(r.Circle, r.Device, r.Time())
 	}
 }
 
@@ -1505,8 +1503,8 @@ func (s *CircleService) verifyAttestations(list [][]byte, devicePub ed25519.Publ
 		// A verified attestation for a circle held here is roster
 		// knowledge: the union peer table admits the device by it.
 		if s.table != nil && a.Stmt != nil {
-			if r, ok := s.table.RosterFor(a.Circle); ok {
-				_, _ = r.Add(a.Stmt, now)
+			if _, ok := s.table.RosterFor(a.Circle); ok {
+				_, _ = s.table.AddAssert(a.Stmt, now)
 			}
 		}
 	}

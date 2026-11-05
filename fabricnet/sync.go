@@ -134,7 +134,11 @@ func NewEventSync(h host.Host, log *event.Log, store *MemberStore, onApply Event
 	// news for every peer in that circle: re-run anti-entropy with the
 	// connected members shortly. Converges because a second exchange that
 	// changes nothing kicks nothing.
-	store.OnChange(s.kick)
+	go func() {
+		for range store.Watch() {
+			s.kick()
+		}
+	}()
 	nb := &network.NotifyBundle{ConnectedF: func(_ network.Network, c network.Conn) {
 		p := c.RemotePeer()
 		if s.store.IsMember(p, time.Now()) {
@@ -567,7 +571,7 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 			if err != nil {
 				continue
 			}
-			if fresh, err := roster.Add(st, now); err == nil && fresh {
+			if fresh, err := s.store.AddAssert(st, now); err == nil && fresh {
 				delta.Asserts = append(delta.Asserts, raw)
 			}
 		}

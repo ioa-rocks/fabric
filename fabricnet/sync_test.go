@@ -339,8 +339,7 @@ func TestSyncV2SendsOnlySharedCircleSets(t *testing.T) {
 		n.store.AddRoster(circle.NewRoster(statement.NewDIDRoots(famDID)))
 	}
 	// The owner admitted the device: its assert is in the owner's roster.
-	ra, _ := a.store.RosterFor(famDID)
-	if _, err := ra.Add(attB.Stmt, time.Now()); err != nil {
+	if _, err := a.store.AddAssert(attB.Stmt, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	a.sync.SetCircleHooks(CircleHooks{OwnAsserts: func(did string) [][]byte {
@@ -442,10 +441,8 @@ func TestLegacyProtocolsServeFirstCircleOnly(t *testing.T) {
 	bOwn, _ := cert.FromStatement(attB.Stmt)
 	bAuth := NewAuthService(bHost, bStore, bOwn, 5*time.Second, nil)
 	// Both know each other in family (admitted / gossiped).
-	ra, _ := a.store.RosterFor(famDID)
-	ra.Add(attB.Stmt, time.Now())
-	rb, _ := bStore.RosterFor(famDID)
-	rb.Add(attA.Stmt, time.Now())
+	a.store.AddAssert(attB.Stmt, time.Now())
+	bStore.AddAssert(attA.Stmt, time.Now())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -119,7 +119,11 @@ func NewAuthService(h host.Host, store *PeerTable, ownCert *cert.Cert, grace tim
 	// A roster change can end a membership without any event naming the
 	// peer (a circle revocation learned by gossip, a root retired): the
 	// connections of peers that are no longer members are closed here.
-	store.OnChange(func() { go a.sweep() })
+	go func() {
+		for range store.Watch() {
+			a.sweep()
+		}
+	}()
 	return a
 }
 

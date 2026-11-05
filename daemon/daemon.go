@@ -70,16 +70,8 @@ type Daemon struct {
 
 	bridgeIP string // overlay address fabric0 was brought up with (renumbering notice)
 
-	// Route refreshes are serialised (routesMu: build and install under one
-	// lock, so an older snapshot can never land over a newer one) and the
-	// roster hook only kicks a worker (routesKick), since the hook runs
-	// inside roster notification and under whatever lock the mutator holds
-	// — a root retirement rechecks the store with cfgMu held, which
-	// NamespaceDID also takes (Codex review, 2026-11-05).
-	routesMu   sync.Mutex
-	routesKick chan struct{}
-	Sync       *fabricnet.EventSync
-	Queue      *admission.Queue // nil unless this node runs the admission queue
+	Sync  *fabricnet.EventSync
+	Queue *admission.Queue // nil unless this node runs the admission queue
 	// Circle answers "is this member one of my circle's devices?" — set by
 	// the composition root when the node has a circle (NewCircleService);
 	// nil on pure-connectivity nodes. Vault gates on it (memo §9 step 3).
@@ -161,7 +153,7 @@ func New(dir state.Dir) (*Daemon, error) {
 			// The first circle's directory: the log-fed roster persists
 			// there too, so an assert the log never carries (a `circle
 			// admit` into this circle) survives a restart.
-			if err := store.Rosters()[0].Attach(c, time.Now()); err != nil {
+			if err := store.Attach(c, time.Now()); err != nil {
 				log.Printf("circle %q: devices.cbor unreadable: %v", c.Config.Name, err)
 			}
 			continue
@@ -302,7 +294,6 @@ func New(dir state.Dir) (*Daemon, error) {
 	// (renewed) cert from the replayed event log.
 	d.Auth = fabricnet.NewAuthService(h, store, d.OwnCert(), AuthGrace, func(p peer.ID, c *cert.Cert) {
 		log.Printf("member joined: %q (%s)", c.Payload.Meta.Name, p)
-		d.refreshRoutes()
 	})
 	d.Auth.SetV1Dialable(d.isConfiguredBootstrap)
 	d.Sync = fabricnet.NewEventSync(h, evLog, store, d.applyEvent)
@@ -533,20 +524,19 @@ func (d *Daemon) startTUN() {
 		log.Printf("tun: %v — running without the IP bridge (grant CAP_NET_ADMIN to enable: sudo setcap cap_net_admin+ep <fabric binary>)", err)
 		return
 	}
-	d.Bridge = tunbridge.New(d.Host, dev, d.Auth.RequireMember)
+	// The routes are in the peer table's published view: the asserts of
+	// the circle this device's address is in (its first circle, until slice
+	// H gives every overlay circle its own interface), each by its assert in
+	// that circle, inside the circle's range. Nothing is rebuilt or
+	// installed on change — the bridge looks each packet up in the current
+	// view (task single-writer-store).
 	d.bridgeIP = d.OwnCert().Payload.Meta.IP
-	if pfx, err := netip.ParsePrefix(d.bridgeIP); err == nil {
+	pfx, _ := netip.ParsePrefix(d.bridgeIP)
+	d.Store.SetOverlay(d.NamespaceDID(), pfx)
+	d.Bridge = tunbridge.New(d.Host, dev, d.Store, d.Auth.RequireMember)
+	if pfx.IsValid() {
 		d.Bridge.SetLocal(pfx.Addr())
 	}
-	d.refreshRoutes()
-	// Routes follow the rosters, not only the membership log: a circle
-	// revocation or a gossiped assert changes who is routable without any
-	// membership event (Codex review, 2026-11-05: a device revoked from
-	// this circle but still a member elsewhere kept its route). The hook
-	// kicks a worker rather than refreshing inline — see routesKick.
-	d.routesKick = make(chan struct{}, 1)
-	go d.routesWorker()
-	d.Store.OnChange(d.kickRoutes)
 	log.Printf("tun: fabric0 up, this node is %s", d.OwnCert().Payload.Meta.IP)
 	d.startDNS()
 }
@@ -590,13 +580,7 @@ func (d *Daemon) dnsLookup(host string) (netip.Addr, bool) {
 	if ip, ok := match(d.OwnCert()); ok {
 		return ip, true
 	}
-	members, _ := d.Store.Snapshot()
-	for _, c := range members {
-		if ip, ok := match(c); ok {
-			return ip, true
-		}
-	}
-	return netip.Addr{}, false
+	return d.Store.Resolve(host)
 }
 
 // registerResolver points systemd-resolved's ~fabric routing domain at
@@ -643,86 +627,6 @@ func registerWithResolved(ip netip.Addr) error {
 	}
 	return obj.CallWithContext(ctx, "org.freedesktop.resolve1.Manager.SetLinkDomains", 0,
 		int32(ifc.Index), []domain{{Name: fabricdns.Suffix, RouteOnly: true}}).Err
-}
-
-// refreshRoutes rebuilds the overlay routing table from the first
-// circle's roster — the assert is the source of address truth. Serialised:
-// two refreshes never interleave build and install, so the table always
-// reflects the newest roster state that triggered a refresh.
-func (d *Daemon) refreshRoutes() {
-	if d.Bridge == nil {
-		return
-	}
-	d.routesMu.Lock()
-	defer d.routesMu.Unlock()
-	within, _ := netip.ParsePrefix(d.bridgeIP)
-	d.Bridge.SetRoutes(overlayRoutes(membersIn(d.Store, d.NamespaceDID()), within))
-}
-
-// kickRoutes asks the route worker for a refresh without blocking or
-// taking any lock: safe to call from a roster change hook.
-func (d *Daemon) kickRoutes() {
-	if d.routesKick == nil {
-		return
-	}
-	select {
-	case d.routesKick <- struct{}{}:
-	default: // a refresh is already pending; it will read the newer state
-	}
-}
-
-// routesWorker refreshes the routes on every kick, one at a time.
-func (d *Daemon) routesWorker() {
-	for {
-		select {
-		case <-d.ctx.Done():
-			return
-		case <-d.routesKick:
-			d.refreshRoutes()
-		}
-	}
-}
-
-// membersIn is the route source: the devices of one circle, each by its
-// assert *in that circle* — never the union's summary, which would let
-// another circle's assert for the same device, or a device of another
-// circle whose range overlaps, onto this interface. The interface belongs
-// to the circle this device's address is in (its first circle) until
-// slice H gives every overlay circle its own (Codex review, 2026-11-05).
-func membersIn(t *fabricnet.PeerTable, circleDID string) map[peer.ID]*cert.Cert {
-	out := map[peer.ID]*cert.Cert{}
-	for _, p := range t.LiveIn(circleDID) {
-		if c, ok := t.CertIn(p, circleDID); ok {
-			out[p] = c
-		}
-	}
-	return out
-}
-
-// overlayRoutes derives the TUN routing table from member certs: an address
-// is routable only if the cert carries one *and* its scope admits the TUN
-// family (fabric ADR 0005) — the outbound half of the no-TUN-leg bound.
-// Routes are fenced to this device's own overlay range: the peer table is
-// the union of every circle held here, and an address another circle
-// assigned is not reachable through this interface — one interface per
-// overlay (task slice H; Codex review, 2026-11-05). An invalid `within`
-// (no own address) fences nothing out.
-func overlayRoutes(members map[peer.ID]*cert.Cert, within netip.Prefix) map[netip.Addr]peer.ID {
-	routes := make(map[netip.Addr]peer.ID, len(members))
-	for p, c := range members {
-		if c.Payload.Meta.IP == "" || !c.Allows(cert.ScopeTun) {
-			continue
-		}
-		pfx, err := netip.ParsePrefix(c.Payload.Meta.IP)
-		if err != nil {
-			continue
-		}
-		if within.IsValid() && !within.Masked().Contains(pfx.Addr()) {
-			continue
-		}
-		routes[pfx.Addr()] = p
-	}
-	return routes
 }
 
 // watchReachability tracks the autonat verdicts for the status API: the
@@ -1015,7 +919,6 @@ func (d *Daemon) applyEvent(e *event.Event) {
 		// root-retired is the last event of a move; nothing follows it to
 		// flush the log, and Run does not save on shutdown — without this
 		// a restart forgets the retirement (agy review, 2026-11-02).
-		d.refreshRoutes()
 		d.persistEvents()
 		return
 	}
@@ -1064,7 +967,6 @@ func (d *Daemon) applyEvent(e *event.Event) {
 			log.Printf("member revoked: %q (%s)", name, p)
 		}
 	}
-	d.refreshRoutes()
 	d.persistEvents()
 }
 
@@ -1222,7 +1124,6 @@ func (d *Daemon) reconnectLoop() {
 		d.connectBootstrap()
 		d.meshFill()
 		d.measureRTT()
-		d.refreshRoutes()
 		d.persistRecords()
 		d.pinQueueHosts()
 		now = time.Now()

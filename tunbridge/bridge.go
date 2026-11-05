@@ -36,14 +36,24 @@ type link struct {
 }
 
 // Bridge pumps packets between a TUN device and per-peer libp2p streams.
-type Bridge struct {
-	h   host.Host
-	dev io.ReadWriteCloser
+// RouteSource answers the bridge's two questions from the current
+// membership view: which peer holds a destination address, and which
+// address a peer holds. The peer table's published view implements it, so
+// a revocation or a new assert changes the answer with the next publish
+// and no table is ever rebuilt or installed here (task
+// single-writer-store).
+type RouteSource interface {
+	Route(dst netip.Addr) (peer.ID, bool)
+	AddrOf(p peer.ID) (netip.Addr, bool)
+}
 
-	routesMu sync.RWMutex
-	byIP     map[netip.Addr]peer.ID
-	byPeer   map[peer.ID]netip.Addr
-	local    netip.Addr // this device's own overlay address; inbound packets go nowhere else
+type Bridge struct {
+	h      host.Host
+	dev    io.ReadWriteCloser
+	routes RouteSource
+
+	localMu sync.RWMutex
+	local   netip.Addr // this device's own overlay address; inbound packets go nowhere else
 
 	linksMu sync.Mutex
 	links   map[peer.ID]*link
@@ -54,11 +64,9 @@ type Bridge struct {
 
 // New starts the bridge on an already-configured device. gate wraps the
 // inbound handler with the membership check.
-func New(h host.Host, dev io.ReadWriteCloser, gate func(network.StreamHandler) network.StreamHandler) *Bridge {
+func New(h host.Host, dev io.ReadWriteCloser, routes RouteSource, gate func(network.StreamHandler) network.StreamHandler) *Bridge {
 	b := &Bridge{
-		h: h, dev: dev,
-		byIP:   map[netip.Addr]peer.ID{},
-		byPeer: map[peer.ID]netip.Addr{},
+		h: h, dev: dev, routes: routes,
 		links:  map[peer.ID]*link{},
 		closed: make(chan struct{}),
 	}
@@ -74,20 +82,9 @@ func New(h host.Host, dev io.ReadWriteCloser, gate func(network.StreamHandler) n
 // kernel — the bridge is an endpoint, not a router between members or
 // between overlays (Codex review, 2026-11-05).
 func (b *Bridge) SetLocal(addr netip.Addr) {
-	b.routesMu.Lock()
+	b.localMu.Lock()
 	b.local = addr
-	b.routesMu.Unlock()
-}
-
-func (b *Bridge) SetRoutes(routes map[netip.Addr]peer.ID) {
-	byPeer := make(map[peer.ID]netip.Addr, len(routes))
-	for a, p := range routes {
-		byPeer[p] = a
-	}
-	b.routesMu.Lock()
-	b.byIP = routes
-	b.byPeer = byPeer
-	b.routesMu.Unlock()
+	b.localMu.Unlock()
 }
 
 // Close stops the bridge and closes the device.
@@ -123,9 +120,7 @@ func (b *Bridge) readLoop() {
 		if !ok {
 			continue // non-IPv4 (v6 not bridged yet) — drop
 		}
-		b.routesMu.RLock()
-		p, known := b.byIP[dst]
-		b.routesMu.RUnlock()
+		p, known := b.routes.Route(dst)
 		if !known {
 			continue // not a member address (broadcast, scans, …)
 		}
@@ -200,10 +195,10 @@ func (b *Bridge) handleInbound(s network.Stream) {
 			continue
 		}
 		dst, _ := dstIPv4(pkt)
-		b.routesMu.RLock()
-		expected, known := b.byPeer[remote]
+		expected, known := b.routes.AddrOf(remote)
+		b.localMu.RLock()
 		local := b.local
-		b.routesMu.RUnlock()
+		b.localMu.RUnlock()
 		if !known || src != expected {
 			continue // spoofed or stale-route source — drop
 		}

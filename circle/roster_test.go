@@ -3,8 +3,6 @@ package circle
 import (
 	"crypto/ed25519"
 	"crypto/rand"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -35,14 +33,22 @@ func TestRosterLifecycle(t *testing.T) {
 	}
 	short, _ := AttestFor(priv, devPub, now, time.Hour)
 	long, _ := AttestFor(priv, devPub, now, 2*time.Hour)
-	if fresh, err := roster.Add(long.Stmt, now); err != nil || !fresh {
+	before := roster
+	roster, fresh, err := roster.Add(long.Stmt, now)
+	if err != nil || !fresh {
 		t.Fatalf("Add(long): fresh=%v err=%v", fresh, err)
 	}
-	if fresh, _ := roster.Add(short.Stmt, now); fresh {
+	if before.Len() != 0 {
+		t.Fatal("Add mutated the roster it was called on — a roster is a value")
+	}
+	if _, fresh, _ := roster.Add(short.Stmt, now); fresh {
 		t.Fatal("a shorter assert replaced a longer one")
 	}
-	if fresh, _ := roster.Add(long.Stmt, now); fresh {
+	if _, fresh, _ := roster.Add(long.Stmt, now); fresh {
 		t.Fatal("the same assert counted as fresh twice")
+	}
+	if err := roster.Save(); err != nil {
+		t.Fatal(err)
 	}
 	if _, ok := roster.Live(devDID, now); !ok {
 		t.Fatal("device not live inside its window")
@@ -76,8 +82,13 @@ func TestRosterLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fresh, err := roster.AddRevocation(byID.Stmt); err != nil || !fresh {
+	live := roster
+	roster, fresh, err = roster.AddRevocation(byID.Stmt)
+	if err != nil || !fresh {
 		t.Fatalf("AddRevocation: fresh=%v err=%v", fresh, err)
+	}
+	if _, ok := live.Live(devDID, now); !ok {
+		t.Fatal("the pre-revocation roster changed under a reader")
 	}
 	if _, ok := roster.Live(devDID, now); ok {
 		t.Fatal("revoked assert still live")
@@ -86,7 +97,10 @@ func TestRosterLifecycle(t *testing.T) {
 		t.Fatalf("Revoked = %v, %v; want until the assert's expiry", until, ok)
 	}
 	renewed, _ := AttestFor(priv, devPub, now.Add(time.Second), time.Hour)
-	if _, err := roster.Add(renewed.Stmt, now.Add(time.Second)); err != nil {
+	if roster, _, err = roster.Add(renewed.Stmt, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := roster.Save(); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := roster.Live(devDID, now.Add(time.Second)); !ok {
@@ -116,10 +130,11 @@ func TestRosterSweep(t *testing.T) {
 	devDID := did.ForKey(devPub)
 	then := time.Now().Add(-time.Hour)
 	old, _ := AttestFor(rootPriv, devPub, then, 2*time.Hour)
-	if _, err := roster.Add(old.Stmt, then); err != nil {
+	roster, _, err := roster.Add(old.Stmt, then)
+	if err != nil {
 		t.Fatal(err)
 	}
-	roster.Sweep(devDID, then.Add(time.Minute))
+	roster, _ = roster.Sweep(devDID, then.Add(time.Minute))
 	if _, ok := roster.Live(devDID, time.Now()); ok {
 		t.Fatal("swept assert still live")
 	}
@@ -127,7 +142,7 @@ func TestRosterSweep(t *testing.T) {
 		t.Fatal("swept device not reported revoked")
 	}
 	fresh, _ := AttestFor(rootPriv, devPub, time.Now(), time.Hour)
-	if _, err := roster.Add(fresh.Stmt, time.Now()); err != nil {
+	if roster, _, err = roster.Add(fresh.Stmt, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := roster.Live(devDID, time.Now()); !ok {
@@ -138,7 +153,7 @@ func TestRosterSweep(t *testing.T) {
 	}
 
 	unknown := did.ForKey(must(ed25519.GenerateKey(rand.Reader)))
-	roster.Sweep(unknown, time.Now())
+	roster, _ = roster.Sweep(unknown, time.Now())
 	if until, ok := roster.Revoked(unknown, time.Now()); !ok || until.Before(time.Now().Add(23*time.Hour)) {
 		t.Fatalf("bare sweep tombstone = %v, %v", until, ok)
 	}
@@ -152,72 +167,4 @@ func must(pub ed25519.PublicKey, _ ed25519.PrivateKey, err error) ed25519.Public
 		panic(err)
 	}
 	return pub
-}
-
-// A roster that cannot persist says so: an admission is never reported
-// durable when the file could not be written (Codex review, 2026-11-05).
-func TestRosterSaveFailureIsReported(t *testing.T) {
-	c, _ := Init(t.TempDir(), "p", "pw")
-	priv, _ := c.Unlock("pw")
-	r := NewRoster(statement.NewDIDRoots(c.Config.DID))
-	r.path = filepath.Join(t.TempDir(), "missing-dir", "devices.cbor")
-	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	a, _ := Attest(priv, devPub, time.Now())
-	if _, err := r.Add(a.Stmt, time.Now()); err == nil {
-		t.Fatal("Add reported success although devices.cbor could not be written")
-	}
-	if _, ok := r.Device(a.Device); ok {
-		t.Fatal("a device whose admission never reached disk is in memory")
-	}
-	// Replaying the same signed assert once the directory exists retries
-	// the write — it is not a duplicate of anything.
-	if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	fresh, err := r.Add(a.Stmt, time.Now())
-	if err != nil || !fresh {
-		t.Fatalf("replay after the disk came back: fresh=%v err=%v, want a fresh admission", fresh, err)
-	}
-	if _, err := os.Stat(r.path); err != nil {
-		t.Fatalf("devices.cbor not written on replay: %v", err)
-	}
-}
-
-// A revocation that lands while a new assert stands in memory, before the
-// save that would make it durable fails, must still kill the device once
-// the old assert is restored.
-func TestRosterRollbackRechecksRestoredAssert(t *testing.T) {
-	c, _ := Init(t.TempDir(), "p", "pw")
-	priv, _ := c.Unlock("pw")
-	r := NewRoster(statement.NewDIDRoots(c.Config.DID))
-	dir := t.TempDir()
-	r.path = filepath.Join(dir, "devices.cbor")
-	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	now := time.Now()
-	first, _ := AttestFor(priv, devPub, now, time.Hour)
-	if _, err := r.Add(first.Stmt, now); err != nil {
-		t.Fatal(err)
-	}
-	// The next save fails; meanwhile the circle revokes the device.
-	r.path = filepath.Join(dir, "missing", "devices.cbor")
-	r.hookBeforeSave = func() {
-		rev, err := Revoke(priv, first.Device, now.Add(time.Second))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := r.AddRevocation(rev.Stmt); err != nil {
-			t.Fatal(err)
-		}
-	}
-	second, _ := AttestFor(priv, devPub, now.Add(time.Second), 2*time.Hour)
-	if _, err := r.Add(second.Stmt, now.Add(time.Second)); err == nil {
-		t.Fatal("save should have failed")
-	}
-	if _, live := r.Live(first.Device, now.Add(2*time.Second)); live {
-		t.Fatal("revoked device is live after the rollback restored its old assert")
-	}
-	dev, ok := r.Device(first.Device)
-	if !ok || dev.Stmt.ID() != first.Stmt.ID() || dev.Dead() == nil {
-		t.Fatalf("restored assert should be the first and judged dead: ok=%v dead=%v", ok, dev != nil && dev.Dead() != nil)
-	}
 }

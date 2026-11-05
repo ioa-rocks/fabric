@@ -92,7 +92,11 @@ func (n *meshNode) admits(t *testing.T, other *meshNode, circleName string) {
 	if err != nil {
 		t.Fatalf("OpenRoster: %v", err)
 	}
-	if _, err := r.Add(a.Stmt, time.Now()); err != nil {
+	nr, _, err := r.Add(a.Stmt, time.Now())
+	if err != nil {
+		t.Fatalf("roster.Add: %v", err)
+	}
+	if err := nr.Save(); err != nil {
 		t.Fatalf("roster.Add: %v", err)
 	}
 }

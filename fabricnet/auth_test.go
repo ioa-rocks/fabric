@@ -245,8 +245,7 @@ func TestDelegatedCertAcceptedAndCascades(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	roster, _ := store.RosterFor(circleDID)
-	if fresh, err := roster.AddRevocation(revoke); err != nil || !fresh {
+	if fresh, err := store.AddRevocation(circleDID, revoke); err != nil || !fresh {
 		t.Fatalf("AddRevocation: fresh=%v err=%v", fresh, err)
 	}
 	if store.IsMember(p, time.Now()) {

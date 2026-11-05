@@ -27,6 +27,25 @@ func NewRevocationSet() *RevocationSet {
 	}
 }
 
+// Clone returns an independent copy: the owner of a roster adds to a copy,
+// saves, then swaps it in — a failed step changes nothing (single-writer
+// store, 2026-11-05).
+func (s *RevocationSet) Clone() *RevocationSet {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	c := NewRevocationSet()
+	for k, v := range s.all {
+		c.all[k] = v
+	}
+	for k, v := range s.byID {
+		c.byID[k] = append([]*Statement(nil), v...)
+	}
+	for k, v := range s.byAud {
+		c.byAud[k] = append([]*Statement(nil), v...)
+	}
+	return c
+}
+
 // Add indexes a revocation. It must be a revoke with one target form and a
 // valid signature over its payload; when it rides a chain, the chain's leaf
 // must name the revoker. Returns false when the revocation was already

@@ -7,6 +7,7 @@ import (
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	ma "github.com/multiformats/go-multiaddr"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -93,12 +94,14 @@ func TestBridgeRelaysAndPinsSource(t *testing.T) {
 	devA, devB := newFakeDev(), newFakeDev()
 	ipA, ipB := netip.MustParseAddr("100.64.0.1"), netip.MustParseAddr("100.64.0.2")
 
-	ba := New(ha, devA, passthrough)
-	bb := New(hb, devB, passthrough)
+	rba := &fakeRoutes{}
+	ba := New(ha, devA, rba, passthrough)
+	rbb := &fakeRoutes{}
+	bb := New(hb, devB, rbb, passthrough)
 	defer ba.Close()
 	defer bb.Close()
-	ba.SetRoutes(map[netip.Addr]peer.ID{ipB: hb.ID()})
-	bb.SetRoutes(map[netip.Addr]peer.ID{ipA: ha.ID()})
+	rba.Set(map[netip.Addr]peer.ID{ipB: hb.ID()})
+	rbb.Set(map[netip.Addr]peer.ID{ipA: ha.ID()})
 
 	devA.in <- ipv4Packet("100.64.0.1", "100.64.0.2", 0x42)
 	select {
@@ -130,7 +133,7 @@ func TestBridgeRelaysAndPinsSource(t *testing.T) {
 	// routes toward B — never reaches B's kernel (the bridge is an
 	// endpoint, not a router).
 	bb.SetLocal(ipB)
-	ba.SetRoutes(map[netip.Addr]peer.ID{ipB: hb.ID(), netip.MustParseAddr("100.64.0.3"): hb.ID()})
+	rba.Set(map[netip.Addr]peer.ID{ipB: hb.ID(), netip.MustParseAddr("100.64.0.3"): hb.ID()})
 	devA.in <- ipv4Packet("100.64.0.1", "100.64.0.3", 0x88)
 	devA.in <- ipv4Packet("100.64.0.1", "100.64.0.2", 0x44)
 	select {
@@ -144,7 +147,7 @@ func TestBridgeRelaysAndPinsSource(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("follow-up packet never arrived")
 	}
-	ba.SetRoutes(map[netip.Addr]peer.ID{ipB: hb.ID()})
+	rba.Set(map[netip.Addr]peer.ID{ipB: hb.ID()})
 
 	// Unknown destination: dropped at the sender, nothing explodes.
 	devA.in <- ipv4Packet("100.64.0.1", "100.64.0.77", 0x55)
@@ -157,7 +160,7 @@ func TestBridgeRelaysAndPinsSource(t *testing.T) {
 	// A member admitted without an overlay address has no route anywhere.
 	// B drops its frames on arrival even though the stream is member-gated
 	// and the source matches what A claims — the cert decides, not A.
-	bb.SetRoutes(map[netip.Addr]peer.ID{})
+	rbb.Set(map[netip.Addr]peer.ID{})
 	devA.in <- ipv4Packet("100.64.0.1", "100.64.0.2", 0x77)
 	select {
 	case pkt := <-devB.out:
@@ -195,11 +198,12 @@ func TestBridgeRelayRecovery(t *testing.T) {
 	a.Peerstore().AddAddr(b.ID(), circuit, time.Hour)
 	devA, devB := newFakeDev(), newFakeDev()
 	gate := func(h network.StreamHandler) network.StreamHandler { return h }
-	ba, bb := New(a, devA, gate), New(b, devB, gate)
+	rba, rbb := &fakeRoutes{}, &fakeRoutes{}
+	ba, bb := New(a, devA, rba, gate), New(b, devB, rbb, gate)
 	defer ba.Close()
 	defer bb.Close()
-	ba.SetRoutes(map[netip.Addr]peer.ID{netip.MustParseAddr("100.64.0.2"): b.ID()})
-	bb.SetRoutes(map[netip.Addr]peer.ID{netip.MustParseAddr("100.64.0.1"): a.ID()})
+	rba.Set(map[netip.Addr]peer.ID{netip.MustParseAddr("100.64.0.2"): b.ID()})
+	rbb.Set(map[netip.Addr]peer.ID{netip.MustParseAddr("100.64.0.1"): a.ID()})
 	deliver := func(payload byte) {
 		t.Helper()
 		devA.in <- ipv4Packet("100.64.0.1", "100.64.0.2", payload)
@@ -237,4 +241,35 @@ func TestBridgeRelayRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	deliver(2)
+}
+
+// fakeRoutes is a RouteSource the tests set directly.
+type fakeRoutes struct {
+	mu     sync.Mutex
+	byIP   map[netip.Addr]peer.ID
+	byPeer map[peer.ID]netip.Addr
+}
+
+func (f *fakeRoutes) Set(routes map[netip.Addr]peer.ID) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.byIP = routes
+	f.byPeer = map[peer.ID]netip.Addr{}
+	for a, p := range routes {
+		f.byPeer[p] = a
+	}
+}
+
+func (f *fakeRoutes) Route(dst netip.Addr) (peer.ID, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.byIP[dst]
+	return p, ok
+}
+
+func (f *fakeRoutes) AddrOf(p peer.ID) (netip.Addr, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.byPeer[p]
+	return a, ok
 }

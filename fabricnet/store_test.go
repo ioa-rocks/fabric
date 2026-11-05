@@ -3,6 +3,11 @@ package fabricnet
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"fmt"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -205,7 +210,7 @@ func TestUnionAdmitsDeviceOfAnyHeldCircle(t *testing.T) {
 	both := NewMemberStore(statement.NewDIDRoots(mainDID))
 	family := circle.NewRoster(statement.NewDIDRoots(familyDID))
 	both.AddRoster(family)
-	if _, err := family.Add(attestation.Stmt, now); err != nil {
+	if _, err := both.AddAssert(attestation.Stmt, now); err != nil {
 		t.Fatal(err)
 	}
 	if !both.IsMember(p, now) {
@@ -248,7 +253,7 @@ func TestUnionAdmitsDeviceOfAnyHeldCircle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := family.AddRevocation(revocation.Stmt); err != nil {
+	if _, err := both.AddRevocation(familyDID, revocation.Stmt); err != nil {
 		t.Fatal(err)
 	}
 	if both.IsMember(p, time.Now()) {
@@ -320,11 +325,10 @@ func TestCertInIsPerCircle(t *testing.T) {
 	table := NewMemberStore(statement.NewDIDRoots(a.Config.DID))
 	rb := circle.NewRoster(statement.NewDIDRoots(b.Config.DID))
 	table.AddRoster(rb)
-	if _, err := table.Rosters()[0].Add(inA.Stmt, now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := rb.Add(inB.Stmt, now); err != nil {
-		t.Fatal(err)
+	for _, a := range []*circle.Attestation{inA, inB} {
+		if _, err := table.AddAssert(a.Stmt, now); err != nil {
+			t.Fatal(err)
+		}
 	}
 	p, _ := PeerOfDID(cert.DIDForKey(devPub))
 	if c, ok := table.Cert(p); !ok || c.Payload.Meta.IP == "" {
@@ -362,7 +366,7 @@ func TestLiveInSpansHonouredRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, a := range []*circle.Attestation{a1, a2} {
-		if _, err := table.Rosters()[0].Add(a.Stmt, now); err != nil {
+		if _, err := table.AddAssert(a.Stmt, now); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -374,5 +378,216 @@ func TestLiveInSpansHonouredRoots(t *testing.T) {
 	}
 	if got := table.MembersIn(oldDID); len(got) != 1 {
 		t.Fatalf("MembersIn(old) = %d devices, want the one still on the old root", len(got))
+	}
+}
+
+// ---- single-writer store ------------------------------------------------------
+
+// A change that cannot be saved changes nothing: the view is as before, the
+// device is not in it, and replaying the same assert once the disk is back
+// records it (no duplicate check hides a failed write).
+func TestOwnerSaveFailureChangesNothing(t *testing.T) {
+	c, _ := circle.Init(t.TempDir(), "p", "pw")
+	priv, _ := c.Unlock("pw")
+	// The circle's devices.cbor sits in a directory that does not exist yet.
+	c.Path = filepath.Join(t.TempDir(), "missing", "p")
+	table := NewPeerTable()
+	r, _ := circle.NewRoster(statement.NewDIDRoots(c.Config.DID)).WithPath(circle.DevicesPath(c), time.Now())
+	table.AddRoster(r)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	a, _ := circle.Attest(priv, devPub, time.Now())
+	before := table.View().Version()
+	if _, err := table.AddAssert(a.Stmt, time.Now()); err == nil {
+		t.Fatal("AddAssert reported success although devices.cbor could not be written")
+	}
+	p, _ := PeerOfDID(cert.DIDForKey(devPub))
+	if table.IsMember(p, time.Now()) || table.View().Version() != before {
+		t.Fatal("a failed save left a trace in the view")
+	}
+	if err := os.MkdirAll(c.Path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := table.AddAssert(a.Stmt, time.Now())
+	if err != nil || !fresh {
+		t.Fatalf("replay after the disk came back: fresh=%v err=%v", fresh, err)
+	}
+	if !table.IsMember(p, time.Now()) {
+		t.Fatal("replayed assert not in the view")
+	}
+	if _, err := os.Stat(circle.DevicesPath(c)); err != nil {
+		t.Fatalf("devices.cbor not written on replay: %v", err)
+	}
+}
+
+// The ledger is order-independent: the same asserts and revocations in
+// every order give the same view (later expiry wins, revocations only grow).
+func TestViewIsOrderIndependent(t *testing.T) {
+	c, _ := circle.Init(t.TempDir(), "p", "pw")
+	priv, _ := c.Unlock("pw")
+	now := time.Now()
+	devA, _, _ := ed25519.GenerateKey(rand.Reader)
+	devB, _, _ := ed25519.GenerateKey(rand.Reader)
+	aShort, _ := circle.AttestFor(priv, devA, now, time.Hour)
+	aLong, _ := circle.AttestFor(priv, devA, now, 2*time.Hour)
+	b, _ := circle.AttestFor(priv, devB, now, time.Hour)
+	revokeB, _ := circle.Revoke(priv, cert.DIDForKey(devB), now.Add(time.Second))
+	ops := []func(t *PeerTable){
+		func(t *PeerTable) { t.AddAssert(aShort.Stmt, now) },
+		func(t *PeerTable) { t.AddAssert(aLong.Stmt, now) },
+		func(t *PeerTable) { t.AddAssert(b.Stmt, now) },
+		func(t *PeerTable) { t.AddRevocation(c.Config.DID, revokeB.Stmt) },
+	}
+	pA, _ := PeerOfDID(cert.DIDForKey(devA))
+	pB, _ := PeerOfDID(cert.DIDForKey(devB))
+	var perms [][]int
+	var permute func(cur, rest []int)
+	permute = func(cur, rest []int) {
+		if len(rest) == 0 {
+			perms = append(perms, append([]int(nil), cur...))
+			return
+		}
+		for i := range rest {
+			next := append(append([]int(nil), rest[:i]...), rest[i+1:]...)
+			permute(append(cur, rest[i]), next)
+		}
+	}
+	permute(nil, []int{0, 1, 2, 3})
+	at := now.Add(2 * time.Second)
+	for _, perm := range perms {
+		table := NewMemberStore(statement.NewDIDRoots(c.Config.DID))
+		for _, i := range perm {
+			ops[i](table)
+		}
+		cA, ok := table.Cert(pA)
+		if !ok || cA.Stmt.ID() != aLong.Stmt.ID() {
+			t.Fatalf("order %v: device A summarised by %v, want the longer assert", perm, ok)
+		}
+		if table.IsMember(pB, at) || !table.IsRevoked(pB, at) {
+			t.Fatalf("order %v: revoked device B is member=%v revoked=%v", perm, table.IsMember(pB, at), table.IsRevoked(pB, at))
+		}
+	}
+}
+
+// Routes and the zone are in the view: only the overlay circle's asserts,
+// inside its range, by each device's assert in that circle; a device of an
+// overlapping circle never becomes a route; a revocation removes the route
+// with the publish, nothing is rebuilt.
+func TestViewRoutesFollowTheOverlayCircle(t *testing.T) {
+	first, _ := circle.Init(t.TempDir(), "main", "pw")
+	other, _ := circle.Init(t.TempDir(), "family", "pw")
+	fPriv, _ := first.Unlock("pw")
+	oPriv, _ := other.Unlock("pw")
+	now := time.Now()
+	tunVerbs := append(append([]string{}, circle.DeviceVerbs...), statement.VerbTun)
+	nasPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	herPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	nasMain, _ := circle.AttestWith(fPriv, nil, first.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
+	nasFamily, _ := circle.AttestWith(oPriv, nil, other.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.7/24"})
+	herFamily, _ := circle.AttestWith(oPriv, nil, other.Config.DID, herPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "her-pc", IP: "100.64.0.9/24"})
+
+	table := NewMemberStore(statement.NewDIDRoots(first.Config.DID))
+	table.AddRoster(circle.NewRoster(statement.NewDIDRoots(other.Config.DID)))
+	for _, a := range []*circle.Attestation{nasMain, nasFamily, herFamily} {
+		if _, err := table.AddAssert(a.Stmt, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := table.Route(netip.MustParseAddr("100.64.0.2")); ok {
+		t.Fatal("routes exist before the overlay circle is set")
+	}
+	table.SetOverlay(first.Config.DID, netip.MustParsePrefix("100.64.0.1/24"))
+	nas, _ := PeerOfDID(cert.DIDForKey(nasPub))
+	if p, ok := table.Route(netip.MustParseAddr("100.64.0.2")); !ok || p != nas {
+		t.Fatalf("route to nas = %v %v", p, ok)
+	}
+	if a, ok := table.AddrOf(nas); !ok || a != netip.MustParseAddr("100.64.0.2") {
+		t.Fatalf("nas's address in the overlay circle = %v %v, want .2 (not family's .7)", a, ok)
+	}
+	for _, dst := range []string{"100.64.0.7", "100.64.0.9"} {
+		if _, ok := table.Route(netip.MustParseAddr(dst)); ok {
+			t.Fatalf("%s is routable: another circle's assert for a device of this circle, or an overlapping circle's device", dst)
+		}
+	}
+	if a, ok := table.Resolve("NAS"); !ok || a != netip.MustParseAddr("100.64.0.2") {
+		t.Fatalf("nas.fabric = %v %v", a, ok)
+	}
+	if _, ok := table.Resolve("her-pc"); ok {
+		t.Fatal("a device of another circle resolves on this interface")
+	}
+	// The circle revokes nas: the next publish has no route, no name.
+	rev, _ := circle.Revoke(fPriv, cert.DIDForKey(nasPub), now.Add(time.Second))
+	if _, err := table.AddRevocation(first.Config.DID, rev.Stmt); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := table.Route(netip.MustParseAddr("100.64.0.2")); ok {
+		t.Fatal("revoked device still routable")
+	}
+	if _, ok := table.AddrOf(nas); ok {
+		t.Fatal("revoked device still has an inbound address")
+	}
+}
+
+// Many writers and readers at once: every read sees a self-consistent
+// view, the version only grows, and the end state is the full set.
+func TestOwnerUnderConcurrentWritersAndReaders(t *testing.T) {
+	c, _ := circle.Init(t.TempDir(), "p", "pw")
+	priv, _ := c.Unlock("pw")
+	table := NewMemberStore(statement.NewDIDRoots(c.Config.DID))
+	now := time.Now()
+	const n = 24
+	asserts := make([]*circle.Attestation, n)
+	for i := range asserts {
+		pub, _, _ := ed25519.GenerateKey(rand.Reader)
+		asserts[i], _ = circle.AttestFor(priv, pub, now, time.Hour)
+	}
+	ch := table.Watch()
+	stop := make(chan struct{})
+	readErr := make(chan error, 1)
+	go func() {
+		last := uint64(0)
+		for {
+			select {
+			case <-stop:
+				readErr <- nil
+				return
+			default:
+			}
+			v := table.View()
+			if v.Version() < last {
+				readErr <- fmt.Errorf("version went backwards: %d after %d", v.Version(), last)
+				return
+			}
+			last = v.Version()
+			members, _ := v.Snapshot()
+			for p := range members {
+				if !v.IsMember(p, now) {
+					readErr <- fmt.Errorf("snapshot and IsMember disagree inside one view")
+					return
+				}
+			}
+		}
+	}()
+	var wg sync.WaitGroup
+	for _, a := range asserts {
+		wg.Add(1)
+		go func(a *circle.Attestation) {
+			defer wg.Done()
+			if _, err := table.AddAssert(a.Stmt, now); err != nil {
+				t.Error(err)
+			}
+		}(a)
+	}
+	wg.Wait()
+	close(stop)
+	if err := <-readErr; err != nil {
+		t.Fatal(err)
+	}
+	if members, _ := table.Snapshot(); len(members) != n {
+		t.Fatalf("%d members after %d concurrent admissions", len(members), n)
+	}
+	select {
+	case <-ch:
+	default:
+		t.Fatal("no change signal reached the watcher")
 	}
 }

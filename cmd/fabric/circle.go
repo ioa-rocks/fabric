@@ -750,6 +750,16 @@ func circlePrefix(root string, c *circle.Circle, subnet string) (string, error) 
 	return prefix, nil
 }
 
+// recordOnDisk adds the attestation to the roster file directly — the CLI
+// is the only writer when no daemon runs here.
+func recordOnDisk(roster *circle.Roster, a *circle.Attestation, now time.Time) error {
+	nr, _, err := roster.Add(a.Stmt, now)
+	if err != nil {
+		return err
+	}
+	return nr.Save()
+}
+
 // deviceOverlayElsewhere reports the circle (name, or DID when unnamed
 // here) in which the device already holds a live overlay address other
 // than c, and that address — from the rosters of the circles this node
@@ -1007,12 +1017,12 @@ func cmdCircleAdmit(args []string) error {
 		if _, err := client.CircleAdmit(raw); err == nil {
 			fmt.Println("  the circle's roster knows the device now; devices online learn it at once, the rest by gossip")
 		} else {
-			if _, err := roster.Add(a.Stmt, now); err != nil {
+			if err := recordOnDisk(roster, a, now); err != nil {
 				return err
 			}
 			fmt.Println("  recorded in the circle's roster on disk (no running daemon here: 'fabric up' gossips it)")
 		}
-	} else if _, err := roster.Add(a.Stmt, now); err != nil {
+	} else if err := recordOnDisk(roster, a, now); err != nil {
 		return err
 	}
 	fmt.Printf("  bundle written to %s — move it privately to the device, then run there: fabric circle join %s (fresh machine: fabric join %s)\n", *out, filepath.Base(*out), filepath.Base(*out))

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"net/netip"
 	"testing"
 	"time"
 
@@ -214,45 +213,6 @@ func TestDurableBootstrapAddr(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// Overlay routes come from certs: an address is routable only when the cert
-// carries one and its scope admits TUN (fabric ADR 0005) — never from what
-// the member itself configures.
-func TestOverlayRoutesHonourScope(t *testing.T) {
-	_, root, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	issue := func(name, ip string, scope []string) (peer.ID, *cert.Cert) {
-		pub, _, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		c, err := cert.Issue(root, pub, cert.CmdMember, cert.Meta{Name: name, IP: ip, Scope: scope}, time.Now(), time.Hour)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return peer.ID(name), c
-	}
-	members := map[peer.ID]*cert.Cert{}
-	add := func(p peer.ID, c *cert.Cert) { members[p] = c }
-	add(issue("full", "100.64.0.2/24", nil))
-	add(issue("tun-scoped", "100.64.0.3/24", []string{cert.ScopeTun, cert.ScopeVault}))
-	add(issue("no-ip", "", nil))
-	add(issue("vault-only-with-stale-ip", "100.64.0.4/24", []string{cert.ScopeVault}))
-	add(issue("other-overlay", "100.64.7.2/24", nil))
-
-	routes := overlayRoutes(members, netip.MustParsePrefix("100.64.0.1/24"))
-	want := map[string]peer.ID{"100.64.0.2": "full", "100.64.0.3": "tun-scoped"}
-	if len(routes) != len(want) {
-		t.Fatalf("routes = %v, want %v", routes, want)
-	}
-	for ip, p := range want {
-		if routes[netip.MustParseAddr(ip)] != p {
-			t.Fatalf("route for %s = %v, want %v", ip, routes[netip.MustParseAddr(ip)], p)
-		}
 	}
 }
 
@@ -667,67 +627,5 @@ func TestFirstCircleAdmissionSurvivesRestart(t *testing.T) {
 	t.Cleanup(func() { again.Host.Close(); again.Stop() })
 	if !again.Store.IsMember(p, time.Now()) {
 		t.Fatal("admission into the first circle was lost on restart")
-	}
-}
-
-// The route table is built from the first circle's asserts alone: a
-// device of another circle, even with an address inside this circle's
-// range, and another circle's assert for a device of this circle, never
-// become routes (Codex review, 2026-11-05).
-func TestRoutesComeFromFirstCircleOnly(t *testing.T) {
-	first, _ := circle.Init(t.TempDir(), "main", "pw")
-	other, _ := circle.Init(t.TempDir(), "family", "pw")
-	fPriv, _ := first.Unlock("pw")
-	oPriv, _ := other.Unlock("pw")
-	now := time.Now()
-	tunVerbs := append(append([]string{}, circle.DeviceVerbs...), statement.VerbTun)
-	nasPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	herPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	nasMain, _ := circle.AttestWith(fPriv, nil, first.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.2/24"})
-	nasFamily, _ := circle.AttestWith(oPriv, nil, other.Config.DID, nasPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "nas", IP: "100.64.0.7/24"})
-	herFamily, _ := circle.AttestWith(oPriv, nil, other.Config.DID, herPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "her-pc", IP: "100.64.0.9/24"})
-
-	table := fabricnet.NewMemberStore(statement.NewDIDRoots(first.Config.DID))
-	family := circle.NewRoster(statement.NewDIDRoots(other.Config.DID))
-	table.AddRoster(family)
-	if _, err := table.Rosters()[0].Add(nasMain.Stmt, now); err != nil {
-		t.Fatal(err)
-	}
-	for _, a := range []*circle.Attestation{nasFamily, herFamily} {
-		if _, err := family.Add(a.Stmt, now); err != nil {
-			t.Fatal(err)
-		}
-	}
-	nas, _ := fabricnet.PeerOfDID(cert.DIDForKey(nasPub))
-	routes := overlayRoutes(membersIn(table, first.Config.DID), netip.MustParsePrefix("100.64.0.1/24"))
-	if len(routes) != 1 || routes[netip.MustParseAddr("100.64.0.2")] != nas {
-		t.Fatalf("routes = %v, want nas at 100.64.0.2 alone", routes)
-	}
-}
-
-// The roster change hook must never block or take a daemon lock: it runs
-// inside roster notification, under whatever lock the mutator holds (a
-// root retirement rechecks the store with cfgMu held). kickRoutes only
-// signals the worker; a second kick while one is pending is dropped, and
-// a daemon without a bridge has no worker to kick.
-func TestKickRoutesNeverBlocks(t *testing.T) {
-	d := &Daemon{routesKick: make(chan struct{}, 1)}
-	d.cfgMu.Lock()
-	defer d.cfgMu.Unlock()
-	done := make(chan struct{})
-	go func() {
-		for i := 0; i < 3; i++ {
-			d.kickRoutes()
-		}
-		(&Daemon{}).kickRoutes()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("kickRoutes blocked")
-	}
-	if len(d.routesKick) != 1 {
-		t.Fatalf("pending kicks = %d, want exactly one coalesced", len(d.routesKick))
 	}
 }
