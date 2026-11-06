@@ -371,7 +371,8 @@ func (r *Roster) verdict(dev *Device) error {
 // admission that a narrower renewal superseded loses the verb the renewal
 // dropped; one under a lapsed or revoked admission ends with it. A chain
 // through the entry itself stands as the entry does (agy review and Codex
-// review, 2026-11-06).
+// review, 2026-11-06). An empty want.Verb asks about standing alone —
+// whether the chain is live — and skips the verb cap.
 func (r *Roster) Cap(c *statement.Compiled, want statement.Want) error {
 	for _, links := range [][]statement.Link{c.Auth, c.Ident} {
 		for _, l := range links {
@@ -391,7 +392,7 @@ func (r *Roster) Cap(c *statement.Compiled, want statement.Want) error {
 			if !dev.Admits(want.Now) {
 				return fmt.Errorf("admission of %s is superseded by one that does not admit it now", shortDID(l.Aud))
 			}
-			if !dev.Chain.Allows(want.Sub, want.Res, want.Verb) {
+			if want.Verb != "" && !dev.Chain.Allows(want.Sub, want.Res, want.Verb) {
 				return fmt.Errorf("admission of %s is superseded by one without %s", shortDID(l.Aud), want.Verb)
 			}
 		}

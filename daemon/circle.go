@@ -808,7 +808,14 @@ func (s *CircleService) Verify(ctx context.Context, p peer.ID, want statement.Wa
 	if chain == nil {
 		return legacyAllows(circle.DeviceVerbs, want)
 	}
-	return chain.Check(statement.NewDIDRoot(c.Config.DID), s.revsFor(want.Sub, want.Now), want)
+	if err := chain.Check(statement.NewDIDRoot(c.Config.DID), s.revsFor(want.Sub, want.Now), want); err != nil {
+		return err
+	}
+	// The chain may be the one the legacy exchange cached when the roster
+	// holds no live entry — an older admission still inside its window
+	// after the device's current one lapsed. The cap judges it by the
+	// roster's entry like every other chain (Codex review, 2026-11-06).
+	return s.capByRoster(chain, want)
 }
 
 // verifyHome is Verify for the home circle: the chain is the membership
@@ -1016,7 +1023,11 @@ func (s *CircleService) Sweep() {
 }
 
 // validLocked is the window + roots + revocations half of Check for a
-// chain on its own resource (caller holds s.mu at least for reading).
+// chain on its own resource (caller holds s.mu at least for reading), then
+// the roster cap on standing alone: whether the chain is live is a
+// question about its lineage, not about one verb — a sub-key granting
+// publish and read stays live when its device loses publish, and the
+// verb is settled at use (Codex review, 2026-11-06).
 func (s *CircleService) validLocked(c *statement.Compiled, now time.Time) error {
 	roots, err := s.rootsForLocked(c.Sub)
 	if err != nil {
@@ -1026,7 +1037,7 @@ func (s *CircleService) validLocked(c *statement.Compiled, now time.Time) error 
 	if err := c.Check(roots, s.revsForLocked(c.Sub, now), want); err != nil {
 		return err
 	}
-	return s.capByRoster(c, want)
+	return s.capByRoster(c, statement.Want{Sub: c.Sub, Now: now})
 }
 
 // ErrNotPresented is a verb under a chain this connection never presented.

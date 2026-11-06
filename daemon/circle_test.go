@@ -750,3 +750,107 @@ func TestPresentedChainIsCappedByTheRosterEntry(t *testing.T) {
 		t.Fatal("sub-key outlives the revocation of its device's current admission")
 	}
 }
+
+// A sub-key granting publish and read stays live when its device's renewal
+// drops publish: liveness is about the lineage, the verb is settled at use.
+// The periodic sweep judged liveness by the leaf's first verb and dropped
+// the chain while VerifyPresented(read) passed (Codex review, 2026-11-06;
+// their reproduction).
+func TestMixedVerbChainSurvivesPartialNarrowing(t *testing.T) {
+	rp, rk, _ := ed25519.GenerateKey(rand.Reader)
+	dp, dk, _ := ed25519.GenerateKey(rand.Reader)
+	kp, _, _ := ed25519.GenerateKey(rand.Reader)
+	sub := did.ForKey(rp)
+	now := time.Now().Add(-time.Minute)
+	res := statement.Resource{Kind: statement.KindSubject, Name: "jobs"}
+	a1, err := circle.AdmitWith(rk, nil, sub, dp, now, time.Hour, []string{statement.VerbMember, statement.VerbPublish, statement.VerbRead}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := statement.Sign(dk, statement.Payload{Sub: sub, Aud: did.ForKey(kp), Res: []statement.Resource{res}, Verbs: []string{statement.VerbPublish, statement.VerbRead}, Iat: now.Unix(), Nbf: now.Unix(), Exp: now.Add(time.Hour).Unix()}, a1.Stmt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := statement.NewDIDRoot(sub)
+	comp, err := statement.Compile(child, nil, sub, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := fabricnet.NewMemberStore(roots)
+	t.Cleanup(table.Close)
+	if _, err := table.AddAdmission(a1.Stmt, now); err != nil {
+		t.Fatal(err)
+	}
+	a2, err := circle.AdmitWith(rk, nil, sub, dp, now.Add(time.Second), time.Hour, []string{statement.VerbMember, statement.VerbRead}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := table.AddAdmission(a2.Stmt, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	p := peer.ID("review-peer")
+	raw, _ := child.Bytes()
+	svc := &CircleService{root: t.TempDir(), home: func() string { return sub }, roots: roots, table: table,
+		presented: map[peer.ID]map[presentKey]presentedChain{p: {{auth: comp.AuthLeafID(), key: comp.PresentingKey}: {comp: comp, raw: raw}}}}
+	want := statement.Want{Sub: sub, Res: res, Verb: statement.VerbRead, PresentingKey: did.ForKey(kp), Now: time.Now()}
+	if err := svc.VerifyPresented(p, child.ID(), want.PresentingKey, want); err != nil {
+		t.Fatalf("remaining read permission should pass: %v", err)
+	}
+	if err := svc.VerifyPresentedValid(p, child.ID(), want.PresentingKey); err != nil {
+		t.Errorf("live chain with still-authorized read judged dead by its first verb: %v", err)
+	}
+	svc.Sweep()
+	if err := svc.VerifyPresented(p, child.ID(), want.PresentingKey, want); err != nil {
+		t.Errorf("the periodic sweep removed the still-authorized reader: %v", err)
+	}
+	want.Verb = statement.VerbPublish
+	if err := svc.VerifyPresented(p, child.ID(), want.PresentingKey, want); err == nil {
+		t.Error("the dropped verb still passes")
+	}
+}
+
+// Verify for a held circle falls back to the chain the legacy exchange
+// cached when the roster holds no live entry — an older admission still in
+// its window after the device's current one lapsed. It is capped by the
+// roster like every other chain, so Verify and CheckChain agree (Codex
+// review, 2026-11-06; their reproduction).
+func TestVerifyDoesNotFallBackToASupersededCachedAdmission(t *testing.T) {
+	root := t.TempDir()
+	c, err := circle.Init(root, "secondary", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk, err := c.Unlock("pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp, _, _ := ed25519.GenerateKey(rand.Reader)
+	p, err := fabricnet.PeerIDForKey(dp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	a1, _ := circle.AdmitWith(rk, nil, c.Config.DID, dp, now.Add(-time.Minute), time.Hour, circle.DeviceVerbs, nil)
+	a2, _ := circle.AdmitWith(rk, nil, c.Config.DID, dp, now.Add(-10*time.Second), time.Second, circle.DeviceVerbs, nil) // the later word, already run out
+	roots := statement.NewDIDRoot(c.Config.DID)
+	table := fabricnet.NewMemberStore(roots)
+	t.Cleanup(table.Close)
+	for _, a := range []*circle.Admission{a1, a2} {
+		if _, err := table.AddAdmission(a.Stmt, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	comp, err := statement.Compile(a1.Stmt, nil, c.Config.DID, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := &CircleService{root: root, table: table, peers: map[peer.ID]circleEntry{p: {dids: []string{c.Config.DID}, chains: map[string]*statement.Compiled{c.Config.DID: comp}, at: now}}}
+	want := statement.Want{Sub: c.Config.DID, Res: statement.Resource{Kind: statement.KindBucket, Name: "private"}, Verb: statement.VerbBlob, Now: now}
+	raw, _ := a1.Stmt.Bytes()
+	if err := svc.CheckChain(raw, want); err == nil {
+		t.Fatal("fixture: CheckChain should refuse the superseded admission")
+	}
+	if err := svc.Verify(context.Background(), p, want); err == nil {
+		t.Fatal("Verify authorizes the cached older admission after the newer one lapsed; CheckChain refuses the same admission")
+	}
+}
