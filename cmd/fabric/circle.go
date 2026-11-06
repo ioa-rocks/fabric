@@ -611,7 +611,7 @@ func cmdCircleStatus(args []string) error {
 
 // cmdCircleRevoke signs a device out of a circle: every admission it holds
 // for the circle, issued up to now, is dead; devices of the circle learn it
-// on their next circle exchange, and the running daemon here pushes it to
+// at their next connect, and the running daemon here pushes it to
 // the ones connected now. Needs the circle key — an owner device. A later
 // admission (an owner re-admitting the device) is a re-admission and
 // stands.
@@ -668,9 +668,9 @@ func cmdCircleRevoke(args []string) error {
 	fmt.Println("the device keeps whatever it already synced; devices of the circle stop serving it as they learn of this")
 	if client != nil {
 		if n, err := client.CircleRefresh(); err == nil {
-			fmt.Printf("pushed to %d connected member(s); others learn it at their next circle exchange\n", n)
+			fmt.Printf("pushed to %d connected member(s); others learn it at their next connect\n", n)
 		} else {
-			fmt.Println("no running node daemon here — connected devices learn it at their next circle exchange ('fabric up' pushes it)")
+			fmt.Println("no running node daemon here — connected devices learn it at their next connect ('fabric up' pushes it)")
 		}
 	}
 	fmt.Println("to re-admit the device later, admit it again on an owner device (an admission issued after the revocation stands)")

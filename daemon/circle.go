@@ -17,43 +17,27 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/protocol"
 
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/fabricnet"
-	"ioa.rocks/fabric/internal/wire"
 	"ioa.rocks/fabric/statement"
 )
 
-// Circle-presence exchange: after membership auth, two members show each
-// other the device admissions they hold — one per circle this device
-// belongs to — and learn which circles the other verifiably serves. It is
-// control plane (always within scope); what it unlocks is the circle-gated
-// data planes.
-//
-// Version 4 (2026-11-02) carries statements (package statement): admissions
-// and revocations in the one signed-statement format, legacy forms included
-// while devices still hold them. Version 3 (2026-10-31) added the
-// admission lifecycle — revocations travel with the admissions — in the
-// bespoke payloads; it is still served and dialled, carrying only legacy
-// forms so an older peer never sees bytes it cannot parse. Version 2
-// (admissions only, as a bare list) likewise. Peers on the older versions
-// do not see statement-form admissions, so re-admit devices only once
-// their peers are upgraded.
-const (
-	CircleProtocolV4ID = "/fabric/circle/4"
-	CircleProtocolID   = "/fabric/circle/3"
-	CircleProtocolV2ID = "/fabric/circle/2"
-)
+// Circle presence: which of this node's circles is a connected member a
+// device of, and with what admission. Since step 5 the answer is the peer
+// table's — the v2 handshake (fabricnet.AuthService) presents one
+// admission per shared circle each way and per-circle gossip
+// (fabricnet.EventSync) fills the rosters — and this service lends both
+// its circle view (hello, hooks) and judges chains against it. The
+// circle-presence exchange that preceded them (/fabric/circle/2|3|4: two
+// members swapping admission lists after membership auth) was served and
+// dialled for one release and retired in slice G (2026-11-06).
 
-const maxAdmissionsWireSize = 64 * 1024
-
-// circleHello is one direction of a v3 exchange.
-type circleHello struct {
-	Admissions  [][]byte `cbor:"a"`
-	Revocations [][]byte `cbor:"r,omitempty"`
-}
+// controlProtocol stands for "any control-plane protocol" where the
+// question is whether a peer is a member at all (cert.ScopeFamily of a
+// control-plane ID is the empty family, admitted to every member).
+const controlProtocol = fabricnet.SyncProtocolV2ID
 
 // CircleService is the circle instance of the namespace engine (ADR 0014,
 // l0-connectivity memo §9 steps 3–4): it answers "which of *my* circles is
@@ -61,8 +45,7 @@ type circleHello struct {
 // ownership, not on mesh membership. A node holds any number of circles
 // (its circle root); verification uses the circle DID inside each
 // admission and the peer key libp2p authenticated, so nothing the remote
-// daemon configures can widen it. Results are cached per connection and
-// dropped for a device the moment a revocation naming it arrives.
+// daemon configures can widen it.
 type CircleService struct {
 	h    host.Host
 	auth *fabricnet.AuthService
@@ -74,8 +57,7 @@ type CircleService struct {
 	ownCert func() *cert.Cert
 	// home is the home circle's DID, roots its root and
 	// certOf the member store: a peer's chain in the home circle is its
-	// membership cert (one admission per device, mesh-root merge), which the
-	// circle exchange never carries.
+	// membership cert (one admission per device, mesh-root merge).
 	home   func() string
 	roots  statement.Roots
 	certOf func(peer.ID, string) (*cert.Cert, bool) // the peer's admission in a circle
@@ -88,7 +70,7 @@ type CircleService struct {
 	sync *fabricnet.EventSync
 
 	mu           sync.RWMutex
-	peers        map[peer.ID]circleEntry
+	homeChains   map[peer.ID]homeChain                     // the compiled membership cert per connected peer (verifyHome's cache)
 	presented    map[peer.ID]map[presentKey]presentedChain // chains presented on a connection (sub-keys, grantees)
 	extraRevs    map[string]*statement.RevocationSet       // revocations for the home circle when not held here (a gate)
 	onInvalidate []func()
@@ -138,37 +120,23 @@ type presentKey struct {
 	key  string
 }
 
-// circleEntry is one exchange result. A result with circles holds for the
-// connection; an empty one (the peer presented no admission) only for
-// noCircleTTL, so a device admitted after connecting (`fabric circle
-// admit` needs no restart) is picked up without a reconnect. chains holds
-// the compiled admission per circle (nil for a legacy admission);
-// homeChain the compiled membership cert, keyed by its ID so a renewal
-// recompiles.
-type circleEntry struct {
-	dids   []string
-	chains map[string]*statement.Compiled
-	at     time.Time
-
-	homeCertID [32]byte
-	homeChain  *statement.Compiled
+// homeChain is a peer's compiled membership cert, keyed by the cert's ID
+// so a renewal recompiles.
+type homeChain struct {
+	certID [32]byte
+	chain  *statement.Compiled
 }
-
-const noCircleTTL = 30 * time.Second
 
 // NewCircleService attaches the exchange to the host for the circles under
 // root (listed on demand — circles added later need no restart).
 func NewCircleService(h host.Host, auth *fabricnet.AuthService, root string) *CircleService {
-	s := &CircleService{h: h, auth: auth, root: root, peers: map[peer.ID]circleEntry{}, presented: map[peer.ID]map[presentKey]presentedChain{}, extraRevs: map[string]*statement.RevocationSet{}}
+	s := &CircleService{h: h, auth: auth, root: root, homeChains: map[peer.ID]homeChain{}, presented: map[peer.ID]map[presentKey]presentedChain{}, extraRevs: map[string]*statement.RevocationSet{}}
 	s.loadExtraRevs()
-	h.SetStreamHandler(CircleProtocolV4ID, auth.RequireMember(s.handleV4))
-	h.SetStreamHandler(CircleProtocolID, auth.RequireMember(s.handleV3))
-	h.SetStreamHandler(CircleProtocolV2ID, auth.RequireMember(s.handleV2))
 	nb := &network.NotifyBundle{DisconnectedF: func(n network.Network, conn network.Conn) {
 		p := conn.RemotePeer()
 		if n.Connectedness(p) != network.Connected {
 			s.mu.Lock()
-			delete(s.peers, p)
+			delete(s.homeChains, p)
 			delete(s.presented, p)
 			s.mu.Unlock()
 		}
@@ -626,158 +594,15 @@ func (s *CircleService) Info(now time.Time) []CircleInfo {
 }
 
 // Close detaches the service.
-func (s *CircleService) Close() {
-	s.h.RemoveStreamHandler(CircleProtocolV4ID)
-	s.h.RemoveStreamHandler(CircleProtocolID)
-	s.h.RemoveStreamHandler(CircleProtocolV2ID)
-	s.stop()
-}
-
-// ownAdmissionsWire is what this node presents on the circle exchange: its
-// live admissions as bytes. A dead one (expired, or revoked by the circle)
-// is not shown — peers would refuse it anyway, and showing it would poison
-// the list. Statement-form admissions go only to peers that speak v4.
-func (s *CircleService) ownAdmissionsWire(now time.Time, statements bool, only []string) ([][]byte, error) {
-	var out [][]byte
-	for _, c := range s.Circles() {
-		if !slices.Contains(only, c.Config.DID) {
-			continue
-		}
-		a := s.liveAdmission(c, now)
-		if a == nil || (a.IsStatement() && !statements) {
-			continue
-		}
-		raw, err := a.Marshal()
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, raw)
-	}
-	return out, nil
-}
-
-// ownRevocations is every live revocation this node holds in the named
-// circles; statement-form ones only for v4 peers.
-func (s *CircleService) ownRevocations(now time.Time, statements bool, only []string) ([][]byte, error) {
-	var out [][]byte
-	if statements {
-		s.mu.RLock()
-		for circleDID, set := range s.extraRevs {
-			if !slices.Contains(only, circleDID) {
-				continue
-			}
-			for _, st := range set.All() {
-				r, err := circle.RevocationFromStatement(st)
-				if err != nil || r.Circle != circleDID {
-					continue
-				}
-				if raw, err := r.Marshal(); err == nil {
-					out = append(out, raw)
-				}
-			}
-		}
-		s.mu.RUnlock()
-	}
-	for _, c := range s.Circles() {
-		if !slices.Contains(only, c.Config.DID) {
-			continue
-		}
-		rs, err := c.Revocations(now)
-		if err != nil {
-			return nil, err
-		}
-		for _, r := range rs {
-			if r.IsStatement() && !statements {
-				continue
-			}
-			raw, err := r.Marshal()
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, raw)
-		}
-	}
-	return out, nil
-}
-
-// heldDIDs lists the DIDs of every circle this node holds.
-func (s *CircleService) heldDIDs() []string {
-	var out []string
-	for _, c := range s.Circles() {
-		out = append(out, c.Config.DID)
-	}
-	return out
-}
-
-// presentable lists the circles this node names on a legacy exchange it
-// opens toward p — the v2 hello's rule: the circles whose roster already
-// knows the device, or whose gate hints name the peer. A peer known
-// nowhere gets the circle the device was joined in alone (what v1 always
-// showed). The responder then answers with exactly the circles the dialer
-// verified in, so neither side learns of a circle it is not in (Codex
-// review, 2026-11-05: any member could read every circle held here).
-func (s *CircleService) presentable(p peer.ID) []string {
-	var out []string
-	deviceDID, _ := fabricnet.DeviceDID(p)
-	for _, c := range s.Circles() {
-		known := s.hinted(c.Config.DID, p)
-		if !known && s.table != nil {
-			if r, ok := s.table.RosterFor(c.Config.DID); ok {
-				_, known = r.Device(deviceDID)
-			}
-		}
-		if known {
-			out = append(out, c.Config.DID)
-		}
-	}
-	if len(out) == 0 {
-		var own *cert.Cert
-		if s.ownCert != nil {
-			own = s.ownCert()
-		}
-		if own == nil && s.auth != nil {
-			own = s.auth.Own()
-		}
-		if own != nil {
-			out = append(out, own.Payload.Sub)
-		}
-	}
-	return out
-}
-
-func (s *CircleService) remember(p peer.ID, dids []string, chains map[string]*statement.Compiled) {
-	s.mu.Lock()
-	prev := s.peers[p]
-	s.peers[p] = circleEntry{dids: dids, chains: chains, at: time.Now(), homeCertID: prev.homeCertID, homeChain: prev.homeChain}
-	s.mu.Unlock()
-}
-
-// chainFor returns a peer's compiled admission in a circle from the
-// current exchange result (nil chain = legacy admission).
-func (s *CircleService) chainFor(p peer.ID, did string) (chain *statement.Compiled, ok bool) {
-	if s.table != nil {
-		if chain, ok := s.table.Chain(p, did, time.Now()); ok {
-			return chain, true
-		}
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	e, known := s.peers[p]
-	if !known {
-		return nil, false
-	}
-	chain, ok = e.chains[did]
-	return chain, ok
-}
+func (s *CircleService) Close() { s.stop() }
 
 // Verify answers one authorization question about a connected member: may
 // the device p do want.Verb on want.Res in circle want.Sub? The chain is
-// the device's admission in that circle (from the exchange) or, for the
-// home circle, its membership cert; want.PresentingKey is set here from
-// the transport-authenticated peer key. Check runs on every call (window,
-// scope, roots still honoured, revocations); only the crypto is cached. A
-// legacy admission or cert carries no verbs and counts as the full
-// device set.
+// the device's current admission in that circle (the roster's entry) or,
+// for the home circle, its membership cert; want.PresentingKey is set here
+// from the transport-authenticated peer key. Check runs on every call
+// (window, scope, roots still honoured, revocations); only the crypto is
+// cached. A legacy cert carries no verbs and counts as the full device set.
 func (s *CircleService) Verify(ctx context.Context, p peer.ID, want statement.Want) error {
 	if want.Sub == "" {
 		return errors.New("verify: circle required")
@@ -797,23 +622,18 @@ func (s *CircleService) Verify(ctx context.Context, p peer.ID, want statement.Wa
 	if c == nil {
 		return fmt.Errorf("circle %s is not held by this node", shortDID(want.Sub))
 	}
-	if _, err := s.Ensure(ctx, p); err != nil {
-		return fmt.Errorf("circle exchange with %s: %w", p, err)
+	if s.table == nil {
+		return errors.New("verify: no peer table")
 	}
-	chain, ok := s.chainFor(p, want.Sub)
+	chain, ok := s.table.Chain(p, want.Sub, want.Now)
 	if !ok {
 		return fmt.Errorf("%s is not a device of circle %s", shortDID(presenter), shortDID(want.Sub))
-	}
-	if chain == nil {
-		return legacyAllows(circle.DeviceVerbs, want)
 	}
 	if err := chain.Check(statement.NewDIDRoot(c.Config.DID), s.revsFor(want.Sub, want.Now), want); err != nil {
 		return err
 	}
-	// The chain may be the one the legacy exchange cached when the roster
-	// holds no live entry — an older admission still inside its window
-	// after the device's current one lapsed. The cap judges it by the
-	// roster's entry like every other chain (Codex review, 2026-11-06).
+	// The roster's entry is the chain, so the cap is its own standing and
+	// the sweep check over its links (Codex review, 2026-11-06).
 	return s.capByRoster(chain, want)
 }
 
@@ -829,22 +649,19 @@ func (s *CircleService) verifyHome(p peer.ID, want statement.Want) error {
 	}
 	id := c.Stmt.ID()
 	s.mu.RLock()
-	e := s.peers[p]
-	chain := e.homeChain
+	hc := s.homeChains[p]
 	s.mu.RUnlock()
-	if chain == nil || e.homeCertID != id {
-		var err error
-		chain, err = statement.Compile(c.Stmt, nil, want.Sub, s.roots)
+	if hc.chain == nil || hc.certID != id {
+		chain, err := statement.Compile(c.Stmt, nil, want.Sub, s.roots)
 		if err != nil {
 			return fmt.Errorf("membership cert: %w", err)
 		}
+		hc = homeChain{certID: id, chain: chain}
 		s.mu.Lock()
-		e = s.peers[p]
-		e.homeCertID, e.homeChain = id, chain
-		s.peers[p] = e
+		s.homeChains[p] = hc
 		s.mu.Unlock()
 	}
-	return chain.Check(s.roots, s.revsFor(want.Sub, want.Now), want)
+	return hc.chain.Check(s.roots, s.revsFor(want.Sub, want.Now), want)
 }
 
 // revsFor is the revocation view for a circle: the circle's own set when
@@ -954,27 +771,31 @@ func shortDID(d string) string {
 	return d
 }
 
-// forgetDevice drops cached results for every connected peer whose key is
-// the given device, so the next question about it re-runs the exchange
-// against the revocation set.
+// forgetDevice drops what is cached for every connected peer whose key is
+// the given device — its presented chains and compiled cert — so the next
+// question about it is judged afresh against the revocation set.
 func (s *CircleService) forgetDevice(deviceDID string) {
 	s.mu.Lock()
-	for p := range s.peers {
+	for p := range s.presented {
 		if did, err := deviceDIDOf(p); err == nil && did == deviceDID {
-			delete(s.peers, p)
 			delete(s.presented, p)
+		}
+	}
+	for p := range s.homeChains {
+		if did, err := deviceDIDOf(p); err == nil && did == deviceDID {
+			delete(s.homeChains, p)
 		}
 	}
 	s.mu.Unlock()
 	s.invalidated()
 }
 
-// forgetAll drops every cached result: a by-id revocation names a statement,
-// not a device, so every connected peer re-runs the exchange on its next
-// question.
+// forgetAll drops every compiled cert: a by-id revocation names a
+// statement, not a device, so every connected peer is judged afresh on its
+// next question.
 func (s *CircleService) forgetAll() {
 	s.mu.Lock()
-	s.peers = map[peer.ID]circleEntry{}
+	s.homeChains = map[peer.ID]homeChain{}
 	s.mu.Unlock()
 	s.invalidated()
 }
@@ -1014,7 +835,7 @@ func (s *CircleService) Sweep() {
 	}
 	s.mu.Unlock()
 	for _, p := range drop {
-		if s.auth != nil && p != s.h.ID() && !s.auth.Allows(p, CircleProtocolID) {
+		if s.auth != nil && p != s.h.ID() && !s.auth.Allows(p, controlProtocol) {
 			log.Printf("circle: stranger %s has no live chain left — dropped", p)
 			s.auth.Drop(p)
 		}
@@ -1095,7 +916,7 @@ func (s *CircleService) Present(p peer.ID, raw []byte) (*statement.Compiled, err
 			s.mu.Unlock()
 			return nil, fmt.Errorf("presented chain: too many chains on this connection (%d)", MaxPresentedPerPeer)
 		}
-		if !self && s.auth != nil && !s.auth.Allows(p, CircleProtocolID) {
+		if !self && s.auth != nil && !s.auth.Allows(p, controlProtocol) {
 			n := 0
 			for q, qm := range s.presented {
 				if q == p {
@@ -1143,8 +964,11 @@ func (s *CircleService) DeviceChain(p peer.ID, circleDID string) ([]byte, bool) 
 		b, err := c.Stmt.Bytes()
 		return b, err == nil
 	}
-	chain, ok := s.chainFor(p, circleDID)
-	if !ok || chain == nil || len(chain.Auth) == 0 {
+	if s.table == nil {
+		return nil, false
+	}
+	chain, ok := s.table.Chain(p, circleDID, time.Now())
+	if !ok || len(chain.Auth) == 0 {
 		return nil, false
 	}
 	b, err := chain.Auth[len(chain.Auth)-1].Stmt.Bytes()
@@ -1239,98 +1063,28 @@ func (s *CircleService) capByRoster(c *statement.Compiled, want statement.Want) 
 	return nil
 }
 
-// CirclesOf returns the member's verified circles, if a current exchange
-// result exists (an empty list means it presented no admission, within
-// noCircleTTL).
-func (s *CircleService) CirclesOf(p peer.ID) (dids []string, known bool) {
-	fromTable, shook := s.tableCircles(p)
-	exchanged, ok := s.exchanged(p)
-	if !ok && !shook {
-		return nil, false
+// CirclesOf returns the circles held here that the member is a live device
+// of, once it has completed a handshake on this connection.
+func (s *CircleService) CirclesOf(p peer.ID) (dids []string, known bool) { return s.tableCircles(p) }
+
+// Ensure returns the circles held here that the member is a live device of
+// — the peer table's view, filled by the handshake and per-circle gossip.
+// An error means no handshake has completed with the peer on this
+// connection. (Until slice G this also ran the circle exchange toward a
+// peer on the old binary; ctx is kept for the callers.)
+func (s *CircleService) Ensure(_ context.Context, p peer.ID) ([]string, error) {
+	dids, shook := s.tableCircles(p)
+	if !shook {
+		return nil, fmt.Errorf("no handshake with %s", p)
 	}
-	return union(fromTable, exchanged), true
+	return dids, nil
 }
 
-// exchanged is the cached result of the legacy circle exchange with a
-// peer (an empty one only within noCircleTTL).
-func (s *CircleService) exchanged(p peer.ID) ([]string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	e, ok := s.peers[p]
-	if !ok || (len(e.dids) == 0 && time.Since(e.at) > noCircleTTL) {
-		return nil, false
-	}
-	return e.dids, true
-}
-
-func union(a, b []string) []string {
-	out := slices.Clone(a)
-	for _, d := range b {
-		if !slices.Contains(out, d) {
-			out = append(out, d)
-		}
-	}
-	return out
-}
-
-// Ensure returns the member's verified circle DIDs: for a v2 peer what the
-// peer table holds (handshake and per-circle gossip); for a peer on the
-// old binary the legacy circle exchange, run on this connection if it has
-// not had one yet (retired with v1).
-func (s *CircleService) Ensure(ctx context.Context, p peer.ID) ([]string, error) {
-	fromTable, shook := s.tableCircles(p)
-	if shook {
-		// A v2 peer: the rosters are the truth; per-circle gossip fills
-		// them, and the handshake delivered what they lacked. The exchange
-		// would only name circles the peer may not be in.
-		return fromTable, nil
-	}
-	if dids, ok := s.exchanged(p); ok {
-		return union(fromTable, dids), nil
-	}
-	st, err := s.h.NewStream(ctx, p, CircleProtocolV4ID, CircleProtocolID, CircleProtocolV2ID)
-	if err != nil {
-		return nil, err
-	}
-	defer st.Close()
-	if dl, ok := ctx.Deadline(); ok {
-		_ = st.SetDeadline(dl)
-	}
-	v := versionOf(st.Protocol())
-	if err := s.writeOwn(st, v, s.presentable(p)); err != nil {
-		st.Reset()
-		return nil, err
-	}
-	pub, err := ed25519Of(s.h.Peerstore().PubKey(p))
-	if err != nil {
-		st.Reset()
-		return nil, err
-	}
-	dids, chains, err := s.readHello(st, pub, v)
-	if err != nil {
-		st.Reset()
-		return nil, err
-	}
-	s.remember(p, dids, chains)
-	return union(fromTable, dids), nil
-}
-
-// versionOf maps a negotiated protocol ID to the exchange version.
-func versionOf(id protocol.ID) int {
-	switch id {
-	case protocol.ID(CircleProtocolV4ID):
-		return 4
-	case protocol.ID(CircleProtocolID):
-		return 3
-	default:
-		return 2
-	}
-}
-
-// Refresh drops every cached result and re-runs the exchange with each
+// Refresh drops every cached verdict and re-runs the handshake with each
 // connected member: the way a freshly signed revocation reaches the devices
-// online right now instead of waiting for their next connection. Returns
-// how many members were reached.
+// online right now instead of waiting for their next connection (the
+// revocations of every shared circle ride the hello). Returns how many
+// members were reached.
 func (s *CircleService) Refresh(ctx context.Context) int {
 	// Drop everything cached — presented chains and the data plane's
 	// holders included: the caller just wrote a revocation to disk that no
@@ -1340,15 +1094,13 @@ func (s *CircleService) Refresh(ctx context.Context) int {
 	s.forgetAll()
 	n := 0
 	for _, p := range s.h.Network().Peers() {
-		if !s.auth.Allows(p, CircleProtocolID) {
+		if !s.auth.Allows(p, controlProtocol) {
 			continue
 		}
-		// A v2 peer gets a fresh handshake: it re-presents, and the
-		// revocations of every shared circle ride the hello.
-		if _, ok := s.auth.Handshake(p); ok {
-			_ = s.auth.Authenticate(ctx, p)
+		if _, ok := s.auth.Handshake(p); !ok {
+			continue
 		}
-		if _, err := s.Ensure(ctx, p); err == nil {
+		if err := s.auth.Authenticate(ctx, p); err == nil {
 			n++
 		}
 	}
@@ -1457,131 +1209,6 @@ func (s *CircleService) RequireAny(next network.StreamHandler) network.StreamHan
 		}
 		next(st)
 	})
-}
-
-func (s *CircleService) handleV4(st network.Stream) { s.handle(st, 4) }
-func (s *CircleService) handleV3(st network.Stream) { s.handle(st, 3) }
-func (s *CircleService) handleV2(st network.Stream) { s.handle(st, 2) }
-
-// handle is the responder side: read theirs, answer with ours.
-func (s *CircleService) handle(st network.Stream, v int) {
-	defer st.Close()
-	_ = st.SetDeadline(time.Now().Add(10 * time.Second))
-	pub, err := ed25519Of(st.Conn().RemotePublicKey())
-	if err != nil {
-		st.Reset()
-		return
-	}
-	dids, chains, err := s.readHello(st, pub, v)
-	if err != nil {
-		st.Reset()
-		return
-	}
-	s.remember(st.Conn().RemotePeer(), dids, chains)
-	// Answer with the circles the peer just proved itself in, no others.
-	if err := s.writeOwn(st, v, dids); err != nil {
-		st.Reset()
-	}
-}
-
-// writeOwn sends this node's admissions (and, from v3, revocations) for
-// the named circles as one frame. Empty when none of them is held or
-// admitted into.
-func (s *CircleService) writeOwn(st network.Stream, v int, only []string) error {
-	now := time.Now()
-	own, err := s.ownAdmissionsWire(now, v >= 4, only)
-	if err != nil {
-		return err
-	}
-	var raw []byte
-	if v >= 3 {
-		revs, err := s.ownRevocations(now, v >= 4, only)
-		if err != nil {
-			return err
-		}
-		raw, err = cbor.Marshal(circleHello{Admissions: own, Revocations: revs})
-	} else {
-		raw, err = cbor.Marshal(own)
-	}
-	if err != nil {
-		return err
-	}
-	return wire.WriteFrame(st, raw)
-}
-
-// readHello reads one frame, ingests any revocations in it, and verifies
-// every admission against the peer key the transport authenticated.
-// Returns the circle DIDs the peer is a live device of.
-func (s *CircleService) readHello(st network.Stream, devicePub ed25519.PublicKey, v int) ([]string, map[string]*statement.Compiled, error) {
-	raw, err := wire.ReadFrame(st, maxAdmissionsWireSize)
-	if err != nil {
-		return nil, nil, fmt.Errorf("reading admissions: %w", err)
-	}
-	var hello circleHello
-	if len(raw) > 0 {
-		if v >= 3 {
-			err = cbor.Unmarshal(raw, &hello)
-		} else {
-			err = cbor.Unmarshal(raw, &hello.Admissions)
-		}
-		if err != nil {
-			return nil, nil, fmt.Errorf("decoding admissions: %w", err)
-		}
-	}
-	now := time.Now()
-	// Revocations first: one of them may name the very device talking to
-	// us (an owner device telling us about a stolen one is the common
-	// case; a revoked device dutifully gossiping its own revocation is the
-	// rare one), and its admissions must be judged against them.
-	if _, err := s.ingestRevocations(hello.Revocations, now); err != nil {
-		return nil, nil, err
-	}
-	return s.verifyAdmissions(hello.Admissions, devicePub, now)
-}
-
-// verifyAdmissions checks each admission: a forgery — wrong device,
-// bad signature, a statement chain that does not verify — fails the whole
-// exchange (a peer presenting a forgery is not trusted for the rest of its
-// list either); a merely dead one — expired, or revoked by a circle we
-// hold — is skipped, since an honest device can lag a renewal or a
-// revocation.
-func (s *CircleService) verifyAdmissions(list [][]byte, devicePub ed25519.PublicKey, now time.Time) ([]string, map[string]*statement.Compiled, error) {
-	dids := make([]string, 0, len(list))
-	chains := make(map[string]*statement.Compiled, len(list))
-	for _, item := range list {
-		a, err := circle.UnmarshalAdmission(item)
-		if err != nil {
-			return nil, nil, err
-		}
-		if a.Device != cert.DIDForKey(devicePub) {
-			return nil, nil, errors.New("peer admission: admission names a different device")
-		}
-		chain, err := a.Compile()
-		if err != nil && !errors.Is(err, circle.ErrLegacy) {
-			return nil, nil, fmt.Errorf("peer admission: %w", err)
-		}
-		if chain == nil {
-			if err := a.VerifySignature(); err != nil {
-				return nil, nil, fmt.Errorf("peer admission: %w", err)
-			}
-		}
-		if a.Valid(now) != nil {
-			continue
-		}
-		if c := s.circleByDID(a.Circle); c != nil && c.Revoked(a, now) {
-			continue
-		}
-		dids = append(dids, a.Circle)
-		chains[a.Circle] = chain
-		// A verified admission for a circle held here is roster
-		// knowledge: the union peer table admits the device by it.
-		if s.table != nil && a.Stmt != nil {
-			if _, ok := s.table.RosterFor(a.Circle); ok {
-				_, _ = s.table.AddAdmission(a.Stmt, now)
-			}
-		}
-	}
-	return dids, chains, nil
 }
 
 // ingestRevocations stores the revocations that concern circles this node

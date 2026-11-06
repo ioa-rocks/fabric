@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"slices"
 	"sort"
 	"time"
 
@@ -258,14 +257,8 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		switch {
 		case sp.Member:
 			// The circles the peer table verified the peer in (handshake,
-			// gossip), plus what the legacy exchange learned from a peer
-			// on the old binary.
+			// gossip).
 			sp.Circles = d.Store.Circles(p, now)
-			for _, did := range d.sharedKnown(p) {
-				if !slices.Contains(sp.Circles, did) {
-					sp.Circles = append(sp.Circles, did)
-				}
-			}
 		case !sp.Revoked && d.Auth.IsKept(p):
 			sp.Grantee = true
 			if d.Circle != nil {
@@ -313,22 +306,6 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	writeJSON(w, reply)
-}
-
-// sharedKnown is the circle service's cached view of the circles shared
-// with a member, minus the home circle (listed by the caller for every
-// member) — nil without a circle service.
-func (d *Daemon) sharedKnown(p peer.ID) []string {
-	if d.Circle == nil {
-		return nil
-	}
-	var out []string
-	for _, did := range d.Circle.SharedKnown(p) {
-		if did != d.CircleDID() {
-			out = append(out, did)
-		}
-	}
-	return out
 }
 
 // handleGraph returns the aggregated mesh link state — every live link any
@@ -840,7 +817,7 @@ func (c *Client) Deny(fingerprint string) error {
 	return c.post("/v0/deny", denyBody{Fingerprint: fingerprint}, nil)
 }
 
-// handleCircleRefresh re-runs the circle exchange with every connected
+// handleCircleRefresh re-runs the handshake with every connected
 // member: the CLI calls it after signing a revocation (or a fresh
 // admission) into the circle directory, so the change reaches the devices
 // online now. The daemon reads the circle directory itself — nothing on the

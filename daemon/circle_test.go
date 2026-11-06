@@ -280,91 +280,6 @@ func tryStream(ctx context.Context, from host.Host, to peer.ID, proto string) er
 	return nil
 }
 
-// Lifecycle: a revocation signed on an owner device kills the device's
-// admission everywhere the circle's devices talk (pushed by Refresh to the
-// ones online, carried on every later exchange), a re-admission issued after
-// it stands, and an expired admission is worth nothing.
-// Statement-form admissions and revocations are presented only on the v4
-// exchange; older peers get the legacy forms they can parse.
-// The legacy exchange follows the v2 rule: the dialer names the circles
-// it knows the peer in (its first circle when none), the responder answers
-// with exactly those the dialer proved itself in. A device of family alone
-// never reads the desk's alex admission or alex's revocations off the
-// legacy stream (Codex review, 2026-11-05).
-func TestLegacyExchangeNamesOnlySharedCircles(t *testing.T) {
-	nsPub, nsRoot, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	alex, alexDID := mintCircle(t, "alex")
-	family, familyDID := mintCircle(t, "family")
-	desk := newCircleTestNode(t, nsPub, nsRoot, "desk", []*circle.Bundle{alex, family}, true)
-	hers := newCircleTestNode(t, nsPub, nsRoot, "her-pc", []*circle.Bundle{family}, true)
-	admit(t, desk, hers, familyDID)
-	meshConnect(t, hers, desk)
-	waitShared(t, desk, hers, []string{familyDID})
-	waitShared(t, hers, desk, []string{familyDID})
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if got := desk.svc.presentable(hers.h.ID()); !slices.Equal(got, []string{familyDID}) {
-		t.Fatalf("desk would present %v to her PC, want [family]", got)
-	}
-	stranger := newCircleTestNode(t, nsPub, nsRoot, "stranger", nil, false)
-	if got := desk.svc.presentable(stranger.h.ID()); !slices.Equal(got, []string{desk.own.Payload.Sub}) {
-		t.Fatalf("desk would present %v to a peer known nowhere, want its first circle alone", got)
-	}
-
-	// Her PC runs the legacy exchange toward the desk by hand (a v2 peer
-	// skips it): the answer names family and nothing else.
-	st, err := hers.h.NewStream(ctx, desk.h.ID(), CircleProtocolV4ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	if err := hers.svc.writeOwn(st, 4, hers.svc.presentable(desk.h.ID())); err != nil {
-		t.Fatal(err)
-	}
-	deskPub, _ := ed25519Of(hers.h.Peerstore().PubKey(desk.h.ID()))
-	dids, _, err := hers.svc.readHello(st, deskPub, 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(dids, []string{familyDID}) {
-		t.Fatalf("legacy exchange named %v, want [family]", dids)
-	}
-	if slices.Contains(dids, alexDID) {
-		t.Fatal("alex leaked over the legacy exchange")
-	}
-}
-
-func TestOlderExchangeVersionsSeeOnlyLegacyForms(t *testing.T) {
-	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
-	owner, err := circle.Init(t.TempDir(), "alex", "pw")
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, _ := owner.Export()
-	n := newCircleTestNode(t, nsPub, nsPriv, "nas", []*circle.Bundle{b}, true)
-	now := time.Now()
-	if own, _ := n.svc.ownAdmissionsWire(now, true, n.svc.heldDIDs()); len(own) != 1 {
-		t.Fatalf("v4 presents %d admissions, want 1", len(own))
-	}
-	if own, _ := n.svc.ownAdmissionsWire(now, false, n.svc.heldDIDs()); len(own) != 0 {
-		t.Fatalf("v3 presents %d statement admissions, want 0", len(own))
-	}
-	priv, _ := owner.Unlock("pw")
-	r, _ := circle.Revoke(priv, cert.DIDForKey(n.devPub), now)
-	c, _ := circle.ByDID(n.root, owner.Config.DID)
-	c.AddRevocations(now, r)
-	if revs, _ := n.svc.ownRevocations(now, true, n.svc.heldDIDs()); len(revs) != 1 {
-		t.Fatalf("v4 presents %d revocations, want 1", len(revs))
-	}
-	if revs, _ := n.svc.ownRevocations(now, false, n.svc.heldDIDs()); len(revs) != 0 {
-		t.Fatalf("v3 presents %d statement revocations, want 0", len(revs))
-	}
-}
-
 // A node's membership cert doubles as its admission into its home circle
 // (the circle whose DID is the circle DID): no separate `circle renew`.
 func TestHomeCircleAdmittedByCert(t *testing.T) {
@@ -388,7 +303,7 @@ func TestHomeCircleAdmittedByCert(t *testing.T) {
 	if !n.svc.Admitted(c) {
 		t.Fatal("home-circle cert not accepted as admission")
 	}
-	if own, _ := n.svc.ownAdmissionsWire(time.Now(), true, n.svc.heldDIDs()); len(own) != 1 {
+	if own := n.svc.ownAdmissionsFor(owner.Config.DID); len(own) != 1 {
 		t.Fatalf("presents %d admissions, want the cert", len(own))
 	}
 	info := n.svc.Info(time.Now())
@@ -809,11 +724,11 @@ func TestMixedVerbChainSurvivesPartialNarrowing(t *testing.T) {
 	}
 }
 
-// Verify for a held circle falls back to the chain the legacy exchange
-// cached when the roster holds no live entry — an older admission still in
-// its window after the device's current one lapsed. It is capped by the
-// roster like every other chain, so Verify and CheckChain agree (Codex
-// review, 2026-11-06; their reproduction).
+// Verify for a held circle answers from the roster's entry: when the
+// device's current admission has lapsed, an older one still inside its
+// window is not a fallback — Verify and CheckChain refuse it alike (Codex
+// review, 2026-11-06; their reproduction, with the legacy exchange's cached
+// chain gone in slice G).
 func TestVerifyDoesNotFallBackToASupersededCachedAdmission(t *testing.T) {
 	root := t.TempDir()
 	c, err := circle.Init(root, "secondary", "pw")
@@ -844,7 +759,10 @@ func TestVerifyDoesNotFallBackToASupersededCachedAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := &CircleService{root: root, table: table, peers: map[peer.ID]circleEntry{p: {dids: []string{c.Config.DID}, chains: map[string]*statement.Compiled{c.Config.DID: comp}, at: now}}}
+	if err := comp.Check(roots, nil, statement.Want{Sub: c.Config.DID, Res: statement.Resource{Kind: statement.KindBucket, Name: "private"}, Verb: statement.VerbBlob, PresentingKey: comp.PresentingKey, Now: now}); err != nil {
+		t.Fatalf("fixture: the older admission is inside its window: %v", err)
+	}
+	svc := &CircleService{root: root, table: table}
 	want := statement.Want{Sub: c.Config.DID, Res: statement.Resource{Kind: statement.KindBucket, Name: "private"}, Verb: statement.VerbBlob, Now: now}
 	raw, _ := a1.Stmt.Bytes()
 	if err := svc.CheckChain(raw, want); err == nil {
