@@ -1191,7 +1191,44 @@ func (s *CircleService) VerifyPresented(p peer.ID, auth [32]byte, key string, wa
 	if err != nil {
 		return err
 	}
-	return c.Check(roots, s.revsFor(want.Sub, want.Now), want)
+	if err := c.Check(roots, s.revsFor(want.Sub, want.Now), want); err != nil {
+		return err
+	}
+	return s.capByRoster(c, want)
+}
+
+// capByRoster holds a presented chain to the roster's current word on every
+// device it passes through. Check knows roots and revocations, not that a
+// device's admission was replaced: a sub-key issued under an admission
+// that a narrower renewal has since superseded would keep the old verbs
+// for the rest of that admission's window, and one under a lapsed or
+// revoked admission would outlive it (agy review, 2026-11-06). So a link
+// that is a device's admission but not the roster's entry for that device
+// is capped by the entry: the entry must admit the device now and allow
+// what is asked. A chain through the entry itself is unchanged, and so is
+// a chain in a circle this node does not hold — a gate can only check what
+// was presented.
+func (s *CircleService) capByRoster(c *statement.Compiled, want statement.Want) error {
+	if s.table == nil {
+		return nil
+	}
+	r, ok := s.table.RosterFor(want.Sub)
+	if !ok {
+		return nil
+	}
+	for _, l := range c.Auth {
+		dev, ok := r.Device(l.Aud)
+		if !ok || dev.Stmt.ID() == l.ID {
+			continue
+		}
+		if !dev.Admits(want.Now) {
+			return fmt.Errorf("admission of %s is superseded by one that does not admit it now", shortDID(l.Aud))
+		}
+		if !dev.Chain.Allows(want.Sub, want.Res, want.Verb) {
+			return fmt.Errorf("admission of %s is superseded by one without %s", shortDID(l.Aud), want.Verb)
+		}
+	}
+	return nil
 }
 
 // CirclesOf returns the member's verified circles, if a current exchange

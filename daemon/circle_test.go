@@ -17,6 +17,7 @@ import (
 
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
+	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/fabricnet"
 	"ioa.rocks/fabric/statement"
@@ -662,5 +663,90 @@ func TestGateReplaysStoredRevocationsIntoTheTable(t *testing.T) {
 	}
 	if !store2.IsRevoked(p, at) {
 		t.Fatal("the device is not reported revoked after the restart")
+	}
+}
+
+// A presented sub-key chain is capped by the roster's current admission of
+// the device it hangs from. Check alone knows roots and revocations, so a
+// sub-key issued under A1 kept A1's verbs after a narrower renewal A2
+// replaced it in the roster, for the rest of A1's window (agy review,
+// 2026-11-06). The cap follows the roster: a renewal that restores the
+// verb restores the sub-key, a revocation of the current admission ends it.
+func TestPresentedChainIsCappedByTheRosterEntry(t *testing.T) {
+	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
+	devPub, devPriv, _ := ed25519.GenerateKey(rand.Reader)
+	keyPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	circleDID := did.ForKey(rootPub)
+	now := time.Now().Add(-time.Minute)
+	withBlob := circle.DeviceVerbs
+	var noBlob []string // blob is implied by nothing (write implies sync)
+	for _, v := range circle.DeviceVerbs {
+		if v != statement.VerbBlob {
+			noBlob = append(noBlob, v)
+		}
+	}
+	a1, err := circle.AdmitWith(rootPriv, nil, circleDID, devPub, now, time.Hour, withBlob, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := statement.Resource{Kind: statement.KindSubject, Name: "inbox", Sub: circleDID}
+	sub, err := statement.Sign(devPriv, statement.Payload{
+		Aud: did.ForKey(keyPub), Sub: circleDID, Res: []statement.Resource{res}, Verbs: []string{statement.VerbBlob},
+		Iat: now.Unix(), Nbf: now.Unix(), Exp: now.Add(time.Hour).Unix(),
+	}, a1.Stmt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := statement.NewDIDRoot(circleDID)
+	comp, err := statement.Compile(sub, nil, circleDID, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := fabricnet.NewMemberStore(roots)
+	if _, err := table.AddAdmission(a1.Stmt, now); err != nil {
+		t.Fatal(err)
+	}
+	svc := &CircleService{}
+	svc.SetPeerTable(table)
+	at := now.Add(time.Second)
+	want := statement.Want{Sub: circleDID, Res: res, Verb: statement.VerbBlob, PresentingKey: did.ForKey(keyPub), Now: at}
+	revs := func() statement.Revocations { r, _ := table.RosterFor(circleDID); return r.Revocations() }
+	if err := comp.Check(roots, revs(), want); err != nil {
+		t.Fatalf("sub-key under the current admission: %v", err)
+	}
+	if err := svc.capByRoster(comp, want); err != nil {
+		t.Fatalf("cap under the current admission: %v", err)
+	}
+	// A narrower renewal replaces A1 in the roster. Check still passes —
+	// nothing revoked A1 — and the cap refuses.
+	a2, _ := circle.AdmitWith(rootPriv, nil, circleDID, devPub, at, time.Hour, noBlob, nil)
+	if _, err := table.AddAdmission(a2.Stmt, at); err != nil {
+		t.Fatal(err)
+	}
+	if err := comp.Check(roots, revs(), want); err != nil {
+		t.Fatalf("Check is expected to pass without the cap: %v", err)
+	}
+	if err := svc.capByRoster(comp, want); err == nil {
+		t.Fatal("sub-key keeps a verb its device's current admission no longer carries")
+	}
+	// A renewal that restores the verb restores the sub-key.
+	at = at.Add(time.Second)
+	want.Now = at
+	a3, _ := circle.AdmitWith(rootPriv, nil, circleDID, devPub, at, time.Hour, withBlob, nil)
+	if _, err := table.AddAdmission(a3.Stmt, at); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.capByRoster(comp, want); err != nil {
+		t.Fatalf("cap after the verb came back: %v", err)
+	}
+	// Revoking the current admission by ID ends the sub-key with it, though
+	// the sub-key's own lineage (A1) was never revoked.
+	id := a3.Stmt.ID()
+	rev, _ := circle.RevokeAs(rootPriv, nil, circleDID, statement.Target{ID: id[:]}, at)
+	if _, err := table.AddRevocation(circleDID, rev.Stmt); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.capByRoster(comp, want); err == nil {
+		t.Fatal("sub-key outlives the revocation of its device's current admission")
 	}
 }
