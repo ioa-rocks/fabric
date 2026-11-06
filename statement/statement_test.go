@@ -571,24 +571,27 @@ func TestWindowIsBoundedFromIssueTime(t *testing.T) {
 	}
 }
 
-// A root by-ID revocation whose target expiry is unknown is retained for
-// MaxValidity plus slack from the revoker's clock, so a revoker running
-// behind the issuer does not drop it before a maximum-validity target has
-// expired (agy review, 2026-11-06).
-func TestByIDRevocationRetentionOutlivesClockSkew(t *testing.T) {
+// A root by-ID revocation whose target expiry is unknown is never spent:
+// nothing signed relates the revoker's clock to the target's window, so no
+// retention reckoned from the revocation is safe (an admission issued on a
+// clock 30 days ahead and revoked today would revive for a month at
+// MaxValidity plus a week). Known target: spent at its expiry.
+func TestByIDRevocationIsKeptUntilItsTargetIsKnownExpired(t *testing.T) {
 	_, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
 	sub := did.ForKey(rootPriv.Public().(ed25519.PublicKey))
-	issued := time.Now()
-	behind := issued.Add(-time.Minute) // the revoker's clock, a minute behind the issuer's
-	r, err := Revoke(rootPriv, sub, nil, Target{ID: make([]byte, 32)}, behind)
+	now := time.Now()
+	r, err := Revoke(rootPriv, sub, nil, Target{ID: make([]byte, 32)}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	targetExp := issued.Add(MaxValidity)
-	if Spent(r, time.Time{}, targetExp.Add(-time.Second)) {
-		t.Fatal("revocation spent while its target could still verify")
+	if Spent(r, time.Time{}, now.Add(10*MaxValidity)) {
+		t.Fatal("by-ID revocation with an unknown target was spent")
 	}
-	if !Spent(r, time.Time{}, behind.Add(MaxValidity+RevocationSlack+time.Second)) {
-		t.Fatal("revocation never spent")
+	targetExp := now.Add(30*24*time.Hour + MaxValidity) // issued on a clock a month ahead
+	if Spent(r, targetExp, targetExp.Add(-time.Second)) {
+		t.Fatal("spent while its target could still verify")
+	}
+	if !Spent(r, targetExp, targetExp) {
+		t.Fatal("not spent once its target expired")
 	}
 }

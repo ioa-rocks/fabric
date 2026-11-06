@@ -361,6 +361,44 @@ func (r *Roster) verdict(dev *Device) error {
 	})
 }
 
+// Cap holds a presented chain — a sub-key's, or an admission a peer
+// presented — to the roster. Check knows roots and revocations; the roster
+// also knows sweeps and which admission is each device's current word, so
+// (1) a link issued to a swept device up to the cut is refused, whatever
+// the chain, and (2) a link that is a device's admission but not the
+// roster's entry for that device is capped by the entry: the entry must
+// admit the device now and allow what is asked — a sub-key under an
+// admission that a narrower renewal superseded loses the verb the renewal
+// dropped; one under a lapsed or revoked admission ends with it. A chain
+// through the entry itself stands as the entry does (agy review and Codex
+// review, 2026-11-06).
+func (r *Roster) Cap(c *statement.Compiled, want statement.Want) error {
+	for _, links := range [][]statement.Link{c.Auth, c.Ident} {
+		for _, l := range links {
+			if at, ok := r.sweeps[l.Aud]; ok && l.Iat <= at {
+				return fmt.Errorf("%s swept by the circle", shortDID(l.Aud))
+			}
+			dev, ok := r.devices[l.Aud]
+			if !ok {
+				continue
+			}
+			if dev.Stmt.ID() == l.ID {
+				if dev.dead != nil {
+					return fmt.Errorf("admission of %s: %w", shortDID(l.Aud), dev.dead)
+				}
+				continue
+			}
+			if !dev.Admits(want.Now) {
+				return fmt.Errorf("admission of %s is superseded by one that does not admit it now", shortDID(l.Aud))
+			}
+			if !dev.Chain.Allows(want.Sub, want.Res, want.Verb) {
+				return fmt.Errorf("admission of %s is superseded by one without %s", shortDID(l.Aud), want.Verb)
+			}
+		}
+	}
+	return nil
+}
+
 // rejudge re-derives one device's verdict in place in a cloned roster,
 // replacing the entry (never the shared one) when it changed.
 func (r *Roster) rejudge(deviceDID string) bool {
@@ -539,7 +577,7 @@ func (r *Roster) Len() int { return len(r.devices) }
 func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
 	nr = r.clone()
 	for _, rv := range nr.revs.All() {
-		if statement.Spent(rv, time.Time{}, now) {
+		if statement.Spent(rv, r.targetExpiry(rv), now) {
 			if nr.revs == r.revs {
 				nr.revs = r.revs.Clone()
 			}
@@ -570,6 +608,31 @@ func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
 		return r, false, false
 	}
 	return nr, true, dropped
+}
+
+// targetExpiry is when a by-ID revocation can go: the expiry of its target
+// plus LapsedRetention, when a link of some entry's chain carries the ID —
+// the entry the revocation kills is remembered that long, and the
+// revocation must outlive it or a later rejudge would revive the entry as
+// merely lapsed (the oracle caught this, 2026-11-06). Zero when unknown,
+// which keeps the revocation (statement.Spent).
+func (r *Roster) targetExpiry(rv *statement.Statement) time.Time {
+	t := rv.Payload.Target
+	if t == nil || len(t.ID) != 32 {
+		return time.Time{}
+	}
+	var id [32]byte
+	copy(id[:], t.ID)
+	for _, dev := range r.devices {
+		for _, links := range [][]statement.Link{dev.Chain.Auth, dev.Chain.Ident} {
+			for _, l := range links {
+				if l.ID == id {
+					return l.Stmt.Expiry().Add(LapsedRetention)
+				}
+			}
+		}
+	}
+	return time.Time{}
 }
 
 // Encode is the saved form: every admission (lapsed included) as statement

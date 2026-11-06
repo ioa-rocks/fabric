@@ -654,7 +654,7 @@ func TestOneHolderPerOverlayAddress(t *testing.T) {
 	aPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	bPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	first, _ := circle.AdmitWith(priv, nil, c.Config.DID, aPub, now.Add(-time.Second), time.Hour, tunVerbs, &statement.Meta{Name: "a", IP: "100.64.0.5/24"})
-	second, _ := circle.AdmitWith(priv, nil, c.Config.DID, bPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "b", IP: "100.64.0.5/24"})
+	second, _ := circle.AdmitWith(priv, nil, c.Config.DID, bPub, now, 10*time.Minute, tunVerbs, &statement.Meta{Name: "b", IP: "100.64.0.5/24"}) // later word, shorter window
 	a, _ := PeerOfDID(cert.DIDForKey(aPub))
 	b, _ := PeerOfDID(cert.DIDForKey(bPub))
 	ip := netip.MustParseAddr("100.64.0.5")
@@ -683,6 +683,18 @@ func TestOneHolderPerOverlayAddress(t *testing.T) {
 		}
 		if !table.IsMember(a, now) {
 			t.Fatal("the loser is still a member; only its address is contested")
+		}
+		// The holder's admission runs out: the other claimant holds the
+		// address from that moment, settled per query, GC or no GC.
+		later := second.Expiry().Add(time.Second)
+		if p, ok := table.View().Route(ip, later); !ok || p != a {
+			t.Fatalf("route after the holder expired = %v %v, want the other claimant", p, ok)
+		}
+		if got, ok := table.View().AddrOf(a, later); !ok || got != ip {
+			t.Fatalf("claimant's address after the holder expired = %v %v", got, ok)
+		}
+		if _, ok := table.View().AddrConflict(a, later); ok {
+			t.Fatal("conflict reported after the holder expired")
 		}
 		// An owner renumbers the loser: both route.
 		moved, _ := circle.AdmitWith(priv, nil, c.Config.DID, aPub, now.Add(time.Second), time.Hour, tunVerbs, &statement.Meta{Name: "a", IP: "100.64.0.6/24"})

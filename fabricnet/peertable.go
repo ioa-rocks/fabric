@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -184,15 +185,17 @@ type View struct {
 	// settled at query time (addrEntry), so Route and AddrOf always agree
 	// and an entry running out stops routing on the spot — no GC tick, no
 	// republish (Codex review, 2026-11-05).
-	addrs   map[peer.ID]deviceIn
-	holders map[netip.Addr][]peer.ID // peers whose entry carries the address
-	names   map[string][]peer.ID     // lower-cased name -> peers whose entry is labelled so
-	// An address two standing entries claim has one holder — the later
-	// admission by the roster's order — and the other device gets neither
-	// route nor inbound address, so Route and AddrOf never split (agy
-	// review, 2026-11-06). conflicts names the losers and what they claimed.
-	conflicts map[peer.ID]netip.Addr
-	version   uint64
+	addrs map[peer.ID]deviceIn
+	// holders lists the peers whose entry carries the address, the later
+	// admission by the roster's order first. The address has one holder
+	// at a time — the first of them admitting right now — and the others
+	// get neither route nor inbound address, so Route and AddrOf never
+	// split (agy review, 2026-11-06); settled per query like the window,
+	// so the answer does not depend on whether GC has run (Codex review,
+	// 2026-11-06).
+	holders map[netip.Addr][]peer.ID
+	names   map[string][]peer.ID // lower-cased name -> peers whose entry is labelled so
+	version uint64
 }
 
 // deviceIn is one roster's entry for a peer; addr is the overlay address
@@ -205,8 +208,7 @@ type deviceIn struct {
 
 func (s *state) snapshot() *View {
 	v := &View{rosters: append([]*circle.Roster(nil), s.rosters...), byPeer: map[peer.ID][]deviceIn{},
-		addrs: map[peer.ID]deviceIn{}, holders: map[netip.Addr][]peer.ID{}, names: map[string][]peer.ID{},
-		conflicts: map[peer.ID]netip.Addr{}, version: s.version}
+		addrs: map[peer.ID]deviceIn{}, holders: map[netip.Addr][]peer.ID{}, names: map[string][]peer.ID{}, version: s.version}
 	for _, r := range s.rosters {
 		for _, dev := range r.Devices() {
 			p, err := PeerOfDID(dev.DID)
@@ -237,18 +239,11 @@ func (s *state) snapshot() *View {
 			if name := strings.ToLower(c.Payload.Meta.Name); name != "" {
 				v.names[name] = append(v.names[name], p)
 			}
-			// One holder per address: the later admission keeps it.
-			if cur, taken := v.holders[pfx.Addr()]; taken {
-				held := v.addrs[cur[0]]
-				if !circle.Later(dev, held.dev) {
-					v.conflicts[p] = pfx.Addr()
-					continue
-				}
-				delete(v.addrs, cur[0])
-				v.conflicts[cur[0]] = pfx.Addr()
-			}
 			v.addrs[p] = deviceIn{roster: r, dev: dev, addr: pfx.Addr()}
-			v.holders[pfx.Addr()] = []peer.ID{p}
+			v.holders[pfx.Addr()] = append(v.holders[pfx.Addr()], p)
+		}
+		for _, ps := range v.holders {
+			sort.Slice(ps, func(i, j int) bool { return circle.Later(v.addrs[ps[i]].dev, v.addrs[ps[j]].dev) })
 		}
 	}
 	return v
@@ -510,12 +505,14 @@ func (t *PeerTable) LapsedCert(p peer.ID) (*cert.Cert, bool) { return t.View().L
 func (t *PeerTable) Snapshot() (map[peer.ID]*cert.Cert, map[peer.ID]time.Time) {
 	return t.View().Snapshot()
 }
-func (t *PeerTable) Lapsed() map[peer.ID]*cert.Cert            { return t.View().Lapsed() }
-func (t *PeerTable) IsRevoked(p peer.ID, now time.Time) bool   { return t.View().IsRevoked(p, now) }
-func (t *PeerTable) LiveIn(circleDID string) []peer.ID         { return t.View().LiveIn(circleDID) }
-func (t *PeerTable) Route(dst netip.Addr) (peer.ID, bool)      { return t.View().Route(dst, time.Now()) }
-func (t *PeerTable) AddrConflict(p peer.ID) (netip.Addr, bool) { return t.View().AddrConflict(p) }
-func (t *PeerTable) AddrOf(p peer.ID) (netip.Addr, bool)       { return t.View().AddrOf(p, time.Now()) }
+func (t *PeerTable) Lapsed() map[peer.ID]*cert.Cert          { return t.View().Lapsed() }
+func (t *PeerTable) IsRevoked(p peer.ID, now time.Time) bool { return t.View().IsRevoked(p, now) }
+func (t *PeerTable) LiveIn(circleDID string) []peer.ID       { return t.View().LiveIn(circleDID) }
+func (t *PeerTable) Route(dst netip.Addr) (peer.ID, bool)    { return t.View().Route(dst, time.Now()) }
+func (t *PeerTable) AddrConflict(p peer.ID) (netip.Addr, bool) {
+	return t.View().AddrConflict(p, time.Now())
+}
+func (t *PeerTable) AddrOf(p peer.ID) (netip.Addr, bool) { return t.View().AddrOf(p, time.Now()) }
 func (t *PeerTable) Resolve(name string) (netip.Addr, bool) {
 	return t.View().Resolve(name, time.Now())
 }
@@ -724,6 +721,9 @@ func (v *View) addrEntry(p peer.ID, now time.Time) (deviceIn, bool) {
 	if !ok || !d.dev.Admits(now) {
 		return deviceIn{}, false
 	}
+	if h, _ := v.holder(d.addr, now); h != p {
+		return deviceIn{}, false // another device's later admission holds the address
+	}
 	return d, true
 }
 
@@ -733,20 +733,33 @@ func (v *View) addrEntry(p peer.ID, now time.Time) (deviceIn, bool) {
 // changes the answer at once and nothing is ever rebuilt or installed
 // (Codex reviews, 2026-11-05).
 func (v *View) Route(dst netip.Addr, now time.Time) (peer.ID, bool) {
-	for _, p := range v.holders[dst] {
-		if d, ok := v.addrEntry(p, now); ok && d.addr == dst {
+	return v.holder(dst, now)
+}
+
+// holder is the device behind an address right now: the first of the
+// address's claimants, later admission first, whose entry admits it.
+func (v *View) holder(addr netip.Addr, now time.Time) (peer.ID, bool) {
+	for _, p := range v.holders[addr] {
+		if d, ok := v.addrs[p]; ok && d.dev.Admits(now) {
 			return p, true
 		}
 	}
 	return "", false
 }
 
-// AddrConflict reports an address the device's admission claims but another
-// device's later admission holds: the device has no route and no inbound
-// address until an owner renumbers one of them.
-func (v *View) AddrConflict(p peer.ID) (netip.Addr, bool) {
-	a, ok := v.conflicts[p]
-	return a, ok
+// AddrConflict reports an address the device's admission claims while
+// another device's later admission holds it right now: the device has no
+// route and no inbound address until an owner renumbers one of them, or
+// the holder's admission runs out.
+func (v *View) AddrConflict(p peer.ID, now time.Time) (netip.Addr, bool) {
+	d, ok := v.addrs[p]
+	if !ok || !d.dev.Admits(now) {
+		return netip.Addr{}, false
+	}
+	if h, ok := v.holder(d.addr, now); ok && h != p {
+		return d.addr, true
+	}
+	return netip.Addr{}, false
 }
 
 // AddrOf is the overlay address a live device of the overlay circle holds

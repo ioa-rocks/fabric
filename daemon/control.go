@@ -240,6 +240,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		if ok {
 			sp.Name = c.Payload.Meta.Name
 			sp.IP = c.Payload.Meta.IP
+			sp.AddrConflict = d.addrConflict(p)
 			sp.Scope = c.Payload.Meta.Scope
 			exp := c.Expiry()
 			sp.CertExpiry = &exp

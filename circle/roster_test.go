@@ -367,3 +367,67 @@ func TestSweepCascadesAlongDelegatedChains(t *testing.T) {
 		t.Fatal("root re-admission after the desk's sweep not live")
 	}
 }
+
+// Cap holds a presented sub-key chain to the roster where Check cannot: a
+// sweep of the device kills the chain though the chain's own admission is
+// the roster's entry; after a re-admission the old swept chain stays dead
+// while a sub-key under the new admission passes (Codex review,
+// 2026-11-06).
+func TestCapRefusesSweptChains(t *testing.T) {
+	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
+	devPub, devPriv, _ := ed25519.GenerateKey(rand.Reader)
+	keyPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	circleDID := did.ForKey(rootPub)
+	devDID := did.ForKey(devPub)
+	now := time.Now().Add(-time.Minute)
+	roots := statement.NewDIDRoot(circleDID)
+	res := statement.Resource{Kind: statement.KindSubject, Name: "inbox", Sub: circleDID}
+	subKey := func(parent *statement.Statement, at time.Time) *statement.Compiled {
+		st, err := statement.Sign(devPriv, statement.Payload{
+			Aud: did.ForKey(keyPub), Sub: circleDID, Res: []statement.Resource{res}, Verbs: []string{statement.VerbBlob},
+			Iat: at.Unix(), Nbf: at.Unix(), Exp: at.Add(time.Hour).Unix(),
+		}, parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := statement.Compile(st, nil, circleDID, roots)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	a1, _ := AdmitFor(rootPriv, devPub, now, time.Hour)
+	r := NewRoster(roots)
+	r, _, _ = r.Add(a1.Stmt, now)
+	s1 := subKey(a1.Stmt, now)
+	want := statement.Want{Sub: circleDID, Res: res, Verb: statement.VerbBlob, PresentingKey: did.ForKey(keyPub), Now: now.Add(time.Second)}
+	if err := s1.Check(roots, r.Revocations(), want); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Cap(s1, want); err != nil {
+		t.Fatalf("sub-key under the device's current admission: %v", err)
+	}
+	// Sweep the device: Check still passes (sweeps are not revocations),
+	// Cap refuses.
+	r, _ = r.Sweep(devDID, now.Add(time.Second))
+	if err := s1.Check(roots, r.Revocations(), want); err != nil {
+		t.Fatalf("Check is expected to pass without the cap: %v", err)
+	}
+	if err := r.Cap(s1, want); err == nil {
+		t.Fatal("sub-key of a swept device passes the cap")
+	}
+	// Re-admit the device: the old chain stays dead, a new sub-key stands.
+	at := now.Add(2 * time.Second)
+	a2, _ := AdmitFor(rootPriv, devPub, at, time.Hour)
+	r, _, _ = r.Add(a2.Stmt, at)
+	want.Now = at.Add(time.Second)
+	if _, ok := r.Live(devDID, want.Now); !ok {
+		t.Fatal("re-admitted device not live")
+	}
+	if err := r.Cap(s1, want); err == nil {
+		t.Fatal("the swept chain is usable again after the re-admission")
+	}
+	if err := r.Cap(subKey(a2.Stmt, at), want); err != nil {
+		t.Fatalf("sub-key under the re-admission: %v", err)
+	}
+}

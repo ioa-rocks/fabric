@@ -895,7 +895,10 @@ func (s *CircleService) CheckChain(raw []byte, want statement.Want) error {
 	if want.Verb == "" {
 		want.Res, want.Verb = firstRes(c), firstVerb(c)
 	}
-	return c.Check(roots, s.revsFor(c.Sub, want.Now), want)
+	if err := c.Check(roots, s.revsFor(c.Sub, want.Now), want); err != nil {
+		return err
+	}
+	return s.capByRoster(c, want)
 }
 
 // PresentedChain returns the bytes of a chain presented on a connection.
@@ -1019,9 +1022,11 @@ func (s *CircleService) validLocked(c *statement.Compiled, now time.Time) error 
 	if err != nil {
 		return err
 	}
-	return c.Check(roots, s.revsForLocked(c.Sub, now), statement.Want{
-		Sub: c.Sub, Res: firstRes(c), Verb: firstVerb(c), PresentingKey: c.PresentingKey, Now: now,
-	})
+	want := statement.Want{Sub: c.Sub, Res: firstRes(c), Verb: firstVerb(c), PresentingKey: c.PresentingKey, Now: now}
+	if err := c.Check(roots, s.revsForLocked(c.Sub, now), want); err != nil {
+		return err
+	}
+	return s.capByRoster(c, want)
 }
 
 // ErrNotPresented is a verb under a chain this connection never presented.
@@ -1197,17 +1202,13 @@ func (s *CircleService) VerifyPresented(p peer.ID, auth [32]byte, key string, wa
 	return s.capByRoster(c, want)
 }
 
-// capByRoster holds a presented chain to the roster's current word on every
-// device it passes through. Check knows roots and revocations, not that a
-// device's admission was replaced: a sub-key issued under an admission
-// that a narrower renewal has since superseded would keep the old verbs
-// for the rest of that admission's window, and one under a lapsed or
-// revoked admission would outlive it (agy review, 2026-11-06). So a link
-// that is a device's admission but not the roster's entry for that device
-// is capped by the entry: the entry must admit the device now and allow
-// what is asked. A chain through the entry itself is unchanged, and so is
-// a chain in a circle this node does not hold — a gate can only check what
-// was presented.
+// capByRoster is circle.Roster.Cap for a circle this node holds: sweeps
+// over every link, and each device's current admission over a chain that
+// hangs from an older one. Every path that answers for a chain — Verify
+// Presented, CheckChain, the validity recheck of held chains — ends here,
+// so a stored hold cannot keep what a fresh request is refused (Codex
+// review, 2026-11-06). A chain in a circle this node does not hold is
+// unchanged: a gate can only check what was presented.
 func (s *CircleService) capByRoster(c *statement.Compiled, want statement.Want) error {
 	if s.table == nil {
 		return nil
@@ -1216,19 +1217,7 @@ func (s *CircleService) capByRoster(c *statement.Compiled, want statement.Want) 
 	if !ok {
 		return nil
 	}
-	for _, l := range c.Auth {
-		dev, ok := r.Device(l.Aud)
-		if !ok || dev.Stmt.ID() == l.ID {
-			continue
-		}
-		if !dev.Admits(want.Now) {
-			return fmt.Errorf("admission of %s is superseded by one that does not admit it now", shortDID(l.Aud))
-		}
-		if !dev.Chain.Allows(want.Sub, want.Res, want.Verb) {
-			return fmt.Errorf("admission of %s is superseded by one without %s", shortDID(l.Aud), want.Verb)
-		}
-	}
-	return nil
+	return r.Cap(c, want)
 }
 
 // CirclesOf returns the member's verified circles, if a current exchange
