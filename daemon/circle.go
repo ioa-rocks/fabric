@@ -293,22 +293,32 @@ func (s *CircleService) hinted(circleDID string, p peer.ID) bool {
 // hello is the v2 presenter (fabricnet.Presenter): on the dialer's side
 // the admissions for the circles this node knows the peer in — its rosters,
 // or the gate hints that named the peer — and on the responder's the
-// admissions for exactly the circles the dialer verified in. The revocations
-// of those circles ride along. A circle the peer is not known in is never
-// named; when the dialer knows the peer from nowhere, fabricnet adds the
+// admissions for the circles the dialer verified in, plus those whose
+// roster here already admits the dialer's device. The revocations of those
+// circles ride along. A circle the peer is not known in is never named;
+// when the dialer knows the peer from nowhere, fabricnet adds the
 // membership cert alone (the device's first circle, as v1 always showed).
+//
+// The responder's second clause is how an owner seeds a cold device: the
+// device was admitted by bundle, its roster of the circle is empty, so it
+// cannot present the circle — but the owner's roster holds its admission,
+// so naming the circle to it leaks nothing, and the device records the
+// owner's admission from the hello before any data plane asks. The circle
+// exchange did this until slice G retired it (Astral's placement gossip
+// on first contact caught the gap, 2026-11-06).
 func (s *CircleService) hello(p peer.ID, verified []string) fabricnet.Hello {
 	now := time.Now()
 	var chosen []ownAdmission
 	deviceDID, _ := fabricnet.DeviceDID(p)
 	for _, o := range s.ownAdmissions(now) {
+		_, known := o.roster.Device(deviceDID)
 		switch {
 		case verified != nil:
-			if slices.Contains(verified, o.roster.CircleDID()) {
+			if known || slices.Contains(verified, o.roster.CircleDID()) {
 				chosen = append(chosen, o)
 			}
 		default:
-			if _, known := o.roster.Device(deviceDID); known || s.hinted(o.circle, p) {
+			if known || s.hinted(o.circle, p) {
 				chosen = append(chosen, o)
 			}
 		}
@@ -351,13 +361,14 @@ func (s *CircleService) revocationsOf(circleDID string, now time.Time) [][]byte 
 	return out
 }
 
-// tableCircles is what the v2 handshake established: the circles this
-// node holds that the peer is a live device of, from the peer table.
+// tableCircles is the peer table's answer: the circles this node holds
+// that the peer is a live device of — by the handshake on this connection,
+// by gossip, or by the event log. (Until slice G a handshake on the
+// connection was required to tell a v2 peer from one on the old binary,
+// which got the circle exchange instead; a member known from gossip alone
+// was served by the exchange then and is served by the table now.)
 func (s *CircleService) tableCircles(p peer.ID) ([]string, bool) {
-	if s.table == nil || s.auth == nil {
-		return nil, false
-	}
-	if _, ok := s.auth.Handshake(p); !ok {
+	if s.table == nil {
 		return nil, false
 	}
 	return s.table.Circles(p, time.Now()), true
@@ -1068,14 +1079,13 @@ func (s *CircleService) capByRoster(c *statement.Compiled, want statement.Want) 
 func (s *CircleService) CirclesOf(p peer.ID) (dids []string, known bool) { return s.tableCircles(p) }
 
 // Ensure returns the circles held here that the member is a live device of
-// — the peer table's view, filled by the handshake and per-circle gossip.
-// An error means no handshake has completed with the peer on this
-// connection. (Until slice G this also ran the circle exchange toward a
+// — the peer table's view, filled by the handshake, per-circle gossip and
+// the event log. (Until slice G this also ran the circle exchange toward a
 // peer on the old binary; ctx is kept for the callers.)
 func (s *CircleService) Ensure(_ context.Context, p peer.ID) ([]string, error) {
-	dids, shook := s.tableCircles(p)
-	if !shook {
-		return nil, fmt.Errorf("no handshake with %s", p)
+	dids, ok := s.tableCircles(p)
+	if !ok {
+		return nil, errors.New("no peer table")
 	}
 	return dids, nil
 }

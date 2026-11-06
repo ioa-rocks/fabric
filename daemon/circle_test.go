@@ -478,8 +478,20 @@ func TestHandshakeV2PresentsOnlySharedCircles(t *testing.T) {
 	if h := desk.svc.hello(gate.h.ID(), []string{mainDID}); len(h.Admissions) != 1 || subOf(t, h.Admissions[0]) != mainDID {
 		t.Fatalf("responder presenter chose %d admissions for [main], want the main cert alone", len(h.Admissions))
 	}
-	if h := desk.svc.hello(nas.h.ID(), []string{familyDID}); len(h.Admissions) != 1 {
-		t.Fatalf("responder presenter chose %d admissions for [family], want the family admission", len(h.Admissions))
+	// nas proved itself in family alone, but desk's main roster already
+	// admits nas, so desk names main too: no leak (nas is in main by desk's
+	// own roster), and the way an owner seeds a device whose roster of a
+	// circle is still empty (slice G, 2026-11-06).
+	h := desk.svc.hello(nas.h.ID(), []string{familyDID})
+	var subs []string
+	for _, raw := range h.Admissions {
+		subs = append(subs, subOf(t, raw))
+	}
+	slices.Sort(subs)
+	want := []string{familyDID, mainDID}
+	slices.Sort(want)
+	if !slices.Equal(subs, want) {
+		t.Fatalf("responder presenter chose %v for [family], want family and main (desk's main roster admits nas)", subs)
 	}
 }
 
@@ -770,5 +782,46 @@ func TestVerifyDoesNotFallBackToASupersededCachedAdmission(t *testing.T) {
 	}
 	if err := svc.Verify(context.Background(), p, want); err == nil {
 		t.Fatal("Verify authorizes the cached older admission after the newer one lapsed; CheckChain refuses the same admission")
+	}
+}
+
+// An owner seeds a cold device at first contact: the device holds circle X
+// (joined by bundle, admitted) but its X roster is empty, so it cannot
+// present X when it dials; the owner's X roster holds the device's
+// admission, so the owner's hello names X and the device records the
+// owner's admission from it — before any data plane asks (Astral announces
+// placements right after the handshake). A peer the owner's X roster does
+// not know is still never told about X.
+func TestOwnerSeedsAColdDeviceOnTheHandshake(t *testing.T) {
+	nsPub, nsRoot, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, xDID := mintCircle(t, "x")
+	owner := newCircleTestNode(t, nsPub, nsRoot, "owner", []*circle.Bundle{x}, true)
+	device := newCircleTestNode(t, nsPub, nsRoot, "device", []*circle.Bundle{x}, true)
+	stranger := newCircleTestNode(t, nsPub, nsRoot, "stranger", nil, false)
+	admit(t, owner, device, xDID) // the owner's roster knows the device; the device's roster knows nobody
+	if r, ok := device.svc.table.RosterFor(xDID); !ok || len(r.Devices()) != 0 {
+		t.Fatal("fixture: the device's X roster should be empty")
+	}
+
+	meshConnect(t, device, owner) // the device dials
+	if !device.svc.table.In(owner.h.ID(), xDID, time.Now()) {
+		t.Fatal("the device did not learn the owner's admission in X from the handshake")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := device.svc.Verify(ctx, owner.h.ID(), statement.Want{Sub: xDID, Res: statement.Resource{Kind: statement.KindSubject, Name: "jobs"}, Verb: statement.VerbMember}); err != nil {
+		t.Fatalf("Verify right after the handshake: %v", err)
+	}
+
+	// The leak rule stands: a member the owner's X roster does not know is
+	// answered for the circles it proved itself in, nothing more.
+	hello := owner.svc.hello(stranger.h.ID(), []string{cert.DIDForKey(nsPub)})
+	for _, raw := range hello.Admissions {
+		if st, err := statement.Decode(raw); err == nil && st.Payload.Sub == xDID {
+			t.Fatal("the owner named X to a peer its X roster does not know")
+		}
 	}
 }
