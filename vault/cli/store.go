@@ -39,9 +39,6 @@ func openStore(p paths) (store_, error) {
 	if cl := daemon.TryClient(*p.store); cl != nil {
 		return clientStore{cl}, nil
 	}
-	if _, err := circle.Migrate(*p.circle, *p.store); err != nil {
-		return nil, fmt.Errorf("adopting the circle from %s: %w", *p.store, err)
-	}
 	if !circle.Any(*p.circle) {
 		return nil, fmt.Errorf("no daemon on %s and this node holds no circle (did you run 'fabric circle init'?)", daemon.SocketPath(*p.store))
 	}

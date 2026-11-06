@@ -64,10 +64,6 @@ type Circle struct {
 // Root is the directory holding a node's circles: <fabricState>/circles/<name>.
 func Root(fabricState string) string { return filepath.Join(fabricState, "circles") }
 
-// LegacyDir is the pre-multi-circle single circle directory (<state>/circle);
-// Migrate adopts it into the root.
-func LegacyDir(fabricState string) string { return filepath.Join(fabricState, "circle") }
-
 // List opens every circle under root, sorted by name. A missing root is an
 // empty list.
 func List(root string) ([]*Circle, error) {
@@ -411,37 +407,6 @@ func Join(root string, b *Bundle) (*Circle, error) {
 		}
 	}
 	return c, nil
-}
-
-// Migrate adopts a pre-hoist circle (its config and key lived in the vault
-// state directory) into path. The legacy files are left in place so an
-// older binary still runs against them; they are inert for this one.
-// Returns true when a migration happened.
-func Migrate(root, legacyDir string) (bool, error) {
-	if !Exists(legacyDir) {
-		return false, nil
-	}
-	if _, err := os.Stat(keyPath(legacyDir)); err != nil {
-		return false, nil
-	}
-	b, err := ReadBundle(legacyDir)
-	if err != nil {
-		return false, err
-	}
-	if _, err := ByDID(root, b.Config.DID); err == nil {
-		return false, nil // already adopted
-	}
-	c, err := Join(root, b)
-	if err != nil {
-		return false, err
-	}
-	// The device admission (if the legacy dir had one) moves with it.
-	if raw, err := os.ReadFile(filepath.Join(legacyDir, admissionFile)); err == nil {
-		if err := os.WriteFile(c.AdmissionPath(), raw, 0o600); err != nil {
-			return true, err
-		}
-	}
-	return true, nil
 }
 
 // validName keeps circle names usable as directory names and CLI words.

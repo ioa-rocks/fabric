@@ -100,36 +100,6 @@ func TestExportJoinAndMigrate(t *testing.T) {
 		t.Fatal("joined a different circle under an already-used name")
 	}
 
-	// Legacy layouts: the single <state>/circle dir (with an admission),
-	// or the two files inside a vault state dir. Both are copied into the
-	// root; the originals stay.
-	legacy := t.TempDir()
-	for _, f := range []string{configFile, keyFile} {
-		data, _ := os.ReadFile(filepath.Join(c.Path, f))
-		os.WriteFile(filepath.Join(legacy, f), data, 0o600)
-	}
-	os.WriteFile(filepath.Join(legacy, admissionFile), []byte("x"), 0o600)
-	dst := filepath.Join(t.TempDir(), "circles")
-	did, err := Migrate(dst, legacy)
-	if err != nil || !did {
-		t.Fatalf("migrate: %v %v", did, err)
-	}
-	m, err := ByDID(dst, c.Config.DID)
-	if err != nil || m.Config.Name != c.Config.Name || m.Config.DID != c.Config.DID {
-		t.Fatalf("migrated: %+v %v", m, err)
-	}
-	if _, err := os.Stat(m.AdmissionPath()); err != nil {
-		t.Fatal("admission did not move with the circle")
-	}
-	if !Exists(legacy) {
-		t.Fatal("legacy files were removed")
-	}
-	if did, err := Migrate(dst, legacy); err != nil || did {
-		t.Fatalf("second migrate: %v %v", did, err)
-	}
-	if did, _ := Migrate(filepath.Join(t.TempDir(), "x"), t.TempDir()); did {
-		t.Fatal("migrated from an empty dir")
-	}
 }
 
 func TestRekey(t *testing.T) {

@@ -177,12 +177,8 @@ func pathFlags(fs *flag.FlagSet) paths {
 }
 
 // openCircle opens one of the node's circles — the named one, or the only
-// one when name is "" — adopting a pre-hoist circle from the store
-// directory first if that is where it still lives.
+// one when name is "".
 func (p paths) openCircle(name string) (*circle.Circle, error) {
-	if _, err := circle.Migrate(*p.circle, *p.store); err != nil {
-		return nil, fmt.Errorf("adopting the circle from %s: %w", *p.store, err)
-	}
 	if name == "" {
 		return circle.Only(*p.circle)
 	}

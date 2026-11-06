@@ -80,18 +80,12 @@ func circleFlags(fs *flag.FlagSet) (statePath, vaultState *string) {
 	return
 }
 
-// circleRoot adopts older single-circle layouts into the node's circle
-// root, then returns the root.
-func circleRoot(statePath, vaultState string) (string, error) {
-	root := circle.Root(statePath)
-	for _, legacy := range []string{circle.LegacyDir(statePath), vaultState} {
-		if did, err := circle.Migrate(root, legacy); err != nil {
-			return "", fmt.Errorf("adopting the circle from %s: %w", legacy, err)
-		} else if did {
-			fmt.Fprintf(os.Stderr, "circle adopted from %s into %s (the old copy is left in place, unused)\n", legacy, root)
-		}
-	}
-	return root, nil
+// circleRoot is the node's circle root. (Until 2026-11-06 it also adopted
+// the two pre-multi-circle layouts — <state>/circle and the circle files
+// inside the vault store directory — into the root; every fleet node has
+// been on circles/<name> since 2026-11-02, so the adoption is gone.)
+func circleRoot(statePath, _ string) (string, error) {
+	return circle.Root(statePath), nil
 }
 
 // pickCircle resolves -circle: the named circle, or the only one.

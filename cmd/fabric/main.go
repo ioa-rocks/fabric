@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -367,16 +366,6 @@ func cmdUp(args []string) error {
 	}
 	if !*noVault {
 		root := circle.Root(*statePath)
-		// Older layouts: the single <state>/circle directory, and before
-		// that the circle files inside the vault store directory. Both are
-		// adopted into the root (copies; the originals stay, inert).
-		for _, legacy := range []string{circle.LegacyDir(*statePath), *vaultState} {
-			if did, err := circle.Migrate(root, legacy); err != nil {
-				return fmt.Errorf("adopting the circle from %s: %w", legacy, err)
-			} else if did {
-				log.Printf("circle adopted from %s into %s (the old copy is left in place, unused)", legacy, root)
-			}
-		}
 		if circle.Any(root) {
 			st, err := vaultstore.Open(*vaultState, root)
 			if err != nil {
