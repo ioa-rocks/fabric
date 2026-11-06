@@ -318,6 +318,12 @@ func (r *Roster) judge(st *statement.Statement, now time.Time) (*Device, error) 
 // before or after the newer one was revoked (Codex review, 2026-11-05).
 // Re-admission after a revocation is a later-issued admission, whatever
 // its window.
+// Later reports whether a is the later word by the roster's order (issue
+// time, expiry, statement ID) — the one order used wherever two admissions
+// must be ranked, for one device or across devices (an overlay address
+// claimed twice, fabricnet).
+func Later(a, b *Device) bool { return prefer(b, a) }
+
 func prefer(cur, next *Device) bool {
 	if ni, ci := next.Stmt.Payload.Iat, cur.Stmt.Payload.Iat; ni != ci {
 		return ni > ci

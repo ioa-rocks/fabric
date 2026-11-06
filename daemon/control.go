@@ -43,6 +43,10 @@ type StatusPeer struct {
 	// member, but it is still known by name and holds its overlay address
 	// until it re-joins or is revoked (cert.LapsedRetention).
 	Expired bool `json:"expired,omitempty"`
+	// AddrConflict is an overlay address the peer's admission claims while a
+	// later admission of another device holds it: no route, no inbound
+	// address, until an owner renumbers one of them.
+	AddrConflict string `json:"addr_conflict,omitempty"`
 	// Scope is the cert-borne protocol scope (fabric ADR 0005); absent means
 	// unrestricted.
 	Scope []string `json:"scope,omitempty"`
@@ -95,6 +99,10 @@ type MemberInfo struct {
 	Connected   bool      `json:"connected"`
 	Self        bool      `json:"self,omitempty"`    // the answering daemon's own entry
 	Expired     bool      `json:"expired,omitempty"` // lapsed: not a member, cert expired; re-join needed
+	// AddrConflict: the address the admission claims is held by another
+	// device's later admission; this device has no route and no inbound
+	// address until an owner renumbers one of them.
+	AddrConflict string `json:"addr_conflict,omitempty"`
 }
 
 type StatusReply struct {
@@ -273,7 +281,7 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	for p, c := range members {
 		if !seen[p.String()] {
 			exp := c.Expiry()
-			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true, IP: c.Payload.Meta.IP, Scope: c.Payload.Meta.Scope, CertExpiry: &exp, KnownAddrs: d.knownAddrs(p)})
+			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true, IP: c.Payload.Meta.IP, AddrConflict: d.addrConflict(p), Scope: c.Payload.Meta.Scope, CertExpiry: &exp, KnownAddrs: d.knownAddrs(p)})
 			seen[p.String()] = true
 		}
 	}
@@ -341,17 +349,18 @@ func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
 			return
 		}
 		info := MemberInfo{
-			ID:          p.String(),
-			Name:        c.Payload.Meta.Name,
-			Fingerprint: admission.Fingerprint(devKey),
-			DevicePub:   devKey,
-			Cert:        raw,
-			IP:          c.Payload.Meta.IP,
-			Scope:       c.Payload.Meta.Scope,
-			Expiry:      c.Expiry(),
-			Connected:   self || d.Host.Network().Connectedness(p) == network.Connected,
-			Self:        self,
-			Expired:     expired,
+			ID:           p.String(),
+			Name:         c.Payload.Meta.Name,
+			Fingerprint:  admission.Fingerprint(devKey),
+			DevicePub:    devKey,
+			Cert:         raw,
+			IP:           c.Payload.Meta.IP,
+			Scope:        c.Payload.Meta.Scope,
+			Expiry:       c.Expiry(),
+			Connected:    self || d.Host.Network().Connectedness(p) == network.Connected,
+			Self:         self,
+			Expired:      expired,
+			AddrConflict: d.addrConflict(p),
 		}
 		out = append(out, info)
 	}
@@ -370,6 +379,15 @@ func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
 		add(p, c, false, true)
 	}
 	writeJSON(w, out)
+}
+
+// addrConflict is the address the peer claims but does not hold, as a
+// string for the replies; "" when it holds its address or has none.
+func (d *Daemon) addrConflict(p peer.ID) string {
+	if a, ok := d.Store.AddrConflict(p); ok {
+		return a.String()
+	}
+	return ""
 }
 
 // handleEvents returns the membership-event feed, newest first — the

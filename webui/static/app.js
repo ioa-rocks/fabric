@@ -699,7 +699,8 @@ function drawNode(svg, x, y, n, radius, d, shown = true) {
     g.append(dotEl);
   });
   g.append(el("text", { x, y: y + radius + 16, "text-anchor": "middle" }, n.name || short(n.id)));
-  const sub = n.ip ? `${n.ip.split("/")[0]} · ${KIND_LABEL[n.kind]}` : KIND_LABEL[n.kind];
+  let sub = n.ip ? `${n.ip.split("/")[0]} · ${KIND_LABEL[n.kind]}` : KIND_LABEL[n.kind];
+  if (n.addr_conflict) sub += " · ADDRESS CONFLICT";
   g.append(el("text", { x, y: y + radius + 30, "text-anchor": "middle", class: "sub" }, sub));
   g.onclick = () => {
     state.selected = n.id;
@@ -775,6 +776,7 @@ function renderDetails(d, ns) {
   add(kv, "name", n.name || "—");
   if ((n.circles || []).length) add(kv, n.kind === "grantee" ? "granted in" : "shares", circleChips(d, n.circles));
   if (n.ip) add(kv, "overlay IP", mono(n.ip.split("/")[0]));
+  if (n.addr_conflict) add(kv, "address conflict", `${n.addr_conflict} is held by another device's later admission — no route, no inbound until one of them is renumbered`);
   if (n.scope) add(kv, "scope", `mesh + ${n.scope.filter(f => f !== "mesh").join(" + ") || "nothing else"}`);
   add(kv, "peer ID", mono(n.id));
   if (n.agent) add(kv, "software", n.agent);

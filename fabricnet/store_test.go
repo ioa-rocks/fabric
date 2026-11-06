@@ -641,3 +641,59 @@ func TestExpiredEntryStopsRoutingAtOnce(t *testing.T) {
 		t.Fatal("an expired entry still resolves by name")
 	}
 }
+
+// Two devices whose admissions claim one overlay address: the later
+// admission holds it, the other gets neither route nor inbound address, so
+// Route and AddrOf never disagree about who is behind an address, and the
+// loser is reported (agy review, 2026-11-06). Renumbering the loser ends it.
+func TestOneHolderPerOverlayAddress(t *testing.T) {
+	c, _ := circle.Init(t.TempDir(), "main", "pw")
+	priv, _ := c.Unlock("pw")
+	now := time.Now()
+	tunVerbs := append(append([]string{}, circle.DeviceVerbs...), statement.VerbTun)
+	aPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	bPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	first, _ := circle.AdmitWith(priv, nil, c.Config.DID, aPub, now.Add(-time.Second), time.Hour, tunVerbs, &statement.Meta{Name: "a", IP: "100.64.0.5/24"})
+	second, _ := circle.AdmitWith(priv, nil, c.Config.DID, bPub, now, time.Hour, tunVerbs, &statement.Meta{Name: "b", IP: "100.64.0.5/24"})
+	a, _ := PeerOfDID(cert.DIDForKey(aPub))
+	b, _ := PeerOfDID(cert.DIDForKey(bPub))
+	ip := netip.MustParseAddr("100.64.0.5")
+	for _, order := range [][]*circle.Admission{{first, second}, {second, first}} {
+		table := NewMemberStore(statement.NewDIDRoot(c.Config.DID))
+		table.SetOverlay(netip.MustParsePrefix("100.64.0.1/24"))
+		for _, adm := range order {
+			if _, err := table.AddAdmission(adm.Stmt, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if p, ok := table.Route(ip); !ok || p != b {
+			t.Fatalf("route to %s = %v %v, want the later admission's device", ip, p, ok)
+		}
+		if got, ok := table.AddrOf(b); !ok || got != ip {
+			t.Fatalf("holder's address = %v %v", got, ok)
+		}
+		if got, ok := table.AddrOf(a); ok {
+			t.Fatalf("the loser still has inbound address %v", got)
+		}
+		if got, ok := table.AddrConflict(a); !ok || got != ip {
+			t.Fatalf("loser's conflict = %v %v, want %s", got, ok, ip)
+		}
+		if _, ok := table.AddrConflict(b); ok {
+			t.Fatal("the holder is reported in conflict")
+		}
+		if !table.IsMember(a, now) {
+			t.Fatal("the loser is still a member; only its address is contested")
+		}
+		// An owner renumbers the loser: both route.
+		moved, _ := circle.AdmitWith(priv, nil, c.Config.DID, aPub, now.Add(time.Second), time.Hour, tunVerbs, &statement.Meta{Name: "a", IP: "100.64.0.6/24"})
+		if _, err := table.AddAdmission(moved.Stmt, now.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := table.View().AddrOf(a, now.Add(time.Second)); !ok || got != netip.MustParseAddr("100.64.0.6") {
+			t.Fatalf("renumbered device's address = %v %v", got, ok)
+		}
+		if _, ok := table.AddrConflict(a); ok {
+			t.Fatal("conflict outlived the renumbering")
+		}
+	}
+}

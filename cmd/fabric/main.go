@@ -520,6 +520,9 @@ func cmdStatus(args []string) error {
 		if ip == "" {
 			ip = "-"
 		}
+		if p.AddrConflict != "" {
+			ip += " !CONFLICT"
+		}
 		scope := ""
 		if p.Scope != nil {
 			scope = "  scope:" + cert.ScopeString(p.Scope)
@@ -554,6 +557,8 @@ func printExpiryWarnings(s *daemon.StatusReply) {
 			name = p.ID
 		}
 		switch {
+		case p.AddrConflict != "":
+			lines = append(lines, fmt.Sprintf("%s claims %s, held by another device's later admission — no route, no inbound; renumber one of them ('fabric renew -ip')", name, p.AddrConflict))
 		case p.Expired:
 			lines = append(lines, fmt.Sprintf("%s EXPIRED %dd ago — off the mesh; run 'fabric join' on it", name, -days(*p.CertExpiry)))
 		case p.CertExpiry.Sub(now) < loud:

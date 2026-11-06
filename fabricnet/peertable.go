@@ -187,7 +187,12 @@ type View struct {
 	addrs   map[peer.ID]deviceIn
 	holders map[netip.Addr][]peer.ID // peers whose entry carries the address
 	names   map[string][]peer.ID     // lower-cased name -> peers whose entry is labelled so
-	version uint64
+	// An address two standing entries claim has one holder — the later
+	// admission by the roster's order — and the other device gets neither
+	// route nor inbound address, so Route and AddrOf never split (agy
+	// review, 2026-11-06). conflicts names the losers and what they claimed.
+	conflicts map[peer.ID]netip.Addr
+	version   uint64
 }
 
 // deviceIn is one roster's entry for a peer; addr is the overlay address
@@ -200,7 +205,8 @@ type deviceIn struct {
 
 func (s *state) snapshot() *View {
 	v := &View{rosters: append([]*circle.Roster(nil), s.rosters...), byPeer: map[peer.ID][]deviceIn{},
-		addrs: map[peer.ID]deviceIn{}, holders: map[netip.Addr][]peer.ID{}, names: map[string][]peer.ID{}, version: s.version}
+		addrs: map[peer.ID]deviceIn{}, holders: map[netip.Addr][]peer.ID{}, names: map[string][]peer.ID{},
+		conflicts: map[peer.ID]netip.Addr{}, version: s.version}
 	for _, r := range s.rosters {
 		for _, dev := range r.Devices() {
 			p, err := PeerOfDID(dev.DID)
@@ -228,11 +234,21 @@ func (s *state) snapshot() *View {
 			if err != nil {
 				continue
 			}
-			v.addrs[p] = deviceIn{roster: r, dev: dev, addr: pfx.Addr()}
-			v.holders[pfx.Addr()] = append(v.holders[pfx.Addr()], p)
 			if name := strings.ToLower(c.Payload.Meta.Name); name != "" {
 				v.names[name] = append(v.names[name], p)
 			}
+			// One holder per address: the later admission keeps it.
+			if cur, taken := v.holders[pfx.Addr()]; taken {
+				held := v.addrs[cur[0]]
+				if !circle.Later(dev, held.dev) {
+					v.conflicts[p] = pfx.Addr()
+					continue
+				}
+				delete(v.addrs, cur[0])
+				v.conflicts[cur[0]] = pfx.Addr()
+			}
+			v.addrs[p] = deviceIn{roster: r, dev: dev, addr: pfx.Addr()}
+			v.holders[pfx.Addr()] = []peer.ID{p}
 		}
 	}
 	return v
@@ -494,11 +510,12 @@ func (t *PeerTable) LapsedCert(p peer.ID) (*cert.Cert, bool) { return t.View().L
 func (t *PeerTable) Snapshot() (map[peer.ID]*cert.Cert, map[peer.ID]time.Time) {
 	return t.View().Snapshot()
 }
-func (t *PeerTable) Lapsed() map[peer.ID]*cert.Cert          { return t.View().Lapsed() }
-func (t *PeerTable) IsRevoked(p peer.ID, now time.Time) bool { return t.View().IsRevoked(p, now) }
-func (t *PeerTable) LiveIn(circleDID string) []peer.ID       { return t.View().LiveIn(circleDID) }
-func (t *PeerTable) Route(dst netip.Addr) (peer.ID, bool)    { return t.View().Route(dst, time.Now()) }
-func (t *PeerTable) AddrOf(p peer.ID) (netip.Addr, bool)     { return t.View().AddrOf(p, time.Now()) }
+func (t *PeerTable) Lapsed() map[peer.ID]*cert.Cert            { return t.View().Lapsed() }
+func (t *PeerTable) IsRevoked(p peer.ID, now time.Time) bool   { return t.View().IsRevoked(p, now) }
+func (t *PeerTable) LiveIn(circleDID string) []peer.ID         { return t.View().LiveIn(circleDID) }
+func (t *PeerTable) Route(dst netip.Addr) (peer.ID, bool)      { return t.View().Route(dst, time.Now()) }
+func (t *PeerTable) AddrConflict(p peer.ID) (netip.Addr, bool) { return t.View().AddrConflict(p) }
+func (t *PeerTable) AddrOf(p peer.ID) (netip.Addr, bool)       { return t.View().AddrOf(p, time.Now()) }
 func (t *PeerTable) Resolve(name string) (netip.Addr, bool) {
 	return t.View().Resolve(name, time.Now())
 }
@@ -722,6 +739,14 @@ func (v *View) Route(dst netip.Addr, now time.Time) (peer.ID, bool) {
 		}
 	}
 	return "", false
+}
+
+// AddrConflict reports an address the device's admission claims but another
+// device's later admission holds: the device has no route and no inbound
+// address until an owner renumbers one of them.
+func (v *View) AddrConflict(p peer.ID) (netip.Addr, bool) {
+	a, ok := v.conflicts[p]
+	return a, ok
 }
 
 // AddrOf is the overlay address a live device of the overlay circle holds
