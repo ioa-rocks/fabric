@@ -47,7 +47,7 @@ import (
 // owns it — mesh membership alone grants nothing.
 func cmdCircle(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: fabric circle init|admit|join|export|renew|revoke|passphrase|grant|status")
+		return fmt.Errorf("usage: fabric circle init|admit|join|export|renew|revoke|restore|passphrase|grant|status")
 	}
 	rest := args[1:]
 	switch args[0] {
@@ -63,6 +63,8 @@ func cmdCircle(args []string) error {
 		return cmdCircleRenew(rest)
 	case "revoke":
 		return cmdCircleRevoke(rest)
+	case "restore":
+		return cmdCircleRestore(rest)
 	case "passphrase":
 		return cmdCirclePassphrase(rest)
 	case "grant":
@@ -70,7 +72,7 @@ func cmdCircle(args []string) error {
 	case "status":
 		return cmdCircleStatus(rest)
 	default:
-		return fmt.Errorf("usage: fabric circle init|admit|join|export|renew|revoke|passphrase|grant|status")
+		return fmt.Errorf("usage: fabric circle init|admit|join|export|renew|revoke|restore|passphrase|grant|status")
 	}
 }
 
@@ -255,6 +257,12 @@ func cmdCircleExport(args []string) error {
 // (circle.Admit) — the statement peers verify before they sync with it.
 // Needs the fabric identity; before 'fabric join' it only says what to run.
 func admitSelf(statePath string, c *circle.Circle, pass string) error {
+	return admitSelfWith(statePath, c, pass, false)
+}
+
+// admitSelfWith is admitSelf; restore says a removal of this device is
+// meant to be acknowledged (`circle restore` with no device named).
+func admitSelfWith(statePath string, c *circle.Circle, pass string, restore bool) error {
 	dir, err := state.Open(statePath)
 	if err != nil {
 		return err
@@ -275,6 +283,18 @@ func admitSelf(statePath string, c *circle.Circle, pass string) error {
 	if err != nil {
 		return err
 	}
+	now := time.Now()
+	selfDID := did.ForKey(ed25519.PublicKey(raw))
+	roster, err := circle.OpenRoster(c, now)
+	if err != nil {
+		return err
+	}
+	// A removed device is not renewed into the circle by the way: an
+	// admission that does not acknowledge the removal counts nowhere, and
+	// one that does is a restoration, which is its own command (ADR 0019).
+	if roster.Removed(selfDID) && !restore {
+		return fmt.Errorf("this device was removed from circle %q (%s) — 'fabric circle restore -circle %s' puts it back on purpose; a renewal would not count", c.Config.Name, removedWhen(roster, selfDID), c.Config.Name)
+	}
 	// Carry the device's current admission in this circle forward: the
 	// membership cert when the circle is the one it was joined in (name,
 	// overlay address, owner verbs), else the admission on disk. A bare
@@ -287,8 +307,7 @@ func admitSelf(statePath string, c *circle.Circle, pass string) error {
 	} else if cur, err := c.LoadAdmission(); err == nil {
 		prev = cur.Stmt
 	}
-	now := time.Now()
-	a, err := circle.Renew(priv, prev, c.Config.DID, ed25519.PublicKey(raw), now, circle.DefaultValidity)
+	a, err := circle.RenewWith(priv, prev, c.Config.DID, ed25519.PublicKey(raw), now, circle.DefaultValidity, roster.Acks(selfDID))
 	if err != nil {
 		return err
 	}
@@ -539,7 +558,7 @@ func cmdCircleStatus(args []string) error {
 		case err != nil:
 			fmt.Printf("  device: NOT admitted — %s; until then no peer serves this circle to this device\n", renew)
 		case c.Revoked(a, now):
-			fmt.Printf("  device: REVOKED by the circle (as of its revocation list) — peers refuse this device; an owner device re-admits it\n")
+			fmt.Printf("  device: REMOVED by the circle (as of its revocation list) — peers refuse this device; an owner device puts it back with 'fabric circle restore'\n")
 		case a.Valid(now) != nil:
 			fmt.Printf("  device: admission EXPIRED %s — %s\n", a.Expiry().Format("2006-01-02"), renew)
 		default:
@@ -606,12 +625,12 @@ func cmdCircleStatus(args []string) error {
 	return nil
 }
 
-// cmdCircleRevoke signs a device out of a circle: every admission it holds
-// for the circle, issued up to now, is dead; devices of the circle learn it
-// at their next connect, and the running daemon here pushes it to
-// the ones connected now. Needs the circle key — an owner device. A later
-// admission (an owner re-admitting the device) is a re-admission and
-// stands.
+// cmdCircleRevoke signs a device out of a circle: a removal (ADR 0019),
+// kept for good — every admission of the device that does not acknowledge
+// it is dead, whenever it was signed. Devices of the circle learn it at
+// their next connect, and the running daemon here pushes it to the ones
+// connected now. Needs the circle key — an owner device. The device comes
+// back only through `circle restore`, which acknowledges the removal.
 func cmdCircleRevoke(args []string) error {
 	fs := flag.NewFlagSet("circle revoke", flag.ExitOnError)
 	statePath, vaultState := circleFlags(fs)
@@ -661,7 +680,7 @@ func cmdCircleRevoke(args []string) error {
 	if _, err := c.AddRevocations(now, r); err != nil {
 		return err
 	}
-	fmt.Printf("revoked %s from circle %q as of %s\n", label, c.Config.Name, now.Format(time.RFC3339))
+	fmt.Printf("removed %s from circle %q (%s)\n", label, c.Config.Name, now.Format(time.RFC3339))
 	fmt.Println("the device keeps whatever it already synced; devices of the circle stop serving it as they learn of this")
 	if client != nil {
 		if n, err := client.CircleRefresh(); err == nil {
@@ -670,7 +689,7 @@ func cmdCircleRevoke(args []string) error {
 			fmt.Println("no running node daemon here — connected devices learn it at their next connect ('fabric up' pushes it)")
 		}
 	}
-	fmt.Println("to re-admit the device later, admit it again on an owner device (an admission issued after the revocation stands)")
+	fmt.Printf("to put the device back later: fabric circle restore %s -circle %s -out <file> on an owner device (an admission that does not acknowledge the removal would not count)\n", target, c.Config.Name)
 	return nil
 }
 
@@ -887,6 +906,11 @@ func cmdCircleAdmit(args []string) error {
 	if err != nil {
 		return err
 	}
+	// A removed device is admitted again only on purpose (ADR 0019): an
+	// admission that does not acknowledge the removal counts nowhere.
+	if roster.Removed(deviceDID) {
+		return fmt.Errorf("%s was removed from circle %q (%s) — 'fabric circle restore %s -circle %s -out <file>' puts it back on purpose; a plain admission would not count", memberName, c.Config.Name, removedWhen(roster, deviceDID), target, c.Config.Name)
+	}
 	if *tun {
 		if *role == circle.RoleGate {
 			return errors.New("a gate never holds tun (memo §17: a public hop reads nothing and is no overlay endpoint)")
@@ -980,20 +1004,28 @@ func cmdCircleAdmit(args []string) error {
 	if err != nil {
 		return err
 	}
-	a, err := circle.AdmitWith(priv, nil, c.Config.DID, devicePub, now, *validity, verbs, meta)
+	a, err := circle.Issue(priv, nil, c.Config.DID, devicePub, now, *validity, circle.Terms{Verbs: verbs, Meta: meta, Acks: roster.Acks(deviceDID)})
 	if err != nil {
-		return err
-	}
-	bundle, err := circle.NewDeviceBundle(c, a, gates)
-	if err != nil {
-		return err
-	}
-	if err := circle.WriteBundle(*out, bundle); err != nil {
 		return err
 	}
 	fmt.Printf("admitted %s into circle %q as a %s until %s\n", memberName, c.Config.Name, *role, a.Expiry().Format("2006-01-02"))
 	if meta.IP != "" {
 		fmt.Printf("  overlay address %s\n", meta.IP)
+	}
+	return handOver(c, roster, client, a, gates, *out, now)
+}
+
+// handOver writes the device's bundle, records the admission in the
+// circle's roster (through the daemon when it runs, else on disk) and tells
+// the operator how to get the bundle to the device: the tail of `admit`
+// and `restore`.
+func handOver(c *circle.Circle, roster *circle.Roster, client *daemon.Client, a *circle.Admission, gates []string, out string, now time.Time) error {
+	bundle, err := circle.NewDeviceBundle(c, a, gates)
+	if err != nil {
+		return err
+	}
+	if err := circle.WriteBundle(out, bundle); err != nil {
+		return err
 	}
 	if len(gates) > 0 {
 		fmt.Printf("  gates: %s\n", strings.Join(gates, " "))
@@ -1016,8 +1048,120 @@ func cmdCircleAdmit(args []string) error {
 	} else if err := recordOnDisk(roster, a, now); err != nil {
 		return err
 	}
-	fmt.Printf("  bundle written to %s — move it privately to the device, then run there: fabric circle join %s (fresh machine: fabric join %s)\n", *out, filepath.Base(*out), filepath.Base(*out))
+	fmt.Printf("  bundle written to %s — move it privately to the device, then run there: fabric circle join %s (fresh machine: fabric join %s)\n", out, filepath.Base(out), filepath.Base(out))
 	return nil
+}
+
+// removedWhen says when the roster's latest removal of the device was
+// signed, for messages.
+func removedWhen(roster *circle.Roster, deviceDID string) string {
+	var latest time.Time
+	for _, rv := range roster.Removals(deviceDID) {
+		if at := time.Unix(rv.Payload.Iat, 0); at.After(latest) {
+			latest = at
+		}
+	}
+	if latest.IsZero() {
+		return "removed"
+	}
+	return "removed " + latest.Format("2006-01-02")
+}
+
+// cmdCircleRestore puts a removed device back into a circle on purpose
+// (ADR 0019): it signs a fresh admission on the device's remembered terms
+// — verbs, label, overlay address — that acknowledges every removal of the
+// device this node knows, which is the one thing a plain `admit` or
+// `renew` refuses to do. Without a device named it restores this very
+// device (an owner device another owner removed). Needs the circle key.
+func cmdCircleRestore(args []string) error {
+	fs := flag.NewFlagSet("circle restore", flag.ExitOnError)
+	statePath, vaultState := circleFlags(fs)
+	name := fs.String("circle", "", "which circle (required when the node holds several)")
+	validity := fs.Duration("validity", circle.DefaultValidity, "admission lifetime")
+	out := fs.String("out", "", "bundle file to write for the device (required when a device is named)")
+	var gates stringList
+	fs.Var(&gates, "gate", "gate hint for the device (repeatable; default: the circle's recorded hints plus this node's own when listed)")
+	fs.Parse(args)
+	if fs.NArg() > 1 || (fs.NArg() == 1 && *out == "") {
+		return fmt.Errorf("usage: fabric circle restore [-circle <name>] [-out <file> <member-name | peer-id | fingerprint | did:key:…>]")
+	}
+	root, err := circleRoot(*statePath, *vaultState)
+	if err != nil {
+		return err
+	}
+	c, err := pickCircle(root, *name)
+	if err != nil {
+		return err
+	}
+	if !c.HasKey() {
+		return fmt.Errorf("this device holds no key for circle %q — restore from an owner device", c.Config.Name)
+	}
+	if fs.NArg() == 0 {
+		pass, err := passFor(c)
+		if err != nil {
+			return err
+		}
+		return admitSelfWith(*statePath, c, pass, true)
+	}
+	target := fs.Arg(0)
+	dir, err := state.Open(*statePath)
+	if err != nil {
+		return err
+	}
+	var client *daemon.Client
+	if _, err := dir.LoadDeviceKey(); err == nil {
+		client = daemon.NewClient(dir)
+	}
+	deviceDID, memberName, err := resolveDevice(client, target)
+	if err != nil {
+		return err
+	}
+	devicePub, err := did.KeyFor(deviceDID)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	roster, err := circle.OpenRoster(c, now)
+	if err != nil {
+		return err
+	}
+	removals := roster.Removals(deviceDID)
+	if len(removals) == 0 {
+		return fmt.Errorf("%s was not removed from circle %q as far as this node knows — 'fabric circle admit' admits, 'fabric circle renew' renews", memberName, c.Config.Name)
+	}
+	// The terms come from what the roster remembers of the device: the
+	// admission the removal retired (the slot's memory), or its last
+	// eligible one. Nothing remembered means the device must be admitted
+	// afresh, with its role and address chosen.
+	prev, ok := roster.Device(deviceDID)
+	if !ok {
+		return fmt.Errorf("the roster remembers no admission of %s to carry forward — 'fabric circle admit' with -role/-tun chooses its terms (the admission acknowledges the removal)", memberName)
+	}
+	if len(gates) == 0 {
+		gates = append(gates, c.Config.Gates...)
+		for _, g := range listedGateHints(*statePath) {
+			if !slices.Contains(gates, g) {
+				gates = append(gates, g)
+			}
+		}
+	}
+	pass, err := passFor(c)
+	if err != nil {
+		return err
+	}
+	priv, err := c.Unlock(pass)
+	if err != nil {
+		return err
+	}
+	a, err := circle.RenewWith(priv, prev.Stmt, c.Config.DID, devicePub, now, *validity, roster.Acks(deviceDID))
+	if err != nil {
+		return err
+	}
+	fmt.Printf("restored %s into circle %q as a %s until %s, acknowledging %d removal(s)\n", memberName, c.Config.Name, a.Role(), a.Expiry().Format("2006-01-02"), len(removals))
+	if a.IP != "" {
+		fmt.Printf("  overlay address %s\n", a.IP)
+	}
+	return handOver(c, roster, client, a, gates, *out, now)
 }
 
 // --- grants (step 4, slice G): a circle hands a bare key the right to a
