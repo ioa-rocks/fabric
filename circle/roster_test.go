@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/statement"
 )
@@ -313,5 +314,56 @@ func TestRevokedLatestAdmissionConvergesWhateverTheOrder(t *testing.T) {
 	// statement only while it is dead.
 	if err := r.Judge(old.Stmt, at); err != nil {
 		t.Fatalf("older admission of a live device refused: %v", err)
+	}
+}
+
+// A sweep of an admin desk — how the web UI's revoke and the legacy CLI
+// reach the roster — kills the admissions the desk issued, as a statement
+// revocation of the desk does through Check. Before 2026-11-06 the sweep
+// was checked against the leaf only, so revoking an admin desk from the UI
+// left its devices admitted (agy review).
+func TestSweepCascadesAlongDelegatedChains(t *testing.T) {
+	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
+	deskPub, deskPriv, _ := ed25519.GenerateKey(rand.Reader)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	circleDID := did.ForKey(rootPub)
+	deskDID, devDID := did.ForKey(deskPub), did.ForKey(devPub)
+	now := time.Now().Add(-time.Minute)
+	desk, err := cert.IssueAsDel(rootPriv, nil, circleDID, deskPub, cert.CmdAdmin, cert.Meta{Name: "desk"}, now, time.Hour, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nas, err := cert.IssueAs(deskPriv, desk.Stmt, circleDID, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewRoster(statement.NewDIDRoot(circleDID))
+	for _, st := range []*statement.Statement{desk.Stmt, nas.Stmt} {
+		if r, _, err = r.Add(st, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := r.Live(devDID, time.Now()); !ok {
+		t.Fatal("device under the desk is not live")
+	}
+	// Sweep the desk as of now: the desk and everything it issued die.
+	r, _ = r.Sweep(deskDID, time.Now())
+	if _, ok := r.Live(deskDID, time.Now()); ok {
+		t.Fatal("swept desk still live")
+	}
+	if _, ok := r.Live(devDID, time.Now()); ok {
+		t.Fatal("device admitted by the swept desk still live")
+	}
+	if _, ok := r.Revoked(devDID, time.Now()); !ok {
+		t.Fatal("device admitted by the swept desk not reported revoked")
+	}
+	// The root re-admits the device directly, later: it stands.
+	later := time.Now().Add(time.Second)
+	direct, _ := AdmitFor(rootPriv, devPub, later, time.Hour)
+	if r, _, err = r.Add(direct.Stmt, later); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.Live(devDID, later); !ok {
+		t.Fatal("root re-admission after the desk's sweep not live")
 	}
 }

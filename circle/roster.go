@@ -333,10 +333,21 @@ func prefer(cur, next *Device) bool {
 
 // verdict is the time-independent half of the §6 checklist for one
 // device: sweeps, presenting key, member verb, and revocations over the
-// chain (Check at the window's start, so only the window is skipped).
+// chain (Check at the window's start, so only the window is skipped). A
+// sweep is checked against every link of the chain, not the leaf alone:
+// sweeping an admin desk kills what the desk admitted, as a statement
+// revocation of the desk would through Check (agy review, 2026-11-06 —
+// the web UI's revoke and the legacy CLI arrive as sweeps).
 func (r *Roster) verdict(dev *Device) error {
-	if at, ok := r.sweeps[dev.DID]; ok && dev.Stmt.Payload.Iat <= at {
-		return errors.New("device swept by the circle")
+	for _, links := range [][]statement.Link{dev.Chain.Auth, dev.Chain.Ident} {
+		for _, l := range links {
+			if at, ok := r.sweeps[l.Aud]; ok && l.Iat <= at {
+				if l.Aud == dev.DID {
+					return errors.New("device swept by the circle")
+				}
+				return fmt.Errorf("issuer %s swept by the circle", shortDID(l.Aud))
+			}
+		}
 	}
 	return dev.Chain.Check(r.roots, r.revs, statement.Want{
 		Sub: dev.Sub(), Res: memberRes, Verb: statement.VerbMember,
@@ -379,7 +390,8 @@ func (r *Roster) AddRevocation(st *statement.Statement) (*Roster, bool, error) {
 }
 
 // Sweep kills every admission of a device issued up to at — the legacy
-// member-revoked event, and the circle's legacy device revocation. A
+// member-revoked event, and the circle's legacy device revocation — and,
+// through their chains, the admissions that device issued up to then. A
 // device the roster never saw is remembered as a tombstone for
 // sweepTombstone so the gater refuses it meanwhile.
 func (r *Roster) Sweep(deviceDID string, at time.Time) (*Roster, bool) {
@@ -389,7 +401,9 @@ func (r *Roster) Sweep(deviceDID string, at time.Time) (*Roster, bool) {
 	}
 	nr := r.clone()
 	nr.sweeps[deviceDID] = cut
-	nr.rejudge(deviceDID)
+	for did := range nr.devices {
+		nr.rejudge(did)
+	}
 	return nr, true
 }
 
