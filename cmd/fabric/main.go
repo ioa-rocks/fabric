@@ -1088,8 +1088,12 @@ func cmdApprove(args []string) error {
 	if err != nil {
 		return err
 	}
+	circleDID, proof, err := daemon.HomeSigner(dir, rootPriv)
+	if err != nil {
+		return err
+	}
 	now := time.Now()
-	c, err := cert.Issue(rootPriv, ed25519.PublicKey(match.DevicePub), cert.CmdMember, cert.Meta{Name: match.Name, IP: ip, Scope: scope}, now, certValidity)
+	c, err := cert.IssueAs(rootPriv, proof, circleDID, ed25519.PublicKey(match.DevicePub), cert.CmdMember, cert.Meta{Name: match.Name, IP: ip, Scope: scope}, now, certValidity)
 	if err != nil {
 		return err
 	}
@@ -1309,6 +1313,10 @@ func cmdRenew(args []string) error {
 	if err != nil {
 		return err
 	}
+	_, proof, err := daemon.HomeSigner(dir, rootPriv)
+	if err != nil {
+		return err
+	}
 	now := time.Now()
 	for _, m := range targets {
 		old, err := cert.Unmarshal(m.Cert)
@@ -1346,7 +1354,7 @@ func cmdRenew(args []string) error {
 			// older gate still looks for the role.
 			fmt.Printf("%q: admin-role cert renewed as a member cert (the role is no longer needed on a device key)\n", m.Name)
 		}
-		renewed, err := cert.IssueAs(rootPriv, nil, old.Payload.Sub, mustDeviceKey(old), cert.CmdMember, meta, now, cert.DefaultValidity)
+		renewed, err := cert.IssueAs(rootPriv, proof, old.Payload.Sub, mustDeviceKey(old), cert.CmdMember, meta, now, cert.DefaultValidity)
 		if err != nil {
 			return fmt.Errorf("renewing %q: %w", m.Name, err)
 		}

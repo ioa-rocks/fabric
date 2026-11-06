@@ -563,7 +563,7 @@ func TestRemovalRetiresUnacknowledgedAdmissions(t *testing.T) {
 	if len(acks) != 1 || !bytes.Equal(acks[0], rid[:]) {
 		t.Fatalf("Acks = %x", acks)
 	}
-	restored, err := RenewWith(rootPriv, a1.Stmt, circleDID, devPub, now.Add(time.Second), time.Hour, acks)
+	restored, err := RenewWith(rootPriv, nil, a1.Stmt, circleDID, devPub, now.Add(time.Second), time.Hour, acks)
 	if err != nil {
 		t.Fatal(err)
 	}

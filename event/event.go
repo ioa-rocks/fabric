@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/statement"
 
 	"github.com/fxamacker/cbor/v2"
@@ -94,6 +95,17 @@ func Verify(e *Event, roots statement.Roots, now time.Time) error {
 	keys := roots.RootKeys(e.Payload.Ns)
 	if len(keys) == 0 {
 		return fmt.Errorf("event is signed by %s, a root this node does not honour", e.Payload.Ns)
+	}
+	// A circle whose key rotated signs its events with the new key; the
+	// legacy log has no place for the handover, so every key of the
+	// known history signs (the event's cert carries the proof and is
+	// judged with it).
+	if h, ok := roots.(statement.RootHistory); ok {
+		for _, ho := range h.Handovers(e.Payload.Ns) {
+			if k, err := did.KeyFor(ho.Payload.Aud); err == nil {
+				keys = append(keys, k)
+			}
+		}
 	}
 	msg, err := encMode.Marshal(e.Payload)
 	if err != nil {

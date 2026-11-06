@@ -60,6 +60,7 @@ type circleSet struct {
 	Roots       []string       `cbor:"roots,omitempty"` // the circle DID again (older binaries listed every root they honoured)
 	Admissions  [][]byte       `cbor:"a,omitempty"`     // admissions, statement bytes (live and lapsed)
 	Revocations [][]byte       `cbor:"r,omitempty"`     // statement bytes
+	Handovers   [][]byte       `cbor:"h,omitempty"`     // the circle's key history, statement bytes, oldest first
 	Events      []*event.Event `cbor:"e,omitempty"`     // membership-event envelopes (first circle only)
 }
 
@@ -272,6 +273,13 @@ func (s *EventSync) PublishStatements(circleDID string, admissions, revocations 
 	s.publishSets([]circleSet{{DID: circleDID, Admissions: admissions, Revocations: revocations}}, "")
 }
 
+// PublishHandover pushes a circle's key handover to the connected members
+// of the circle at once: a rotation must not wait for the first statement
+// of the new key to reach them, least of all after a compromise.
+func (s *EventSync) PublishHandover(circleDID string, handover []byte) {
+	s.publishSets([]circleSet{{DID: circleDID, Handovers: [][]byte{handover}}}, "")
+}
+
 // publishSets pushes per-circle deltas to the connected members verified
 // in each circle, v2 speakers only (an older peer has no roster to put
 // them in). Fire-and-forget: the reply is drained, not applied.
@@ -330,6 +338,11 @@ func (s *EventSync) setsFor(p peer.ID, evs []*event.Event, full bool) []circleSe
 			set.Events = evs
 		}
 		if full {
+			for _, h := range r.Roots().Handovers(did) {
+				if raw, err := h.Bytes(); err == nil {
+					set.Handovers = append(set.Handovers, raw)
+				}
+			}
 			for _, dev := range r.Devices() {
 				if raw, err := dev.Stmt.Bytes(); err == nil {
 					set.Admissions = append(set.Admissions, raw)
@@ -493,6 +506,20 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 			continue
 		}
 		delta := circleSet{DID: set.DID, Roots: set.Roots}
+		// The key history first: an admission of the new key would teach
+		// it too, but a bare handover (a rotation with nothing signed yet)
+		// must reach the roster on its own.
+		for _, raw := range set.Handovers {
+			st, err := statement.Decode(raw)
+			if err != nil {
+				continue
+			}
+			if grew, err := s.store.AddHandover(set.DID, st); err != nil {
+				log.Printf("sync: key handover from %s for circle %s: %v", from, shortDID(set.DID), err)
+			} else if grew {
+				delta.Handovers = append(delta.Handovers, raw)
+			}
+		}
 		event.Sort(set.Events)
 		for _, e := range set.Events {
 			if !roster.Honours(e.Payload.Ns) {
@@ -523,7 +550,7 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 			}
 			delta.Revocations = fresh
 		}
-		if len(delta.Admissions) > 0 || len(delta.Revocations) > 0 {
+		if len(delta.Admissions) > 0 || len(delta.Revocations) > 0 || len(delta.Handovers) > 0 {
 			deltas = append(deltas, delta)
 		}
 	}

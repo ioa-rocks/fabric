@@ -46,26 +46,38 @@ type Roster struct {
 	slots  map[string]*slot // by device DID; never mutated in place
 	revs   *statement.RevocationSet
 	sweeps map[string]int64 // device DID -> cut-off (unix s): admissions issued up to it are dead
+	// learned marks a roster whose roots' key history grew when it was
+	// made (a handover learned from a statement or the gossip): the owner
+	// saves such a roster even when nothing else about it persists.
+	learned bool
 }
 
 // slot is one device's admissions. held is the antichain of the eligible
 // ones under Dominates, later-issued first, so held[0] is the entry; it
 // has one element in every normal history and two for the instant
 // between a stale renewal and the removal it missed (a single register
-// diverges by arrival order: agy's S, N, R trace, ADR 0019). memory is the
-// latest admission that missed a removal — dead, kept until it would have
-// expired past retention, whatever else is held, so what the roster
+// diverges by arrival order: agy's S, N, R trace, ADR 0019). retired holds
+// the latest admission that missed a removal — dead, kept until it would
+// have expired past retention, whatever else is held, so what the roster
 // remembers does not depend on arrival order (the oracle's shuffled
 // phase); it is the entry when nothing is eligible, so a removed device
 // is reported revoked rather than forgotten, keeps its address, and a
 // restoration can carry its terms forward.
+//
+// Both are kept per key epoch — the root key (through its handovers) that
+// signed the admission's root link: an admission is dominated, or shadows
+// an older memory, only by one of its own epoch. A later key may yet be
+// declared compromised, which makes everything it signed no fact, and the
+// earlier key's admission must then still be there to stand (the oracle
+// caught this, 2026-11-06). Epochs are few (MaxHandovers), so the slot
+// stays small.
 type slot struct {
-	held   []*Device
-	memory *Device
+	held    []*Device
+	retired []*Device // latest per epoch, later-issued first
 }
 
 // entry is the device's standing admission: the eligible winner, else the
-// memory.
+// latest memory.
 func (s *slot) entry() *Device {
 	if s == nil {
 		return nil
@@ -73,7 +85,10 @@ func (s *slot) entry() *Device {
 	if len(s.held) > 0 {
 		return s.held[0]
 	}
-	return s.memory
+	if len(s.retired) > 0 {
+		return s.retired[0]
+	}
+	return nil
 }
 
 // all lists every admission the slot keeps, entry first.
@@ -81,10 +96,7 @@ func (s *slot) all() []*Device {
 	if s == nil {
 		return nil
 	}
-	if s.memory != nil {
-		return append(append([]*Device(nil), s.held...), s.memory)
-	}
-	return s.held
+	return append(append([]*Device(nil), s.held...), s.retired...)
 }
 
 // Device is one admission in a roster with its verdict.
@@ -161,10 +173,15 @@ func NewRoster(roots *statement.DIDRoot) *Roster {
 	}
 }
 
-// OpenRoster loads a circle directory's roster: its devices.cbor and the
-// circle's revocation file. Save writes back to devices.cbor.
+// OpenRoster loads a circle directory's roster: its key history, its
+// devices.cbor and the circle's revocation file. Save writes back to
+// devices.cbor (and handovers.cbor when the history grew).
 func OpenRoster(c *Circle, now time.Time) (*Roster, error) {
-	return NewRoster(statement.NewDIDRoot(c.Config.DID)).Attach(c, now)
+	roots, err := c.DIDRoot()
+	if err != nil {
+		return nil, fmt.Errorf("circle %q: %w", c.Config.Name, err)
+	}
+	return NewRoster(roots).Attach(c, now)
 }
 
 // Attach returns the roster with a circle directory folded in — its
@@ -175,6 +192,15 @@ func OpenRoster(c *Circle, now time.Time) (*Roster, error) {
 // revocations and a device revoked before a restart stays revoked after
 // it (Codex review, 2026-11-05).
 func (r *Roster) Attach(c *Circle, now time.Time) (*Roster, error) {
+	hs, err := c.Handovers()
+	if err != nil {
+		return nil, fmt.Errorf("circle %q: %w", c.Config.Name, err)
+	}
+	if n := len(hs); n > 0 {
+		if _, err := r.roots.Learn(hs[n-1]); err != nil {
+			return nil, fmt.Errorf("circle %q key history: %w", c.Config.Name, err)
+		}
+	}
 	revs, err := c.Revocations(now)
 	if err != nil {
 		return nil, err
@@ -229,6 +255,11 @@ func (r *Roster) WithPath(path string, now time.Time) (*Roster, error) {
 // Path is where Save writes; "" for a memory-only roster.
 func (r *Roster) Path() string { return r.path }
 
+// Learned reports whether this roster's key history grew when it was made,
+// so the owner saves it (Save writes the history) even for a change that
+// otherwise lives in memory.
+func (r *Roster) Learned() bool { return r.learned }
+
 // Roots is the roster's root: the circle's key as statement.Roots.
 func (r *Roster) Roots() *statement.DIDRoot { return r.roots }
 
@@ -257,6 +288,48 @@ func (r *Roster) clone() *Roster {
 	return nr
 }
 
+// learn folds the key history a statement carries into the roster's roots
+// (a holder learns a rotation from the first statement of the new key).
+// Returns the roster to continue with — a clone with every slot rebuilt
+// when the history grew, since admissions of the retired key issued after
+// the handover are no facts any more — or an error when the statement's
+// history conflicts with what is known.
+func (r *Roster) learn(st *statement.Statement) (*Roster, error) {
+	proof := st.RootProof()
+	if proof == nil {
+		return r, nil
+	}
+	grew, err := r.roots.Learn(proof)
+	if err != nil {
+		return nil, fmt.Errorf("roster: %w", err)
+	}
+	if !grew {
+		return r, nil
+	}
+	nr := r.clone()
+	nr.learned = true
+	nr.reslotAll()
+	return nr, nil
+}
+
+// AddHandover records a key handover learned from the gossip or the CLI
+// and re-judges every device: a retired key's admissions issued after its
+// handover — all of them, when it was declared compromised — drop out.
+// Reports whether the history grew.
+func (r *Roster) AddHandover(st *statement.Statement) (*Roster, bool, error) {
+	grew, err := r.roots.Learn(st)
+	if err != nil {
+		return r, false, err
+	}
+	if !grew {
+		return r, false, nil
+	}
+	nr := r.clone()
+	nr.learned = true
+	nr.reslotAll()
+	return nr, true, nil
+}
+
 // Add verifies an admission against the circle's root and returns the
 // roster with it recorded, and whether that changed anything. The device's
 // slot is rebuilt from what it held plus the newcomer (build), so the
@@ -271,9 +344,20 @@ func (r *Roster) clone() *Roster {
 // device is then reported revoked until the admission expires) and a
 // later-issued admission — a deliberate re-admission — stands over it.
 func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, error) {
+	if st == nil {
+		return r, false, errors.New("roster: nil statement")
+	}
+	r0 := r
+	r, err := r.learn(st)
+	if err != nil {
+		return r0, false, err
+	}
 	dev, err := r.judge(st, now)
 	if err != nil {
-		return r, false, err
+		if r != r0 {
+			return r, true, err // the history grew even though the admission is refused
+		}
+		return r0, false, err
 	}
 	cur := r.slots[dev.DID]
 	for _, d := range cur.all() {
@@ -283,9 +367,12 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, err
 	}
 	ns := r.build(append(cur.all(), dev))
 	if sameSlot(cur, ns) {
-		return r, false, nil
+		return r, r != r0, nil
 	}
-	nr := r.clone()
+	nr := r
+	if nr == r0 {
+		nr = r.clone()
+	}
 	nr.slots[dev.DID] = ns
 	return nr, true, nil
 }
@@ -298,6 +385,9 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, err
 func (r *Roster) build(ps []*Device) *slot {
 	var elig, retired []*Device
 	for _, p := range ps {
+		if p.Chain.RootsHonoured(r.roots) != nil {
+			continue // signed by a retired key after its handover (or a compromised one): no fact
+		}
 		p = r.judged(p)
 		if r.eligible(p) {
 			elig = append(elig, p)
@@ -309,7 +399,7 @@ func (r *Roster) build(ps []*Device) *slot {
 	for _, p := range elig {
 		dominated := false
 		for _, q := range elig {
-			if q != p && Dominates(q, p) {
+			if q != p && epoch(q) == epoch(p) && Dominates(q, p) {
 				dominated = true
 				break
 			}
@@ -319,17 +409,26 @@ func (r *Roster) build(ps []*Device) *slot {
 		}
 	}
 	sort.Slice(held, func(i, j int) bool { return Later(held[i], held[j]) })
-	var mem *Device
+	latest := map[int]*Device{}
 	for _, p := range retired {
-		if mem == nil || Later(p, mem) {
-			mem = p
+		if cur := latest[epoch(p)]; cur == nil || Later(p, cur) {
+			latest[epoch(p)] = p
 		}
 	}
-	if len(held) == 0 && mem == nil {
+	var mem []*Device
+	for _, p := range latest {
+		mem = append(mem, p)
+	}
+	sort.Slice(mem, func(i, j int) bool { return Later(mem[i], mem[j]) })
+	if len(held) == 0 && len(mem) == 0 {
 		return nil
 	}
-	return &slot{held: held, memory: mem}
+	return &slot{held: held, retired: mem}
 }
+
+// epoch is the key epoch of an admission: how many handovers its root
+// link rides — which of the circle's keys signed it.
+func epoch(d *Device) int { return len(d.Chain.Handovers) }
 
 // judged returns dev with its verdict re-derived: the same pointer when
 // nothing changed, a copy otherwise.
@@ -362,7 +461,8 @@ func sameSlot(a, b *slot) bool {
 // every removal p1 does and is the later word, so under any future removal
 // set p1 is eligible only when p2 is, and p2 wins (ADR 0019). Removals
 // never go away, so a dominated admission never comes back; dropping it on
-// arrival is what keeps a slot small.
+// arrival is what keeps a slot small. The slot applies it within one key
+// epoch only (see slot).
 func Dominates(p2, p1 *Device) bool {
 	if !Later(p2, p1) {
 		return false
@@ -389,22 +489,10 @@ func (r *Roster) Removals(deviceDID string) []*statement.Statement {
 	return out
 }
 
-// rootSigned reports whether a parentless statement is signed by the
-// circle's root.
+// rootSigned reports whether a statement is root-issued and signed by the
+// circle's root as the roster's key history has it.
 func (r *Roster) rootSigned(st *statement.Statement) bool {
-	if !st.IsRootIssued() {
-		return false
-	}
-	k, err := st.IssuerKey()
-	if err != nil {
-		return false
-	}
-	for _, rk := range r.roots.RootKeys(r.CircleDID()) {
-		if bytes.Equal(rk, k) {
-			return true
-		}
-	}
-	return false
+	return statement.RootSigned(r.roots, r.CircleDID(), st)
 }
 
 // eligible is the filter in front of the order: an admission counts for
@@ -651,15 +739,28 @@ func (r *Roster) reslotAll() {
 }
 
 // AddRevocation indexes a statement revocation and re-derives the verdicts
-// it may reach (rule 3: by ID or by swept recipient, root-signed or riding
-// a chain above the target). Reports whether it was new.
+// it may reach (rule 3: by ID, by removed or swept recipient, root-signed
+// or riding a chain above the target). A revocation of a rotated key
+// carries the circle's key history, learned here too. Reports whether it
+// was new.
 func (r *Roster) AddRevocation(st *statement.Statement) (*Roster, bool, error) {
+	if st == nil {
+		return r, false, errors.New("roster: nil statement")
+	}
+	r0 := r
+	r, err := r.learn(st)
+	if err != nil {
+		return r0, false, err
+	}
 	revs := r.revs.Clone()
 	fresh, err := revs.Add(st)
 	if err != nil || !fresh {
-		return r, fresh, err
+		return r, r != r0, err
 	}
-	nr := r.clone()
+	nr := r
+	if nr == r0 {
+		nr = r.clone()
+	}
 	nr.revs = revs
 	nr.reslotAll()
 	return nr, true, nil
@@ -844,20 +945,9 @@ func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
 			continue
 		}
 		changed = true
-		// Retention is by signed facts, so what is kept keeps its place:
-		// the held stay held, the memory stays the memory.
-		ns := &slot{}
-		for _, dev := range kept {
-			if s.memory != nil && dev.Stmt.ID() == s.memory.Stmt.ID() {
-				ns.memory = dev
-			} else {
-				ns.held = append(ns.held, dev)
-			}
-		}
-		switch {
-		case len(ns.held) == 0 && ns.memory == nil:
+		if ns := nr.build(kept); ns == nil {
 			delete(nr.slots, did)
-		default:
+		} else {
 			nr.slots[did] = ns
 		}
 	}
@@ -915,13 +1005,22 @@ func (r *Roster) Encode() ([]byte, error) {
 	return encMode.Marshal(list)
 }
 
-// Save writes the roster to its path atomically (temp file + rename); a
-// memory-only roster saves nothing. The caller — the owner, or the CLI
-// without a daemon — saves before it publishes or reports the roster, so
-// an admission is never reported durable when it is not.
+// Save writes the roster to its path atomically (temp file + rename), and
+// the circle's key history beside it whenever there is one — the history
+// is a few hundred bytes, and a flag saying "learned since the last save"
+// cannot survive the clones in between (the oracle's reload phase caught a
+// handover that never reached the file, 2026-11-06); a memory-only roster
+// saves nothing. The caller — the owner, or the CLI without a daemon —
+// saves before it publishes or reports the roster, so an admission is
+// never reported durable when it is not.
 func (r *Roster) Save() error {
 	if r.path == "" {
 		return nil
+	}
+	if hs := r.roots.Handovers(r.CircleDID()); len(hs) > 0 {
+		if err := SaveHandovers(filepath.Dir(r.path), hs); err != nil {
+			return err
+		}
 	}
 	raw, err := r.Encode()
 	if err != nil {

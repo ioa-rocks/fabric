@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -786,4 +787,192 @@ func TestByIDRevocationIsKeptUntilItsTargetIsKnownExpired(t *testing.T) {
 	if !Spent(r, targetExp, targetExp) {
 		t.Fatal("not spent once its target expired")
 	}
+}
+
+// Key history (task single-writer-store (b)): a handover retires the
+// circle's key; statements of the new key carry the handover in prf, so a
+// verifier knowing only the DID walks to the signer; a holder's history
+// refuses what the retired key signed after the handover — or at all, when
+// the key was declared compromised.
+func TestKeyHandover(t *testing.T) {
+	h := newHome(t)
+	k2, k3 := newKey(t), newKey(t)
+	rotated := t0.Add(time.Hour)
+	hand, err := Handover(h.root.priv, k2.pub, h.did, false, rotated, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hand.Payload.Typ != TypeHandover || !hand.IsRootIssued() || hand.Depth() != 0 || len(hand.Handovers()) != 1 {
+		t.Fatal("handover shape")
+	}
+	// K2 admits a device, riding the handover. Verifies against the bare
+	// DID (no history) and against a history that knows the handover.
+	dev2 := newKey(t)
+	adm := func(k key, proof *Statement, at time.Time) *Statement {
+		s, err := Sign(k.priv, Payload{Aud: dev2.did, Sub: h.did, Res: all, Verbs: []string{VerbMember}, Del: 1,
+			Iat: at.Unix(), Nbf: at.Unix(), Exp: at.Add(time.Hour).Unix()}, proof)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	byK2 := adm(k2, hand, rotated.Add(time.Minute))
+	if !byK2.IsRootIssued() || byK2.Depth() != 1 || byK2.RootProof().ID() != hand.ID() || len(byK2.Chain()) != 1 {
+		t.Fatal("a K2 admission riding the handover is root-issued, depth 1, with the handover as proof")
+	}
+	w := Want{Sub: h.did, Res: Resource{Kind: KindRole, Name: VerbMember}, Verb: VerbMember, PresentingKey: dev2.did, Now: rotated.Add(2 * time.Minute)}
+	if _, err := Verify(byK2, nil, h.roots, nil, w); err != nil {
+		t.Fatalf("K2 admission against the bare DID: %v", err)
+	}
+	hist := NewDIDRoot(h.did)
+	if grew, err := hist.Learn(hand); err != nil || !grew {
+		t.Fatalf("Learn: %v %v", grew, err)
+	}
+	if grew, err := hist.Learn(hand); err != nil || grew {
+		t.Fatalf("Learn again: %v %v", grew, err)
+	}
+	if hist.CurrentDID() != k2.did || hist.RootProof().ID() != hand.ID() {
+		t.Fatal("history does not name K2 as current")
+	}
+	if _, err := Verify(byK2, nil, hist, nil, w); err != nil {
+		t.Fatalf("K2 admission against the history: %v", err)
+	}
+	// Round trip: the handover travels inside the admission.
+	raw, _ := byK2.Bytes()
+	back, err := Decode(raw)
+	if err != nil || back.RootProof() == nil || back.RootProof().ID() != hand.ID() {
+		t.Fatalf("decode: %v", err)
+	}
+	// A K2 admission without the proof does not verify: K2 is no root on
+	// its own.
+	bare := adm(k2, nil, rotated.Add(time.Minute))
+	mustFail(t, func() error { _, err := Verify(bare, nil, hist, nil, w); return err }(), "does not honour")
+	// K1's admission before the handover still counts under the history;
+	// one signed after it does not; without history both pass (a node not
+	// holding the circle cannot know).
+	before := adm(h.root, nil, t0)
+	after := adm(h.root, nil, rotated.Add(time.Minute))
+	wb := w
+	wb.Now = t0.Add(time.Minute)
+	if _, err := Verify(before, nil, hist, nil, wb); err != nil {
+		t.Fatalf("K1 before the handover: %v", err)
+	}
+	mustFail(t, func() error { _, err := Verify(after, nil, hist, nil, w); return err }(), "retired key after its handover")
+	if _, err := Verify(after, nil, h.roots, nil, w); err != nil {
+		t.Fatalf("without history K1 is still the root: %v", err)
+	}
+	// A cached chain compiled before the history was learned stops at its
+	// next Check (the roots re-check), without recompiling.
+	fresh := NewDIDRoot(h.did)
+	cached, err := Compile(after, nil, h.did, fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cached.Check(fresh, nil, w); err != nil {
+		t.Fatal(err)
+	}
+	fresh.Learn(hand)
+	mustFail(t, cached.Check(fresh, nil, w), "no longer honoured")
+	// Chains of the home circle anchored as identity elsewhere follow the
+	// same rule through the anchor's history.
+	p := newKey(t)
+	wide := assert(t, p, nil, h.did, p.did, []Resource{{Kind: KindSubject, Name: "jobs/*"}}, []string{VerbClaim}, nil, 0)
+	both := multiRoots{p.did: RootMap{p.did: {p.pub}}, h.did: hist}
+	ident2, err := Sign(k2.priv, Payload{Aud: dev2.did, Sub: h.did, Res: all, Verbs: []string{VerbMember, VerbClaim}, Del: 1,
+		Iat: rotated.Unix(), Nbf: rotated.Unix(), Exp: rotated.Add(time.Hour).Unix()}, hand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2 := Want{Sub: p.did, Res: Resource{Kind: KindSubject, Name: "jobs/2"}, Verb: VerbClaim, PresentingKey: dev2.did, Now: rotated.Add(time.Minute)}
+	if _, err := Verify(wide, ident2, both, nil, w2); err != nil {
+		t.Fatalf("identity chain of a rotated circle: %v", err)
+	}
+	// A K2 removal rides the handover and kills a K2 admission.
+	revs := NewRevocationSet()
+	removal, err := Revoke(k2.priv, h.did, hand, Target{Aud: dev2.did}, rotated.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !removal.IsRootIssued() || !removal.IsRemoval() {
+		t.Fatal("K2 removal riding the handover is a root removal")
+	}
+	if _, err := revs.Add(removal); err != nil {
+		t.Fatal(err)
+	}
+	mustFail(t, func() error { _, err := Verify(byK2, nil, hist, revs, w); return err }(), "revoked by the root")
+	mustFail(t, func() error { _, err := Verify(byK2, nil, h.roots, revs, w); return err }(), "revoked by the root")
+	// Second handover, K2 → K3, chained on the first. A K3 statement
+	// carries both; a K2 statement after it is refused by the history.
+	hand2, err := Handover(k2.priv, k3.pub, h.did, false, rotated.Add(time.Hour), hand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hand2.Handovers()) != 2 {
+		t.Fatal("second handover does not carry the first")
+	}
+	hist.Learn(hand2)
+	byK3 := adm(k3, hand2, rotated.Add(2*time.Hour))
+	w3 := w
+	w3.Now = rotated.Add(2*time.Hour + time.Minute)
+	if _, err := Verify(byK3, nil, hist, nil, w3); err != nil {
+		t.Fatalf("K3 admission: %v", err)
+	}
+	if _, err := Verify(byK3, nil, h.roots, nil, w3); err != nil {
+		t.Fatalf("K3 admission against the bare DID: %v", err)
+	}
+	lateK2 := adm(k2, hand, rotated.Add(2*time.Hour))
+	mustFail(t, func() error { _, err := Verify(lateK2, nil, hist, nil, w3); return err }(), "retired key after its handover")
+	// A handover not chained on the previous one, or signed by the wrong
+	// key, is refused; a fork from the same key is a conflict.
+	if _, err := Handover(h.root.priv, k3.pub, h.did, false, rotated.Add(time.Hour), nil); err != nil {
+		t.Fatal(err) // signs fine...
+	} else {
+		fork, _ := Handover(h.root.priv, k3.pub, h.did, false, rotated.Add(time.Hour), nil)
+		if _, err := hist.Learn(fork); !errors.Is(err, ErrConflictingHandover) {
+			t.Fatalf("fork from K1: %v", err)
+		}
+	}
+	stray, _ := Handover(h.root.priv, k3.pub, h.did, false, rotated.Add(time.Hour), hand) // K1 is not hand's recipient
+	if stray != nil {
+		t.Fatal("a handover signed by a key that is not the previous recipient was signed")
+	}
+	// Compromised: nothing K1 signed counts, even before the handover.
+	comp := NewDIDRoot(h.did)
+	bad, err := Handover(h.root.priv, k2.pub, h.did, true, rotated, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	comp.Learn(bad)
+	mustFail(t, func() error { _, err := Verify(before, nil, comp, nil, wb); return err }(), "compromised")
+	byK2c := adm(k2, bad, rotated.Add(time.Minute))
+	if _, err := Verify(byK2c, nil, comp, nil, w); err != nil {
+		t.Fatalf("K2 after a compromised handover: %v", err)
+	}
+	// Shape: a handover carries nothing else; compromised is its field.
+	if _, err := Sign(h.root.priv, Payload{Typ: TypeHandover, Aud: k2.did, Sub: h.did, Iat: t0.Unix(), Verbs: []string{VerbMember}}, nil); err == nil {
+		t.Fatal("handover with verbs signed")
+	}
+	if _, err := Sign(h.root.priv, Payload{Aud: dev2.did, Sub: h.did, Res: all, Verbs: []string{VerbMember}, Iat: t0.Unix(), Nbf: t0.Unix(), Exp: t0.Add(time.Hour).Unix(), Compromised: true}, nil); err == nil {
+		t.Fatal("compromised on an assert signed")
+	}
+	if _, err := Sign(dev2.priv, Payload{Aud: p.did, Sub: h.did, Res: all, Verbs: []string{VerbClaim}, Iat: t0.Unix(), Nbf: t0.Unix(), Exp: t0.Add(time.Hour).Unix()}, hand); err == nil {
+		t.Fatal("a device chained on a handover it is not the recipient of")
+	}
+}
+
+// multiRoots composes Roots per circle so one may carry a history.
+type multiRoots map[string]Roots
+
+func (m multiRoots) RootKeys(circleDID string) []ed25519.PublicKey {
+	if r, ok := m[circleDID]; ok {
+		return r.RootKeys(circleDID)
+	}
+	return nil
+}
+
+func (m multiRoots) Handovers(circleDID string) []*Statement {
+	if r, ok := m[circleDID].(RootHistory); ok {
+		return r.Handovers(circleDID)
+	}
+	return nil
 }

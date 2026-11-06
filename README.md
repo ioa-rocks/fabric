@@ -450,6 +450,19 @@ terms carrying the removal's ID in its signed `acks`; `admit` and
 signs carries the removals it knows of the device, so ordinary renewals
 stay eligible everywhere. `fabric status` warns loudly about expired,
 expiring and removed admissions, as it does for certs.
+
+The circle's **key can be rotated** (`circle rotate`, 2026-11-06). The
+circle's DID stays its first key; a handover signed by the current key
+names the new one and joins the circle's key history
+(`circles/<name>/handovers.cbor`), every statement the new key signs
+carries that history in `prf`, and devices learn it from the first such
+statement, from the gossip, and from bundles. A clean rotation (a lost
+key) keeps what the old key signed up to the handover; renewals come from
+the new key. `-compromised` (a leaked key) retires everything the old key
+signed, and the command lists the devices to admit again. Other owner
+devices still hold the retired key and re-join from a fresh `circle
+export`; on the master the root key container is rewritten with the
+circle's new key.
 Admissions, certs and revocations are statements (since 2026-11-02); the
 bespoke pre-statement forms no longer decode (2026-11-06) — a device
 still holding one is re-admitted (`circle admit`) or renewed (`fabric
@@ -771,6 +784,7 @@ the UI and daemon use a non-default Astral state directory.
 | `fabric circle init -name <name>` | any device | mint a circle — a user key that buckets (and next, subjects) belong to. A node holds any number of circles under `<state>/circles/<name>`: the owner's personal one, a shared `family` one, … |
 | `fabric circle renew [-expiring]` | each device of a circle | sign this device into the circle (done automatically by `circle init`/`join` when the node already has a fabric identity), or renew its admission: admissions live one year like certs; `-expiring` re-signs every one past half-life. `circle attest` is the pre-2026-11-05 spelling and still accepted. Peers sync buckets and serve blobs only to admitted devices of their own circle — mesh membership alone no longer grants vault access |
 | `fabric circle revoke [-circle <name>] <member \| did:key>` | an owner device of the circle | sign a device out of the circle — a removal, kept for good: no later admission counts unless it acknowledges it; devices of the circle learn it at their next connect, the running daemon pushes it to those connected now (see *Circle admissions*) |
+| `fabric circle rotate [-circle <name>] [-compromised]` | an owner device of the circle | hand the circle over to a fresh key: the handover joins the circle's key history, the key container (and the master's root key container) is rewritten, the daemon pushes the handover, this device re-signs its admission. Clean by default (what the old key signed stands until renewed); `-compromised` retires everything the old key signed and lists the devices to admit again. Other owner devices re-join from a fresh `circle export` |
 | `fabric circle restore [-circle <name>] [-out <file> <member \| did:key>]` | an owner device of the circle | put a removed device back on purpose: a fresh admission on its remembered terms (role, name, overlay address) acknowledging every removal this node knows, written as a bundle for the device; with no device named, this very device (an owner another owner removed) |
 | `fabric circle export [-circle <name>] <file>` / `fabric circle join <file>` | another device | carry a circle to another device, which then holds its key and is admitted into it (interim until sub-key grants). A shared circle is how two people share buckets: both devices hold it, neither holds the other's personal circle |
 | `fabric circle passphrase [-circle <name>]` | each device holding the circle | re-encrypt the circle's key container under a new passphrase. The key does not change, so nothing is re-signed or re-sent; when the circle's key is the root (circle `main` since the 2026-11-02 migration) the root key container is rewritten with it. Other devices holding the circle keep the old passphrase until the same is run there (or they re-join from a fresh `export`). There is no recovery for a forgotten passphrase: back up the container (`circles/<name>/user.key.age`) and the passphrase off the device |

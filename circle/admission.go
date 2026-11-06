@@ -138,15 +138,17 @@ func AdmitAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID string
 // back to DeviceVerbs and no attributes. The renewal acknowledges no
 // removal: RenewWith is the production form, with Roster.Acks.
 func Renew(priv ed25519.PrivateKey, prev *statement.Statement, circleDID string, devicePub ed25519.PublicKey, now time.Time, validity time.Duration) (*Admission, error) {
-	return RenewWith(priv, prev, circleDID, devicePub, now, validity, nil)
+	return RenewWith(priv, nil, prev, circleDID, devicePub, now, validity, nil)
 }
 
-// RenewWith is Renew acknowledging acks — the roster's Acks for the device
-// (ADR 0019: every removal the issuer holds for the device plus every one
-// its existing admissions acknowledge), so the renewal stays eligible
-// where the removal is known. With a removal in acks it is a restoration;
-// the command decides whether that is meant (`restore`, never `renew`).
-func RenewWith(priv ed25519.PrivateKey, prev *statement.Statement, circleDID string, devicePub ed25519.PublicKey, now time.Time, validity time.Duration, acks [][]byte) (*Admission, error) {
+// RenewWith is Renew by the circle's current key riding proof
+// (Circle.Signer; nil when the key is the DID key), acknowledging acks —
+// the roster's Acks for the device (ADR 0019: every removal the issuer
+// holds for the device plus every one its existing admissions
+// acknowledge), so the renewal stays eligible where the removal is known.
+// With a removal in acks it is a restoration; the command decides whether
+// that is meant (`restore`, never `renew`).
+func RenewWith(priv ed25519.PrivateKey, proof, prev *statement.Statement, circleDID string, devicePub ed25519.PublicKey, now time.Time, validity time.Duration, acks [][]byte) (*Admission, error) {
 	verbs, meta := DeviceVerbs, (*statement.Meta)(nil)
 	if prev != nil && prev.Payload.Sub == circleDID && prev.Payload.Aud == did.ForKey(devicePub) {
 		if len(prev.Payload.Verbs) > 0 {
@@ -157,7 +159,7 @@ func RenewWith(priv ed25519.PrivateKey, prev *statement.Statement, circleDID str
 			meta = &m
 		}
 	}
-	return Issue(priv, nil, circleDID, devicePub, now, validity, Terms{Verbs: verbs, Meta: meta, Acks: acks})
+	return Issue(priv, proof, circleDID, devicePub, now, validity, Terms{Verbs: verbs, Meta: meta, Acks: acks})
 }
 
 // Terms are what a positive admission says about the device beyond its
@@ -181,7 +183,8 @@ func AdmitWith(priv ed25519.PrivateKey, own *statement.Statement, circleDID stri
 }
 
 // Issue signs a positive admission of devicePub into circleDID on terms,
-// by the root (own == nil) or by an admin desk under its own admission.
+// by the root (own nil, or the handover a rotated key rides: Circle.Signer)
+// or by an admin desk under its own admission.
 func Issue(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, devicePub ed25519.PublicKey, now time.Time, validity time.Duration, terms Terms) (*Admission, error) {
 	verbs, meta := terms.Verbs, terms.Meta
 	if validity <= 0 {

@@ -838,3 +838,89 @@ func TestOwnerSeedsAColdDeviceOnTheHandshake(t *testing.T) {
 		}
 	}
 }
+
+// A key rotation on an owner device reaches the circle: the daemon pushes
+// the handover, a device's roster learns and persists it, refuses what
+// the retired key signs afterwards and admits what the new key signs with
+// its proof.
+func TestKeyRotationReachesTheCircle(t *testing.T) {
+	nsPub, nsRoot, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alex, alexDID := mintCircle(t, "alex")
+	desk := newCircleTestNode(t, nsPub, nsRoot, "desk", []*circle.Bundle{alex}, true)
+	nas := newCircleTestNode(t, nsPub, nsRoot, "nas", []*circle.Bundle{alex}, true)
+	admit(t, desk, nas, alexDID)
+	meshConnect(t, nas, desk)
+	waitShared(t, desk, nas, []string{alexDID})
+
+	dc, err := circle.ByDID(desk.root, alexDID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldKey, err := dc.Unlock("pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := dc.Rotate("pw", false, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := h.Bytes()
+	if grew, err := desk.svc.Handover(raw); err != nil || !grew {
+		t.Fatalf("Handover: grew=%v err=%v", grew, err)
+	}
+	newKey, proof, err := dc.Signer("pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDID := cert.DIDForKey(newKey.Public().(ed25519.PublicKey))
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if r, ok := nas.store.RosterFor(alexDID); ok && r.Roots().CurrentDID() == newDID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("nas did not learn the handover")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	nc, _ := circle.ByDID(nas.root, alexDID)
+	if hs, err := nc.Handovers(); err != nil || len(hs) != 1 {
+		t.Fatalf("nas persisted %d handovers (%v), want 1", len(hs), err)
+	}
+
+	// The retired key signing on is refused on nas; the new key, riding
+	// the proof, admits.
+	time.Sleep(1100 * time.Millisecond) // issue times are whole seconds
+	laptopPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	stale, err := circle.Admit(oldKey, laptopPub, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = stale.Marshal()
+	if _, err := nas.svc.Admit(raw); err == nil {
+		t.Fatal("an admission the retired key signed after the handover was accepted")
+	}
+	fresh, err := circle.Issue(newKey, proof, alexDID, laptopPub, time.Now(), circle.DefaultValidity, circle.Terms{Verbs: circle.DeviceVerbs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = fresh.Marshal()
+	if ok, err := nas.svc.Admit(raw); err != nil || !ok {
+		t.Fatalf("new key's admission: fresh=%v err=%v", ok, err)
+	}
+	if _, ok := nas.store.RosterFor(alexDID); !ok {
+		t.Fatal("roster gone")
+	}
+	r, _ := nas.store.RosterFor(alexDID)
+	if _, ok := r.Live(cert.DIDForKey(laptopPub), time.Now()); !ok {
+		t.Fatal("device admitted by the new key is not live on nas")
+	}
+	// The owner's export carries the history for the next co-owner.
+	exp, err := dc.Export()
+	if err != nil || len(exp.Handovers) != 1 {
+		t.Fatalf("export carries %d handovers (%v)", len(exp.Handovers), err)
+	}
+}

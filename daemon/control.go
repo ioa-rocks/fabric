@@ -186,6 +186,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/publish", d.handlePublish)
 	mux.HandleFunc("POST /v0/circle/refresh", d.handleCircleRefresh)
 	mux.HandleFunc("POST /v0/circle/admit", d.handleCircleAdmit)
+	mux.HandleFunc("POST /v0/circle/handover", d.handleCircleHandover)
 	mux.HandleFunc("GET /v0/keys", d.handleKeys)
 	mux.HandleFunc("POST /v0/keys/issue", d.handleKeyIssue)
 	mux.HandleFunc("POST /v0/keys/revoke", d.handleKeyRevoke)
@@ -869,6 +870,47 @@ func (d *Daemon) handleCircleAdmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, circleAdmitReply{Fresh: fresh})
+}
+
+type circleHandoverBody struct {
+	HandoverB64 string `json:"handover_b64"`
+}
+
+type circleHandoverReply struct {
+	Grew bool `json:"grew"` // the circle's key history did not hold this handover yet
+}
+
+func (d *Daemon) handleCircleHandover(w http.ResponseWriter, r *http.Request) {
+	if d.Circle == nil {
+		http.Error(w, "this node serves no circle", http.StatusNotFound)
+		return
+	}
+	var body circleHandoverBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	raw, err := base64.StdEncoding.DecodeString(body.HandoverB64)
+	if err != nil {
+		http.Error(w, "handover_b64: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	grew, err := d.Circle.Handover(raw)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, circleHandoverReply{Grew: grew})
+}
+
+// CircleHandover hands the daemon a key handover signed here (`circle
+// rotate`) so the rosters re-judge and the circle's devices learn it now.
+func (c *Client) CircleHandover(handover []byte) (bool, error) {
+	var out circleHandoverReply
+	if err := c.post("/v0/circle/handover", circleHandoverBody{HandoverB64: base64.StdEncoding.EncodeToString(handover)}, &out); err != nil {
+		return false, err
+	}
+	return out.Grew, nil
 }
 
 // CircleAdmit hands the daemon a device admission signed here so the

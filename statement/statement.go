@@ -44,7 +44,13 @@ import (
 //     is a removal — no `before`, kept for good — and kills every statement
 //     naming the device that does not acknowledge it. A version-1 sweep
 //     keeps its cut rule until the legacy paths retire and is never read as
-//     a removal; a version-2 statement cannot be a sweep.
+//     a removal; a version-2 statement cannot be a sweep. Version 2 also
+//     defines the key handover (TypeHandover): a circle's root key may be
+//     replaced, and a statement signed by the new key embeds the handovers
+//     from the circle's DID key in prf, so any verifier can walk to the
+//     signer; a node holding the circle also keeps the history and refuses
+//     what the retired key signed after its handover (task
+//     single-writer-store, (b)).
 //
 // A node at version 1 refuses version-2 statements outright, so the fleet
 // moves together. The pre-statement cert, admission and revocation bytes
@@ -65,10 +71,23 @@ const MaxAcks = 64
 const (
 	TypeAssert = "assert"
 	TypeRevoke = "revoke"
+	// TypeHandover is a circle root's statement "from now on this circle's
+	// key is aud": iss is the key being retired, aud the new did:key, sub
+	// the circle (whose DID never changes). What iss signed before the
+	// handover still counts, iss signs nothing new; with Compromised set,
+	// nothing iss signed counts at all. A handover chains on the previous
+	// one in prf, and every root-issued statement of the new key chains on
+	// the latest handover, so the proof travels with the statement.
+	TypeHandover = "handover"
 )
 
-// MaxDepth is the hard cap on chain length regardless of `del`.
+// MaxDepth is the hard cap on chain length regardless of `del`. Handovers
+// do not count toward it; MaxHandovers caps them.
 const MaxDepth = 8
+
+// MaxHandovers caps the key handovers a lineage may carry: a circle's key
+// changes rarely, and a longer chain is a forgery or a bug.
+const MaxHandovers = 16
 
 // DefaultValidity is the standard lifetime of an admission: long, because
 // gossiped revocation is the real-time cut-off and short windows would force
@@ -175,6 +194,11 @@ type Payload struct {
 	// Revocations only.
 	Target *Target `cbor:"target,omitempty"`
 	At     int64   `cbor:"at,omitempty"` // informational; never used for authority
+	// Handovers only: the retired key is not to be trusted at all —
+	// nothing it signed counts, whenever it was signed (a leaked key; the
+	// owner re-admits by hand). Without it the handover is a clean
+	// rotation: what the retired key signed up to the handover stands.
+	Compromised bool `cbor:"compromised,omitempty"`
 }
 
 // Statement is a decoded payload with its signature and the exact payload
@@ -210,7 +234,7 @@ func Sign(priv ed25519.PrivateKey, p Payload, parent *Statement) (*Statement, er
 	if p.Typ == "" {
 		p.Typ = TypeAssert
 	}
-	if p.Typ != TypeAssert && p.Typ != TypeRevoke {
+	if p.Typ != TypeAssert && p.Typ != TypeRevoke && p.Typ != TypeHandover {
 		return nil, fmt.Errorf("unknown statement type %q", p.Typ)
 	}
 	issuer := did.ForKey(priv.Public().(ed25519.PublicKey))
@@ -263,16 +287,38 @@ func Sign(priv ed25519.PrivateKey, p Payload, parent *Statement) (*Statement, er
 		if len(p.Acks) != 0 {
 			return nil, errors.New("a revoke carries no acks")
 		}
+	case TypeHandover:
+		if err := handoverShape(p); err != nil {
+			return nil, err
+		}
+		if parent != nil && parent.Payload.Typ != TypeHandover {
+			return nil, errors.New("a handover chains only on the previous handover")
+		}
+	}
+	if p.Typ != TypeHandover && p.Compromised {
+		return nil, errors.New("compromised is a handover's field")
 	}
 	if parent != nil {
-		if parent.Payload.Typ != TypeAssert {
-			return nil, errors.New("parent must be an assert")
+		switch parent.Payload.Typ {
+		case TypeAssert:
+		case TypeHandover:
+			// A root-issued statement of the circle's current key rides the
+			// latest handover; the chaining rule below makes the new key
+			// the issuer.
+			if parent.Payload.Sub != p.Sub {
+				return nil, errors.New("handover is for a different circle")
+			}
+		default:
+			return nil, errors.New("parent must be an assert or a handover")
 		}
 		if parent.Payload.Aud != p.Iss {
 			return nil, errors.New("issuer is not the parent's recipient")
 		}
 		if parent.Depth() >= MaxDepth {
 			return nil, fmt.Errorf("chain would exceed MaxDepth %d", MaxDepth)
+		}
+		if len(parent.Handovers())+boolInt(parent.Payload.Typ == TypeHandover) > MaxHandovers {
+			return nil, fmt.Errorf("lineage would exceed MaxHandovers %d", MaxHandovers)
 		}
 		pb, err := parent.Bytes()
 		if err != nil {
@@ -297,14 +343,17 @@ func Sign(priv ed25519.PrivateKey, p Payload, parent *Statement) (*Statement, er
 
 // Decode parses a statement and, recursively, the parents embedded in prf.
 // The result is untrusted until Compile/Verify; Decode only enforces shape:
-// version, one parent per link, MaxDepth.
+// version, one parent per link, MaxDepth and MaxHandovers.
 func Decode(data []byte) (*Statement, error) {
-	return decode(data, 1)
+	return decode(data, 0, 0)
 }
 
-func decode(data []byte, depth int) (*Statement, error) {
+func decode(data []byte, depth, handovers int) (*Statement, error) {
 	if depth > MaxDepth {
 		return nil, fmt.Errorf("chain deeper than MaxDepth %d", MaxDepth)
+	}
+	if handovers > MaxHandovers {
+		return nil, fmt.Errorf("lineage carries more than MaxHandovers %d", MaxHandovers)
 	}
 	var w wire
 	if err := cbor.Unmarshal(data, &w); err != nil {
@@ -320,12 +369,20 @@ func decode(data []byte, depth int) (*Statement, error) {
 	if err := shape(s.Payload); err != nil {
 		return nil, err
 	}
+	if s.Payload.Typ == TypeHandover {
+		handovers++
+	} else {
+		depth++
+	}
 	switch len(s.Payload.Prf) {
 	case 0:
 	case 1:
-		parent, err := decode(s.Payload.Prf[0], depth+1)
+		parent, err := decode(s.Payload.Prf[0], depth, handovers)
 		if err != nil {
 			return nil, fmt.Errorf("prf: %w", err)
+		}
+		if parent.Payload.Typ == TypeAssert && s.Payload.Typ == TypeHandover {
+			return nil, errors.New("a handover chains only on a handover")
 		}
 		s.parent = parent
 	default:
@@ -352,7 +409,40 @@ func shape(p Payload) error {
 	if t := p.Target; t != nil && t.Aud != "" && p.V >= 2 && t.Before != 0 {
 		return errors.New("a version-2 revoke with an aud target is a removal and carries no before")
 	}
+	if p.Typ == TypeHandover {
+		if p.V < 2 {
+			return errors.New("a handover is a version-2 statement")
+		}
+		return handoverShape(p)
+	}
+	if p.Compromised {
+		return errors.New("compromised on a statement that is not a handover")
+	}
 	return nil
+}
+
+// handoverShape is what a handover may say: a new key and nothing else.
+func handoverShape(p Payload) error {
+	if p.Aud == "" {
+		return errors.New("handover needs an aud (the new key)")
+	}
+	if _, err := did.KeyFor(p.Aud); err != nil {
+		return fmt.Errorf("handover aud: %w", err)
+	}
+	if p.Aud == p.Iss {
+		return errors.New("handover to the same key")
+	}
+	if len(p.Res) != 0 || len(p.Verbs) != 0 || p.Meta != nil || p.Del != 0 || p.Nbf != 0 || p.Exp != 0 || p.Target != nil || len(p.Acks) != 0 {
+		return errors.New("a handover carries only the new key")
+	}
+	return nil
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // CanonicalIDs returns ids as an acks set: 32-byte IDs, ascending, without
@@ -433,24 +523,25 @@ func (s *Statement) IDHex() string {
 	return hex.EncodeToString(id[:])
 }
 
-// Parent is the statement this one chains from; nil when root-issued.
+// Parent is the statement this one chains from: the parent assert, the
+// handover a root-issued statement of a rotated key rides (RootProof), or
+// nil.
 func (s *Statement) Parent() *Statement { return s.parent }
 
-// IsRootIssued reports whether the statement has no parent: its issuer
-// must then be a root the verifier honours.
-func (s *Statement) IsRootIssued() bool { return s.parent == nil }
-
-// Depth counts the links from the root-issued statement to this one.
-func (s *Statement) Depth() int {
-	n := 0
-	for p := s; p != nil; p = p.parent {
-		n++
-	}
-	return n
+// IsRootIssued reports whether the statement is issued by the circle's
+// root: it has no parent assert — none at all, or only the handovers that
+// make its issuer the root.
+func (s *Statement) IsRootIssued() bool {
+	return s.parent == nil || s.parent.Payload.Typ == TypeHandover
 }
 
-// Chain lists the statements root-first, ending with s.
-func (s *Statement) Chain() []*Statement {
+// Depth counts the asserts from the root-issued statement to this one;
+// handovers do not count.
+func (s *Statement) Depth() int { return len(s.Chain()) }
+
+// lineage lists every statement root-first, handovers included, ending
+// with s.
+func (s *Statement) lineage() []*Statement {
 	var out []*Statement
 	for p := s; p != nil; p = p.parent {
 		out = append(out, p)
@@ -459,6 +550,51 @@ func (s *Statement) Chain() []*Statement {
 		out[i], out[j] = out[j], out[i]
 	}
 	return out
+}
+
+// Chain lists the asserts (and the revoke, for one) root-first, ending
+// with s: the links the verifier judges. Handovers are left out —
+// Handovers lists them; a handover's own Chain is empty.
+func (s *Statement) Chain() []*Statement {
+	var out []*Statement
+	for _, p := range s.lineage() {
+		if p.Payload.Typ != TypeHandover {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// Handovers lists the key handovers the lineage carries, oldest first: the
+// proof that the root-issued link's issuer is the circle's key. For a
+// handover statement, the list ends with it.
+func (s *Statement) Handovers() []*Statement {
+	var out []*Statement
+	for _, p := range s.lineage() {
+		if p.Payload.Typ == TypeHandover {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// RootProof is the latest handover the lineage carries — what a
+// root-issued statement of the circle's current key rides — or nil when
+// the circle's key is its DID key.
+func (s *Statement) RootProof() *Statement {
+	hs := s.Handovers()
+	if len(hs) == 0 {
+		return nil
+	}
+	return hs[len(hs)-1]
+}
+
+// Handover signs "from now on the key of circle sub is newPub": the
+// retiring root key signs it, chained on the previous handover (prev; nil
+// for the first). compromised says nothing the retiring key signed is to
+// be trusted.
+func Handover(priv ed25519.PrivateKey, newPub ed25519.PublicKey, sub string, compromised bool, now time.Time, prev *Statement) (*Statement, error) {
+	return Sign(priv, Payload{Typ: TypeHandover, Aud: did.ForKey(newPub), Sub: sub, Iat: now.Unix(), Compromised: compromised}, prev)
 }
 
 // NotBefore and Expiry are the window ends.
@@ -489,6 +625,9 @@ func (s *Statement) Label() string {
 	if s.Payload.Typ == TypeRevoke {
 		return "revocation"
 	}
+	if s.Payload.Typ == TypeHandover {
+		return "key handover"
+	}
 	if hasVerb(s.Payload.Verbs, VerbAdmin) {
 		return "admin admission"
 	}
@@ -498,7 +637,7 @@ func (s *Statement) Label() string {
 	if hasVerb(s.Payload.Verbs, VerbMember) {
 		return "admission"
 	}
-	if s.parent != nil && s.parent.Payload.Aud == s.Payload.Iss && !s.parent.IsRootIssued() {
+	if !s.IsRootIssued() && s.parent.Payload.Aud == s.Payload.Iss && !s.parent.IsRootIssued() {
 		return "sub-key"
 	}
 	return "grant"

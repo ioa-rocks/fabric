@@ -400,6 +400,38 @@ func (s *CircleService) Admit(raw []byte) (bool, error) {
 	return fresh, nil
 }
 
+// Handover records a circle's key handover signed here (`fabric circle
+// rotate`) or handed in: it must extend the circle's history and name a
+// circle this node holds; the roster re-judges every device, persists the
+// history, and the circle's devices learn it at once. Reports whether the
+// history grew.
+func (s *CircleService) Handover(raw []byte) (bool, error) {
+	st, err := statement.Decode(raw)
+	if err != nil {
+		return false, err
+	}
+	if st.Payload.Typ != statement.TypeHandover {
+		return false, errors.New("not a key handover")
+	}
+	if s.table == nil {
+		return false, errors.New("no peer table attached")
+	}
+	if s.circleByDID(st.Payload.Sub) == nil {
+		return false, fmt.Errorf("circle %s is not held by this node", shortDID(st.Payload.Sub))
+	}
+	grew, err := s.table.AddHandover(st.Payload.Sub, st)
+	if err != nil {
+		return false, err
+	}
+	if grew {
+		s.forgetAll()
+		if s.sync != nil {
+			s.sync.PublishHandover(st.Payload.Sub, raw)
+		}
+	}
+	return grew, nil
+}
+
 // reloadRevocations feeds every revocation on disk into the rosters: what
 // the CLI wrote beside the circle (and a restart) must reach transport
 // membership without waiting for a peer to echo it.
@@ -621,7 +653,11 @@ func (s *CircleService) Verify(ctx context.Context, p peer.ID, want statement.Wa
 	if !ok {
 		return fmt.Errorf("%s is not a device of circle %s", shortDID(presenter), shortDID(want.Sub))
 	}
-	if err := chain.Check(statement.NewDIDRoot(c.Config.DID), s.revsFor(want.Sub, want.Now), want); err != nil {
+	roots, err := s.rootsFor(want.Sub)
+	if err != nil {
+		return err
+	}
+	if err := chain.Check(roots, s.revsFor(want.Sub, want.Now), want); err != nil {
 		return err
 	}
 	// The roster's entry is the chain, so the cap is its own standing and
@@ -842,13 +878,19 @@ func (s *CircleService) validLocked(c *statement.Compiled, now time.Time) error 
 var ErrNotPresented = errors.New("chain not presented on this connection")
 
 // rootsFor is the Roots view for a circle this node answers for: the home
-// circle's root, the circle's own key when held.
+// circle's root, else the roster's roots — the one DIDRoot per circle on
+// this node, with the key history every path learns into.
 func (s *CircleService) rootsFor(circleDID string) (statement.Roots, error) {
 	if s.home != nil && circleDID == s.home() && s.roots != nil {
 		return s.roots, nil
 	}
 	if s.circleByDID(circleDID) == nil {
 		return nil, fmt.Errorf("circle %s is not held by this node", shortDID(circleDID))
+	}
+	if s.table != nil {
+		if r, ok := s.table.RosterFor(circleDID); ok {
+			return r.Roots(), nil
+		}
 	}
 	return statement.NewDIDRoot(circleDID), nil
 }

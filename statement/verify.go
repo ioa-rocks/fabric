@@ -23,6 +23,15 @@ type RootMap map[string][]ed25519.PublicKey
 
 func (m RootMap) RootKeys(circleDID string) []ed25519.PublicKey { return m[circleDID] }
 
+// RootHistory is a Roots that also knows a circle's key handovers
+// (TypeHandover), oldest first. With it the verifier refuses what a
+// retired key signed after its handover, and anything a key declared
+// compromised signed; without it, a lineage's own handovers are the only
+// history (what a node verifying for a circle it does not hold can do).
+type RootHistory interface {
+	Handovers(circleDID string) []*Statement
+}
+
 // Revocations answers "which revocations might concern this link": those
 // targeting the link's ID, and those sweeping its recipient. Candidates must
 // already be signature-checked (RevocationSet does that on Add); Check only
@@ -46,13 +55,15 @@ type Link struct {
 // (who presents). Nothing in it depends on now or on revocations; those are
 // Check's business.
 type Compiled struct {
-	Sub           string    // circle of the authority chain
-	PresentingKey string    // did:key that must present: identity leaf aud, else authority leaf aud
-	Nbf, Exp      time.Time // max(nbf), min(exp) across both chains
-	Auth          []Link    // root-first
-	Ident         []Link    // root-first; empty when the presenter is the authority leaf's aud
-	IdentAnchor   string    // circle DID the identity chain was anchored at through roots; "" when anchored at a did:key
-	UnknownVerbs  []string  // verbs on the authority leaf this binary does not know
+	Sub            string       // circle of the authority chain
+	PresentingKey  string       // did:key that must present: identity leaf aud, else authority leaf aud
+	Nbf, Exp       time.Time    // max(nbf), min(exp) across both chains
+	Auth           []Link       // root-first
+	Ident          []Link       // root-first; empty when the presenter is the authority leaf's aud
+	IdentAnchor    string       // circle DID the identity chain was anchored at through roots; "" when anchored at a did:key
+	Handovers      []*Statement // key handovers the authority lineage carries, oldest first
+	IdentHandovers []*Statement // and the identity lineage's, when anchored at a circle
+	UnknownVerbs   []string     // verbs on the authority leaf this binary does not know
 }
 
 // AuthLeafID is the ID of the presented authority statement.
@@ -88,10 +99,13 @@ func Compile(authority, identity *Statement, sub string, roots Roots) (*Compiled
 			return nil, fmt.Errorf("authority link %s is in circle %q, want %q", l.IDHex()[:8], l.Payload.Sub, sub)
 		}
 	}
-	c := &Compiled{Sub: sub}
+	c := &Compiled{Sub: sub, Handovers: auth[0].Handovers()}
 	var err error
-	if c.Auth, c.Nbf, c.Exp, err = compileChain(auth, roots.RootKeys(sub), "authority"); err != nil {
+	if c.Auth, c.Nbf, c.Exp, err = compileChain(auth, roots.RootKeys(sub), sub, c.Handovers, "authority"); err != nil {
 		return nil, err
+	}
+	if err := historyAllows(roots, sub, c.Handovers, auth[0]); err != nil {
+		return nil, fmt.Errorf("authority root link: %w", err)
 	}
 	leaf := auth[len(auth)-1]
 	for _, v := range leaf.Payload.Verbs {
@@ -123,8 +137,10 @@ func Compile(authority, identity *Statement, sub string, roots Roots) (*Compiled
 		}
 	}
 	anchorKeys := roots.RootKeys(anchor)
+	identHandovers := ident[0].Handovers()
 	if len(anchorKeys) > 0 {
 		c.IdentAnchor = anchor
+		c.IdentHandovers = identHandovers
 	} else {
 		k, err := did.KeyFor(anchor)
 		if err != nil {
@@ -134,6 +150,7 @@ func Compile(authority, identity *Statement, sub string, roots Roots) (*Compiled
 		for i, l := range ident {
 			if l.Payload.Aud == anchor {
 				ident = ident[i+1:]
+				identHandovers = nil // the suffix starts at a device key, not a circle's
 				break
 			}
 		}
@@ -143,9 +160,14 @@ func Compile(authority, identity *Statement, sub string, roots Roots) (*Compiled
 			return c, nil
 		}
 	}
-	links, inbf, iexp, err := compileChain(ident, anchorKeys, "identity")
+	links, inbf, iexp, err := compileChain(ident, anchorKeys, isub, identHandovers, "identity")
 	if err != nil {
 		return nil, err
+	}
+	if c.IdentAnchor != "" {
+		if err := historyAllows(roots, anchor, identHandovers, ident[0]); err != nil {
+			return nil, fmt.Errorf("identity root link: %w", err)
+		}
 	}
 	c.Ident = links
 	if inbf.After(c.Nbf) {
@@ -158,12 +180,17 @@ func Compile(authority, identity *Statement, sub string, roots Roots) (*Compiled
 	return c, nil
 }
 
-// compileChain checks one chain root-first. rootKeys are the keys whose
+// compileChain checks one chain root-first. anchorKeys are the keys whose
 // signature may stand at the top (the honoured roots of the circle, or the
-// identity anchor).
-func compileChain(chain []*Statement, rootKeys []ed25519.PublicKey, what string) ([]Link, time.Time, time.Time, error) {
+// identity anchor), or from which the lineage's handovers must run to the
+// key that does.
+func compileChain(chain []*Statement, anchorKeys []ed25519.PublicKey, sub string, handovers []*Statement, what string) ([]Link, time.Time, time.Time, error) {
 	if len(chain) > MaxDepth {
 		return nil, time.Time{}, time.Time{}, fmt.Errorf("%s chain deeper than %d", what, MaxDepth)
+	}
+	rootKeys, err := walkHandovers(handovers, anchorKeys, sub, true)
+	if err != nil {
+		return nil, time.Time{}, time.Time{}, fmt.Errorf("%s key handovers: %w", what, err)
 	}
 	var links []Link
 	var nbf, exp time.Time
@@ -366,21 +393,8 @@ func linkAllows(p Payload, sub string, res Resource, verb string) bool {
 // retired (root-retired event), without waiting for the cache to notice
 // (Codex review, 2026-11-02).
 func (c *Compiled) Check(roots Roots, revs Revocations, want Want) error {
-	if !rootSigned(c.Auth[0].Stmt, roots.RootKeys(c.Sub)) {
-		return errors.New("authority chain root is no longer honoured for the circle")
-	}
-	if c.IdentAnchor != "" {
-		keys := roots.RootKeys(c.IdentAnchor)
-		if len(keys) == 0 {
-			// The circle is no longer held here; as in Compile, a did:key
-			// anchor still resolves on its own.
-			if k, err := did.KeyFor(c.IdentAnchor); err == nil {
-				keys = []ed25519.PublicKey{k}
-			}
-		}
-		if !rootSigned(c.Ident[0].Stmt, keys) {
-			return errors.New("identity chain anchor is no longer honoured")
-		}
+	if err := c.RootsHonoured(roots); err != nil {
+		return err
 	}
 	if want.PresentingKey != c.PresentingKey {
 		return fmt.Errorf("presented by %s, chain is for %s", short(want.PresentingKey), short(c.PresentingKey))
@@ -395,6 +409,30 @@ func (c *Compiled) Check(roots Roots, revs Revocations, want Want) error {
 		return fmt.Errorf("chain does not grant %s on %s/%s in %s", want.Verb, want.Res.Kind, want.Res.Name, short(want.Sub))
 	}
 	return c.RevokedBy(roots, revs)
+}
+
+// RootsHonoured is the roots half of Check on its own: are both chains'
+// roots still honoured — the circle held, its key history not retiring
+// the signer before it signed. What makes a cached Compiled safe (see
+// Check), and what a roster asks of every entry when the history grows.
+func (c *Compiled) RootsHonoured(roots Roots) error {
+	if err := honourRoot(roots, c.Sub, roots.RootKeys(c.Sub), c.Handovers, c.Auth[0].Stmt, false); err != nil {
+		return fmt.Errorf("authority chain root is no longer honoured for the circle: %w", err)
+	}
+	if c.IdentAnchor != "" {
+		keys := roots.RootKeys(c.IdentAnchor)
+		if len(keys) == 0 {
+			// The circle is no longer held here; as in Compile, a did:key
+			// anchor still resolves on its own.
+			if k, err := did.KeyFor(c.IdentAnchor); err == nil {
+				keys = []ed25519.PublicKey{k}
+			}
+		}
+		if err := honourRoot(roots, c.IdentAnchor, keys, c.IdentHandovers, c.Ident[0].Stmt, false); err != nil {
+			return fmt.Errorf("identity chain anchor is no longer honoured: %w", err)
+		}
+	}
+	return nil
 }
 
 // RevokedBy is the revocation half of Check on its own: rule 3 over both
@@ -427,7 +465,10 @@ func revoked(links []Link, roots Roots, revs Revocations) error {
 				continue
 			}
 			if r.IsRootIssued() {
-				if rootSigned(r, rootKeysOrDID(roots, l.Sub)) {
+				// The revocation's own lineage signatures were checked at
+				// RevocationSet.Add; here its handovers are walked and the
+				// node's history applied, as for any root-issued statement.
+				if honourRoot(roots, l.Sub, rootKeysOrDID(roots, l.Sub), r.Handovers(), r, false) == nil {
 					return fmt.Errorf("link %s revoked by the root", short(l.Aud))
 				}
 				continue
@@ -489,6 +530,108 @@ func rootSigned(r *Statement, rootKeys []ed25519.PublicKey) bool {
 		}
 	}
 	return false
+}
+
+// walkHandovers checks that a lineage's handovers run from one of
+// anchorKeys to one current key, each signed by the key it retires (when
+// sigs), each for circle sub, and returns the keys a root-issued statement
+// of that lineage may be signed with: the last handover's recipient, or
+// anchorKeys when there is none.
+func walkHandovers(hs []*Statement, anchorKeys []ed25519.PublicKey, sub string, sigs bool) ([]ed25519.PublicKey, error) {
+	if len(hs) > MaxHandovers {
+		return nil, fmt.Errorf("more than MaxHandovers %d", MaxHandovers)
+	}
+	keys := anchorKeys
+	for i, h := range hs {
+		if h.Payload.Typ != TypeHandover {
+			return nil, errors.New("not a handover")
+		}
+		if h.Payload.Sub != sub {
+			return nil, fmt.Errorf("handover %d is for circle %s, not %s", i, short(h.Payload.Sub), short(sub))
+		}
+		if err := handoverShape(h.Payload); err != nil {
+			return nil, fmt.Errorf("handover %d: %w", i, err)
+		}
+		if !rootSigned(h, keys) {
+			if i == 0 {
+				return nil, errors.New("the first handover is not signed by the circle's key")
+			}
+			return nil, fmt.Errorf("handover %d is not signed by the key the previous one handed over to", i)
+		}
+		if sigs {
+			if err := h.VerifySignature(); err != nil {
+				return nil, fmt.Errorf("handover %d: %w", i, err)
+			}
+		}
+		k, err := did.KeyFor(h.Payload.Aud)
+		if err != nil {
+			return nil, fmt.Errorf("handover %d: %w", i, err)
+		}
+		keys = []ed25519.PublicKey{k}
+	}
+	return keys, nil
+}
+
+// historyAllows applies the node's known key history (RootHistory, when
+// roots has one) to a root-issued statement st whose lineage carries the
+// handovers hs: the two histories must agree where they overlap, and when
+// the node knows a handover the lineage does not — one that retired st's
+// signer — st must have been issued no later than that handover, and the
+// handover must not have declared the key compromised. A lineage that
+// knows more than the node is honoured on its own proof; the holder learns
+// it from the statement (DIDRoot.Learn) outside the verifier.
+func historyAllows(roots Roots, sub string, hs []*Statement, st *Statement) error {
+	h, ok := roots.(RootHistory)
+	if !ok {
+		return nil
+	}
+	known := h.Handovers(sub)
+	for i := 0; i < len(known) && i < len(hs); i++ {
+		if known[i].ID() != hs[i].ID() {
+			return ErrConflictingHandover
+		}
+	}
+	if len(known) <= len(hs) {
+		return nil
+	}
+	retiring := known[len(hs)]
+	if retiring.Payload.Compromised {
+		return errors.New("signed by a key the circle declared compromised")
+	}
+	if st.Payload.Iat > retiring.Payload.Iat {
+		return errors.New("signed by a retired key after its handover")
+	}
+	return nil
+}
+
+// honourRoot is the whole root check for a root-issued statement st of
+// circle sub: its lineage's handovers hs run from anchorKeys to its
+// signer, and the node's history allows it. sigs re-verifies the
+// handovers' signatures (Compile does; Check and the revocation pass rely
+// on what was verified at compile or ingest).
+func honourRoot(roots Roots, sub string, anchorKeys []ed25519.PublicKey, hs []*Statement, st *Statement, sigs bool) error {
+	keys, err := walkHandovers(hs, anchorKeys, sub, sigs)
+	if err != nil {
+		return err
+	}
+	if !rootSigned(st, keys) {
+		return errors.New("not signed by the circle's key")
+	}
+	return historyAllows(roots, sub, hs, st)
+}
+
+// RootSigned reports whether a parentless statement of circle sub is
+// signed by the circle's root as roots knows it: by the anchor key, or by
+// the current key through the handovers the statement carries, within the
+// node's history. Signatures are verified.
+func RootSigned(roots Roots, sub string, st *Statement) bool {
+	if st == nil || !st.IsRootIssued() {
+		return false
+	}
+	if err := st.VerifySignature(); err != nil {
+		return false
+	}
+	return honourRoot(roots, sub, rootKeysOrDID(roots, sub), st.Handovers(), st, true) == nil
 }
 
 // Verify is Compile followed by Check: the whole §6 checklist in one call,

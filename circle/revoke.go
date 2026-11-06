@@ -46,18 +46,26 @@ const revocationsFile = "revocations.cbor"
 
 // Revoke signs, with the circle's root key, the removal "deviceDID is no
 // longer a device of this circle": every admission of the device that does
-// not acknowledge this statement is dead.
+// not acknowledge this statement is dead. The circle is the key's own
+// did:key; RevokeIn is the form for a circle whose key has rotated.
 func Revoke(circlePriv ed25519.PrivateKey, deviceDID string, now time.Time) (*Revocation, error) {
+	circleDID := did.ForKey(circlePriv.Public().(ed25519.PublicKey))
+	return RevokeIn(circlePriv, nil, circleDID, deviceDID, now)
+}
+
+// RevokeIn signs a device's removal from circleDID with the circle's
+// current key, riding proof (Circle.Signer): the latest handover, or nil
+// when the key is the DID key.
+func RevokeIn(priv ed25519.PrivateKey, proof *statement.Statement, circleDID, deviceDID string, now time.Time) (*Revocation, error) {
 	if _, err := did.KeyFor(deviceDID); err != nil {
 		return nil, fmt.Errorf("device: %w", err)
 	}
-	circleDID := did.ForKey(circlePriv.Public().(ed25519.PublicKey))
-	return RevokeAs(circlePriv, nil, circleDID, statement.Target{Aud: deviceDID}, now)
+	return RevokeAs(priv, proof, circleDID, statement.Target{Aud: deviceDID}, now)
 }
 
-// RevokeAs signs any revocation: by the root (own == nil) or by an admin
-// desk under its own admission (own), targeting a device (a removal) or a
-// statement ID in circleDID.
+// RevokeAs signs any revocation: by the root (own nil, or the handover a
+// rotated key rides) or by an admin desk under its own admission (own),
+// targeting a device (a removal) or a statement ID in circleDID.
 func RevokeAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, target statement.Target, now time.Time) (*Revocation, error) {
 	s, err := statement.Revoke(priv, circleDID, own, target, now)
 	if err != nil {
@@ -102,15 +110,10 @@ func (r *Revocation) Verify() error {
 		return err
 	}
 	if r.Stmt.IsRootIssued() {
-		k, err := r.Stmt.IssuerKey()
-		if err != nil {
-			return err
-		}
-		rootKey, err := did.KeyFor(r.Circle)
-		if err != nil {
-			return fmt.Errorf("revocation circle: %w", err)
-		}
-		if !bytes.Equal(k, rootKey) {
+		// The circle's key, or its current key through the handovers the
+		// revocation carries. The node's history (a retired key signing
+		// late) is applied where the revocation is judged, in the roster.
+		if !statement.RootSigned(didKeyRoots{}, r.Circle, r.Stmt) {
 			return errors.New("revocation is signed neither by the circle root nor under a chain")
 		}
 		return nil

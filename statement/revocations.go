@@ -75,9 +75,11 @@ func (s *RevocationSet) Add(r *Statement) (bool, error) {
 			return false, errors.New("revocation chain is in a different circle")
 		}
 		// The chain's own validity is settled in Check against the lineage
-		// (its leaf must be a verified ancestor of the target); signatures
-		// are checked here so a forged chain never enters the index.
-		for _, l := range p.Chain() {
+		// (its leaf must be a verified ancestor of the target; a root
+		// revocation's handovers must run from the circle's key);
+		// signatures are checked here so a forged chain never enters the
+		// index.
+		for _, l := range p.lineage() {
 			if err := l.VerifySignature(); err != nil {
 				return false, fmt.Errorf("revocation chain: %w", err)
 			}

@@ -233,8 +233,13 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, err)
 		return
 	}
+	circleDID, proof, err := daemon.HomeSigner(s.dir, rootPriv)
+	if err != nil {
+		httpError(w, http.StatusForbidden, err)
+		return
+	}
 	now := time.Now()
-	c, err := cert.Issue(rootPriv, ed25519.PublicKey(match.DevicePub), cert.CmdMember, cert.Meta{Name: match.Name, IP: ip, Scope: scope}, now, cert.DefaultValidity)
+	c, err := cert.IssueAs(rootPriv, proof, circleDID, ed25519.PublicKey(match.DevicePub), cert.CmdMember, cert.Meta{Name: match.Name, IP: ip, Scope: scope}, now, cert.DefaultValidity)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return

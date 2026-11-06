@@ -129,7 +129,7 @@ func (s *state) replace(i int, nr *circle.Roster, persist bool) error {
 	if nr == s.rosters[i] {
 		return nil
 	}
-	if persist {
+	if persist || nr.Learned() {
 		if err := nr.Save(); err != nil {
 			return fmt.Errorf("roster: not recorded, %s not written: %w", nr.Path(), err)
 		}
@@ -349,6 +349,33 @@ func (t *PeerTable) AddRevocation(circleDID string, st *statement.Statement) (fr
 	return fresh, err
 }
 
+// AddHandover records a circle's key handover (statement.TypeHandover)
+// learned from the gossip or the CLI in the circle's roster, which
+// re-judges every device and saves the history; grew says whether it was
+// new. A handover carried inside an admission or revocation is learned by
+// AddAdmission and AddRevocation on their own.
+func (t *PeerTable) AddHandover(circleDID string, st *statement.Statement) (grew bool, err error) {
+	if st == nil {
+		return false, errors.New("roster: nil statement")
+	}
+	err = t.apply(func(s *state) error {
+		i := s.index(circleDID)
+		if i < 0 {
+			return fmt.Errorf("roster: circle %s is not honoured here", shortDID(circleDID))
+		}
+		nr, g, err := s.rosters[i].AddHandover(st)
+		if err != nil {
+			return err
+		}
+		if g {
+			grew = true
+			return s.replace(i, nr, true)
+		}
+		return nil
+	})
+	return grew, err
+}
+
 // SweepIn kills a device's admissions issued up to at in one circle.
 func (t *PeerTable) SweepIn(circleDID, deviceDID string, at time.Time) {
 	_ = t.apply(func(s *state) error {
@@ -517,6 +544,14 @@ type tableRoots struct{ t *PeerTable }
 func (r tableRoots) RootKeys(circleDID string) []ed25519.PublicKey {
 	if ro, ok := r.t.RosterFor(circleDID); ok {
 		return ro.Roots().RootKeys(circleDID)
+	}
+	return nil
+}
+
+// Handovers implements statement.RootHistory from the circle's roster.
+func (r tableRoots) Handovers(circleDID string) []*statement.Statement {
+	if ro, ok := r.t.RosterFor(circleDID); ok {
+		return ro.Roots().Handovers(circleDID)
 	}
 	return nil
 }

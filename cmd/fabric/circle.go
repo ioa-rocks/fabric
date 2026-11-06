@@ -47,7 +47,7 @@ import (
 // owns it — mesh membership alone grants nothing.
 func cmdCircle(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: fabric circle init|admit|join|export|renew|revoke|restore|passphrase|grant|status")
+		return fmt.Errorf("usage: fabric circle init|admit|join|export|renew|revoke|restore|rotate|passphrase|grant|status")
 	}
 	rest := args[1:]
 	switch args[0] {
@@ -65,6 +65,8 @@ func cmdCircle(args []string) error {
 		return cmdCircleRevoke(rest)
 	case "restore":
 		return cmdCircleRestore(rest)
+	case "rotate":
+		return cmdCircleRotate(rest)
 	case "passphrase":
 		return cmdCirclePassphrase(rest)
 	case "grant":
@@ -72,8 +74,118 @@ func cmdCircle(args []string) error {
 	case "status":
 		return cmdCircleStatus(rest)
 	default:
-		return fmt.Errorf("usage: fabric circle init|admit|join|export|renew|revoke|restore|passphrase|grant|status")
+		return fmt.Errorf("usage: fabric circle init|admit|join|export|renew|revoke|restore|rotate|passphrase|grant|status")
 	}
+}
+
+// cmdCircleRotate replaces the circle's key on this device (task
+// single-writer-store (b)): a handover signed by the current key names a
+// fresh one and is recorded in the circle's history; the key container is
+// rewritten with the new key under the same passphrase (the root key
+// container too, when the circle is the home circle on the master); the
+// running daemon pushes the handover to the circle's devices and this
+// device re-signs its own admission with the new key. Without
+// -compromised the rotation is clean: what the old key signed up to now
+// stands until renewed. With it, nothing the old key signed counts any
+// more — every device it admitted is out until an owner admits it again
+// (`circle admit`), which the command lists. Other owner devices keep a
+// container of the retired key and must re-join from a fresh `circle
+// export` of this device.
+func cmdCircleRotate(args []string) error {
+	fs := flag.NewFlagSet("circle rotate", flag.ExitOnError)
+	statePath, vaultState := circleFlags(fs)
+	name := fs.String("circle", "", "which circle (required when the node holds several)")
+	compromised := fs.Bool("compromised", false, "the current key leaked: nothing it signed is to be trusted (every device it admitted must be admitted again)")
+	fs.Parse(args)
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: fabric circle rotate [-circle <name>] [-compromised]")
+	}
+	root, err := circleRoot(*statePath, *vaultState)
+	if err != nil {
+		return err
+	}
+	c, err := pickCircle(root, *name)
+	if err != nil {
+		return err
+	}
+	if !c.HasKey() {
+		return fmt.Errorf("this device holds no key for circle %q — rotate on an owner device", c.Config.Name)
+	}
+	now := time.Now()
+	before, err := circle.OpenRoster(c, now)
+	if err != nil {
+		return err
+	}
+	pass, err := passFor(c)
+	if err != nil {
+		return err
+	}
+	h, err := c.Rotate(pass, *compromised, now)
+	if err != nil {
+		return err
+	}
+	raw, err := h.Bytes()
+	if err != nil {
+		return err
+	}
+	priv, _, err := c.Signer(pass)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("circle %q: key handed over to %s (handover #%d, %s)\n", c.Config.Name, shortDID(did.ForKey(priv.Public().(ed25519.PublicKey))), len(h.Handovers()), map[bool]string{false: "clean: what the old key signed up to now stands until renewed", true: "COMPROMISED: nothing the old key signed counts any more"}[*compromised])
+	// The master's root key container is the same key as the home circle's.
+	dir, err := state.Open(*statePath)
+	if err != nil {
+		return err
+	}
+	if cfg, err := dir.LoadConfig(); err == nil && cfg.CircleDID == c.Config.DID && dir.IsMaster() {
+		tmp := dir.KeystorePath() + ".tmp"
+		if err := keystore.SaveSeed(tmp, priv.Seed(), pass); err != nil {
+			return fmt.Errorf("rewriting the root key container: %w", err)
+		}
+		if err := os.Rename(tmp, dir.KeystorePath()); err != nil {
+			return err
+		}
+		fmt.Printf("  root key container rewritten with the new key (%s) — back it up again\n", dir.KeystorePath())
+	}
+	var client *daemon.Client
+	if _, err := dir.LoadDeviceKey(); err == nil {
+		client = daemon.NewClient(dir)
+	}
+	if client != nil {
+		if _, err := client.CircleHandover(raw); err == nil {
+			fmt.Println("  the running daemon knows the new key; devices online learn it at once, the rest at their next connect")
+		} else {
+			fmt.Println("  no running node daemon here: 'fabric up' loads the history from the circle directory and gossips it")
+		}
+	}
+	if err := admitSelfWith(*statePath, c, pass, false); err != nil {
+		fmt.Fprintf(os.Stderr, "  re-signing this device's admission with the new key failed: %v — run 'fabric circle renew -circle %s'\n", err, c.Config.Name)
+	}
+	if *compromised {
+		after, err := circle.OpenRoster(c, now)
+		if err != nil {
+			return err
+		}
+		var gone []string
+		for _, dev := range before.Devices() {
+			if _, ok := after.Device(dev.DID); !ok {
+				label := dev.DID
+				if m := dev.Stmt.Payload.Meta; m != nil && m.Name != "" {
+					label = fmt.Sprintf("%s (%s)", m.Name, shortDID(dev.DID))
+				}
+				gone = append(gone, label)
+			}
+		}
+		if len(gone) > 0 {
+			fmt.Printf("  devices admitted by the compromised key, now out — admit each again with 'fabric circle admit <device> -circle %s -out <file>':\n", c.Config.Name)
+			for _, g := range gone {
+				fmt.Printf("    %s\n", g)
+			}
+		}
+	}
+	fmt.Printf("  other owner devices hold a container of the retired key: on each, remove the circle and re-join from a fresh 'fabric circle export -circle %s' of this device\n", c.Config.Name)
+	return nil
 }
 
 func circleFlags(fs *flag.FlagSet) (statePath, vaultState *string) {
@@ -279,7 +391,7 @@ func admitSelfWith(statePath string, c *circle.Circle, pass string, restore bool
 	if !c.HasKey() {
 		return fmt.Errorf("this device holds no key for circle %q — an owner device renews it with 'fabric circle admit %s -circle %s'", c.Config.Name, did.ForKey(ed25519.PublicKey(raw)), c.Config.Name)
 	}
-	priv, err := c.Unlock(pass)
+	priv, proof, err := c.Signer(pass)
 	if err != nil {
 		return err
 	}
@@ -307,7 +419,7 @@ func admitSelfWith(statePath string, c *circle.Circle, pass string, restore bool
 	} else if cur, err := c.LoadAdmission(); err == nil {
 		prev = cur.Stmt
 	}
-	a, err := circle.RenewWith(priv, prev, c.Config.DID, ed25519.PublicKey(raw), now, circle.DefaultValidity, roster.Acks(selfDID))
+	a, err := circle.RenewWith(priv, proof, prev, c.Config.DID, ed25519.PublicKey(raw), now, circle.DefaultValidity, roster.Acks(selfDID))
 	if err != nil {
 		return err
 	}
@@ -668,12 +780,12 @@ func cmdCircleRevoke(args []string) error {
 	if err != nil {
 		return err
 	}
-	priv, err := c.Unlock(pass)
+	priv, proof, err := c.Signer(pass)
 	if err != nil {
 		return err
 	}
 	now := time.Now()
-	r, err := circle.Revoke(priv, deviceDID, now)
+	r, err := circle.RevokeIn(priv, proof, c.Config.DID, deviceDID, now)
 	if err != nil {
 		return err
 	}
@@ -1000,11 +1112,11 @@ func cmdCircleAdmit(args []string) error {
 	if err != nil {
 		return err
 	}
-	priv, err := c.Unlock(pass)
+	priv, proof, err := c.Signer(pass)
 	if err != nil {
 		return err
 	}
-	a, err := circle.Issue(priv, nil, c.Config.DID, devicePub, now, *validity, circle.Terms{Verbs: verbs, Meta: meta, Acks: roster.Acks(deviceDID)})
+	a, err := circle.Issue(priv, proof, c.Config.DID, devicePub, now, *validity, circle.Terms{Verbs: verbs, Meta: meta, Acks: roster.Acks(deviceDID)})
 	if err != nil {
 		return err
 	}
@@ -1149,11 +1261,11 @@ func cmdCircleRestore(args []string) error {
 	if err != nil {
 		return err
 	}
-	priv, err := c.Unlock(pass)
+	priv, proof, err := c.Signer(pass)
 	if err != nil {
 		return err
 	}
-	a, err := circle.RenewWith(priv, prev.Stmt, c.Config.DID, devicePub, now, *validity, roster.Acks(deviceDID))
+	a, err := circle.RenewWith(priv, proof, prev.Stmt, c.Config.DID, devicePub, now, *validity, roster.Acks(deviceDID))
 	if err != nil {
 		return err
 	}
@@ -1273,7 +1385,7 @@ func cmdCircleGrantNew(args []string) error {
 	if err != nil {
 		return err
 	}
-	priv, err := c.Unlock(pass)
+	priv, proof, err := c.Signer(pass)
 	if err != nil {
 		return err
 	}
@@ -1289,7 +1401,7 @@ func cmdCircleGrantNew(args []string) error {
 	st, err := statement.Sign(priv, statement.Payload{
 		Aud: did.ForKey(pub), Sub: c.Config.DID, Res: rs, Verbs: verbList,
 		Nbf: now.Unix(), Exp: now.Add(*exp).Unix(), Iat: now.Unix(), Del: 0,
-	}, nil)
+	}, proof)
 	if err != nil {
 		return err
 	}
@@ -1395,12 +1507,12 @@ func cmdCircleGrantRevoke(args []string) error {
 	if err != nil {
 		return err
 	}
-	priv, err := c.Unlock(pass)
+	priv, proof, err := c.Signer(pass)
 	if err != nil {
 		return err
 	}
 	now := time.Now()
-	r, err := circle.RevokeAs(priv, nil, c.Config.DID, statement.Target{ID: id}, now)
+	r, err := circle.RevokeAs(priv, proof, c.Config.DID, statement.Target{ID: id}, now)
 	if err != nil {
 		return err
 	}

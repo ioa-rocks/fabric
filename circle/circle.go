@@ -29,6 +29,7 @@ import (
 	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
+	"ioa.rocks/fabric/statement"
 )
 
 const (
@@ -252,9 +253,10 @@ func (c *Circle) Rekey(oldPass, newPass string) error {
 // circle's gate hints, so a device that knows the circle from nowhere else
 // can find a gate and present itself there.
 type Bundle struct {
-	Config    Config `json:"config"`
-	Key       []byte `json:"key,omitempty"`         // the age container, verbatim (owner bundle)
-	Admission []byte `json:"attestation,omitempty"` // this device's admission, wire bytes (device bundle)
+	Config    Config   `json:"config"`
+	Key       []byte   `json:"key,omitempty"`         // the age container, verbatim (owner bundle)
+	Admission []byte   `json:"attestation,omitempty"` // this device's admission, wire bytes (device bundle)
+	Handovers [][]byte `json:"handovers,omitempty"`   // the circle's key history, wire bytes, oldest first
 }
 
 // HasKey reports whether the bundle carries the circle key (co-ownership).
@@ -287,7 +289,28 @@ func NewDeviceBundle(c *Circle, a *Admission, gates []string) (*Bundle, error) {
 	}
 	cfg := c.Config
 	cfg.Gates = gates
-	return &Bundle{Config: cfg, Admission: raw}, nil
+	hs, err := c.handoverBytes()
+	if err != nil {
+		return nil, err
+	}
+	return &Bundle{Config: cfg, Admission: raw, Handovers: hs}, nil
+}
+
+// handoverBytes is the circle's key history as wire bytes, for bundles.
+func (c *Circle) handoverBytes() ([][]byte, error) {
+	hs, err := c.Handovers()
+	if err != nil {
+		return nil, err
+	}
+	var out [][]byte
+	for _, h := range hs {
+		raw, err := h.Bytes()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, raw)
+	}
+	return out, nil
 }
 
 // HasKey reports whether this device holds the circle key — whether it is
@@ -331,7 +354,11 @@ func (c *Circle) Export() (*Bundle, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Bundle{Config: c.Config, Key: key}, nil
+	hs, err := c.handoverBytes()
+	if err != nil {
+		return nil, err
+	}
+	return &Bundle{Config: c.Config, Key: key, Handovers: hs}, nil
 }
 
 // ReadBundle loads a bundle from a file written by Export, or from a
@@ -400,6 +427,21 @@ func Join(root string, b *Bundle) (*Circle, error) {
 	c, err := Open(path)
 	if err != nil {
 		return nil, err
+	}
+	if len(b.Handovers) > 0 {
+		roots := statement.NewDIDRoot(b.Config.DID)
+		for _, raw := range b.Handovers {
+			h, err := statement.Decode(raw)
+			if err != nil {
+				return nil, fmt.Errorf("bundle key history: %w", err)
+			}
+			if _, err := roots.Learn(h); err != nil {
+				return nil, fmt.Errorf("bundle key history: %w", err)
+			}
+		}
+		if err := SaveHandovers(path, roots.Handovers(b.Config.DID)); err != nil {
+			return nil, err
+		}
 	}
 	if admission != nil {
 		if err := c.SaveAdmission(admission); err != nil {
