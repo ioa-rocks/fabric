@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	mrand "math/rand"
+	"os"
 	"sort"
 	"testing"
 	"time"
@@ -247,9 +248,19 @@ func script(rng *mrand.Rand, rootPriv ed25519.PrivateKey, foreignPriv ed25519.Pr
 }
 
 func TestRosterAgreesWithTheOracle(t *testing.T) {
-	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
+	// The circle is a real directory so the roster can be saved and
+	// reloaded through it (devices.cbor plus the revocation file with its
+	// own Spent pruning) — the restart path, under the same oracle.
+	c, err := Init(t.TempDir(), "oracle", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootPriv, err := c.Unlock("pw")
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, foreignPriv, _ := ed25519.GenerateKey(rand.Reader)
-	circleDID := did.ForKey(rootPub)
+	circleDID := c.Config.DID
 	var devs []ed25519.PublicKey
 	var devDIDs []string
 	for i := 0; i < 3; i++ {
@@ -300,8 +311,26 @@ func TestRosterAgreesWithTheOracle(t *testing.T) {
 
 		// In order, with the clock running: the roster is checked after
 		// every step, GC included.
-		r := NewRoster(statement.NewDIDRoot(circleDID))
+		if err := os.RemoveAll(c.Path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(c.Path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		r, err := NewRoster(statement.NewDIDRoot(circleDID)).WithPath(DevicesPath(c), t0)
+		if err != nil {
+			t.Fatal(err)
+		}
 		o := newOracle(circleDID)
+		var revocations []*Revocation
+		for _, p := range ops {
+			if p.rev != nil {
+				revocations = append(revocations, p.rev)
+			}
+			if p.sweep != nil {
+				revocations = append(revocations, p.sweep)
+			}
+		}
 		for i, p := range ops {
 			r = apply(r, p)
 			o.apply(p)
@@ -338,6 +367,19 @@ func TestRosterAgreesWithTheOracle(t *testing.T) {
 		for _, now := range instants {
 			r, _, _ = r.GC(now)
 			compare(r, o, now, false, fmt.Sprintf("+%s after GC", now.Sub(end).Round(time.Hour)))
+			// Restart: save, write the circle's revocation file (spent
+			// records drop there), reload through the directory.
+			if err := r.Save(); err != nil {
+				fail("save: %v", err)
+			}
+			if _, err := c.AddRevocations(now, revocations...); err != nil {
+				fail("revocations: %v", err)
+			}
+			reloaded, err := OpenRoster(c, now)
+			if err != nil {
+				fail("reload: %v", err)
+			}
+			compare(reloaded, o, now, false, fmt.Sprintf("+%s after reload", now.Sub(end).Round(time.Hour)))
 			for _, k := range rng.Perm(len(ops)) {
 				p := ops[k]
 				p.at = now

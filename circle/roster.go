@@ -533,10 +533,20 @@ func (r *Roster) UsedIPs() []string {
 func (r *Roster) Len() int { return len(r.devices) }
 
 // GC marks devices whose window closed as lapsed, drops lapsed entries past
-// their retention, and drops sweeps that can no longer kill anything.
+// their retention, and drops sweeps and revocations that can no longer kill
+// anything (statement.Spent, as the circle directory does on load).
 // dropped says whether an entry left (the saved form changed).
 func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
 	nr = r.clone()
+	for _, rv := range nr.revs.All() {
+		if statement.Spent(rv, time.Time{}, now) {
+			if nr.revs == r.revs {
+				nr.revs = r.revs.Clone()
+			}
+			nr.revs.Remove(rv.ID())
+			changed = true
+		}
+	}
 	for did, dev := range nr.devices {
 		if !now.Before(dev.Exp.Add(LapsedRetention)) {
 			delete(nr.devices, did)

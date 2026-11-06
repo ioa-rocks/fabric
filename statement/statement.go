@@ -206,6 +206,12 @@ func Sign(priv ed25519.PrivateKey, p Payload, parent *Statement) (*Statement, er
 		if time.Duration(p.Exp-p.Nbf)*time.Second > MaxValidity {
 			return nil, fmt.Errorf("assert window exceeds MaxValidity (%s)", MaxValidity)
 		}
+		// Retention reasons from the issue time (an admission has expired
+		// by iat + MaxValidity), so the bound holds from iat as well as
+		// from nbf (agy review, 2026-11-06).
+		if time.Duration(p.Exp-p.Iat)*time.Second > MaxValidity {
+			return nil, fmt.Errorf("assert expires more than MaxValidity (%s) after it was issued", MaxValidity)
+		}
 		if p.Target != nil {
 			return nil, errors.New("assert carries a revocation target")
 		}

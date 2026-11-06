@@ -160,6 +160,13 @@ func (s *RevocationSet) Remove(id [32]byte) {
 // could still verify (task file, Retention). targetExp is the target's
 // expiry when the caller knows it (by-id revocations whose target is in the
 // local store); zero when unknown.
+// RevocationSlack is added to a root by-ID revocation's retention when the
+// target's expiry is unknown: the retention then reasons from the
+// revoker's clock, and a revoker whose clock runs behind the issuer's
+// would otherwise drop the revocation that many seconds before a
+// maximum-validity target expired (agy review, 2026-11-06).
+const RevocationSlack = 7 * 24 * time.Hour
+
 func Spent(r *Statement, targetExp time.Time, now time.Time) bool {
 	if p := r.Parent(); p != nil {
 		// A non-root revocation dies with its own chain.
@@ -177,7 +184,12 @@ func Spent(r *Statement, targetExp time.Time, now time.Time) bool {
 		if r.Parent() != nil {
 			return false // bounded by the chain check above
 		}
-		return !now.Before(time.Unix(r.Payload.At, 0).Add(MaxValidity))
+		// The target expires by its iat + MaxValidity; the revocation was
+		// issued no earlier than the target (iat and at are the revoker's
+		// clock, the later of them), so retention from there covers the
+		// target, with slack for the clock.
+		since := max(r.Payload.At, r.Payload.Iat)
+		return !now.Before(time.Unix(since, 0).Add(MaxValidity + RevocationSlack))
 	default:
 		return !now.Before(time.Unix(t.Before, 0).Add(MaxValidity))
 	}

@@ -549,3 +549,46 @@ func TestResourceCovers(t *testing.T) {
 		}
 	}
 }
+
+// The window bound holds from the issue time, not only from nbf: retention
+// reasons that an admission has expired by iat + MaxValidity, so a
+// future-dated nbf must not push exp past it (agy review, 2026-11-06).
+func TestWindowIsBoundedFromIssueTime(t *testing.T) {
+	_, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+	p := Payload{
+		Aud: did.ForKey(devPub), Sub: did.ForKey(rootPriv.Public().(ed25519.PublicKey)),
+		Res: []Resource{{Kind: Any, Name: Any, Sub: Any}}, Verbs: []string{VerbMember},
+		Iat: now.Unix(), Nbf: now.Add(30 * 24 * time.Hour).Unix(), Exp: now.Add(30*24*time.Hour + MaxValidity).Unix(),
+	}
+	if _, err := Sign(rootPriv, p, nil); err == nil {
+		t.Fatal("an admission expiring more than MaxValidity after its issue time was signed")
+	}
+	p.Exp = now.Add(MaxValidity).Unix()
+	if _, err := Sign(rootPriv, p, nil); err != nil {
+		t.Fatalf("an admission within MaxValidity of its issue time refused: %v", err)
+	}
+}
+
+// A root by-ID revocation whose target expiry is unknown is retained for
+// MaxValidity plus slack from the revoker's clock, so a revoker running
+// behind the issuer does not drop it before a maximum-validity target has
+// expired (agy review, 2026-11-06).
+func TestByIDRevocationRetentionOutlivesClockSkew(t *testing.T) {
+	_, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
+	sub := did.ForKey(rootPriv.Public().(ed25519.PublicKey))
+	issued := time.Now()
+	behind := issued.Add(-time.Minute) // the revoker's clock, a minute behind the issuer's
+	r, err := Revoke(rootPriv, sub, nil, Target{ID: make([]byte, 32)}, behind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetExp := issued.Add(MaxValidity)
+	if Spent(r, time.Time{}, targetExp.Add(-time.Second)) {
+		t.Fatal("revocation spent while its target could still verify")
+	}
+	if !Spent(r, time.Time{}, behind.Add(MaxValidity+RevocationSlack+time.Second)) {
+		t.Fatal("revocation never spent")
+	}
+}

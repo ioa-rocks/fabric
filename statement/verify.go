@@ -183,7 +183,7 @@ func compileChain(chain []*Statement, rootKeys []ed25519.PublicKey, what string)
 		if p.Nbf == 0 || p.Exp <= p.Nbf {
 			return nil, nbf, exp, fmt.Errorf("%s link %s has no valid window", what, id)
 		}
-		if time.Duration(p.Exp-p.Nbf)*time.Second > MaxValidity {
+		if time.Duration(p.Exp-p.Nbf)*time.Second > MaxValidity || time.Duration(p.Exp-p.Iat)*time.Second > MaxValidity {
 			return nil, nbf, exp, fmt.Errorf("%s link %s window exceeds MaxValidity", what, id)
 		}
 		if i == 0 {
