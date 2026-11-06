@@ -16,14 +16,17 @@ import (
 	"ioa.rocks/fabric/statement"
 )
 
-// Revocation is a signed statement that kills admissions in a circle.
-// Since 2026-11-02 it is a statement revoke (package statement) with one of
-// two targets: {aud, before} — every admission of that device issued up
-// to before, today's lost-device sweep — or {id}, one statement. It is
-// signed by the root (kills anything in the circle) or by an admin desk
+// Revocation is a signed statement that kills admissions in a circle: a
+// statement revoke (package statement) with one of two targets. {aud} is
+// a device-wide removal (ADR 0019, 2026-11-06): every admission of the
+// device that does not acknowledge the removal's ID is dead, whenever it
+// was issued, and the removal is kept for good; a restoration is an
+// admission carrying the ID in its acks. {id} kills one statement. Either
+// is signed by the root (kills anything in the circle) or by an admin desk
 // under its own admission (kills only what chains through that admission;
-// verifier rule 3). An admission issued after a sweep's `before` is a
-// deliberate re-admission and stands.
+// verifier rule 3). The version-1 sweep {aud, before} — dead up to a clock
+// cut, so a renewal signed after the cut by a signer that never saw it
+// put the device back — is still read (Stmt.IsSweep) but no longer signed.
 //
 // Revocations travel inside the circle: devices of the circle swap their
 // sets on every circle exchange (daemon.CircleService), and a fresh one is
@@ -32,28 +35,29 @@ import (
 // 2026-10 no longer decodes since 2026-11-06.)
 type Revocation struct {
 	Circle   string // circle DID
-	Device   string // swept device key, did:key; "" for a by-id revocation
-	TargetID []byte // revoked statement ID; nil for a sweep
-	At       int64  // unix seconds; sweeps kill admissions with Iat <= At
+	Device   string // removed (or, legacy, swept) device key, did:key; "" for a by-id revocation
+	TargetID []byte // revoked statement ID; nil for a removal or sweep
+	At       int64  // unix seconds: when signed; a legacy sweep's cut (admissions with Iat <= At are dead)
 	Sig      []byte
 	Stmt     *statement.Statement
 }
 
 const revocationsFile = "revocations.cbor"
 
-// Revoke signs, with the circle's root key, the statement "deviceDID is no
-// longer a device of this circle, as of now".
+// Revoke signs, with the circle's root key, the removal "deviceDID is no
+// longer a device of this circle": every admission of the device that does
+// not acknowledge this statement is dead.
 func Revoke(circlePriv ed25519.PrivateKey, deviceDID string, now time.Time) (*Revocation, error) {
 	if _, err := did.KeyFor(deviceDID); err != nil {
 		return nil, fmt.Errorf("device: %w", err)
 	}
 	circleDID := did.ForKey(circlePriv.Public().(ed25519.PublicKey))
-	return RevokeAs(circlePriv, nil, circleDID, statement.Target{Aud: deviceDID, Before: now.Unix()}, now)
+	return RevokeAs(circlePriv, nil, circleDID, statement.Target{Aud: deviceDID}, now)
 }
 
 // RevokeAs signs any revocation: by the root (own == nil) or by an admin
-// desk under its own admission (own), targeting a device sweep or a statement
-// ID in circleDID.
+// desk under its own admission (own), targeting a device (a removal) or a
+// statement ID in circleDID.
 func RevokeAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, target statement.Target, now time.Time) (*Revocation, error) {
 	s, err := statement.Revoke(priv, circleDID, own, target, now)
 	if err != nil {
@@ -72,12 +76,14 @@ func revocationFromStatement(s *statement.Statement) (*Revocation, error) {
 	if p.Typ != statement.TypeRevoke || p.Target == nil {
 		return nil, errors.New("not a revocation")
 	}
-	r := &Revocation{Circle: p.Sub, At: p.At, Sig: s.Sig, Stmt: s}
+	r := &Revocation{Circle: p.Sub, At: p.Iat, Sig: s.Sig, Stmt: s}
 	if len(p.Target.ID) != 0 {
 		r.TargetID = p.Target.ID
 	} else {
 		r.Device = p.Target.Aud
-		r.At = p.Target.Before
+		if s.IsSweep() {
+			r.At = p.Target.Before
+		}
 	}
 	return r, nil
 }
@@ -129,11 +135,11 @@ func (r *Revocation) Verify() error {
 func (r *Revocation) Delegated() bool { return r.Stmt != nil && !r.Stmt.IsRootIssued() }
 
 // Kills reports whether this revocation voids the admission on its own:
-// same circle and, for a sweep, same device issued no later than the
-// sweep; for a by-id revocation, that very statement. Only root authority
-// is judged here; a delegated revocation is applied by Circle.Revoked
-// through the verifier, since whether it reaches the admission depends
-// on the admission's chain.
+// same circle and, for a removal, same device not acknowledging it; for a
+// legacy sweep, same device issued no later than the cut; for a by-id
+// revocation, that very statement. Only root authority is judged here; a
+// delegated revocation is applied by Circle.Revoked through the verifier,
+// since whether it reaches the admission depends on the admission's chain.
 func (r *Revocation) Kills(a *Admission) bool {
 	if a.Circle != r.Circle || r.Delegated() {
 		return false
@@ -142,14 +148,25 @@ func (r *Revocation) Kills(a *Admission) bool {
 		id := a.Stmt.ID()
 		return bytes.Equal(r.TargetID, id[:])
 	}
-	return a.Device == r.Device && a.Iat <= r.At
+	if a.Device != r.Device {
+		return false
+	}
+	if r.Stmt.IsSweep() {
+		return a.Iat <= r.At
+	}
+	return !a.Stmt.Acknowledges(r.Stmt.ID())
 }
 
-// Time is when the revocation was signed (sweeps: the cut-off).
+// Removal reports whether this is a device-wide removal (as opposed to a
+// by-id revocation or a legacy sweep).
+func (r *Revocation) Removal() bool { return r.Stmt != nil && r.Stmt.IsRemoval() }
+
+// Time is when the revocation was signed (legacy sweeps: the cut-off).
 func (r *Revocation) Time() time.Time { return time.Unix(r.At, 0) }
 
 // Spent reports whether every admission this revocation could kill has
 // expired on its own, so the record can be dropped (task file, Retention).
+// A removal never is: an admission that missed it may arrive at any time.
 func (r *Revocation) Spent(now time.Time) bool { return statement.Spent(r.Stmt, time.Time{}, now) }
 
 // ID is the dedup key: the statement ID.

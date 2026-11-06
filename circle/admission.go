@@ -96,6 +96,9 @@ type Admission struct {
 	IP    string // overlay address in the circle's prefix, when `tun` was signed
 }
 
+// Acks lists the removals the admission acknowledges (statement IDs).
+func (a *Admission) Acks() [][]byte { return a.Stmt.Payload.Acks }
+
 const admissionFile = "device.attestation"
 
 var encMode cbor.EncMode
@@ -132,8 +135,18 @@ func AdmitAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID string
 // or its role: a fresh admission outranks the old one everywhere by expiry,
 // and a bare one would have shadowed the named cert in every roster
 // (desk listed as "?" without an address, 2026-11-05). prev nil falls
-// back to DeviceVerbs and no attributes.
+// back to DeviceVerbs and no attributes. The renewal acknowledges no
+// removal: RenewWith is the production form, with Roster.Acks.
 func Renew(priv ed25519.PrivateKey, prev *statement.Statement, circleDID string, devicePub ed25519.PublicKey, now time.Time, validity time.Duration) (*Admission, error) {
+	return RenewWith(priv, prev, circleDID, devicePub, now, validity, nil)
+}
+
+// RenewWith is Renew acknowledging acks — the roster's Acks for the device
+// (ADR 0019: every removal the issuer holds for the device plus every one
+// its existing admissions acknowledge), so the renewal stays eligible
+// where the removal is known. With a removal in acks it is a restoration;
+// the command decides whether that is meant (`restore`, never `renew`).
+func RenewWith(priv ed25519.PrivateKey, prev *statement.Statement, circleDID string, devicePub ed25519.PublicKey, now time.Time, validity time.Duration, acks [][]byte) (*Admission, error) {
 	verbs, meta := DeviceVerbs, (*statement.Meta)(nil)
 	if prev != nil && prev.Payload.Sub == circleDID && prev.Payload.Aud == did.ForKey(devicePub) {
 		if len(prev.Payload.Verbs) > 0 {
@@ -144,15 +157,33 @@ func Renew(priv ed25519.PrivateKey, prev *statement.Statement, circleDID string,
 			meta = &m
 		}
 	}
-	return AdmitWith(priv, nil, circleDID, devicePub, now, validity, verbs, meta)
+	return Issue(priv, nil, circleDID, devicePub, now, validity, Terms{Verbs: verbs, Meta: meta, Acks: acks})
+}
+
+// Terms are what a positive admission says about the device beyond its
+// window: its verbs, its label and overlay address, and the removals its
+// issuer acknowledges (ADR 0019). One shape serves admit, renew, scope or
+// address edits and restore; the commands differ in what they refuse.
+type Terms struct {
+	Verbs []string
+	Meta  *statement.Meta
+	Acks  [][]byte // statement IDs of the device's removals; Roster.Acks
 }
 
 // AdmitWith is AdmitAs with the verbs and attributes chosen: a role
 // preset (VerbsForRole) plus `tun`, and meta carrying the device's label
 // and — when `tun` is signed — its overlay address inside the circle's
 // prefix (rule 7 lets a root-issued link carry any well-formed address;
-// an admin desk's must lie in the desk's own prefix).
+// an admin desk's must lie in the desk's own prefix). It acknowledges no
+// removal: Issue is the production form.
 func AdmitWith(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, devicePub ed25519.PublicKey, now time.Time, validity time.Duration, verbs []string, meta *statement.Meta) (*Admission, error) {
+	return Issue(priv, own, circleDID, devicePub, now, validity, Terms{Verbs: verbs, Meta: meta})
+}
+
+// Issue signs a positive admission of devicePub into circleDID on terms,
+// by the root (own == nil) or by an admin desk under its own admission.
+func Issue(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, devicePub ed25519.PublicKey, now time.Time, validity time.Duration, terms Terms) (*Admission, error) {
+	verbs, meta := terms.Verbs, terms.Meta
 	if validity <= 0 {
 		return nil, errors.New("admission validity must be positive")
 	}
@@ -174,6 +205,7 @@ func AdmitWith(priv ed25519.PrivateKey, own *statement.Statement, circleDID stri
 		Iat:   now.Unix(),
 		Nbf:   now.Unix(),
 		Exp:   now.Add(validity).Unix(),
+		Acks:  terms.Acks,
 	}, own)
 	if err != nil {
 		return nil, err

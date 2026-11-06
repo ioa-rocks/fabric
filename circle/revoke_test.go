@@ -8,13 +8,15 @@ import (
 
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/statement"
+	"ioa.rocks/fabric/statement/statementtest"
 )
 
-func TestRevocationKillsEarlierAdmissionsOnly(t *testing.T) {
-	_, cpriv, _ := ed25519.GenerateKey(rand.Reader)
+func TestRemovalKillsUnlessAcknowledged(t *testing.T) {
+	cpub, cpriv, _ := ed25519.GenerateKey(rand.Reader)
 	dpub, _, _ := ed25519.GenerateKey(rand.Reader)
 	other, _, _ := ed25519.GenerateKey(rand.Reader)
 	t0 := time.Now()
+	circleDID := cert.DIDForKey(cpub)
 
 	before, _ := Admit(cpriv, dpub, t0.Add(-time.Hour))
 	r, err := Revoke(cpriv, cert.DIDForKey(dpub), t0)
@@ -32,25 +34,60 @@ func TestRevocationKillsEarlierAdmissionsOnly(t *testing.T) {
 	if back.ID() != r.ID() {
 		t.Fatal("ID changed across the wire")
 	}
+	if !back.Removal() {
+		t.Fatal("Revoke did not sign a removal")
+	}
 	if !back.Kills(before) {
-		t.Fatal("revocation must kill an admission issued before it")
+		t.Fatal("removal must kill an admission issued before it")
 	}
 	same, _ := Admit(cpriv, dpub, t0)
 	if !back.Kills(same) {
-		t.Fatal("revocation must kill an admission issued in the same second")
+		t.Fatal("removal must kill an admission issued in the same second")
 	}
-	readmitted, _ := Admit(cpriv, dpub, t0.Add(time.Second))
-	if back.Kills(readmitted) {
-		t.Fatal("an admission issued after the revocation is a re-admission and must stand")
+	// The hole ADR 0019 closes: a later-issued admission that never saw
+	// the removal is no re-admission. One acknowledging it is.
+	stale, _ := Admit(cpriv, dpub, t0.Add(time.Second))
+	if !back.Kills(stale) {
+		t.Fatal("an admission issued after the removal without acknowledging it stood")
+	}
+	rid := back.Stmt.ID()
+	restored, err := Issue(cpriv, nil, circleDID, dpub, t0.Add(time.Second), DefaultValidity, Terms{Verbs: DeviceVerbs, Acks: [][]byte{rid[:]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Kills(restored) {
+		t.Fatal("a restoration acknowledging the removal was killed by it")
 	}
 	otherDev, _ := Admit(cpriv, other, t0.Add(-time.Hour))
 	if back.Kills(otherDev) {
-		t.Fatal("revocation killed a different device")
+		t.Fatal("removal killed a different device")
 	}
-	// A sweep is spent once nothing issued up to its cut-off can still
-	// verify: before + MaxValidity (the enforced maximum, not the default).
-	if back.Spent(t0.Add(statement.MaxValidity-time.Hour)) || !back.Spent(t0.Add(statement.MaxValidity)) {
-		t.Fatal("Spent is wrong")
+	// A removal is never spent: an admission that missed it may arrive at
+	// any time.
+	if back.Spent(t0.Add(100 * statement.MaxValidity)) {
+		t.Fatal("removal reported spent")
+	}
+	// A legacy sweep kills by its cut and is spent once nothing issued up
+	// to the cut can still verify: before + MaxValidity (the enforced
+	// maximum, not the default). Acknowledging it means nothing.
+	sw, err := statementtest.SweepV1(cpriv, circleDID, nil, cert.DIDForKey(dpub), t0.Unix(), t0.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sweep, err := RevocationFromStatement(sw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sweep.Removal() || !sweep.Kills(before) || !sweep.Kills(same) || sweep.Kills(stale) {
+		t.Fatal("legacy sweep does not kill by its cut")
+	}
+	sid := sw.ID()
+	ackedSweep, _ := Issue(cpriv, nil, circleDID, dpub, t0.Add(-time.Minute), time.Hour, Terms{Verbs: DeviceVerbs, Acks: [][]byte{sid[:]}})
+	if !sweep.Kills(ackedSweep) {
+		t.Fatal("acknowledging a legacy sweep lifted it")
+	}
+	if sweep.Spent(t0.Add(statement.MaxValidity-time.Hour)) || !sweep.Spent(t0.Add(statement.MaxValidity)) {
+		t.Fatal("sweep Spent is wrong")
 	}
 
 	// Tampered: flip a signature byte on the wire.
@@ -61,7 +98,7 @@ func TestRevocationKillsEarlierAdmissionsOnly(t *testing.T) {
 	}
 	// Signed by a stranger with no chain: refused as neither root nor delegated.
 	_, stranger, _ := ed25519.GenerateKey(rand.Reader)
-	rogue, err := RevokeAs(stranger, nil, back.Circle, statement.Target{Aud: back.Device, Before: t0.Unix()}, t0)
+	rogue, err := RevokeAs(stranger, nil, back.Circle, statement.Target{Aud: back.Device}, t0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,15 +144,21 @@ func TestRevocationStorage(t *testing.T) {
 		t.Fatalf("stored %d revocations, want 1", len(rs))
 	}
 
-	// Re-admission after revocation stands.
-	readmit, _ := Admit(priv, dpub, now.Add(time.Second))
+	// A later admission that does not acknowledge the removal is dead; a
+	// restoration acknowledging it stands.
+	stale, _ := Admit(priv, dpub, now.Add(time.Second))
+	if !c.Revoked(stale, now.Add(time.Second)) {
+		t.Fatal("admission issued after the removal without acknowledging it not reported revoked")
+	}
+	rid := r.Stmt.ID()
+	readmit, _ := Issue(priv, nil, c.Config.DID, dpub, now.Add(time.Second), DefaultValidity, Terms{Verbs: DeviceVerbs, Acks: [][]byte{rid[:]}})
 	if c.Revoked(readmit, now.Add(time.Second)) {
-		t.Fatal("re-admission after revocation reported revoked")
+		t.Fatal("restoration acknowledging the removal reported revoked")
 	}
 
-	// Spent records fall out on read.
-	if rs, _ := c.Revocations(now.Add(statement.MaxValidity)); len(rs) != 0 {
-		t.Fatalf("spent revocation still listed: %d", len(rs))
+	// A removal is kept for good; it never falls out as spent.
+	if rs, _ := c.Revocations(now.Add(10 * statement.MaxValidity)); len(rs) != 1 {
+		t.Fatalf("removal fell out of the file: %d listed", len(rs))
 	}
 
 	// Another circle's revocation is refused; a forged one too.
@@ -124,14 +167,14 @@ func TestRevocationStorage(t *testing.T) {
 	if _, err := c.AddRevocations(now, foreign); err == nil {
 		t.Fatal("stored a revocation for a different circle")
 	}
-	forged, _ := RevokeAs(otherPriv, nil, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub), Before: now.Unix()}, now)
+	forged, _ := RevokeAs(otherPriv, nil, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub)}, now)
 	if _, err := c.AddRevocations(now, forged); err == nil {
 		t.Fatal("stored a forged revocation")
 	}
 
 	// A by-id revocation kills exactly that statement; the device's next
-	// admission stands.
-	victim, _ := Admit(priv, dpub, now.Add(2*time.Second))
+	// admission (acknowledging the removal above) stands.
+	victim, _ := Issue(priv, nil, c.Config.DID, dpub, now.Add(2*time.Second), DefaultValidity, Terms{Verbs: DeviceVerbs, Acks: [][]byte{rid[:]}})
 	vid := victim.Stmt.ID()
 	byID, err := RevokeAs(priv, nil, c.Config.DID, statement.Target{ID: vid[:]}, now.Add(3*time.Second))
 	if err != nil {
@@ -143,7 +186,7 @@ func TestRevocationStorage(t *testing.T) {
 	if !c.Revoked(victim, now.Add(3*time.Second)) {
 		t.Fatal("by-id revocation did not kill its target")
 	}
-	next, _ := Admit(priv, dpub, now.Add(4*time.Second))
+	next, _ := Issue(priv, nil, c.Config.DID, dpub, now.Add(4*time.Second), DefaultValidity, Terms{Verbs: DeviceVerbs, Acks: [][]byte{rid[:]}})
 	if c.Revoked(next, now.Add(4*time.Second)) {
 		t.Fatal("by-id revocation killed a different statement")
 	}
@@ -179,9 +222,9 @@ func TestDelegatedAdmitAndRevoke(t *testing.T) {
 	}
 	byRoot, _ := Admit(root, dpub, now)
 
-	// The desk sweeps the device under its admission: kills its own
-	// admission of it, not the root's.
-	r, err := RevokeAs(deskPriv, deskA, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub), Before: now.Unix()}, now)
+	// The desk removes the device under its admission: kills its own
+	// admission of it, not the root's (rule 3).
+	r, err := RevokeAs(deskPriv, deskA, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub)}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +287,7 @@ func TestDelegatedAdmitAndRevoke(t *testing.T) {
 		Del:   3, Iat: now.Unix(), Nbf: now.Unix(), Exp: now.Add(DefaultValidity).Unix(),
 	}, nil)
 	_ = k1Pub
-	bogus, err := RevokeAs(k2, fakeDesk, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub), Before: now.Unix()}, now)
+	bogus, err := RevokeAs(k2, fakeDesk, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub)}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +310,7 @@ func TestDelegatedAdmitAndRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	leaf, err := RevokeAs(sPriv, subA, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub), Before: now.Unix()}, now)
+	leaf, err := RevokeAs(sPriv, subA, c.Config.DID, statement.Target{Aud: cert.DIDForKey(dpub)}, now)
 	if err != nil {
 		t.Fatal(err)
 	}

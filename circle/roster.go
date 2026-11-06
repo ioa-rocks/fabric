@@ -28,10 +28,14 @@ import (
 // hooks, and a mutation returns a new roster — the old one is unchanged and
 // stays valid for anyone still reading it. Exactly one goroutine applies
 // mutations (fabricnet.PeerTable's owner; the CLI when no daemon runs) and
-// decides when the result is saved and published. The ledger has four
-// rules and they are order-independent: the latest-issued admission for a
-// device is its standing whichever arrived first, a revocation set only
-// grows, a sweep is a monotone cut-off, GC drops the expired.
+// decides when the result is saved and published. The ledger's rules are
+// order-independent (ADR 0019): a device's eligible admissions are those
+// acknowledging every root removal of the device the roster knows; its
+// entry is the latest-issued of them whichever arrived first; a revocation
+// set only grows and removals are kept for good; a legacy sweep is a
+// monotone cut-off; GC drops the expired. Revocation, the chain check and
+// the window are verdicts on the entry — a device whose entry fails is
+// out, with no fallback to an older admission.
 //
 // The package is libp2p-free: fabricnet maps device DIDs to peer IDs and
 // builds the union over a node's rosters.
@@ -39,9 +43,48 @@ type Roster struct {
 	roots *statement.DIDRoot // the circle's root
 	path  string             // devices.cbor the admissions are saved to; "" = memory only
 
-	devices map[string]*Device // by device DID; never mutated in place
-	revs    *statement.RevocationSet
-	sweeps  map[string]int64 // device DID -> cut-off (unix s): admissions issued up to it are dead
+	slots  map[string]*slot // by device DID; never mutated in place
+	revs   *statement.RevocationSet
+	sweeps map[string]int64 // device DID -> cut-off (unix s): admissions issued up to it are dead
+}
+
+// slot is one device's admissions. held is the antichain of the eligible
+// ones under Dominates, later-issued first, so held[0] is the entry; it
+// has one element in every normal history and two for the instant
+// between a stale renewal and the removal it missed (a single register
+// diverges by arrival order: agy's S, N, R trace, ADR 0019). memory is the
+// latest admission that missed a removal — dead, kept until it would have
+// expired past retention, whatever else is held, so what the roster
+// remembers does not depend on arrival order (the oracle's shuffled
+// phase); it is the entry when nothing is eligible, so a removed device
+// is reported revoked rather than forgotten, keeps its address, and a
+// restoration can carry its terms forward.
+type slot struct {
+	held   []*Device
+	memory *Device
+}
+
+// entry is the device's standing admission: the eligible winner, else the
+// memory.
+func (s *slot) entry() *Device {
+	if s == nil {
+		return nil
+	}
+	if len(s.held) > 0 {
+		return s.held[0]
+	}
+	return s.memory
+}
+
+// all lists every admission the slot keeps, entry first.
+func (s *slot) all() []*Device {
+	if s == nil {
+		return nil
+	}
+	if s.memory != nil {
+		return append(append([]*Device(nil), s.held...), s.memory)
+	}
+	return s.held
 }
 
 // Device is one admission in a roster with its verdict.
@@ -111,10 +154,10 @@ var memberRes = statement.Resource{Kind: statement.KindRole, Name: statement.Ver
 // NewRoster returns an empty, memory-only roster of the circle roots names.
 func NewRoster(roots *statement.DIDRoot) *Roster {
 	return &Roster{
-		roots:   roots,
-		devices: map[string]*Device{},
-		revs:    statement.NewRevocationSet(),
-		sweeps:  map[string]int64{},
+		roots:  roots,
+		slots:  map[string]*slot{},
+		revs:   statement.NewRevocationSet(),
+		sweeps: map[string]int64{},
 	}
 }
 
@@ -144,9 +187,7 @@ func (r *Roster) Attach(c *Circle, now time.Time) (*Roster, error) {
 		}
 	}
 	nr.revs = set
-	for did := range nr.devices {
-		nr.rejudge(did)
-	}
+	nr.reslotAll()
 	nr, err = nr.WithPath(DevicesPath(c), now)
 	if err != nil {
 		return nil, fmt.Errorf("circle %q: %w", c.Config.Name, err)
@@ -201,14 +242,14 @@ func (r *Roster) Honours(circleDID string) bool { return r.roots.Honours(circleD
 // only: AddRevocation returns a roster with a grown set.
 func (r *Roster) Revocations() *statement.RevocationSet { return r.revs }
 
-// clone is a shallow copy: the maps are new, the entries shared. A
-// mutation replaces entries in the copy and never touches a shared one.
+// clone is a shallow copy: the maps are new, the slots and entries shared.
+// A mutation replaces slots in the copy and never touches a shared one.
 func (r *Roster) clone() *Roster {
 	nr := &Roster{roots: r.roots, path: r.path, revs: r.revs,
-		devices: make(map[string]*Device, len(r.devices)),
-		sweeps:  make(map[string]int64, len(r.sweeps))}
-	for k, v := range r.devices {
-		nr.devices[k] = v
+		slots:  make(map[string]*slot, len(r.slots)),
+		sweeps: make(map[string]int64, len(r.sweeps))}
+	for k, v := range r.slots {
+		nr.slots[k] = v
 	}
 	for k, v := range r.sweeps {
 		nr.sweeps[k] = v
@@ -217,27 +258,203 @@ func (r *Roster) clone() *Roster {
 }
 
 // Add verifies an admission against the circle's root and returns the
-// roster with it recorded, and whether that changed anything. A device has
-// one entry, the circle's latest word on it: the latest-issued admission
-// wins whatever order they arrive in (gossip, anti-entropy, handshakes) — a
-// renewal replaces the grant, so `renew -scope` demotes as the README says;
-// an earlier-issued admission never demotes, stale or not; an expired
-// admission within LapsedRetention is kept as roster memory; older ones are
-// refused. A revoked or swept admission is recorded with its verdict (the
-// device is then reported revoked until the admission expires), so a
-// later-issued admission — a deliberate re-admission — stands.
+// roster with it recorded, and whether that changed anything. The device's
+// slot is rebuilt from what it held plus the newcomer (build), so the
+// result is the same whatever order admissions, removals and revocations
+// arrive in (gossip, anti-entropy, handshakes): the latest-issued eligible
+// admission is the entry — a renewal replaces the grant, so `renew -scope`
+// demotes as the README says; an earlier-issued admission never demotes,
+// stale or not; one dominated by what is held is dropped; one that never
+// acknowledged a known removal of its device is kept only as memory. An
+// expired admission within LapsedRetention is kept as roster memory; older
+// ones are refused. A revoked admission is recorded with its verdict (the
+// device is then reported revoked until the admission expires) and a
+// later-issued admission — a deliberate re-admission — stands over it.
 func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, error) {
 	dev, err := r.judge(st, now)
 	if err != nil {
 		return r, false, err
 	}
-	cur := r.devices[dev.DID]
-	if cur != nil && (cur.Stmt.ID() == st.ID() || !prefer(cur, dev)) {
+	cur := r.slots[dev.DID]
+	for _, d := range cur.all() {
+		if d.Stmt.ID() == st.ID() {
+			return r, false, nil
+		}
+	}
+	ns := r.build(append(cur.all(), dev))
+	if sameSlot(cur, ns) {
 		return r, false, nil
 	}
 	nr := r.clone()
-	nr.devices[dev.DID] = dev
+	nr.slots[dev.DID] = ns
 	return nr, true, nil
+}
+
+// build derives a device's slot from a set of its admissions under the
+// roster's current removals, revocations and sweeps: verdicts are
+// re-derived, the eligible ones are reduced to their antichain and ordered
+// by Later, and the latest of the rest is the memory. Entries whose
+// verdict did not change are shared, never copied.
+func (r *Roster) build(ps []*Device) *slot {
+	var elig, retired []*Device
+	for _, p := range ps {
+		p = r.judged(p)
+		if r.eligible(p) {
+			elig = append(elig, p)
+		} else {
+			retired = append(retired, p)
+		}
+	}
+	var held []*Device
+	for _, p := range elig {
+		dominated := false
+		for _, q := range elig {
+			if q != p && Dominates(q, p) {
+				dominated = true
+				break
+			}
+		}
+		if !dominated {
+			held = append(held, p)
+		}
+	}
+	sort.Slice(held, func(i, j int) bool { return Later(held[i], held[j]) })
+	var mem *Device
+	for _, p := range retired {
+		if mem == nil || Later(p, mem) {
+			mem = p
+		}
+	}
+	if len(held) == 0 && mem == nil {
+		return nil
+	}
+	return &slot{held: held, memory: mem}
+}
+
+// judged returns dev with its verdict re-derived: the same pointer when
+// nothing changed, a copy otherwise.
+func (r *Roster) judged(dev *Device) *Device {
+	verdict := r.verdict(dev)
+	if (verdict == nil) == (dev.dead == nil) && (verdict == nil || verdict.Error() == dev.dead.Error()) {
+		return dev
+	}
+	nd := *dev
+	nd.dead = verdict
+	return &nd
+}
+
+// sameSlot reports whether two slots keep the same entries with the same
+// verdicts.
+func sameSlot(a, b *slot) bool {
+	as, bs := a.all(), b.all()
+	if len(as) != len(bs) {
+		return false
+	}
+	for i := range as {
+		if as[i] != bs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Dominates reports whether p2 makes p1 redundant for good: p2 acknowledges
+// every removal p1 does and is the later word, so under any future removal
+// set p1 is eligible only when p2 is, and p2 wins (ADR 0019). Removals
+// never go away, so a dominated admission never comes back; dropping it on
+// arrival is what keeps a slot small.
+func Dominates(p2, p1 *Device) bool {
+	if !Later(p2, p1) {
+		return false
+	}
+	for _, id := range p1.Stmt.Payload.Acks {
+		var k [32]byte
+		copy(k[:], id)
+		if !p2.Stmt.Acknowledges(k) {
+			return false
+		}
+	}
+	return true
+}
+
+// Removals lists the root-signed removals of a device the roster knows:
+// what an admission of the device must acknowledge to be eligible.
+func (r *Roster) Removals(deviceDID string) []*statement.Statement {
+	var out []*statement.Statement
+	for _, rv := range r.revs.ForAud(deviceDID) {
+		if rv.IsRemoval() && rv.Payload.Sub == r.CircleDID() && r.rootSigned(rv) {
+			out = append(out, rv)
+		}
+	}
+	return out
+}
+
+// rootSigned reports whether a parentless statement is signed by the
+// circle's root.
+func (r *Roster) rootSigned(st *statement.Statement) bool {
+	if !st.IsRootIssued() {
+		return false
+	}
+	k, err := st.IssuerKey()
+	if err != nil {
+		return false
+	}
+	for _, rk := range r.roots.RootKeys(r.CircleDID()) {
+		if bytes.Equal(rk, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// eligible is the filter in front of the order: an admission counts for
+// its device only if it acknowledges every root removal of the device
+// known here. Admin-signed removals and the chain's other links are the
+// verdict's business (rule 3 through Check), not the filter's — retiring
+// an admin's admissions before selection would let a device spring back
+// to an older, wider root admission (ADR 0019, Chains).
+func (r *Roster) eligible(dev *Device) bool {
+	for _, rv := range r.Removals(dev.DID) {
+		if !dev.Stmt.Acknowledges(rv.ID()) {
+			return false
+		}
+	}
+	return true
+}
+
+// Acks is what a new admission of the device must carry to be eligible
+// here and to strip nothing: every root removal of the device this roster
+// knows, plus every removal its held admissions already acknowledge (a
+// restoration may reach a peer before the removal it acknowledges; a
+// renewal there must not drop it). Canonical, for statement.Payload.Acks.
+func (r *Roster) Acks(deviceDID string) [][]byte {
+	var ids [][]byte
+	for _, rv := range r.Removals(deviceDID) {
+		id := rv.ID()
+		ids = append(ids, id[:])
+	}
+	for _, d := range r.slots[deviceDID].all() {
+		ids = append(ids, d.Stmt.Payload.Acks...)
+	}
+	out, err := statement.CanonicalIDs(ids)
+	if err != nil {
+		return nil // past MaxAcks: the signer refuses, loudly
+	}
+	return out
+}
+
+// Removed reports whether the roster shows the device removed from the
+// circle with no eligible admission: what `admit` and `renew` refuse, and
+// `restore` is for.
+func (r *Roster) Removed(deviceDID string) bool {
+	return len(r.Removals(deviceDID)) > 0 && len(r.slots[deviceDID].heldOf()) == 0
+}
+
+func (s *slot) heldOf() []*Device {
+	if s == nil {
+		return nil
+	}
+	return s.held
 }
 
 // Judge answers for one admission — the one a peer presented: nil when
@@ -258,7 +475,7 @@ func (r *Roster) Judge(st *statement.Statement, now time.Time) error {
 	if dev.dead != nil {
 		return dev.dead
 	}
-	if cur := r.devices[dev.DID]; cur != nil && cur.Stmt.ID() != st.ID() && !prefer(cur, dev) && !cur.Admits(now) {
+	if cur := r.slots[dev.DID].entry(); cur != nil && cur.Stmt.ID() != st.ID() && !prefer(cur, dev) && !cur.Admits(now) {
 		if cur.dead != nil {
 			return fmt.Errorf("superseded by a later admission that is %w", cur.dead)
 		}
@@ -288,6 +505,11 @@ func (r *Roster) judge(st *statement.Statement, now time.Time) (*Device, error) 
 		return nil, errors.New("roster: statement does not grant member")
 	}
 	dev := &Device{DID: st.Payload.Aud, Stmt: st, Chain: chain, Nbf: chain.Nbf, Exp: chain.Exp}
+	if !dev.Nbf.Before(dev.Exp) {
+		// Issued under a link that had already expired: valid at no
+		// instant, so no fact worth remembering.
+		return nil, errors.New("roster: the chain's window is empty (issued under an expired link)")
+	}
 	if !now.Before(dev.Exp) {
 		if !now.Before(dev.Exp.Add(LapsedRetention)) {
 			return nil, errors.New("roster: admission expired past retention")
@@ -330,12 +552,17 @@ func prefer(cur, next *Device) bool {
 
 // verdict is the time-independent half of the §6 checklist for one
 // device: sweeps, presenting key, member verb, and revocations over the
-// chain (Check at the window's start, so only the window is skipped). A
-// sweep is checked against every link of the chain, not the leaf alone:
-// sweeping an admin desk kills what the desk admitted, as a statement
-// revocation of the desk would through Check (agy review, 2026-11-06 —
-// the web UI's revoke and `fabric revoke` arrive as sweeps).
+// chain (Check at the window's start, so only the window is skipped) —
+// removals among them, which kill every link that does not acknowledge
+// its own device's removal (the cascade: removing an admin kills what it
+// admitted). A sweep is checked against every link of the chain, not the
+// leaf alone: sweeping an admin desk kills what the desk admitted, as a
+// statement revocation of the desk would through Check (agy review,
+// 2026-11-06 — the web UI's revoke and `fabric revoke` arrive as sweeps).
 func (r *Roster) verdict(dev *Device) error {
+	if !r.eligible(dev) {
+		return errors.New("device removed from the circle; this admission does not acknowledge the removal (restore the device on an owner device)")
+	}
 	for _, links := range [][]statement.Link{dev.Chain.Auth, dev.Chain.Ident} {
 		for _, l := range links {
 			if at, ok := r.sweeps[l.Aud]; ok && l.Iat <= at {
@@ -381,8 +608,13 @@ func (r *Roster) Cap(c *statement.Compiled, want statement.Want) error {
 			if l.Sub != r.CircleDID() {
 				continue
 			}
-			dev, ok := r.devices[l.Aud]
-			if !ok {
+			for _, rv := range r.Removals(l.Aud) {
+				if !l.Stmt.Acknowledges(rv.ID()) {
+					return fmt.Errorf("%s removed from the circle", shortDID(l.Aud))
+				}
+			}
+			dev := r.slots[l.Aud].entry()
+			if dev == nil {
 				continue
 			}
 			if dev.Stmt.ID() == l.ID {
@@ -402,21 +634,20 @@ func (r *Roster) Cap(c *statement.Compiled, want statement.Want) error {
 	return nil
 }
 
-// rejudge re-derives one device's verdict in place in a cloned roster,
-// replacing the entry (never the shared one) when it changed.
-func (r *Roster) rejudge(deviceDID string) bool {
-	dev := r.devices[deviceDID]
-	if dev == nil {
-		return false
+// reslotAll rebuilds every slot in a cloned roster after its removals,
+// revocations or sweeps changed: verdicts move, an admission that missed
+// a removal that just arrived retires to memory. Shared slots are replaced,
+// never touched.
+func (r *Roster) reslotAll() {
+	for did, s := range r.slots {
+		if ns := r.build(s.all()); !sameSlot(s, ns) {
+			if ns == nil {
+				delete(r.slots, did)
+			} else {
+				r.slots[did] = ns
+			}
+		}
 	}
-	verdict := r.verdict(dev)
-	if (verdict != nil) == (dev.dead != nil) {
-		return false
-	}
-	nd := *dev
-	nd.dead = verdict
-	r.devices[deviceDID] = &nd
-	return true
 }
 
 // AddRevocation indexes a statement revocation and re-derives the verdicts
@@ -430,9 +661,7 @@ func (r *Roster) AddRevocation(st *statement.Statement) (*Roster, bool, error) {
 	}
 	nr := r.clone()
 	nr.revs = revs
-	for did := range nr.devices {
-		nr.rejudge(did)
-	}
+	nr.reslotAll()
 	return nr, true, nil
 }
 
@@ -448,16 +677,14 @@ func (r *Roster) Sweep(deviceDID string, at time.Time) (*Roster, bool) {
 	}
 	nr := r.clone()
 	nr.sweeps[deviceDID] = cut
-	for did := range nr.devices {
-		nr.rejudge(did)
-	}
+	nr.reslotAll()
 	return nr, true
 }
 
 // Live returns the device's entry if it is admitted right now — inside its
 // window, not lapsed, not dead.
 func (r *Roster) Live(deviceDID string, now time.Time) (*Device, bool) {
-	dev := r.devices[deviceDID]
+	dev := r.slots[deviceDID].entry()
 	if dev == nil || !dev.Admits(now) {
 		return nil, false
 	}
@@ -467,7 +694,7 @@ func (r *Roster) Live(deviceDID string, now time.Time) (*Device, bool) {
 // Lapsed returns the device's entry if its admission ran out unrenewed within
 // LapsedRetention: no member, but remembered.
 func (r *Roster) Lapsed(deviceDID string, now time.Time) (*Device, bool) {
-	dev := r.devices[deviceDID]
+	dev := r.slots[deviceDID].entry()
 	if dev == nil || !dev.LapsedAt(now) {
 		return nil, false
 	}
@@ -475,11 +702,12 @@ func (r *Roster) Lapsed(deviceDID string, now time.Time) (*Device, bool) {
 }
 
 // Revoked reports whether the device is refused as revoked right now, and
-// until when: a dead admission until it would have expired, or a bare sweep
-// for sweepTombstone. An entry that is not dead — live or merely lapsed —
+// until when: a dead entry (revoked, swept, or removed without an eligible
+// admission) until it would have expired, or a bare sweep for
+// sweepTombstone. An entry that is not dead — live or merely lapsed —
 // means not revoked.
 func (r *Roster) Revoked(deviceDID string, now time.Time) (time.Time, bool) {
-	if dev := r.devices[deviceDID]; dev != nil {
+	if dev := r.slots[deviceDID].entry(); dev != nil {
 		if dev.dead == nil {
 			return time.Time{}, false
 		}
@@ -500,7 +728,7 @@ func (r *Roster) Revoked(deviceDID string, now time.Time) (time.Time, bool) {
 // of its tombstone.
 func (r *Roster) Tombstones(now time.Time) map[string]time.Time {
 	out := map[string]time.Time{}
-	for did := range r.devices {
+	for did := range r.slots {
 		if until, ok := r.Revoked(did, now); ok {
 			out[did] = until
 		}
@@ -516,17 +744,24 @@ func (r *Roster) Tombstones(now time.Time) map[string]time.Time {
 	return out
 }
 
-// Device returns the roster's entry for a device whatever its verdict.
+// Device returns the roster's entry for a device whatever its verdict: the
+// latest-issued eligible admission, or the memory of a removed device.
 func (r *Roster) Device(deviceDID string) (*Device, bool) {
-	dev, ok := r.devices[deviceDID]
-	return dev, ok
+	dev := r.slots[deviceDID].entry()
+	return dev, dev != nil
+}
+
+// Held lists every admission the roster keeps for a device, entry first:
+// the eligible antichain, or the memory alone.
+func (r *Roster) Held(deviceDID string) []*Device {
+	return append([]*Device(nil), r.slots[deviceDID].all()...)
 }
 
 // Devices lists every entry by device DID.
 func (r *Roster) Devices() []*Device {
-	out := make([]*Device, 0, len(r.devices))
-	for _, dev := range r.devices {
-		out = append(out, dev)
+	out := make([]*Device, 0, len(r.slots))
+	for _, s := range r.slots {
+		out = append(out, s.entry())
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].DID < out[j].DID })
 	return out
@@ -560,10 +795,12 @@ func (r *Roster) LapsedDevices(now time.Time) []*Device {
 func (r *Roster) UsedIPs() []string {
 	seen := map[string]bool{}
 	var out []string
-	for _, dev := range r.devices {
-		if m := dev.Stmt.Payload.Meta; m != nil && m.IP != "" && !seen[m.IP] {
-			seen[m.IP] = true
-			out = append(out, m.IP)
+	for _, s := range r.slots {
+		for _, dev := range s.all() {
+			if m := dev.Stmt.Payload.Meta; m != nil && m.IP != "" && !seen[m.IP] {
+				seen[m.IP] = true
+				out = append(out, m.IP)
+			}
 		}
 	}
 	sort.Strings(out)
@@ -571,7 +808,7 @@ func (r *Roster) UsedIPs() []string {
 }
 
 // Len is the number of devices on the roster, live or not.
-func (r *Roster) Len() int { return len(r.devices) }
+func (r *Roster) Len() int { return len(r.slots) }
 
 // GC marks devices whose window closed as lapsed, drops lapsed entries past
 // their retention, and drops sweeps and revocations that can no longer kill
@@ -588,17 +825,40 @@ func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
 			changed = true
 		}
 	}
-	for did, dev := range nr.devices {
-		if !now.Before(dev.Exp.Add(LapsedRetention)) {
-			delete(nr.devices, did)
-			changed, dropped = true, true
+	for did, s := range nr.slots {
+		var kept []*Device
+		moved := false
+		for _, dev := range s.all() {
+			if !now.Before(dev.Exp.Add(LapsedRetention)) {
+				moved, dropped = true, true
+				continue
+			}
+			if !now.Before(dev.Exp) && !dev.lapsed {
+				nd := *dev
+				nd.lapsed = true
+				dev, moved = &nd, true
+			}
+			kept = append(kept, dev)
+		}
+		if !moved {
 			continue
 		}
-		if !now.Before(dev.Exp) && !dev.lapsed {
-			nd := *dev
-			nd.lapsed = true
-			nr.devices[did] = &nd
-			changed = true
+		changed = true
+		// Retention is by signed facts, so what is kept keeps its place:
+		// the held stay held, the memory stays the memory.
+		ns := &slot{}
+		for _, dev := range kept {
+			if s.memory != nil && dev.Stmt.ID() == s.memory.Stmt.ID() {
+				ns.memory = dev
+			} else {
+				ns.held = append(ns.held, dev)
+			}
+		}
+		switch {
+		case len(ns.held) == 0 && ns.memory == nil:
+			delete(nr.slots, did)
+		default:
+			nr.slots[did] = ns
 		}
 	}
 	for did, at := range nr.sweeps {
@@ -626,11 +886,13 @@ func (r *Roster) targetExpiry(rv *statement.Statement) time.Time {
 	}
 	var id [32]byte
 	copy(id[:], t.ID)
-	for _, dev := range r.devices {
-		for _, links := range [][]statement.Link{dev.Chain.Auth, dev.Chain.Ident} {
-			for _, l := range links {
-				if l.ID == id {
-					return l.Stmt.Expiry().Add(LapsedRetention)
+	for _, s := range r.slots {
+		for _, dev := range s.all() {
+			for _, links := range [][]statement.Link{dev.Chain.Auth, dev.Chain.Ident} {
+				for _, l := range links {
+					if l.ID == id {
+						return l.Stmt.Expiry().Add(LapsedRetention)
+					}
 				}
 			}
 		}
@@ -638,13 +900,16 @@ func (r *Roster) targetExpiry(rv *statement.Statement) time.Time {
 	return time.Time{}
 }
 
-// Encode is the saved form: every admission (lapsed included) as statement
-// bytes, in DID order.
+// Encode is the saved form: every admission kept (the held antichain and
+// the memory, lapsed included) as statement bytes, in DID order, entry
+// first.
 func (r *Roster) Encode() ([]byte, error) {
-	list := make([][]byte, 0, len(r.devices))
+	list := make([][]byte, 0, len(r.slots))
 	for _, dev := range r.Devices() {
-		if raw, err := dev.Stmt.Bytes(); err == nil {
-			list = append(list, raw)
+		for _, d := range r.slots[dev.DID].all() {
+			if raw, err := d.Stmt.Bytes(); err == nil {
+				list = append(list, raw)
+			}
 		}
 	}
 	return encMode.Marshal(list)

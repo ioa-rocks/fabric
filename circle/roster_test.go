@@ -1,8 +1,10 @@
 package circle
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -501,5 +503,138 @@ func TestCapJudgesLinksByTheirOwnCircle(t *testing.T) {
 	}
 	if err := rx.Cap(c, want); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// ADR 0019: a removal retires every admission of the device that does not
+// acknowledge it, whenever issued; the roster remembers the retired one
+// (address and terms) and reports the device removed; a restoration is an
+// admission carrying the removal's ID, and `Acks` is what it must carry.
+func TestRemovalRetiresUnacknowledgedAdmissions(t *testing.T) {
+	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
+	circleDID := did.ForKey(rootPub)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	devDID := did.ForKey(devPub)
+	t0 := time.Now().Add(-time.Hour)
+	r := NewRoster(statement.NewDIDRoot(circleDID))
+	a1, _ := AdmitWith(rootPriv, nil, circleDID, devPub, t0, 24*time.Hour, append(DeviceVerbs, statement.VerbTun), &statement.Meta{Name: "nas", IP: "100.64.0.7/24"})
+	r, _, _ = r.Add(a1.Stmt, t0)
+	if _, ok := r.Live(devDID, t0.Add(time.Minute)); !ok {
+		t.Fatal("not live")
+	}
+	removal, err := Revoke(rootPriv, devDID, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, fresh, err := r.AddRevocation(removal.Stmt)
+	if err != nil || !fresh {
+		t.Fatalf("AddRevocation: %v %v", fresh, err)
+	}
+	now := t0.Add(2 * time.Minute)
+	if _, ok := r.Revoked(devDID, now); !ok {
+		t.Fatal("removed device not reported revoked")
+	}
+	if !r.Removed(devDID) {
+		t.Fatal("Removed is false after a removal with nothing eligible")
+	}
+	if ips := r.UsedIPs(); len(ips) != 1 || ips[0] != "100.64.0.7/24" {
+		t.Fatalf("the removed device's address is not held: %v", ips)
+	}
+	// A later admission that never saw the removal does not count — the
+	// hole the ADR closes — and becomes the memory instead.
+	stale, _ := AdmitFor(rootPriv, devPub, now, time.Hour)
+	r, fresh, _ = r.Add(stale.Stmt, now)
+	if !fresh {
+		t.Fatal("the stale admission was not even remembered")
+	}
+	if _, ok := r.Live(devDID, now); ok {
+		t.Fatal("an admission that does not acknowledge the removal readmitted the device")
+	}
+	if entry, _ := r.Device(devDID); entry.Stmt.ID() != stale.Stmt.ID() || entry.Dead() == nil {
+		t.Fatal("the memory is not the latest retired admission, dead")
+	}
+	if err := r.Judge(stale.Stmt, now); err == nil || !strings.Contains(err.Error(), "removed") {
+		t.Fatalf("Judge of the stale admission: %v", err)
+	}
+	// Acks names the removal; a renewal carrying it is a restoration, on
+	// the remembered terms.
+	acks := r.Acks(devDID)
+	rid := removal.Stmt.ID()
+	if len(acks) != 1 || !bytes.Equal(acks[0], rid[:]) {
+		t.Fatalf("Acks = %x", acks)
+	}
+	restored, err := RenewWith(rootPriv, a1.Stmt, circleDID, devPub, now.Add(time.Second), time.Hour, acks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _, _ = r.Add(restored.Stmt, now.Add(time.Second))
+	live, ok := r.Live(devDID, now.Add(2*time.Second))
+	if !ok || live.Stmt.ID() != restored.Stmt.ID() || live.Stmt.Payload.Meta.IP != "100.64.0.7/24" {
+		t.Fatal("restoration is not live with the device's terms")
+	}
+	if r.Removed(devDID) {
+		t.Fatal("Removed stays true after a restoration")
+	}
+	// The restoration inherits the acknowledgment into the next renewal:
+	// Acks still names the removal though the device is back.
+	if acks := r.Acks(devDID); len(acks) != 1 {
+		t.Fatalf("Acks after restoration = %x", acks)
+	}
+	// The restoration and the memory are both kept.
+	if n := len(r.Held(devDID)); n != 2 {
+		t.Fatalf("held %d, want the restoration and the memory", n)
+	}
+}
+
+// The device slot is an antichain, not a register: with removal R,
+// restoration S (acks {R}) and a stale renewal N (acks ∅, later issue
+// time), a peer receiving S, N, R and one receiving R, S, N must agree
+// (agy's trace, ADR 0019).
+func TestSlotIsAnAntichainNotARegister(t *testing.T) {
+	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
+	circleDID := did.ForKey(rootPub)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	devDID := did.ForKey(devPub)
+	t0 := time.Now().Add(-time.Hour)
+	R, _ := Revoke(rootPriv, devDID, t0)
+	rid := R.Stmt.ID()
+	S, _ := Issue(rootPriv, nil, circleDID, devPub, t0.Add(time.Second), time.Hour, Terms{Verbs: DeviceVerbs, Acks: [][]byte{rid[:]}})
+	N, _ := AdmitFor(rootPriv, devPub, t0.Add(2*time.Second), time.Hour)
+	now := t0.Add(3 * time.Second)
+	run := func(order ...string) *Roster {
+		r := NewRoster(statement.NewDIDRoot(circleDID))
+		for _, o := range order {
+			switch o {
+			case "R":
+				r, _, _ = r.AddRevocation(R.Stmt)
+			case "S":
+				r, _, _ = r.Add(S.Stmt, now)
+			case "N":
+				r, _, _ = r.Add(N.Stmt, now)
+			}
+		}
+		return r
+	}
+	for _, order := range [][]string{{"S", "N", "R"}, {"R", "S", "N"}, {"N", "S", "R"}, {"R", "N", "S"}, {"S", "R", "N"}, {"N", "R", "S"}} {
+		r := run(order...)
+		live, ok := r.Live(devDID, now)
+		if !ok || live.Stmt.ID() != S.Stmt.ID() {
+			t.Fatalf("order %v: the restoration is not the entry", order)
+		}
+	}
+	// Before R arrives both S and N are held — neither dominates the other,
+	// since S acknowledges something N does not; N is the entry meanwhile.
+	r := run("S", "N")
+	if n := len(r.Held(devDID)); n != 2 {
+		t.Fatalf("held %d before the removal, want 2", n)
+	}
+	if entry, _ := r.Device(devDID); entry.Stmt.ID() != N.Stmt.ID() {
+		t.Fatal("the later renewal is not the entry before the removal is known")
+	}
+	// A later admission acknowledging R dominates S and N alike: one held.
+	T, _ := Issue(rootPriv, nil, circleDID, devPub, t0.Add(4*time.Second), time.Hour, Terms{Verbs: DeviceVerbs, Acks: [][]byte{rid[:]}})
+	r, _, _ = r.Add(T.Stmt, now.Add(time.Second))
+	if n := len(r.Held(devDID)); n != 1 {
+		t.Fatalf("held %d after a dominating admission, want 1", n)
 	}
 }

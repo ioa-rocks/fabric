@@ -56,7 +56,10 @@ func (s *RevocationSet) Add(r *Statement) (bool, error) {
 	}
 	t := r.Payload.Target
 	if t == nil || (len(t.ID) == 0 && t.Aud == "") || (len(t.ID) != 0 && t.Aud != "") {
-		return false, errors.New("revocation target must be id or aud+before")
+		return false, errors.New("revocation target must be id or aud")
+	}
+	if t.Aud != "" && r.Payload.V >= 2 && t.Before != 0 {
+		return false, errors.New("a removal carries no before")
 	}
 	if len(t.ID) != 0 && len(t.ID) != 32 {
 		return false, errors.New("revocation target id is not a sha256")
@@ -103,6 +106,14 @@ func (s *RevocationSet) Candidates(id [32]byte, aud string) []*Statement {
 	defer s.mu.RUnlock()
 	out := append([]*Statement(nil), s.byID[id]...)
 	return append(out, s.byAud[aud]...)
+}
+
+// ForAud lists the indexed revocations whose target is the device aud:
+// removals and legacy sweeps, root-signed or riding a chain.
+func (s *RevocationSet) ForAud(aud string) []*Statement {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]*Statement(nil), s.byAud[aud]...)
 }
 
 // All returns every indexed revocation.
@@ -182,10 +193,17 @@ func Spent(r *Statement, targetExp time.Time, now time.Time) bool {
 		// roster passes the target's expiry once a chain it holds carries
 		// the ID; the circle's file keeps the record until then.
 		return false
+	case r.IsRemoval():
+		// Kept for good (ADR 0019): a positive that never acknowledged it
+		// may arrive at any time — nothing fences an offline root holder,
+		// so no age bounds a removal's relevance. Removals are rare and
+		// small.
+		return false
 	default:
-		// A sweep's kill condition is iat <= before, and an admission
-		// expires by iat + MaxValidity, so before + MaxValidity covers
-		// every admission it can kill: this bound is verified, not assumed.
+		// A legacy sweep's kill condition is iat <= before, and an
+		// admission expires by iat + MaxValidity, so before + MaxValidity
+		// covers every admission it can kill: this bound is verified, not
+		// assumed.
 		return !now.Before(time.Unix(t.Before, 0).Add(MaxValidity))
 	}
 }

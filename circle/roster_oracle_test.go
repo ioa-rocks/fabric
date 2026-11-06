@@ -13,43 +13,52 @@ import (
 
 	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/statement"
+	"ioa.rocks/fabric/statement/statementtest"
 )
 
-// The oracle is the ledger's four rules written as plainly as possible, with
-// no care for memory or speed, and the roster is checked against it over
-// random scripts of admissions, by-ID revocations and sweeps, fed in order
-// and then again shuffled. It knows nothing but the rules, so it never
-// grows with the implementation: a change that needs the oracle to learn
+// The oracle is the ledger's rules (ADR 0019) written as plainly as
+// possible, with no care for memory or speed, and the roster is checked
+// against it over random scripts of admissions — root- and desk-issued,
+// acknowledging all, some or none of the removals their issuer could have
+// seen — by-ID revocations, removals and legacy sweeps, fed in order and
+// then again shuffled. It knows nothing but the rules, so it never grows
+// with the implementation: a change that needs the oracle to learn
 // something is a change to the rules, to be made on purpose.
 //
-//  1. Within one key the latest-issued admission for a device supersedes
-//     (issue time, then expiry, then statement ID).
-//  2. Revocations and sweeps only grow.
-//  3. Nothing supersedes across keys: another key's admissions are not facts.
+//  1. An admission is eligible for its device only if it acknowledges every
+//     root removal of the device. Among the eligible ones the latest-issued
+//     is the device's entry (issue time, then the chain's expiry, then
+//     statement ID). No fallback: if the entry is dead the device is out.
+//  2. Revocations, removals and sweeps only grow. An admission is dead
+//     when any link of its chain is revoked by ID, swept (issued up to the
+//     cut) or names a removed device without acknowledging the removal.
+//  3. Nothing supersedes across keys: another key's admissions are not
+//     facts. Nor is an admission whose chain has no window (issued under a
+//     link that had already expired): it is refused on arrival.
 //  4. GC drops the expired — past LapsedRetention an admission is no fact.
+//     Removals are kept for good.
 //
-// A roster keeps one entry per device and forgets what it superseded, so
-// once GC has dropped the entry a superseded admission can be replayed and
-// stand as the roster's memory of the device. The membership verdict must
-// not move for that — the retention is at least the longest window, so
-// anything revivable has expired — but the memory may: inside the
-// retention the roster is held to the oracle exactly, past it on
-// membership (live, revoked) only. Codex review, 2026-11-05: a 400-day
-// admission superseded by a one-second one came back live for 35 days at
-// the 365-day retention.
+// A roster keeps, per device, the antichain of its eligible admissions
+// and forgets the dominated ones, so once GC has dropped an entry a
+// forgotten admission can be replayed and stand as the roster's memory of
+// the device. The membership verdict must not move for that — the
+// retention is at least the longest window, so anything revivable has
+// expired — but the memory may: inside the retention the roster is held
+// to the oracle exactly, past it on membership (live, revoked) only.
 type oracle struct {
-	circle  string
-	adms    []*Admission
-	revoked map[[32]byte]bool
-	swept   map[string]int64 // device DID -> latest cut: admissions issued up to it are dead
+	circle   string
+	adms     []*Admission
+	revoked  map[[32]byte]bool
+	swept    map[string]int64      // device DID -> latest cut: admissions issued up to it are dead
+	removals map[string][][32]byte // device DID -> root removals, kept for good
 }
 
 func newOracle(circleDID string) *oracle {
-	return &oracle{circle: circleDID, revoked: map[[32]byte]bool{}, swept: map[string]int64{}}
+	return &oracle{circle: circleDID, revoked: map[[32]byte]bool{}, swept: map[string]int64{}, removals: map[string][][32]byte{}}
 }
 
 func (o *oracle) admit(a *Admission) {
-	if a.Stmt.Payload.Sub == o.circle { // rule 3
+	if a.Stmt.Payload.Sub == o.circle && chainNbf(a).Before(chainExp(a)) { // rule 3
 		o.adms = append(o.adms, a)
 	}
 }
@@ -62,36 +71,103 @@ func (o *oracle) sweep(dev string, before int64) {
 	}
 }
 
-// later is rule 1.
+func (o *oracle) remove(dev string, id [32]byte) {
+	for _, have := range o.removals[dev] {
+		if have == id {
+			return
+		}
+	}
+	o.removals[dev] = append(o.removals[dev], id)
+}
+
+// chainExp and chainNbf are the window of the whole chain, as the roster
+// judges it.
+func chainExp(a *Admission) time.Time {
+	exp := a.Expiry()
+	for _, l := range a.Stmt.Chain() {
+		if l.Expiry().Before(exp) {
+			exp = l.Expiry()
+		}
+	}
+	return exp
+}
+
+func chainNbf(a *Admission) time.Time {
+	nbf := a.NotBefore()
+	for _, l := range a.Stmt.Chain() {
+		if l.NotBefore().After(nbf) {
+			nbf = l.NotBefore()
+		}
+	}
+	return nbf
+}
+
+// later is rule 1's order.
 func later(a, b *Admission) bool {
 	if ai, bi := a.Stmt.Payload.Iat, b.Stmt.Payload.Iat; ai != bi {
 		return ai > bi
 	}
-	if !a.Expiry().Equal(b.Expiry()) {
-		return a.Expiry().After(b.Expiry())
+	if ae, be := chainExp(a), chainExp(b); !ae.Equal(be) {
+		return ae.After(be)
 	}
 	ai, bi := a.Stmt.ID(), b.Stmt.ID()
 	return bytes.Compare(ai[:], bi[:]) > 0
 }
 
-// pick is the circle's latest word on the device among the admissions
-// still facts at now (rule 4).
+// eligible is rule 1's filter.
+func (o *oracle) eligible(a *Admission) bool {
+	for _, id := range o.removals[a.Stmt.Payload.Aud] {
+		if !a.Stmt.Acknowledges(id) {
+			return false
+		}
+	}
+	return true
+}
+
+// pick is the circle's latest word on the device among the eligible
+// admissions still facts at now (rule 4).
 func (o *oracle) pick(dev string, now time.Time) *Admission {
 	var best *Admission
 	for _, a := range o.adms {
-		if !now.Before(a.Expiry().Add(LapsedRetention)) {
+		if a.Stmt.Payload.Aud != dev || !now.Before(chainExp(a).Add(LapsedRetention)) || !o.eligible(a) {
 			continue
 		}
-		if a.Stmt.Payload.Aud == dev && (best == nil || later(a, best)) {
+		if best == nil || later(a, best) {
 			best = a
 		}
 	}
 	return best
 }
 
-// dead says whether rule 2 has killed the admission.
+// memory is the latest admission of a removed device that missed a removal
+// and is still a fact: what the roster remembers the device by.
+func (o *oracle) memory(dev string, now time.Time) *Admission {
+	var best *Admission
+	for _, a := range o.adms {
+		if a.Stmt.Payload.Aud != dev || !now.Before(chainExp(a).Add(LapsedRetention)) || o.eligible(a) {
+			continue
+		}
+		if best == nil || later(a, best) {
+			best = a
+		}
+	}
+	return best
+}
+
+// dead says whether rule 2 has killed the admission, through any link of
+// its chain.
 func (o *oracle) dead(a *Admission) bool {
-	return o.revoked[a.Stmt.ID()] || a.Stmt.Payload.Iat <= o.swept[a.Stmt.Payload.Aud]
+	for _, l := range a.Stmt.Chain() {
+		if o.revoked[l.ID()] || l.Payload.Iat <= o.swept[l.Payload.Aud] {
+			return true
+		}
+		for _, id := range o.removals[l.Payload.Aud] {
+			if !l.Acknowledges(id) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type standing string
@@ -104,34 +180,51 @@ const (
 	expired standing = "dead and expired" // the roster reports neither live, lapsed nor revoked
 )
 
+// entry is what the roster's Device should return: the pick, else the memory.
+func (o *oracle) entry(dev string, now time.Time) *Admission {
+	if a := o.pick(dev, now); a != nil {
+		return a
+	}
+	return o.memory(dev, now)
+}
+
 func (o *oracle) standing(dev string, now time.Time) standing {
 	a := o.pick(dev, now)
+	if a == nil {
+		m := o.memory(dev, now)
+		switch {
+		case m == nil:
+			return absent
+		case now.Before(chainExp(m)):
+			return revoked
+		default:
+			return expired
+		}
+	}
 	switch {
-	case a == nil:
-		return absent
-	case o.dead(a) && now.Before(a.Expiry()):
+	case o.dead(a) && now.Before(chainExp(a)):
 		return revoked
 	case o.dead(a):
 		return expired
-	case now.Before(a.Expiry()):
+	case now.Before(chainExp(a)):
 		return live
 	default:
 		return lapsed
 	}
 }
 
-// admits is the handshake's answer for one presented admission: it must
-// verify on its own, and a later word on the device may stand over it only
-// if that word admits the device right now.
+// admits is the handshake's answer for one presented admission: it must be
+// eligible and verify on its own, and a later word on the device may stand
+// over it only if that word admits the device right now.
 func (o *oracle) admits(a *Admission, now time.Time) bool {
-	if o.dead(a) || now.Before(a.Stmt.NotBefore()) || !now.Before(a.Expiry()) {
+	if !o.eligible(a) || o.dead(a) || now.Before(chainNbf(a)) || !now.Before(chainExp(a)) {
 		return false
 	}
 	p := o.pick(a.Stmt.Payload.Aud, now)
 	if p == nil || p.Stmt.ID() == a.Stmt.ID() || !later(p, a) {
 		return true
 	}
-	return !o.dead(p) && !now.Before(p.Stmt.NotBefore()) && now.Before(p.Expiry())
+	return !o.dead(p) && !now.Before(chainNbf(p)) && now.Before(chainExp(p))
 }
 
 // member reduces a standing to what transport acts on.
@@ -160,34 +253,50 @@ func rosterStanding(r *Roster, dev string, now time.Time) standing {
 
 // op is one step of a script: exactly one field set, applied at `at`.
 type op struct {
-	at    time.Time
-	admit *Admission
-	rev   *Revocation // by ID
-	sweep *Revocation // aud + before
-	tick  bool
+	at      time.Time
+	admit   *Admission
+	rev     *Revocation // by ID
+	sweep   *Revocation // legacy: aud + before
+	removal *Revocation // aud
+	tick    bool
 }
 
 func (o op) String() string {
 	switch {
 	case o.admit != nil:
-		return fmt.Sprintf("admit %s by %s iat=%d exp=%d", shortDID(o.admit.Stmt.Payload.Aud), shortDID(o.admit.Stmt.Payload.Sub), o.admit.Stmt.Payload.Iat, o.admit.Stmt.Payload.Exp)
+		by := "root"
+		if !o.admit.Stmt.IsRootIssued() {
+			by = "desk"
+		}
+		return fmt.Sprintf("admit %s by %s iat=%d exp=%d acks=%d", shortDID(o.admit.Stmt.Payload.Aud), by, o.admit.Stmt.Payload.Iat, chainExp(o.admit).Unix(), len(o.admit.Acks()))
 	case o.rev != nil:
 		return fmt.Sprintf("revoke id %x…", o.rev.TargetID[:4])
 	case o.sweep != nil:
 		return fmt.Sprintf("sweep %s before=%d", shortDID(o.sweep.Device), o.sweep.At)
+	case o.removal != nil:
+		return fmt.Sprintf("remove %s (%x…)", shortDID(o.removal.Device), o.removal.Stmt.IDHex()[:8])
 	default:
 		return "tick"
 	}
 }
 
-func apply(r *Roster, o op) *Roster {
+func (o op) revocation() *Revocation {
 	switch {
-	case o.admit != nil:
-		r, _, _ = r.Add(o.admit.Stmt, o.at)
 	case o.rev != nil:
-		r, _, _ = r.AddRevocation(o.rev.Stmt)
+		return o.rev
 	case o.sweep != nil:
-		r, _, _ = r.AddRevocation(o.sweep.Stmt)
+		return o.sweep
+	case o.removal != nil:
+		return o.removal
+	}
+	return nil
+}
+
+func apply(r *Roster, o op) *Roster {
+	if o.admit != nil {
+		r, _, _ = r.Add(o.admit.Stmt, o.at)
+	} else if rv := o.revocation(); rv != nil {
+		r, _, _ = r.AddRevocation(rv.Stmt)
 	}
 	return r
 }
@@ -202,43 +311,127 @@ func (o *oracle) apply(p op) {
 		o.revoke(id)
 	case p.sweep != nil:
 		o.sweep(p.sweep.Device, p.sweep.At)
+	case p.removal != nil:
+		o.remove(p.removal.Device, p.removal.Stmt.ID())
 	}
+}
+
+// cast is the circle of a script: the root, one admin desk, the devices,
+// and a foreign root whose admissions are not facts.
+type cast struct {
+	rootPriv, deskPriv, foreignPriv ed25519.PrivateKey
+	deskPub                         ed25519.PublicKey
+	devs                            []ed25519.PublicKey
+	circleDID, deskDID, foreignDID  string
+}
+
+var deskVerbs = append(append([]string(nil), DeviceVerbs...), statement.VerbAdmin, statement.VerbTun)
+
+// deskAdmission is the root's admission of the desk: admin, delegable, on
+// the acks given.
+func (c *cast) deskAdmission(at time.Time, validity time.Duration, acks [][]byte) *Admission {
+	st, err := statement.Sign(c.rootPriv, statement.Payload{
+		Aud: c.deskDID, Sub: c.circleDID,
+		Res:   []statement.Resource{{Kind: statement.Any, Name: statement.Any, Sub: statement.Any}},
+		Verbs: deskVerbs, Meta: &statement.Meta{Name: "desk"}, Del: 3,
+		Iat: at.Unix(), Nbf: at.Unix(), Exp: at.Add(validity).Unix(), Acks: acks,
+	}, nil)
+	if err != nil {
+		panic(err)
+	}
+	a, err := fromStatement(st)
+	if err != nil {
+		panic(err)
+	}
+	return a
 }
 
 // script draws a random sequence of operations over a few devices. Issue
 // times tie often (same second), validities run from a second to the
 // longest allowed and the clock advances up to three days a step, so
-// admissions expire, get renewed, revoked and swept mid-script in every
-// combination, and long windows outlive short later ones by far more than
-// the retention lasts after the short ones.
-func script(rng *mrand.Rand, rootPriv ed25519.PrivateKey, foreignPriv ed25519.PrivateKey, devs []ed25519.PublicKey, t0 time.Time, steps int) []op {
-	circleDID := did.ForKey(rootPriv.Public().(ed25519.PublicKey))
-	foreignDID := did.ForKey(foreignPriv.Public().(ed25519.PublicKey))
+// admissions expire, get renewed, revoked, removed, restored and swept
+// mid-script in every combination, long windows outlive short later ones
+// by far more than the retention lasts after the short ones, and a
+// renewal may be signed by an issuer that saw all, some or none of the
+// device's removals (a laptop offline for a week; an admin restored from
+// backup).
+func script(rng *mrand.Rand, c *cast, t0 time.Time, steps int) []op {
 	validities := []time.Duration{time.Second, time.Minute, time.Hour, 24 * time.Hour, 7 * 24 * time.Hour, 30 * 24 * time.Hour, 200 * 24 * time.Hour, statement.MaxValidity}
 	clock := t0
 	var ops []op
 	var seen []*Admission
+	removals := map[string][][]byte{} // what an issuer could acknowledge
+	acksFor := func(dev string) [][]byte {
+		all := removals[dev]
+		switch rng.Intn(3) {
+		case 0:
+			return all // saw everything
+		case 1:
+			return nil // saw nothing
+		default:
+			var some [][]byte
+			for _, id := range all {
+				if rng.Intn(2) == 0 {
+					some = append(some, id)
+				}
+			}
+			return some
+		}
+	}
+	// The desk is admitted first and lives a long time; it is re-admitted
+	// (restored or not) now and then, and devices are admitted under its
+	// latest admission.
+	desk := c.deskAdmission(clock, statement.MaxValidity, nil)
+	ops = append(ops, op{at: clock, admit: desk})
+	seen = append(seen, desk)
 	for i := 0; i < steps; i++ {
 		if rng.Intn(5) > 1 {
 			clock = clock.Add(time.Duration(1+rng.Int63n(int64(3*24*time.Hour/time.Second))) * time.Second)
 		}
-		dev := devs[rng.Intn(len(devs))]
+		dev := c.devs[rng.Intn(len(c.devs))]
+		devDID := did.ForKey(dev)
 		var o op
 		o.at = clock
-		switch k := rng.Intn(20); {
-		case k < 10:
-			a, _ := AdmitFor(rootPriv, dev, clock, validities[rng.Intn(len(validities))])
+		switch k := rng.Intn(24); {
+		case k < 8:
+			a, err := Issue(c.rootPriv, nil, c.circleDID, dev, clock, validities[rng.Intn(len(validities))], Terms{Verbs: DeviceVerbs, Acks: acksFor(devDID)})
+			if err != nil {
+				panic(err)
+			}
+			seen = append(seen, a)
+			o.admit = a
+		case k < 11:
+			a, err := Issue(c.deskPriv, desk.Stmt, c.circleDID, dev, clock, validities[rng.Intn(len(validities))], Terms{Verbs: DeviceVerbs, Acks: acksFor(devDID)})
+			if err != nil {
+				panic(err)
+			}
 			seen = append(seen, a)
 			o.admit = a
 		case k < 12:
-			a, _ := AdmitWith(foreignPriv, nil, foreignDID, dev, clock, 24*time.Hour, DeviceVerbs, nil)
+			desk = c.deskAdmission(clock, validities[4+rng.Intn(len(validities)-4)], acksFor(c.deskDID))
+			seen = append(seen, desk)
+			o.admit = desk
+		case k < 13:
+			a, _ := AdmitWith(c.foreignPriv, nil, c.foreignDID, dev, clock, 24*time.Hour, DeviceVerbs, nil)
 			o.admit = a
-		case k < 15 && len(seen) > 0:
+		case k < 16 && len(seen) > 0:
 			id := seen[rng.Intn(len(seen))].Stmt.ID()
-			o.rev, _ = RevokeAs(rootPriv, nil, circleDID, statement.Target{ID: id[:]}, clock)
+			o.rev, _ = RevokeAs(c.rootPriv, nil, c.circleDID, statement.Target{ID: id[:]}, clock)
 		case k < 18:
 			before := clock.Add(-time.Duration(rng.Int63n(int64(2*24*time.Hour/time.Second))) * time.Second)
-			o.sweep, _ = RevokeAs(rootPriv, nil, circleDID, statement.Target{Aud: did.ForKey(dev), Before: before.Unix()}, clock)
+			st, err := statementtest.SweepV1(c.rootPriv, c.circleDID, nil, devDID, before.Unix(), clock.Unix())
+			if err != nil {
+				panic(err)
+			}
+			o.sweep, _ = RevocationFromStatement(st)
+		case k < 21:
+			target := devDID
+			if rng.Intn(4) == 0 {
+				target = c.deskDID
+			}
+			o.removal, _ = RevokeAs(c.rootPriv, nil, c.circleDID, statement.Target{Aud: target}, clock)
+			id := o.removal.Stmt.ID()
+			removals[target] = append(removals[target], id[:])
 		default:
 			o.tick = true
 		}
@@ -259,15 +452,20 @@ func TestRosterAgreesWithTheOracle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, foreignPriv, _ := ed25519.GenerateKey(rand.Reader)
-	circleDID := c.Config.DID
-	var devs []ed25519.PublicKey
+	cs := &cast{rootPriv: rootPriv, circleDID: c.Config.DID}
+	cs.deskPub, cs.deskPriv, _ = ed25519.GenerateKey(rand.Reader)
+	cs.deskDID = did.ForKey(cs.deskPub)
+	var foreignPub ed25519.PublicKey
+	foreignPub, cs.foreignPriv, _ = ed25519.GenerateKey(rand.Reader)
+	cs.foreignDID = did.ForKey(foreignPub)
 	var devDIDs []string
 	for i := 0; i < 3; i++ {
 		pub, _, _ := ed25519.GenerateKey(rand.Reader)
-		devs = append(devs, pub)
+		cs.devs = append(cs.devs, pub)
 		devDIDs = append(devDIDs, did.ForKey(pub))
 	}
+	devDIDs = append(devDIDs, cs.deskDID)
+	circleDID := c.Config.DID
 	t0 := time.Now().Truncate(time.Second)
 	seeds := 150
 	if testing.Short() {
@@ -275,7 +473,7 @@ func TestRosterAgreesWithTheOracle(t *testing.T) {
 	}
 	for seed := 1; seed <= seeds; seed++ {
 		rng := mrand.New(mrand.NewSource(int64(seed)))
-		ops := script(rng, rootPriv, foreignPriv, devs, t0, 24)
+		ops := script(rng, cs, t0, 28)
 		fail := func(format string, args ...any) {
 			t.Helper()
 			var trace bytes.Buffer
@@ -296,9 +494,21 @@ func TestRosterAgreesWithTheOracle(t *testing.T) {
 				if want != got {
 					fail("%s: device %s is %s, oracle says %s", where, shortDID(dev), got, want)
 				}
-				if p := o.pick(dev, now); p != nil && exact {
+				if !exact {
+					continue
+				}
+				if p := o.entry(dev, now); p != nil {
 					if entry, ok := r.Device(dev); !ok || entry.Stmt.ID() != p.Stmt.ID() {
-						fail("%s: device %s: the roster's entry is not the latest-issued admission", where, shortDID(dev))
+						fail("%s: device %s: the roster's entry is not the oracle's", where, shortDID(dev))
+					}
+				}
+				// The held set is an antichain of eligible admissions.
+				held := r.Held(dev)
+				for i, p := range held {
+					for j, q := range held {
+						if i != j && Dominates(q, p) && r.eligible(p) && r.eligible(q) {
+							fail("%s: device %s holds a dominated admission", where, shortDID(dev))
+						}
 					}
 				}
 			}
@@ -324,11 +534,8 @@ func TestRosterAgreesWithTheOracle(t *testing.T) {
 		o := newOracle(circleDID)
 		var revocations []*Revocation
 		for _, p := range ops {
-			if p.rev != nil {
-				revocations = append(revocations, p.rev)
-			}
-			if p.sweep != nil {
-				revocations = append(revocations, p.sweep)
+			if rv := p.revocation(); rv != nil {
+				revocations = append(revocations, rv)
 			}
 		}
 		for i, p := range ops {
@@ -358,7 +565,7 @@ func TestRosterAgreesWithTheOracle(t *testing.T) {
 		var instants []time.Time
 		for _, a := range o.adms {
 			for _, d := range []time.Duration{time.Second, LapsedRetention + time.Second} {
-				if x := a.Expiry().Add(d); x.After(end) {
+				if x := chainExp(a).Add(d); x.After(end) {
 					instants = append(instants, x)
 				}
 			}

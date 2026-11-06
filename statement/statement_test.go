@@ -3,6 +3,7 @@ package statement
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"strings"
 	"testing"
 	"time"
@@ -350,9 +351,9 @@ func TestRevocationRule3(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The root kills anything, here by sweeping the device key up to now;
-	// a statement issued after `before` stands.
-	r, _ = Revoke(h.root.priv, h.did, nil, Target{Aud: h.dev.did, Before: t0.Unix()}, t0.Add(time.Minute))
+	// The root kills anything, here by a legacy sweep of the device key up
+	// to now; a statement issued after `before` stands.
+	r = sweepV1(t, h.root.priv, h.did, nil, h.dev.did, t0.Unix(), t0.Add(time.Minute).Unix())
 	revs.Add(r)
 	mustFail(t, ok(h.devA, h.dev.did), "revoked by the root")
 	later, _ := Sign(h.desk.priv, Payload{Aud: h.dev.did, Sub: h.did, Res: all, Verbs: []string{VerbMember},
@@ -518,9 +519,200 @@ func TestRevocationSetShapeChecks(t *testing.T) {
 	if !Spent(r, time.Time{}, h.deskA.Expiry()) {
 		t.Fatal("non-root revocation should die with its chain")
 	}
-	sweep, _ := Revoke(h.root.priv, h.did, nil, Target{Aud: h.dev.did, Before: t0.Unix()}, t0)
+	// A removal is kept for good; a legacy sweep for before + MaxValidity.
+	removal, err := Revoke(h.root.priv, h.did, nil, Target{Aud: h.dev.did}, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Spent(removal, time.Time{}, t0.Add(100*MaxValidity)) {
+		t.Fatal("a removal is never spent")
+	}
+	sweep := sweepV1(t, h.root.priv, h.did, nil, h.dev.did, t0.Unix(), t0.Unix())
 	if Spent(sweep, time.Time{}, t0.Add(MaxValidity-time.Hour)) || !Spent(sweep, time.Time{}, t0.Add(MaxValidity)) {
 		t.Fatal("sweep retention wrong")
+	}
+	// The sweep is a version-1 form: the signer refuses it.
+	if _, err := Revoke(h.root.priv, h.did, nil, Target{Aud: h.dev.did, Before: t0.Unix()}, t0); err == nil {
+		t.Fatal("a sweep was signed at version 2")
+	}
+}
+
+// sweepV1 builds a legacy sweep by hand (statementtest.SweepV1 cannot be
+// imported here without a cycle): the version-1 form with its cut.
+func sweepV1(t *testing.T, priv ed25519.PrivateKey, sub string, own *Statement, dev string, before, now int64) *Statement {
+	t.Helper()
+	s, err := signVersion(1, priv, Payload{Typ: TypeRevoke, Sub: sub, Iat: now, At: now, Target: &Target{Aud: dev, Before: before}}, own)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// signVersion is Sign at a chosen format version, shape checks skipped: how
+// a test produces what another version of this binary would have signed.
+func signVersion(v int, priv ed25519.PrivateKey, p Payload, parent *Statement) (*Statement, error) {
+	p.V = v
+	if p.Typ == "" {
+		p.Typ = TypeAssert
+	}
+	p.Iss = did.ForKey(priv.Public().(ed25519.PublicKey))
+	if parent != nil {
+		pb, err := parent.Bytes()
+		if err != nil {
+			return nil, err
+		}
+		p.Prf = [][]byte{pb}
+	} else {
+		p.Prf = [][]byte{}
+	}
+	if p.Nonce == nil {
+		p.Nonce = make([]byte, nonceSize)
+		rand.Read(p.Nonce)
+	}
+	msg, err := encMode.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := encMode.Marshal(wire{Payload: msg, Sig: ed25519.Sign(priv, msg)})
+	if err != nil {
+		return nil, err
+	}
+	return Decode(raw)
+}
+
+func TestVersionWindow(t *testing.T) {
+	h := newHome(t)
+	// Version 1 still reads; 3 does not; a signed statement is version 2.
+	if h.devA.Payload.V != Version || Version != 2 {
+		t.Fatalf("signed at version %d", h.devA.Payload.V)
+	}
+	v1, err := signVersion(1, h.root.priv, Payload{Aud: h.dev.did, Sub: h.did, Res: all, Verbs: []string{VerbMember},
+		Iat: t0.Unix(), Nbf: t0.Unix(), Exp: t0.Add(time.Hour).Unix()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Compile(v1, nil, h.did, h.roots); err != nil {
+		t.Fatalf("version 1 does not verify: %v", err)
+	}
+	_, err = signVersion(3, h.root.priv, Payload{Aud: h.dev.did, Sub: h.did, Res: all, Verbs: []string{VerbMember},
+		Iat: t0.Unix(), Nbf: t0.Unix(), Exp: t0.Add(time.Hour).Unix()}, nil)
+	mustFail(t, err, "version 3")
+	// Shape by version: acks on a version-1 statement, a cut on a
+	// version-2 aud target, acks on a revoke, a non-canonical set.
+	id := h.devA.ID()
+	base := Payload{Aud: h.dev.did, Sub: h.did, Res: all, Verbs: []string{VerbMember}, Iat: t0.Unix(), Nbf: t0.Unix(), Exp: t0.Add(time.Hour).Unix()}
+	p := base
+	p.Acks = [][]byte{id[:]}
+	_, err = signVersion(1, h.root.priv, p, nil)
+	mustFail(t, err, "acks on a version-1")
+	_, err = signVersion(2, h.root.priv, Payload{Typ: TypeRevoke, Sub: h.did, Iat: t0.Unix(), Target: &Target{Aud: h.dev.did, Before: t0.Unix()}}, nil)
+	mustFail(t, err, "carries no before")
+	_, err = signVersion(2, h.root.priv, Payload{Typ: TypeRevoke, Sub: h.did, Iat: t0.Unix(), Target: &Target{Aud: h.dev.did}, Acks: [][]byte{id[:]}}, nil)
+	mustFail(t, err, "acks on a revoke")
+	p = base
+	p.Acks = [][]byte{id[:], id[:]}
+	_, err = signVersion(2, h.root.priv, p, nil)
+	mustFail(t, err, "canonical order")
+	p = base
+	p.Acks = [][]byte{id[:4]}
+	_, err = signVersion(2, h.root.priv, p, nil)
+	mustFail(t, err, "not a sha256")
+}
+
+func TestAcksAreCanonicalAndBounded(t *testing.T) {
+	h := newHome(t)
+	a, b := h.devA.ID(), h.deskA.ID()
+	// Sign sorts and deduplicates; Acknowledges finds members only.
+	st, err := Sign(h.root.priv, Payload{Aud: h.dev.did, Sub: h.did, Res: all, Verbs: []string{VerbMember},
+		Iat: t0.Unix(), Nbf: t0.Unix(), Exp: t0.Add(time.Hour).Unix(), Acks: [][]byte{b[:], a[:], b[:]}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Payload.Acks) != 2 || !st.Acknowledges(a) || !st.Acknowledges(b) || st.Acknowledges(st.ID()) {
+		t.Fatalf("acks %x", st.Payload.Acks)
+	}
+	if h.devA.Acknowledges(a) {
+		t.Fatal("an empty set acknowledges something")
+	}
+	// Round trip keeps the set.
+	raw, _ := st.Bytes()
+	back, err := Decode(raw)
+	if err != nil || !back.Acknowledges(a) {
+		t.Fatalf("decode: %v", err)
+	}
+	// Too many is refused, never truncated.
+	var many [][]byte
+	for i := 0; i < MaxAcks+1; i++ {
+		id := sha256.Sum256([]byte{byte(i), byte(i >> 8)})
+		many = append(many, id[:])
+	}
+	_, err = Sign(h.root.priv, Payload{Aud: h.dev.did, Sub: h.did, Res: all, Verbs: []string{VerbMember},
+		Iat: t0.Unix(), Nbf: t0.Unix(), Exp: t0.Add(time.Hour).Unix(), Acks: many}, nil)
+	mustFail(t, err, "at most 64")
+}
+
+func TestRemovalKillsUnlessAcknowledged(t *testing.T) {
+	// Root removes the device; the desk-issued admission and the sub-key
+	// under it die (rule 3 through the removal); a restoration acknowledging
+	// the removal stands, and a sub-key chained on the restoration stands,
+	// while the old sub-key stays dead: its own link's admission never saw
+	// the removal.
+	h := newHome(t)
+	revs := NewRevocationSet()
+	removal, err := Revoke(h.root.priv, h.did, nil, Target{Aud: h.dev.did}, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := revs.Add(removal); err != nil {
+		t.Fatal(err)
+	}
+	w := want(h.did, KindSubject, "jobs/1", VerbClaim, h.sub.did)
+	if _, err := Verify(h.subA, nil, h.roots, revs, w); err == nil {
+		t.Fatal("sub-key under a removed device verifies")
+	} else {
+		mustFail(t, err, "revoked by the root")
+	}
+	dw := want(h.did, KindRole, VerbMember, VerbMember, h.dev.did)
+	if _, err := Verify(h.devA, nil, h.roots, revs, dw); err == nil {
+		t.Fatal("removed device verifies")
+	}
+	rid := removal.ID()
+	restored, err := Sign(h.desk.priv, Payload{Aud: h.dev.did, Sub: h.did, Res: all,
+		Verbs: []string{VerbMember, VerbTun, VerbSync, VerbWrite, VerbPublish, VerbClaim}, Meta: &Meta{Name: "nas", IP: "100.64.0.7/24"}, Del: 1,
+		Iat: t0.Unix() + 1, Nbf: t0.Unix() + 1, Exp: t0.Add(DefaultValidity).Unix(), Acks: [][]byte{rid[:]}}, h.deskA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(restored, nil, h.roots, revs, dw); err != nil {
+		t.Fatalf("restoration does not verify: %v", err)
+	}
+	newSub, err := Sign(h.dev.priv, Payload{Aud: h.sub.did, Sub: h.did, Res: []Resource{{Kind: KindSubject, Name: "jobs/*"}},
+		Verbs: []string{VerbClaim}, Iat: t0.Unix() + 2, Nbf: t0.Unix() + 2, Exp: t0.Add(DefaultValidity).Unix()}, restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(newSub, nil, h.roots, revs, w); err != nil {
+		t.Fatalf("sub-key under the restoration does not verify: %v", err)
+	}
+	if _, err := Verify(h.subA, nil, h.roots, revs, w); err == nil {
+		t.Fatal("the old sub-key came back with the device")
+	}
+	// A legacy sweep kills by the cut, and acknowledging it means nothing.
+	sweepRevs := NewRevocationSet()
+	sweep := sweepV1(t, h.root.priv, h.did, nil, h.dev.did, t0.Unix(), t0.Unix())
+	if _, err := sweepRevs.Add(sweep); err != nil {
+		t.Fatal(err)
+	}
+	sid := sweep.ID()
+	acked, _ := Sign(h.desk.priv, Payload{Aud: h.dev.did, Sub: h.did, Res: all, Verbs: []string{VerbMember}, Del: 1,
+		Iat: t0.Unix(), Nbf: t0.Unix(), Exp: t0.Add(time.Hour).Unix(), Acks: [][]byte{sid[:]}}, h.deskA)
+	if _, err := Verify(acked, nil, h.roots, sweepRevs, dw); err == nil {
+		t.Fatal("acknowledging a legacy sweep lifted it")
+	}
+	later, _ := Sign(h.desk.priv, Payload{Aud: h.dev.did, Sub: h.did, Res: all, Verbs: []string{VerbMember}, Del: 1,
+		Iat: t0.Unix() + 1, Nbf: t0.Unix() + 1, Exp: t0.Add(time.Hour).Unix()}, h.deskA)
+	if _, err := Verify(later, nil, h.roots, sweepRevs, Want{Sub: h.did, Res: Resource{Kind: KindRole, Name: VerbMember}, Verb: VerbMember, PresentingKey: h.dev.did, Now: t0.Add(2 * time.Second)}); err != nil {
+		t.Fatalf("an admission issued after the sweep's cut should stand: %v", err)
 	}
 }
 

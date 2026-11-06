@@ -25,6 +25,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
@@ -32,10 +33,32 @@ import (
 	"ioa.rocks/fabric/did"
 )
 
-// Version is the format version every statement carries. The pre-statement
-// cert, admission and revocation bytes (no `v`) no longer decode anywhere
-// since 2026-11-06.
-const Version = 1
+// Version is the format version a statement is signed at. Decode accepts
+// MinVersion through Version; what a version means:
+//
+//   - 1 (2026-11-02): the format as first shipped. A revoke with an aud
+//     target is a sweep: it kills the device's admissions issued up to
+//     `before`, and nothing acknowledges it.
+//   - 2 (2026-11-06, ADR 0019): an assert may carry `acks`, the IDs of the
+//     device-wide removals its issuer had seen; a revoke with an aud target
+//     is a removal — no `before`, kept for good — and kills every statement
+//     naming the device that does not acknowledge it. A version-1 sweep
+//     keeps its cut rule until the legacy paths retire and is never read as
+//     a removal; a version-2 statement cannot be a sweep.
+//
+// A node at version 1 refuses version-2 statements outright, so the fleet
+// moves together. The pre-statement cert, admission and revocation bytes
+// (no `v`) no longer decode anywhere since 2026-11-06.
+const (
+	Version    = 2
+	MinVersion = 1
+)
+
+// MaxAcks bounds the `acks` set of one statement: a device-wide removal is
+// rare, so a set this large is a forgery or a bug, refused at the shape
+// check and never truncated (a truncated set would read as "never saw the
+// removal" — ADR 0019).
+const MaxAcks = 64
 
 // Statement types. Display labels (admission, grant, sub-key…) are
 // derived from fields and never used for authorization.
@@ -118,8 +141,10 @@ type Meta struct {
 	Host   string `cbor:"host,omitempty"`
 }
 
-// Target is what a revocation kills: one statement by ID, or every
-// statement whose recipient is Aud issued up to Before.
+// Target is what a revocation kills: one statement by ID (any version);
+// or, by Aud, a device: at version 2 a removal — every statement naming the
+// device that does not acknowledge the removal's ID (Statement.Acknowledges)
+// — and at version 1 the legacy sweep of its statements issued up to Before.
 type Target struct {
 	ID     []byte `cbor:"id,omitempty"`
 	Aud    string `cbor:"aud,omitempty"`
@@ -142,6 +167,11 @@ type Payload struct {
 	Del   int        `cbor:"del,omitempty"` // delegation depth; 0 = not delegable
 	Nonce []byte     `cbor:"nonce,omitempty"`
 	Prf   [][]byte   `cbor:"prf"` // the parent statement's wire bytes; empty when root-issued
+	// Asserts only, version 2: the IDs of the device-wide removals of aud
+	// the issuer had seen when signing — canonical (ascending, no
+	// duplicates), at most MaxAcks (ADR 0019). An assert that does not
+	// acknowledge a known removal of its device is no admission of it.
+	Acks [][]byte `cbor:"acks,omitempty"`
 	// Revocations only.
 	Target *Target `cbor:"target,omitempty"`
 	At     int64   `cbor:"at,omitempty"` // informational; never used for authority
@@ -215,12 +245,23 @@ func Sign(priv ed25519.PrivateKey, p Payload, parent *Statement) (*Statement, er
 		if p.Target != nil {
 			return nil, errors.New("assert carries a revocation target")
 		}
+		acks, err := CanonicalIDs(p.Acks)
+		if err != nil {
+			return nil, fmt.Errorf("acks: %w", err)
+		}
+		p.Acks = acks
 	case TypeRevoke:
 		if p.Target == nil || (len(p.Target.ID) == 0 && p.Target.Aud == "") {
-			return nil, errors.New("revoke needs a target (id or aud+before)")
+			return nil, errors.New("revoke needs a target (id or aud)")
 		}
 		if len(p.Target.ID) != 0 && p.Target.Aud != "" {
-			return nil, errors.New("revoke target is either id or aud+before, not both")
+			return nil, errors.New("revoke target is either id or aud, not both")
+		}
+		if p.Target.Before != 0 {
+			return nil, errors.New("a removal has no before: the sweep is a version-1 form and is no longer signed")
+		}
+		if len(p.Acks) != 0 {
+			return nil, errors.New("a revoke carries no acks")
 		}
 	}
 	if parent != nil {
@@ -273,8 +314,11 @@ func decode(data []byte, depth int) (*Statement, error) {
 	if err := cbor.Unmarshal(w.Payload, &s.Payload); err != nil {
 		return nil, fmt.Errorf("decoding statement payload: %w", err)
 	}
-	if s.Payload.V != Version {
-		return nil, fmt.Errorf("statement version %d, want %d", s.Payload.V, Version)
+	if v := s.Payload.V; v < MinVersion || v > Version {
+		return nil, fmt.Errorf("statement version %d, this node reads %d through %d", v, MinVersion, Version)
+	}
+	if err := shape(s.Payload); err != nil {
+		return nil, err
 	}
 	switch len(s.Payload.Prf) {
 	case 0:
@@ -288,6 +332,91 @@ func decode(data []byte, depth int) (*Statement, error) {
 		return nil, errors.New("a statement has at most one parent")
 	}
 	return s, nil
+}
+
+// shape is the version-dependent structural check Decode applies before
+// anything is trusted: what acks and aud targets may look like at each
+// version. Decode refuses, never repairs.
+func shape(p Payload) error {
+	if len(p.Acks) != 0 {
+		if p.V < 2 {
+			return errors.New("acks on a version-1 statement")
+		}
+		if p.Typ != TypeAssert {
+			return errors.New("acks on a revoke")
+		}
+		if err := checkCanonicalIDs(p.Acks); err != nil {
+			return fmt.Errorf("acks: %w", err)
+		}
+	}
+	if t := p.Target; t != nil && t.Aud != "" && p.V >= 2 && t.Before != 0 {
+		return errors.New("a version-2 revoke with an aud target is a removal and carries no before")
+	}
+	return nil
+}
+
+// CanonicalIDs returns ids as an acks set: 32-byte IDs, ascending, without
+// duplicates; an error past MaxAcks or on a malformed ID.
+func CanonicalIDs(ids [][]byte) ([][]byte, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	out := make([][]byte, 0, len(ids))
+	for _, id := range ids {
+		if len(id) != 32 {
+			return nil, errors.New("an ID is not a sha256")
+		}
+		out = append(out, bytes.Clone(id))
+	}
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i], out[j]) < 0 })
+	dedup := out[:1]
+	for _, id := range out[1:] {
+		if !bytes.Equal(id, dedup[len(dedup)-1]) {
+			dedup = append(dedup, id)
+		}
+	}
+	if len(dedup) > MaxAcks {
+		return nil, fmt.Errorf("%d removal IDs, at most %d", len(dedup), MaxAcks)
+	}
+	return dedup, nil
+}
+
+func checkCanonicalIDs(ids [][]byte) error {
+	if len(ids) > MaxAcks {
+		return fmt.Errorf("%d removal IDs, at most %d", len(ids), MaxAcks)
+	}
+	for i, id := range ids {
+		if len(id) != 32 {
+			return errors.New("an ID is not a sha256")
+		}
+		if i > 0 && bytes.Compare(ids[i-1], id) >= 0 {
+			return errors.New("not in canonical order")
+		}
+	}
+	return nil
+}
+
+// Acknowledges reports whether the statement's acks name id: an assert
+// issued in the knowledge of that removal.
+func (s *Statement) Acknowledges(id [32]byte) bool {
+	acks := s.Payload.Acks
+	i := sort.Search(len(acks), func(i int) bool { return bytes.Compare(acks[i], id[:]) >= 0 })
+	return i < len(acks) && bytes.Equal(acks[i], id[:])
+}
+
+// IsRemoval reports whether the statement is a device-wide removal (a
+// version-2 revoke with an aud target): the kind an assert acknowledges.
+func (s *Statement) IsRemoval() bool {
+	t := s.Payload.Target
+	return s.Payload.Typ == TypeRevoke && s.Payload.V >= 2 && t != nil && t.Aud != ""
+}
+
+// IsSweep reports whether the statement is a legacy sweep (a version-1
+// revoke with an aud target): it kills by the cut, and nothing
+// acknowledges it.
+func (s *Statement) IsSweep() bool {
+	t := s.Payload.Target
+	return s.Payload.Typ == TypeRevoke && s.Payload.V < 2 && t != nil && t.Aud != ""
 }
 
 // Bytes encodes the statement for the wire or disk, payload verbatim.
@@ -375,8 +504,9 @@ func (s *Statement) Label() string {
 	return "grant"
 }
 
-// Revoke signs a revocation of target in circle sub. own is the revoker's
-// own statement in that circle (the chain the revocation rides; nil when the
+// Revoke signs a revocation of target in circle sub: one statement by ID,
+// or a device-wide removal by aud (ADR 0019). own is the revoker's own
+// statement in that circle (the chain the revocation rides; nil when the
 // root signs). Rule 3 then lets the revocation kill only statements that
 // chain through own.
 func Revoke(priv ed25519.PrivateKey, sub string, own *Statement, target Target, now time.Time) (*Statement, error) {

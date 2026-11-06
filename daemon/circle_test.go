@@ -375,10 +375,23 @@ func TestCircleRevocationAndExpiry(t *testing.T) {
 		t.Fatal("the revoked laptop still considers itself admitted")
 	}
 
-	// Re-admission: an admission issued after the revocation stands.
-	// Admission times are whole seconds, so step past the revocation's.
+	// Re-admission (ADR 0019): an admission issued after the removal by a
+	// signer that never saw it is no re-admission — the laptop stays out
+	// on it; one acknowledging the removal restores the device. Admission
+	// times are whole seconds, so step past the removal's.
 	time.Sleep(1100 * time.Millisecond)
-	a, err := circle.Admit(priv, laptop.devPub, time.Now())
+	unaware, err := circle.Admit(priv, laptop.devPub, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lc.SaveAdmission(unaware); err != nil {
+		t.Fatal(err)
+	}
+	if laptop.svc.Admitted(lc) {
+		t.Fatal("an admission that does not acknowledge the removal readmitted the laptop")
+	}
+	rid := r.Stmt.ID()
+	a, err := circle.Issue(priv, nil, alexDID, laptop.devPub, time.Now(), circle.DefaultValidity, circle.Terms{Verbs: circle.DeviceVerbs, Acks: [][]byte{rid[:]}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +399,7 @@ func TestCircleRevocationAndExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !laptop.svc.Admitted(lc) {
-		t.Fatal("re-admitted laptop does not consider itself admitted")
+		t.Fatal("restored laptop does not consider itself admitted")
 	}
 	desk.svc.Refresh(ctx)
 	waitShared(t, desk, laptop, []string{alexDID})

@@ -413,9 +413,13 @@ func (c *Compiled) RevokedBy(roots Roots, revs Revocations) error {
 }
 
 // revoked applies rule 3 to one lineage, root-first: a revocation kills link
-// i if it targets it (by id, or by aud with iat <= before) and either is
+// i if it targets it (by id; by aud as a removal the link does not
+// acknowledge; by aud as a legacy sweep with iat <= before) and either is
 // root-signed for the link's circle, or rides a chain whose leaf is a link
-// strictly above i in this very lineage.
+// strictly above i in this very lineage. The acknowledgment rule is the
+// cascade of ADR 0019: removing an admin kills what it admitted, and a
+// sub-key under an admission that never saw its device's removal stays
+// dead after the device is restored.
 func revoked(links []Link, roots Roots, revs Revocations) error {
 	for i, l := range links {
 		for _, r := range revs.Candidates(l.ID, l.Aud) {
@@ -451,7 +455,13 @@ func targets(r *Statement, l Link) bool {
 	if len(t.ID) != 0 {
 		return bytes.Equal(t.ID, l.ID[:])
 	}
-	return t.Aud == l.Aud && l.Iat <= t.Before
+	if t.Aud != l.Aud {
+		return false
+	}
+	if r.Payload.V < 2 {
+		return l.Iat <= t.Before // legacy sweep: the cut rule, never an acknowledgment
+	}
+	return !l.Stmt.Acknowledges(r.ID())
 }
 
 // rootKeysOrDID resolves a circle's root keys through roots, falling back
