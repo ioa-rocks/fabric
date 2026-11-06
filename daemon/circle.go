@@ -1224,11 +1224,20 @@ func (s *CircleService) capByRoster(c *statement.Compiled, want statement.Want) 
 	if s.table == nil {
 		return nil
 	}
-	r, ok := s.table.RosterFor(want.Sub)
-	if !ok {
-		return nil
+	if r, ok := s.table.RosterFor(want.Sub); ok {
+		if err := r.Cap(c, want); err != nil {
+			return err
+		}
 	}
-	return r.Cap(c, want)
+	// An identity chain anchored in another circle this node holds is
+	// judged by that circle's roster, on standing alone: the verb was that
+	// of the grant, settled above.
+	if len(c.Ident) > 0 && c.Ident[0].Sub != want.Sub {
+		if r, ok := s.table.RosterFor(c.Ident[0].Sub); ok {
+			return r.Cap(c, statement.Want{Sub: c.Ident[0].Sub, Now: want.Now})
+		}
+	}
+	return nil
 }
 
 // CirclesOf returns the member's verified circles, if a current exchange

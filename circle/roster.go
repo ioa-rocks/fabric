@@ -379,6 +379,17 @@ func (r *Roster) Cap(c *statement.Compiled, want statement.Want) error {
 			if at, ok := r.sweeps[l.Aud]; ok && l.Iat <= at {
 				return fmt.Errorf("%s swept by the circle", shortDID(l.Aud))
 			}
+			// The entry comparison is this circle's judgement of its own
+			// admissions. An identity chain anchored in another circle (a
+			// grant to that circle, presented by one of its members) has
+			// links issued there; they are that circle's roster's business
+			// (capByRoster asks it), not this one's — a device that is a
+			// member of both would be judged against the wrong entry (agy,
+			// 2026-11-06). Sweeps above stay over every link: this circle's
+			// word that a key is not to be trusted holds whoever admitted it.
+			if l.Sub != r.CircleDID() {
+				continue
+			}
 			dev, ok := r.devices[l.Aud]
 			if !ok {
 				continue

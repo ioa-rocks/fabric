@@ -431,3 +431,75 @@ func TestCapRefusesSweptChains(t *testing.T) {
 		t.Fatalf("sub-key under the re-admission: %v", err)
 	}
 }
+
+// A grant from circle X to circle Y is presented by a Y member with its Y
+// admission as identity chain. X's roster caps the authority links (its
+// own) and leaves the identity links to Y's roster — even when the device
+// is a member of X too, with a narrower admission there (agy, 2026-11-06).
+func TestCapJudgesLinksByTheirOwnCircle(t *testing.T) {
+	xPub, xPriv, _ := ed25519.GenerateKey(rand.Reader)
+	yPub, yPriv, _ := ed25519.GenerateKey(rand.Reader)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	xDID, yDID, devDID := did.ForKey(xPub), did.ForKey(yPub), did.ForKey(devPub)
+	now := time.Now().Add(-time.Minute)
+	roots := statement.RootMap{xDID: {xPub}, yDID: {yPub}}
+	admit := func(priv ed25519.PrivateKey, sub string, verbs ...string) *statement.Statement {
+		st, err := statement.Sign(priv, statement.Payload{
+			Aud: devDID, Sub: sub, Verbs: verbs, Res: []statement.Resource{{Kind: statement.Any, Name: statement.Any, Sub: statement.Any}},
+			Iat: now.Unix(), Nbf: now.Unix(), Exp: now.Add(time.Hour).Unix(), Del: 1,
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+	inX := admit(xPriv, xDID, statement.VerbMember)                     // a plain member of X
+	inY := admit(yPriv, yDID, statement.VerbMember, statement.VerbBlob) // a full member of Y
+	res := statement.Resource{Kind: statement.KindSubject, Name: "inbox", Sub: xDID}
+	grant, err := statement.Sign(xPriv, statement.Payload{ // X grants circle Y blob on inbox
+		Aud: yDID, Sub: xDID, Res: []statement.Resource{res}, Verbs: []string{statement.VerbBlob},
+		Iat: now.Unix(), Nbf: now.Unix(), Exp: now.Add(time.Hour).Unix(),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := statement.Compile(grant, inY, xDID, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.IdentAnchor != yDID || len(c.Ident) != 1 || c.Ident[0].Sub != yDID {
+		t.Fatalf("identity chain not anchored in Y: anchor %q, %d links", c.IdentAnchor, len(c.Ident))
+	}
+	rx := NewRoster(statement.NewDIDRoot(xDID))
+	rx, _, _ = rx.Add(inX, now)
+	ry := NewRoster(statement.NewDIDRoot(yDID))
+	ry, _, _ = ry.Add(inY, now)
+	at := now.Add(time.Second)
+	want := statement.Want{Sub: xDID, Res: res, Verb: statement.VerbBlob, PresentingKey: devDID, Now: at}
+	if err := c.Check(roots, nil, want); err != nil {
+		t.Fatal(err)
+	}
+	if err := rx.Cap(c, want); err != nil {
+		t.Fatalf("X judged Y's identity link against the device's X entry: %v", err)
+	}
+	standing := statement.Want{Sub: yDID, Now: at}
+	if err := ry.Cap(c, standing); err != nil {
+		t.Fatalf("Y's roster over its own link: %v", err)
+	}
+	// X sweeping the device's key still ends the presentation: a sweep is
+	// about the key, whoever admitted it.
+	swept, _ := rx.Sweep(devDID, at)
+	if err := swept.Cap(c, want); err == nil {
+		t.Fatal("X's sweep of the key ignored on Y's link")
+	}
+	// Y's roster is what judges Y's admission: sweep the device there and
+	// the identity link is dead for Y's cap, while X's cap (its own links
+	// only) is unchanged.
+	ySwept, _ := ry.Sweep(devDID, at)
+	if err := ySwept.Cap(c, standing); err == nil {
+		t.Fatal("Y's sweep ignored on Y's link")
+	}
+	if err := rx.Cap(c, want); err != nil {
+		t.Fatal(err)
+	}
+}
