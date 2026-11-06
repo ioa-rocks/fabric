@@ -119,15 +119,13 @@ func NewRoster(roots *statement.DIDRoot) *Roster {
 }
 
 // OpenRoster loads a circle directory's roster: its devices.cbor and the
-// circle's revocation file (statement revocations into the set, legacy
-// device sweeps as sweeps). Save writes back to devices.cbor.
+// circle's revocation file. Save writes back to devices.cbor.
 func OpenRoster(c *Circle, now time.Time) (*Roster, error) {
 	return NewRoster(statement.NewDIDRoot(c.Config.DID)).Attach(c, now)
 }
 
 // Attach returns the roster with a circle directory folded in — its
-// revocation file (statement revocations into the set, legacy device
-// sweeps as sweeps), then its devices.cbor, which also becomes the place
+// revocation file, then its devices.cbor, which also becomes the place
 // Save writes to. The roster's root must be the circle's. OpenRoster is
 // Attach on an empty roster; the log-fed roster attaches its circle's
 // directory, so the devices the file names are judged by the circle's
@@ -141,15 +139,8 @@ func (r *Roster) Attach(c *Circle, now time.Time) (*Roster, error) {
 	nr := r.clone()
 	set := nr.revs.Clone()
 	for _, rv := range revs {
-		switch {
-		case rv.Stmt != nil:
-			if _, err := set.Add(rv.Stmt); err != nil {
-				return nil, fmt.Errorf("circle %q revocation: %w", c.Config.Name, err)
-			}
-		case rv.Device != "":
-			if at := rv.Time().Unix(); at > nr.sweeps[rv.Device] {
-				nr.sweeps[rv.Device] = at
-			}
+		if _, err := set.Add(rv.Stmt); err != nil {
+			return nil, fmt.Errorf("circle %q revocation: %w", c.Config.Name, err)
 		}
 	}
 	nr.revs = set
@@ -343,7 +334,7 @@ func prefer(cur, next *Device) bool {
 // sweep is checked against every link of the chain, not the leaf alone:
 // sweeping an admin desk kills what the desk admitted, as a statement
 // revocation of the desk would through Check (agy review, 2026-11-06 —
-// the web UI's revoke and the legacy CLI arrive as sweeps).
+// the web UI's revoke and `fabric revoke` arrive as sweeps).
 func (r *Roster) verdict(dev *Device) error {
 	for _, links := range [][]statement.Link{dev.Chain.Auth, dev.Chain.Ident} {
 		for _, l := range links {
@@ -445,8 +436,8 @@ func (r *Roster) AddRevocation(st *statement.Statement) (*Roster, bool, error) {
 	return nr, true, nil
 }
 
-// Sweep kills every admission of a device issued up to at — the legacy
-// member-revoked event, and the circle's legacy device revocation — and,
+// Sweep kills every admission of a device issued up to at — the
+// member-revoked event of the first circle's log — and,
 // through their chains, the admissions that device issued up to then. A
 // device the roster never saw is remembered as a tombstone for
 // sweepTombstone so the gater refuses it meanwhile.

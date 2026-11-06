@@ -367,7 +367,7 @@ func New(dir state.Dir) (*Daemon, error) {
 func firstCircle(cfg state.Config, own *cert.Cert, circles []*circle.Circle, now time.Time) (string, *cert.Cert, error) {
 	fromDir := func(c *circle.Circle) *cert.Cert {
 		a, err := c.LoadAdmission()
-		if err != nil || a.Stmt == nil || a.Valid(now) != nil {
+		if err != nil || a.Valid(now) != nil {
 			return nil
 		}
 		view, err := cert.FromStatement(a.Stmt)

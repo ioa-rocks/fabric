@@ -349,8 +349,7 @@ func (t *PeerTable) AddRevocation(circleDID string, st *statement.Statement) (fr
 	return fresh, err
 }
 
-// SweepIn kills a device's admissions issued up to at in one circle (a legacy
-// device revocation).
+// SweepIn kills a device's admissions issued up to at in one circle.
 func (t *PeerTable) SweepIn(circleDID, deviceDID string, at time.Time) {
 	_ = t.apply(func(s *state) error {
 		if i := s.index(circleDID); i >= 0 {
@@ -361,14 +360,11 @@ func (t *PeerTable) SweepIn(circleDID, deviceDID string, at time.Time) {
 	})
 }
 
-// Admit records a cert a peer presented on the handshake: it must be a
-// statement, name the connected peer, be in a circle this node holds, and
+// Admit records a cert a peer presented on the handshake: it must name the
+// connected peer, be in a circle this node holds, and
 // leave the device live there — a revoked or expired chain is refused and
 // the handshake fails. Lapsed memory is the event log's business (AddMember).
 func (t *PeerTable) Admit(p peer.ID, c *cert.Cert) error {
-	if c.Stmt == nil {
-		return errors.New("legacy certificate: statement form required on transport")
-	}
 	deviceDID, err := DeviceDID(p)
 	if err != nil {
 		return err
@@ -434,9 +430,6 @@ func (t *PeerTable) Verify(p peer.ID, st *statement.Statement) (circleDID string
 // fails the chain check, is dropped silently — the caller validated it as
 // far as it could.
 func (t *PeerTable) AddMember(p peer.ID, c *cert.Cert) {
-	if c.Stmt == nil {
-		return
-	}
 	_, _ = t.AddAdmission(c.Stmt, time.Now())
 }
 

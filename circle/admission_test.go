@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,9 +41,6 @@ func TestAdmissionRoundTrip(t *testing.T) {
 	if err := back.Verify(other, now); err == nil {
 		t.Fatal("admission verified for a device it does not name")
 	}
-	if back.Legacy() {
-		t.Fatal("a freshly minted admission must carry its validity window")
-	}
 	if got := back.Expiry(); got.Sub(now.Add(DefaultValidity)).Abs() > 2*time.Second {
 		t.Fatalf("expiry %v, want now+DefaultValidity", got)
 	}
@@ -61,40 +59,20 @@ func TestAdmissionRoundTrip(t *testing.T) {
 	if forged, err := UnmarshalAdmission(raw2); err == nil && forged.Verify(dpub, now) == nil {
 		t.Fatal("admission with a tampered signature verified")
 	}
-	if !back.IsStatement() || back.Stmt.Label() != "admission" {
+	if back.Stmt == nil || back.Stmt.Label() != "admission" {
 		t.Fatalf("fresh admission should be a statement labelled admission, got %v", back.Stmt)
 	}
 }
 
-// A legacy admission (no nbf/exp, as minted before 2026-10-31) is read as
-// valid from Iat for DefaultValidity — and must still verify, since its
-// signed bytes carry no window.
-func TestLegacyAdmissionWindow(t *testing.T) {
+// Pre-statement admission bytes (the bespoke {payload, sig} of 2026-10) no
+// longer decode; the error names the remedy.
+func TestPreStatementAdmissionIsRefused(t *testing.T) {
 	_, cpriv, _ := ed25519.GenerateKey(rand.Reader)
 	dpub, _, _ := ed25519.GenerateKey(rand.Reader)
-	issued := time.Now().Add(-100 * 24 * time.Hour)
-	legacy := &Admission{Circle: cert.DIDForKey(cpriv.Public().(ed25519.PublicKey)), Device: cert.DIDForKey(dpub), Iat: issued.Unix()}
-	msg, _ := legacy.payloadBytes()
-	legacy.Sig = ed25519.Sign(cpriv, msg)
-	wire, err := legacy.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
-	back, err := UnmarshalAdmission(wire)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !back.Legacy() {
-		t.Fatal("legacy admission not recognised")
-	}
-	if err := back.Verify(dpub, time.Now()); err != nil {
-		t.Fatalf("legacy admission within its implied window failed: %v", err)
-	}
-	if got, want := back.Expiry(), issued.Add(DefaultValidity); got.Unix() != want.Unix() {
-		t.Fatalf("legacy expiry %v, want %v", got, want)
-	}
-	if err := back.Verify(dpub, issued.Add(DefaultValidity+time.Hour)); err == nil {
-		t.Fatal("legacy admission verified past its implied expiry")
+	payload, _ := encMode.Marshal(map[string]any{"circle": cert.DIDForKey(cpriv.Public().(ed25519.PublicKey)), "device": cert.DIDForKey(dpub), "iat": time.Now().Unix()})
+	wire, _ := encMode.Marshal(map[string]any{"payload": payload, "sig": ed25519.Sign(cpriv, payload)})
+	if _, err := UnmarshalAdmission(wire); err == nil || !strings.Contains(err.Error(), "re-admit") {
+		t.Fatalf("pre-statement admission decoded, or without the remedy: %v", err)
 	}
 }
 

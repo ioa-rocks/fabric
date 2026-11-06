@@ -32,9 +32,9 @@ import (
 	"ioa.rocks/fabric/did"
 )
 
-// Version is the format version every statement carries. Legacy cert,
-// admission and revocation bytes have no `v` and decode on their own
-// paths, never through this package.
+// Version is the format version every statement carries. The pre-statement
+// cert, admission and revocation bytes (no `v`) no longer decode anywhere
+// since 2026-11-06.
 const Version = 1
 
 // Statement types. Display labels (admission, grant, sub-key…) are

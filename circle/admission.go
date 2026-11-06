@@ -1,7 +1,6 @@
 package circle
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
@@ -79,43 +78,22 @@ func RoleOf(verbs []string) string {
 //
 // Since 2026-11-02 an admission is a statement (package statement): an
 // admission {iss root, aud device, sub circle, res *, verbs DeviceVerbs, del
-// 1}, possibly chained through an admin desk. Stmt holds it. Admissions
-// minted before that (v3: the bespoke admissionPayload with a window; v2:
-// without) still decode, verify and are presented on the older exchange
-// versions; Stmt is nil for them. Re-admitting migrates a device.
+// 1}, possibly chained through an admin desk. Stmt holds it; the fields
+// are its view. Admissions minted before that (the bespoke payloads of
+// 2026-10) no longer decode since 2026-11-06 — re-admitting a device
+// migrates it.
 type Admission struct {
 	Circle string // circle owner DID
 	Device string // device key, did:key — the libp2p peer identity
 	Iat    int64  // issued at, unix seconds
-	Nbf    int64  // not before, unix seconds; 0 on v2 admissions (= Iat)
-	Exp    int64  // expiry, unix seconds; 0 on v2 admissions (= Iat + DefaultValidity)
+	Nbf    int64  // not before, unix seconds (0 = Iat)
+	Exp    int64  // expiry, unix seconds
 	Sig    []byte
-	Stmt   *statement.Statement // the statement form; nil for legacy bytes
-	raw    []byte               // legacy payload bytes as signed
+	Stmt   *statement.Statement
 
-	// Statement admissions only (a legacy one carries DeviceVerbs and no
-	// attributes).
 	Verbs []string
 	Name  string // human label the admitting owner gave the device
 	IP    string // overlay address in the circle's prefix, when `tun` was signed
-}
-
-type admissionPayload struct {
-	Circle string `cbor:"circle"`
-	Device string `cbor:"device"`
-	Iat    int64  `cbor:"iat"`
-	Nbf    int64  `cbor:"nbf,omitempty"`
-	Exp    int64  `cbor:"exp,omitempty"`
-}
-
-type wireAdmission struct {
-	Payload cbor.RawMessage `cbor:"payload"`
-	Sig     []byte          `cbor:"sig"`
-}
-
-// versionProbe tells statement bytes (payload carries `v`) from legacy ones.
-type versionProbe struct {
-	V int `cbor:"v,omitempty"`
 }
 
 const admissionFile = "device.attestation"
@@ -153,9 +131,8 @@ func AdmitAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID string
 // renewal (`circle renew`) never silently strips a device of its address
 // or its role: a fresh admission outranks the old one everywhere by expiry,
 // and a bare one would have shadowed the named cert in every roster
-// (desk listed as "?" without an address, 2026-11-05). prev nil, or a
-// legacy admission without statement form, falls back to DeviceVerbs
-// and no attributes.
+// (desk listed as "?" without an address, 2026-11-05). prev nil falls
+// back to DeviceVerbs and no attributes.
 func Renew(priv ed25519.PrivateKey, prev *statement.Statement, circleDID string, devicePub ed25519.PublicKey, now time.Time, validity time.Duration) (*Admission, error) {
 	verbs, meta := DeviceVerbs, (*statement.Meta)(nil)
 	if prev != nil && prev.Payload.Sub == circleDID && prev.Payload.Aud == did.ForKey(devicePub) {
@@ -219,14 +196,8 @@ func fromStatement(s *statement.Statement) (*Admission, error) {
 	return a, nil
 }
 
-// Role is the role the admission's verbs amount to (device for a legacy
-// one, which carries the full device set).
-func (a *Admission) Role() string {
-	if a.Stmt == nil {
-		return RoleDevice
-	}
-	return RoleOf(a.Verbs)
-}
+// Role is the role the admission's verbs amount to.
+func (a *Admission) Role() string { return RoleOf(a.Verbs) }
 
 func hasVerb(verbs []string, v string) bool {
 	for _, h := range verbs {
@@ -237,14 +208,6 @@ func hasVerb(verbs []string, v string) bool {
 	return false
 }
 
-// Legacy reports whether the admission predates validity windows (v2).
-func (a *Admission) Legacy() bool { return a.Exp == 0 }
-
-// IsStatement reports whether the admission is in statement form; only
-// those are presented on the v4 exchange to peers that speak it, and only
-// legacy ones on v3/v2.
-func (a *Admission) IsStatement() bool { return a.Stmt != nil }
-
 // NotBefore is the start of the validity window.
 func (a *Admission) NotBefore() time.Time {
 	if a.Nbf == 0 {
@@ -253,14 +216,8 @@ func (a *Admission) NotBefore() time.Time {
 	return time.Unix(a.Nbf, 0)
 }
 
-// Expiry is the end of the validity window. A legacy admission expires
-// DefaultValidity after it was issued.
-func (a *Admission) Expiry() time.Time {
-	if a.Exp == 0 {
-		return time.Unix(a.Iat, 0).Add(DefaultValidity)
-	}
-	return time.Unix(a.Exp, 0)
-}
+// Expiry is the end of the validity window.
+func (a *Admission) Expiry() time.Time { return time.Unix(a.Exp, 0) }
 
 // PastHalfLife reports whether the admission is due for renewal: more
 // than half of its window has elapsed (the mesh's `renew -expiring` rule).
@@ -269,18 +226,15 @@ func (a *Admission) PastHalfLife(now time.Time) bool {
 	return now.After(nbf.Add(exp.Sub(nbf) / 2))
 }
 
-// Valid checks only the validity window (of the whole chain, for a
-// statement admission).
+// Valid checks only the validity window, of the whole chain.
 func (a *Admission) Valid(now time.Time) error {
 	nbf, exp := a.NotBefore(), a.Expiry()
-	if a.Stmt != nil {
-		for _, l := range a.Stmt.Chain() {
-			if l.NotBefore().After(nbf) {
-				nbf = l.NotBefore()
-			}
-			if l.Expiry().Before(exp) {
-				exp = l.Expiry()
-			}
+	for _, l := range a.Stmt.Chain() {
+		if l.NotBefore().After(nbf) {
+			nbf = l.NotBefore()
+		}
+		if l.Expiry().Before(exp) {
+			exp = l.Expiry()
 		}
 	}
 	if now.Before(nbf) {
@@ -311,37 +265,13 @@ func (a *Admission) Verify(devicePub ed25519.PublicKey, now time.Time) error {
 // directly or through a verifying chain (statement.Compile: signatures,
 // chaining, attenuation, admission authority). Windows are Valid's job.
 func (a *Admission) VerifySignature() error {
-	if a.Stmt != nil {
-		_, err := a.compile()
-		return err
-	}
-	circlePub, err := did.KeyFor(a.Circle)
-	if err != nil {
-		return fmt.Errorf("admission circle: %w", err)
-	}
-	msg, err := a.payloadBytes()
-	if err != nil {
-		return err
-	}
-	if !ed25519.Verify(circlePub, msg, a.Sig) {
-		return errors.New("admission signature verification failed")
-	}
-	return nil
+	_, err := a.compile()
+	return err
 }
 
-// Compile runs the structural verifier over a statement admission and
-// returns the compiled chain for per-verb checks (statement.Compiled.Check);
-// a legacy admission has no chain and returns ErrLegacy.
-func (a *Admission) Compile() (*statement.Compiled, error) {
-	if a.Stmt == nil {
-		return nil, ErrLegacy
-	}
-	return a.compile()
-}
-
-// ErrLegacy marks an admission that predates statements: it carries no
-// verbs, and holders treat it as a full device admission (DeviceVerbs).
-var ErrLegacy = errors.New("legacy admission (no statement)")
+// Compile runs the structural verifier over the admission and returns the
+// compiled chain for per-verb checks (statement.Compiled.Check).
+func (a *Admission) Compile() (*statement.Compiled, error) { return a.compile() }
 
 // compile runs the structural verifier over a statement admission, with
 // the circle DID resolved to its root key.
@@ -356,52 +286,19 @@ func (a *Admission) compile() (*statement.Compiled, error) {
 	return c, nil
 }
 
-func (a *Admission) payloadBytes() ([]byte, error) {
-	if a.raw != nil {
-		return a.raw, nil
-	}
-	return encMode.Marshal(admissionPayload{Circle: a.Circle, Device: a.Device, Iat: a.Iat, Nbf: a.Nbf, Exp: a.Exp})
-}
+// Marshal encodes the admission for the wire or disk: the statement's
+// bytes, verbatim as signed.
+func (a *Admission) Marshal() ([]byte, error) { return a.Stmt.Bytes() }
 
-// Marshal encodes the admission for the wire or disk, payload bytes
-// verbatim.
-func (a *Admission) Marshal() ([]byte, error) {
-	if a.Stmt != nil {
-		return a.Stmt.Bytes()
-	}
-	msg, err := a.payloadBytes()
-	if err != nil {
-		return nil, err
-	}
-	return encMode.Marshal(wireAdmission{Payload: msg, Sig: a.Sig})
-}
-
-// isStatementBytes reports whether a {payload, sig} frame carries a
-// statement (its payload has `v`) rather than a legacy payload.
-func isStatementBytes(payload []byte) bool {
-	var probe versionProbe
-	return cbor.Unmarshal(payload, &probe) == nil && probe.V == statement.Version
-}
-
-// UnmarshalAdmission decodes an admission of either form. Untrusted
-// until Verify.
+// UnmarshalAdmission decodes an admission. Untrusted until Verify. An
+// admission minted before statements (2026-11-02) no longer decodes:
+// re-admit the device.
 func UnmarshalAdmission(data []byte) (*Admission, error) {
-	var w wireAdmission
-	if err := cbor.Unmarshal(data, &w); err != nil {
-		return nil, fmt.Errorf("decoding admission: %w", err)
+	s, err := statement.Decode(data)
+	if err != nil {
+		return nil, fmt.Errorf("decoding admission: %w (a pre-statement admission? re-admit the device)", err)
 	}
-	if isStatementBytes(w.Payload) {
-		s, err := statement.Decode(data)
-		if err != nil {
-			return nil, fmt.Errorf("decoding admission: %w", err)
-		}
-		return fromStatement(s)
-	}
-	var p admissionPayload
-	if err := cbor.Unmarshal(w.Payload, &p); err != nil {
-		return nil, fmt.Errorf("decoding admission payload: %w", err)
-	}
-	return &Admission{Circle: p.Circle, Device: p.Device, Iat: p.Iat, Nbf: p.Nbf, Exp: p.Exp, Sig: w.Sig, raw: bytes.Clone(w.Payload)}, nil
+	return fromStatement(s)
 }
 
 // AdmissionPath is where this node's device admission lives.

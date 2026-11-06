@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -117,32 +118,26 @@ func TestVerifyRejections(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var w wireCert
+		var w struct {
+			Payload cbor.RawMessage `cbor:"payload"`
+			Sig     []byte          `cbor:"sig"`
+		}
 		if err := cbor.Unmarshal(wire, &w); err != nil {
 			t.Fatal(err)
 		}
-		var p Payload
-		if err := cbor.Unmarshal(w.Payload, &p); err != nil {
-			t.Fatal(err)
+		// Flip the member verb's last byte: a different payload under the
+		// same signature.
+		i := bytes.LastIndex(w.Payload, []byte(statement.VerbMember))
+		if i < 0 {
+			t.Fatal("fixture: member verb not found in the payload")
 		}
-		p.Cmd = CmdAdmin // privilege escalation attempt
-		w.Payload, err = encMode.Marshal(p)
+		w.Payload[i+len(statement.VerbMember)-1] ^= 1
+		tampered, err := cbor.Marshal(w)
 		if err != nil {
 			t.Fatal(err)
 		}
-		tampered, err := encMode.Marshal(w)
-		if err != nil {
-			t.Fatal(err)
-		}
-		c, err := Unmarshal(tampered)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if c.Payload.Cmd != CmdAdmin {
-			t.Fatal("test setup: tamper did not land")
-		}
-		if err := Verify(c, nsPub, now); err == nil {
-			t.Fatal("verified a tampered cert")
+		if c, err := Unmarshal(tampered); err == nil && Verify(c, nsPub, now) == nil {
+			t.Fatal("tampered cert verified")
 		}
 	})
 	t.Run("forged signature", func(t *testing.T) {
@@ -154,14 +149,6 @@ func TestVerifyRejections(t *testing.T) {
 		c.Sig = forged.Sig
 		if err := Verify(c, nsPub, now); err == nil {
 			t.Fatal("verified a cert with a foreign signature")
-		}
-	})
-	t.Run("legacy cert with prf rejected", func(t *testing.T) {
-		c := legacyCert(t, nsPriv, devPub, CmdMember, Meta{Name: "x"}, now, time.Hour)
-		c.Payload.Prf = [][]byte{{0x01}}
-		c.raw = nil
-		if err := Verify(c, nsPub, now); err == nil {
-			t.Fatal("verified a legacy cert with a proof chain")
 		}
 	})
 	t.Run("delegated cert verifies through its chain", func(t *testing.T) {
@@ -206,20 +193,6 @@ func TestVerifyRejections(t *testing.T) {
 			t.Fatal("a member device issued a verifying cert")
 		}
 	})
-}
-
-// legacyCert mints a pre-statement certificate the way the old binary did,
-// so the legacy decode/verify path stays exercised.
-func legacyCert(t *testing.T, rootPriv ed25519.PrivateKey, devPub ed25519.PublicKey, cmd string, meta Meta, nbf time.Time, validity time.Duration) *Cert {
-	t.Helper()
-	rootDID := DIDForKey(rootPriv.Public().(ed25519.PublicKey))
-	p := Payload{Iss: rootDID, Aud: DIDForKey(devPub), Sub: rootDID, Cmd: cmd, Meta: meta,
-		Nbf: nbf.Unix(), Exp: nbf.Add(validity).Unix(), Nonce: make([]byte, nonceSize), Prf: [][]byte{}}
-	msg, err := encMode.Marshal(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &Cert{Payload: p, Sig: ed25519.Sign(rootPriv, msg), raw: msg}
 }
 
 func TestRenewPreservesPayload(t *testing.T) {
@@ -271,47 +244,36 @@ func TestRenewRejectsForeignRootKey(t *testing.T) {
 }
 
 // A cert whose payload carries fields this binary does not know (a future
-// scope attribute, fabric ADR 0005) must still verify, and must leave this
-// node byte-for-byte as it arrived — otherwise the fleet could never be
-// upgraded ahead of the first scoped cert.
+// attribute) must still verify, and must leave this node byte-for-byte as
+// it arrived — otherwise the fleet could never be upgraded ahead of the
+// first cert carrying the attribute. The statement keeps the signed bytes;
+// this checks the cert view over it.
 func TestVerifyAndForwardUnknownPayloadFields(t *testing.T) {
 	nsPub, nsPriv := genKey(t)
 	devPub, _ := genKey(t)
 	now := time.Now()
-
-	// The same payload as a hypothetical newer binary would encode it.
-	type futureMeta struct {
-		Name string `cbor:"name"`
-		IP   string `cbor:"ip,omitempty"`
-		Ring string `cbor:"ring,omitempty"` // unknown here
-	}
-	type futurePayload struct {
-		Iss   string     `cbor:"iss"`
-		Aud   string     `cbor:"aud"`
-		Sub   string     `cbor:"sub"`
-		Cmd   string     `cbor:"cmd"`
-		Meta  futureMeta `cbor:"meta"`
-		Nbf   int64      `cbor:"nbf"`
-		Exp   int64      `cbor:"exp"`
-		Nonce []byte     `cbor:"nonce"`
-		Prf   [][]byte   `cbor:"prf"`
-		Ext   string     `cbor:"ext,omitempty"` // unknown top-level field
-	}
-	rootDID := DIDForKey(nsPub)
-	fp := futurePayload{
-		Iss: rootDID, Aud: DIDForKey(devPub), Sub: rootDID, Cmd: CmdMember,
-		Meta:  futureMeta{Name: "guest-pc", Ring: "guest"},
-		Nbf:   now.Unix(),
-		Exp:   now.Add(time.Hour).Unix(),
-		Nonce: make([]byte, nonceSize),
-		Prf:   [][]byte{},
-		Ext:   "something newer",
-	}
-	payload, err := encMode.Marshal(fp)
+	enc, err := cbor.CoreDetEncOptions().EncMode()
 	if err != nil {
 		t.Fatal(err)
 	}
-	wire, err := encMode.Marshal(wireCert{Payload: payload, Sig: ed25519.Sign(nsPriv, payload)})
+	// The same payload as a hypothetical newer binary would encode it:
+	// a statement with an unknown meta attribute and an unknown top-level
+	// field.
+	rootDID := DIDForKey(nsPub)
+	payload, err := enc.Marshal(map[string]any{
+		"v": statement.Version, "typ": statement.TypeAssert,
+		"iss": rootDID, "aud": DIDForKey(devPub), "sub": rootDID,
+		"res":   []map[string]any{{"kind": statement.Any, "name": statement.Any, "sub": statement.Any}},
+		"verbs": []string{statement.VerbMember},
+		"nbf":   now.Unix(), "exp": now.Add(time.Hour).Unix(), "iat": now.Unix(),
+		"meta": map[string]any{"name": "guest-pc", "ring": "guest"},
+		"prf":  [][]byte{},
+		"ext":  "something newer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := enc.Marshal(map[string]any{"payload": cbor.RawMessage(payload), "sig": ed25519.Sign(nsPriv, payload)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,9 +307,8 @@ func TestVerifyAndForwardUnknownPayloadFields(t *testing.T) {
 
 // A fresh cert is a statement on the wire: it decodes with package
 // statement, labels as a admission, and the Payload view derives role
-// and scope from its verbs. A legacy cert still round-trips byte-for-byte
-// and renews into a statement.
-func TestStatementCertWireAndLegacyRenewal(t *testing.T) {
+// and scope from its verbs. Pre-statement bytes no longer decode.
+func TestStatementCertWire(t *testing.T) {
 	nsPub, nsPriv := genKey(t)
 	devPub, _ := genKey(t)
 	now := time.Now()
@@ -364,7 +325,7 @@ func TestStatementCertWireAndLegacyRenewal(t *testing.T) {
 		t.Fatalf("label %q del %d", s.Label(), s.Payload.Del)
 	}
 	back, _ := Unmarshal(wire)
-	if !back.IsStatement() || back.Payload.Cmd != CmdAdmin || !slices.Equal(back.Payload.Meta.Scope, []string{ScopeTun, ScopeVault}) ||
+	if back.Stmt == nil || back.Payload.Cmd != CmdAdmin || !slices.Equal(back.Payload.Meta.Scope, []string{ScopeTun, ScopeVault}) ||
 		back.Payload.Meta.IP != "100.64.0.1/24" || !back.Allows(ScopeTun) || back.Allows(ScopeAstral) || !back.Allows("") {
 		t.Fatalf("view: %+v", back.Payload)
 	}
@@ -372,30 +333,12 @@ func TestStatementCertWireAndLegacyRenewal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	legacy := legacyCert(t, nsPriv, devPub, CmdMember, Meta{Name: "nas", Scope: []string{ScopeVault}}, now, time.Hour)
-	lw, _ := legacy.Marshal()
-	lb, err := Unmarshal(lw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lb.IsStatement() {
-		t.Fatal("legacy bytes decoded as a statement")
-	}
-	if err := Verify(lb, nsPub, now); err != nil {
-		t.Fatalf("legacy verify: %v", err)
-	}
-	if again, _ := lb.Marshal(); !bytes.Equal(again, lw) {
-		t.Fatal("legacy re-marshal changed bytes")
-	}
-	renewed, err := Renew(nsPriv, lb, now.Add(time.Minute), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !renewed.IsStatement() || renewed.Payload.Aud != lb.Payload.Aud || !renewed.Allows(ScopeVault) || renewed.Allows(ScopeTun) {
-		t.Fatalf("legacy renewal: %+v", renewed.Payload)
-	}
-	if err := Verify(renewed, nsPub, now.Add(2*time.Minute)); err != nil {
-		t.Fatal(err)
+	// A {payload, sig} frame whose payload is not a statement is refused.
+	rootDID := DIDForKey(nsPub)
+	oldPayload, _ := cbor.Marshal(map[string]any{"iss": rootDID, "aud": DIDForKey(devPub), "sub": rootDID, "cmd": CmdMember, "nbf": now.Unix(), "exp": now.Add(time.Hour).Unix()})
+	oldWire, _ := cbor.Marshal(map[string]any{"payload": oldPayload, "sig": ed25519.Sign(nsPriv, oldPayload)})
+	if _, err := Unmarshal(oldWire); err == nil || !strings.Contains(err.Error(), "fabric renew") {
+		t.Fatalf("pre-statement cert decoded, or without the remedy: %v", err)
 	}
 }
 

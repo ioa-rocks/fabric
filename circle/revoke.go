@@ -3,8 +3,6 @@ package circle
 import (
 	"bytes"
 	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -30,27 +28,15 @@ import (
 // Revocations travel inside the circle: devices of the circle swap their
 // sets on every circle exchange (daemon.CircleService), and a fresh one is
 // pushed to connected devices at once. Expiry remains the backstop for a
-// device the gossip never reached. Legacy (v3) revocations — root-signed
-// device sweeps in the bespoke revokePayload — still decode and apply.
+// device the gossip never reached. (The pre-statement revocation form of
+// 2026-10 no longer decodes since 2026-11-06.)
 type Revocation struct {
 	Circle   string // circle DID
 	Device   string // swept device key, did:key; "" for a by-id revocation
 	TargetID []byte // revoked statement ID; nil for a sweep
 	At       int64  // unix seconds; sweeps kill admissions with Iat <= At
 	Sig      []byte
-	Stmt     *statement.Statement // statement form; nil for legacy bytes
-	raw      []byte
-}
-
-type revokePayload struct {
-	Circle string `cbor:"circle"`
-	Device string `cbor:"device"`
-	At     int64  `cbor:"at"`
-}
-
-type wireRevocation struct {
-	Payload cbor.RawMessage `cbor:"payload"`
-	Sig     []byte          `cbor:"sig"`
+	Stmt     *statement.Statement
 }
 
 const revocationsFile = "revocations.cbor"
@@ -96,58 +82,44 @@ func revocationFromStatement(s *statement.Statement) (*Revocation, error) {
 	return r, nil
 }
 
-// Verify checks the revocation's signatures and shape: a legacy or
-// root-signed one must be signed by the circle's root; a delegated one must
-// ride a chain whose leaf names the revoker, in this circle. Whether a
-// delegated revocation actually reaches a given admission is rule 3, in
+// Verify checks the revocation's signatures and shape: a root-signed one
+// must be signed by the circle's root; a delegated one must ride a chain
+// whose leaf names the revoker, in this circle. Whether a delegated
+// revocation actually reaches a given admission is rule 3, in
 // Circle.Revoked.
 func (r *Revocation) Verify() error {
-	if r.Stmt != nil {
-		set := statement.NewRevocationSet()
-		if _, err := set.Add(r.Stmt); err != nil {
+	if r.Stmt == nil {
+		return errors.New("revocation without statement form")
+	}
+	set := statement.NewRevocationSet()
+	if _, err := set.Add(r.Stmt); err != nil {
+		return err
+	}
+	if r.Stmt.IsRootIssued() {
+		k, err := r.Stmt.IssuerKey()
+		if err != nil {
 			return err
 		}
-		if r.Stmt.IsRootIssued() {
-			k, err := r.Stmt.IssuerKey()
-			if err != nil {
-				return err
-			}
-			rootKey, err := did.KeyFor(r.Circle)
-			if err != nil {
-				return fmt.Errorf("revocation circle: %w", err)
-			}
-			if !bytes.Equal(k, rootKey) {
-				return errors.New("revocation is signed neither by the circle root nor under a chain")
-			}
-			return nil
+		rootKey, err := did.KeyFor(r.Circle)
+		if err != nil {
+			return fmt.Errorf("revocation circle: %w", err)
 		}
-		// Delegated: the chain it rides must compile against this circle's
-		// root and be delegable, or anyone could flood a circle with
-		// revocations under throwaway keys (stored for MaxValidity,
-		// re-gossiped, cache-thrashing) — whether a revocation reaches a
-		// given admission is still rule 3 (agy review, 2026-11-02).
-		parent := r.Stmt.Parent()
-		if _, err := statement.Compile(parent, nil, r.Circle, didKeyRoots{}); err != nil {
-			return fmt.Errorf("revocation chain: %w", err)
-		}
-		if parent.Payload.Del < 1 {
-			return errors.New("revocation chain leaf is not delegable: nothing can be under it")
+		if !bytes.Equal(k, rootKey) {
+			return errors.New("revocation is signed neither by the circle root nor under a chain")
 		}
 		return nil
 	}
-	circlePub, err := did.KeyFor(r.Circle)
-	if err != nil {
-		return fmt.Errorf("revocation circle: %w", err)
+	// Delegated: the chain it rides must compile against this circle's
+	// root and be delegable, or anyone could flood a circle with
+	// revocations under throwaway keys (stored for MaxValidity,
+	// re-gossiped, cache-thrashing) — whether a revocation reaches a
+	// given admission is still rule 3 (agy review, 2026-11-02).
+	parent := r.Stmt.Parent()
+	if _, err := statement.Compile(parent, nil, r.Circle, didKeyRoots{}); err != nil {
+		return fmt.Errorf("revocation chain: %w", err)
 	}
-	if _, err := did.KeyFor(r.Device); err != nil {
-		return fmt.Errorf("revocation device: %w", err)
-	}
-	msg, err := r.payloadBytes()
-	if err != nil {
-		return err
-	}
-	if !ed25519.Verify(circlePub, msg, r.Sig) {
-		return errors.New("revocation signature verification failed")
+	if parent.Payload.Del < 1 {
+		return errors.New("revocation chain leaf is not delegable: nothing can be under it")
 	}
 	return nil
 }
@@ -167,9 +139,6 @@ func (r *Revocation) Kills(a *Admission) bool {
 		return false
 	}
 	if r.TargetID != nil {
-		if a.Stmt == nil {
-			return false
-		}
 		id := a.Stmt.ID()
 		return bytes.Equal(r.TargetID, id[:])
 	}
@@ -181,68 +150,24 @@ func (r *Revocation) Time() time.Time { return time.Unix(r.At, 0) }
 
 // Spent reports whether every admission this revocation could kill has
 // expired on its own, so the record can be dropped (task file, Retention).
-func (r *Revocation) Spent(now time.Time) bool {
-	if r.Stmt != nil {
-		return statement.Spent(r.Stmt, time.Time{}, now)
-	}
-	return !now.Before(r.Time().Add(DefaultValidity))
-}
+func (r *Revocation) Spent(now time.Time) bool { return statement.Spent(r.Stmt, time.Time{}, now) }
 
-// ID is the dedup key: the hash of the signed payload bytes.
-func (r *Revocation) ID() string {
-	if r.Stmt != nil {
-		return r.Stmt.IDHex()
-	}
-	msg, err := r.payloadBytes()
-	if err != nil {
-		panic(fmt.Sprintf("circle: encoding revocation: %v", err))
-	}
-	sum := sha256.Sum256(msg)
-	return hex.EncodeToString(sum[:])
-}
+// ID is the dedup key: the statement ID.
+func (r *Revocation) ID() string { return r.Stmt.IDHex() }
 
-func (r *Revocation) payloadBytes() ([]byte, error) {
-	if r.raw != nil {
-		return r.raw, nil
-	}
-	return encMode.Marshal(revokePayload{Circle: r.Circle, Device: r.Device, At: r.At})
-}
+// Marshal encodes the revocation for the wire or disk: the statement's
+// bytes, verbatim as signed.
+func (r *Revocation) Marshal() ([]byte, error) { return r.Stmt.Bytes() }
 
-// Marshal encodes the revocation for the wire or disk, payload verbatim.
-func (r *Revocation) Marshal() ([]byte, error) {
-	if r.Stmt != nil {
-		return r.Stmt.Bytes()
-	}
-	msg, err := r.payloadBytes()
-	if err != nil {
-		return nil, err
-	}
-	return encMode.Marshal(wireRevocation{Payload: msg, Sig: r.Sig})
-}
-
-// IsStatement reports whether the revocation is in statement form (v4
-// exchange only).
-func (r *Revocation) IsStatement() bool { return r.Stmt != nil }
-
-// UnmarshalRevocation decodes a revocation of either form. Untrusted until
-// Verify.
+// UnmarshalRevocation decodes a revocation. Untrusted until Verify. A
+// revocation minted before statements (2026-11-02) no longer decodes; it
+// could only have killed admissions of that age, themselves undecodable.
 func UnmarshalRevocation(data []byte) (*Revocation, error) {
-	var w wireRevocation
-	if err := cbor.Unmarshal(data, &w); err != nil {
-		return nil, fmt.Errorf("decoding revocation: %w", err)
+	s, err := statement.Decode(data)
+	if err != nil {
+		return nil, fmt.Errorf("decoding revocation: %w (a pre-statement revocation?)", err)
 	}
-	if isStatementBytes(w.Payload) {
-		s, err := statement.Decode(data)
-		if err != nil {
-			return nil, fmt.Errorf("decoding revocation: %w", err)
-		}
-		return revocationFromStatement(s)
-	}
-	var p revokePayload
-	if err := cbor.Unmarshal(w.Payload, &p); err != nil {
-		return nil, fmt.Errorf("decoding revocation payload: %w", err)
-	}
-	return &Revocation{Circle: p.Circle, Device: p.Device, At: p.At, Sig: w.Sig, raw: bytes.Clone(w.Payload)}, nil
+	return revocationFromStatement(s)
 }
 
 // RevocationsPath is where this node keeps the circle's revocations.
@@ -344,10 +269,8 @@ func (c *Circle) RevocationSet(now time.Time) (*statement.RevocationSet, error) 
 	}
 	set := statement.NewRevocationSet()
 	for _, r := range rs {
-		if r.Stmt != nil {
-			if _, err := set.Add(r.Stmt); err != nil {
-				return nil, err
-			}
+		if _, err := set.Add(r.Stmt); err != nil {
+			return nil, err
 		}
 	}
 	return set, nil
@@ -355,26 +278,20 @@ func (c *Circle) RevocationSet(now time.Time) (*statement.RevocationSet, error) 
 
 // Revoked reports whether the admission is dead under this circle's
 // revocation set: a root sweep or by-id revocation of the admission
-// itself (Kills), or — for a statement admission — any statement
-// revocation reaching a link of its chain (verifier rule 3: the root
-// revoking a desk's admission kills what the desk admitted; a delegated
-// revocation kills what lies under its chain). Kills alone sees only the
-// leaf, so the chain check runs whenever a statement revocation exists,
-// not only a delegated one (Codex review, 2026-11-02).
+// itself (Kills), or any revocation reaching a link of its chain
+// (verifier rule 3: the root revoking a desk's admission kills what the
+// desk admitted; a delegated revocation kills what lies under its chain).
+// Kills alone sees only the leaf, so the chain check runs whenever a
+// revocation exists, not only a delegated one (Codex review, 2026-11-02).
 func (c *Circle) Revoked(a *Admission, now time.Time) bool {
 	rs, err := c.Revocations(now)
-	if err != nil {
+	if err != nil || len(rs) == 0 {
 		return false
 	}
-	statements := false
 	for _, r := range rs {
 		if r.Kills(a) {
 			return true
 		}
-		statements = statements || r.Stmt != nil
-	}
-	if !statements || a.Stmt == nil {
-		return false
 	}
 	compiled, err := a.compile()
 	if err != nil {
@@ -382,9 +299,7 @@ func (c *Circle) Revoked(a *Admission, now time.Time) bool {
 	}
 	set := statement.NewRevocationSet()
 	for _, r := range rs {
-		if r.Stmt != nil {
-			set.Add(r.Stmt)
-		}
+		set.Add(r.Stmt)
 	}
 	return compiled.RevokedBy(c.Roots(), set) != nil
 }

@@ -336,7 +336,7 @@ func (a *AuthService) present(p peer.ID, verified []string) Hello {
 	if presenter != nil {
 		hello = presenter(p, verified)
 	}
-	if own == nil || own.Stmt == nil {
+	if own == nil {
 		return hello
 	}
 	ownCircle := own.Payload.Sub

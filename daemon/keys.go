@@ -109,8 +109,8 @@ func (d *Daemon) devicePriv() (ed25519.PrivateKey, error) {
 func (d *Daemon) ownAdmission(circleDID string) (*statement.Statement, error) {
 	if circleDID == d.CircleDID() {
 		c := d.OwnCert()
-		if c == nil || c.Stmt == nil {
-			return nil, errors.New("this device's membership cert predates statements — `fabric renew` it on the master first")
+		if c == nil {
+			return nil, errors.New("this device holds no membership cert")
 		}
 		return c.Stmt, nil
 	}
@@ -124,9 +124,6 @@ func (d *Daemon) ownAdmission(circleDID string) (*statement.Statement, error) {
 	a := d.Circle.liveAdmission(c, time.Now())
 	if a == nil {
 		return nil, fmt.Errorf("this device has no live admission in circle %q", c.Config.Name)
-	}
-	if a.Stmt == nil {
-		return nil, fmt.Errorf("this device's admission in %q predates statements — `fabric circle renew -circle %s` first", c.Config.Name, c.Config.Name)
 	}
 	return a.Stmt, nil
 }

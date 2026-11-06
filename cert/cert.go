@@ -20,8 +20,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fxamacker/cbor/v2"
-
 	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/statement"
 )
@@ -128,14 +126,10 @@ func ScopeAllows(scope []string, family string) bool {
 	return slices.Contains(scope, family)
 }
 
-// Allows reports whether the cert admits a protocol family: for a statement
-// cert, whether it carries the family's verbs; for a legacy cert,
-// ScopeAllows over its scope.
+// Allows reports whether the cert admits a protocol family: whether it
+// carries the family's verbs (the control plane, "", always).
 func (c *Cert) Allows(family string) bool {
-	if c.Stmt != nil {
-		return family == "" || hasAnyVerb(c.Stmt.Payload.Verbs, familyVerbs[family])
-	}
-	return ScopeAllows(c.Payload.Meta.Scope, family)
+	return family == "" || hasAnyVerb(c.Stmt.Payload.Verbs, familyVerbs[family])
 }
 
 // NormalizeScope validates and canonicalizes a scope as entered on the
@@ -189,9 +183,10 @@ func ScopeString(scope []string) string {
 	return strings.Join(scope, ",")
 }
 
-// Payload is the signed portion of a legacy membership certificate, and the
-// view every caller reads for a statement certificate too (derived from the
-// statement: Cmd from the admin verb, Meta.Scope from the resource verbs).
+// Payload is the view every caller reads of a membership certificate,
+// derived from the statement: Cmd from the admin verb, Meta.Scope from the
+// resource verbs. (It was the signed portion of the pre-statement
+// certificate; those no longer decode since 2026-11-06.)
 type Payload struct {
 	Iss   string   `cbor:"iss"` // issuer: root key, did:key
 	Aud   string   `cbor:"aud"` // audience: the member device key, did:key
@@ -205,44 +200,13 @@ type Payload struct {
 }
 
 // Cert is a membership certificate: a statement (Stmt) read through the
-// Payload view, or a legacy payload plus the root key's signature over its
-// deterministic CBOR encoding.
-//
-// A decoded cert keeps the payload bytes exactly as they arrived, and
-// Verify checks the signature over those — never over a re-encoding of the
-// parsed struct. This is what lets the master sign new payload fields
-// before every node understands them: an older binary drops unknown fields
-// when parsing, but still verifies and re-gossips the original bytes
-// untouched.
+// Payload view. The statement keeps the payload bytes exactly as they
+// arrived and verifies the signature over those, never over a re-encoding,
+// so a master may sign fields before every node understands them.
 type Cert struct {
 	Payload Payload // read-only: edits are neither signed over nor emitted
 	Sig     []byte
-	Stmt    *statement.Statement // the statement form; nil for a legacy cert
-	raw     []byte               // legacy payload bytes as signed; nil until marshalled once
-}
-
-// wireCert is the legacy on-the-wire shape (statements share it: {payload,
-// sig}); the payload travels as an opaque CBOR item so unknown fields
-// survive a round trip through any node.
-type wireCert struct {
-	Payload cbor.RawMessage `cbor:"payload"`
-	Sig     []byte          `cbor:"sig"`
-}
-
-type versionProbe struct {
-	V int `cbor:"v,omitempty"`
-}
-
-// Deterministic encoding (RFC 8949 core deterministic requirements) so that
-// sign and verify agree on the exact bytes.
-var encMode cbor.EncMode
-
-func init() {
-	var err error
-	encMode, err = cbor.CoreDetEncOptions().EncMode()
-	if err != nil {
-		panic(fmt.Sprintf("cert: building CBOR enc mode: %v", err))
-	}
+	Stmt    *statement.Statement
 }
 
 // familyVerbs maps a scope family to the verbs that realise it.
@@ -386,7 +350,7 @@ func FromStatement(s *statement.Statement) (*Cert, error) {
 // Renew re-issues an existing certificate with a fresh validity window
 // (spec §5). The payload is preserved — same device key, name, role, and
 // overlay IP: a renewal must never renumber a node — only the validity
-// window and nonce change. A legacy cert renews into a statement.
+// window and nonce change.
 func Renew(rootPriv ed25519.PrivateKey, old *Cert, nbf time.Time, validity time.Duration) (*Cert, error) {
 	return RenewMeta(rootPriv, old, old.Payload.Meta, nbf, validity)
 }
@@ -402,83 +366,22 @@ func RenewMeta(rootPriv ed25519.PrivateKey, old *Cert, meta Meta, nbf time.Time,
 	if err != nil {
 		return nil, err
 	}
-	var parent *statement.Statement
-	if old.Stmt != nil {
-		parent = old.Stmt.Parent()
-	}
-	return IssueAs(rootPriv, parent, old.Payload.Sub, devPub, old.Payload.Cmd, meta, nbf, validity)
-}
-
-// payloadBytes returns the bytes a legacy signature covers.
-func (c *Cert) payloadBytes() ([]byte, error) {
-	if c.raw != nil {
-		return c.raw, nil
-	}
-	msg, err := encMode.Marshal(c.Payload)
-	if err != nil {
-		return nil, fmt.Errorf("encoding payload: %w", err)
-	}
-	return msg, nil
+	return IssueAs(rootPriv, old.Stmt.Parent(), old.Payload.Sub, devPub, old.Payload.Cmd, meta, nbf, validity)
 }
 
 // Verify checks a certificate against the expected root key at the given
 // time. It returns nil only if the cert is a currently valid membership
 // proof for the circle that key roots.
 func Verify(c *Cert, rootPub ed25519.PublicKey, now time.Time) error {
-	if c.Stmt != nil {
-		return VerifyRoots(c, statement.RootMap{did.ForKey(rootPub): {rootPub}}, now)
-	}
-	issKey, err := did.KeyFor(c.Payload.Iss)
-	if err != nil {
-		return fmt.Errorf("issuer: %w", err)
-	}
-	if !bytes.Equal(issKey, rootPub) {
-		return errors.New("issuer is not this circle's root key")
-	}
-	// A legacy cert is always root-issued: issuer owns the circle and
-	// the proof chain is empty (parsed, but rejected — spec §2).
-	if c.Payload.Sub != c.Payload.Iss {
-		return errors.New("legacy certificate with sub != iss")
-	}
-	if len(c.Payload.Prf) != 0 {
-		return errors.New("legacy certificate with a non-empty prf")
-	}
-	if c.Payload.Cmd != CmdMember && c.Payload.Cmd != CmdAdmin {
-		return fmt.Errorf("unknown command path %q", c.Payload.Cmd)
-	}
-	if now.Unix() < c.Payload.Nbf {
-		return errors.New("certificate not yet valid")
-	}
-	if now.Unix() > c.Payload.Exp {
-		return errors.New("certificate expired")
-	}
-	msg, err := c.payloadBytes()
-	if err != nil {
-		return err
-	}
-	if !ed25519.Verify(rootPub, msg, c.Sig) {
-		return errors.New("signature verification failed")
-	}
-	return nil
+	return VerifyRoots(c, statement.RootMap{did.ForKey(rootPub): {rootPub}}, now)
 }
 
 // VerifyRoots checks a certificate against a set of honoured roots: the
 // cert's circle (sub) must be one the roots store answers for, and the
-// chain must verify for member at now (statement rules 1–8). A legacy cert
-// is checked against the root key of its own circle, if honoured.
+// chain must verify for member at now (statement rules 1–8).
 func VerifyRoots(c *Cert, roots statement.Roots, now time.Time) error {
 	if c.Stmt == nil {
-		keys := roots.RootKeys(c.Payload.Sub)
-		if len(keys) == 0 {
-			return fmt.Errorf("certificate circle %s is not honoured here", c.Payload.Sub)
-		}
-		var err error
-		for _, k := range keys {
-			if err = Verify(c, k, now); err == nil {
-				return nil
-			}
-		}
-		return err
+		return errors.New("certificate without statement form")
 	}
 	if !bytes.Equal(c.Sig, c.Stmt.Sig) {
 		return errors.New("signature does not match the statement")
@@ -503,41 +406,18 @@ func (c *Cert) Expiry() time.Time {
 	return time.Unix(c.Payload.Exp, 0)
 }
 
-// IsStatement reports whether the cert is in statement form.
-func (c *Cert) IsStatement() bool { return c.Stmt != nil }
+// Marshal encodes the certificate for the wire: the statement's bytes,
+// byte-for-byte as signed, so fields this binary does not know are
+// forwarded rather than stripped.
+func (c *Cert) Marshal() ([]byte, error) { return c.Stmt.Bytes() }
 
-// Marshal encodes the certificate for the wire. A decoded cert re-emits its
-// payload byte-for-byte, so fields this binary does not know are forwarded
-// rather than stripped.
-func (c *Cert) Marshal() ([]byte, error) {
-	if c.Stmt != nil {
-		return c.Stmt.Bytes()
-	}
-	msg, err := c.payloadBytes()
-	if err != nil {
-		return nil, err
-	}
-	return encMode.Marshal(wireCert{Payload: msg, Sig: c.Sig})
-}
-
-// Unmarshal decodes a certificate of either form from the wire. The result
-// is untrusted until Verify passes.
+// Unmarshal decodes a certificate from the wire. The result is untrusted
+// until Verify passes. A certificate minted before statements (2026-11-02)
+// no longer decodes: re-issue it with `fabric renew` on the master.
 func Unmarshal(data []byte) (*Cert, error) {
-	var w wireCert
-	if err := cbor.Unmarshal(data, &w); err != nil {
-		return nil, fmt.Errorf("decoding certificate: %w", err)
+	s, err := statement.Decode(data)
+	if err != nil {
+		return nil, fmt.Errorf("decoding certificate: %w (a pre-statement certificate? re-issue it with 'fabric renew')", err)
 	}
-	var probe versionProbe
-	if cbor.Unmarshal(w.Payload, &probe) == nil && probe.V == statement.Version {
-		s, err := statement.Decode(data)
-		if err != nil {
-			return nil, fmt.Errorf("decoding certificate: %w", err)
-		}
-		return FromStatement(s)
-	}
-	c := Cert{Sig: w.Sig, raw: append([]byte(nil), w.Payload...)}
-	if err := cbor.Unmarshal(w.Payload, &c.Payload); err != nil {
-		return nil, fmt.Errorf("decoding certificate payload: %w", err)
-	}
-	return &c, nil
+	return FromStatement(s)
 }

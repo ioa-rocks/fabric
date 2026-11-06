@@ -208,12 +208,6 @@ func (s *CircleService) ownAllows(family string) bool {
 			return true
 		}
 	}
-	// No statement admissions at all (a legacy cert): the cert decides.
-	if s.auth != nil {
-		if own := s.auth.Own(); own != nil && own.Stmt == nil {
-			return own.Allows(family)
-		}
-	}
 	return false
 }
 
@@ -238,10 +232,9 @@ type ownAdmission struct {
 	stmt   *statement.Statement
 }
 
-// ownAdmissions lists this node's live admissions in statement form, one
-// per roster: the membership cert for the circle it is in, the stored
-// admission for every other circle directory. Legacy admissions have
-// no statement form and are not presentable (re-admit to migrate).
+// ownAdmissions lists this node's live admissions, one per roster: the
+// membership cert for the circle it is in, the stored admission for every
+// other circle directory.
 func (s *CircleService) ownAdmissions(now time.Time) []ownAdmission {
 	if s.table == nil {
 		return nil
@@ -255,7 +248,7 @@ func (s *CircleService) ownAdmissions(now time.Time) []ownAdmission {
 	if own == nil && s.auth != nil {
 		own = s.auth.Own()
 	}
-	if own != nil && own.Stmt != nil {
+	if own != nil {
 		if r, ok := s.table.RosterFor(own.Payload.Sub); ok {
 			out = append(out, ownAdmission{roster: r, circle: own.Payload.Sub, stmt: own.Stmt})
 			seen[r] = true
@@ -267,7 +260,7 @@ func (s *CircleService) ownAdmissions(now time.Time) []ownAdmission {
 			continue
 		}
 		a := s.liveAdmission(c, now)
-		if a == nil || a.Stmt == nil {
+		if a == nil {
 			continue
 		}
 		out = append(out, ownAdmission{roster: r, circle: c.Config.DID, stmt: a.Stmt})
@@ -385,9 +378,6 @@ func (s *CircleService) Admit(raw []byte) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if a.Stmt == nil {
-		return false, errors.New("admission is not a statement")
-	}
 	if err := a.VerifySignature(); err != nil {
 		return false, err
 	}
@@ -460,23 +450,17 @@ func (s *CircleService) rosterRevoked(r *circle.Revocation) {
 	if _, ok := s.table.RosterFor(r.Circle); !ok {
 		return
 	}
-	switch {
-	case r.Stmt != nil:
-		_, _ = s.table.AddRevocation(r.Circle, r.Stmt)
-	case r.Device != "":
-		s.table.SweepIn(r.Circle, r.Device, r.Time())
-	}
+	_, _ = s.table.AddRevocation(r.Circle, r.Stmt)
 }
 
 // homeAdmission returns the node's cert read as an admission into c,
-// when c is the node's home circle and the cert is a statement; nil
-// otherwise.
+// when c is the node's home circle; nil otherwise.
 func (s *CircleService) homeAdmission(c *circle.Circle) *circle.Admission {
 	if s.ownCert == nil {
 		return nil
 	}
 	own := s.ownCert()
-	if own == nil || own.Stmt == nil || own.Payload.Sub != c.Config.DID {
+	if own == nil || own.Payload.Sub != c.Config.DID {
 		return nil
 	}
 	raw, err := own.Marshal()
@@ -491,11 +475,10 @@ func (s *CircleService) homeAdmission(c *circle.Circle) *circle.Admission {
 }
 
 // liveAdmission is the admission this node presents for c: the
-// membership cert when c is the circle the device was joined in (what the
-// v2 handshake presents too — the cert carries the name and overlay
-// address; a bare `circle renew` file must not shadow it on the legacy
-// exchange), else the stored admission when live. nil when the node has
-// none.
+// membership cert when c is the circle the device was joined in (the cert
+// carries the name and overlay address; a bare `circle renew` file must
+// not shadow it), else the stored admission when live. nil when the node
+// has none.
 func (s *CircleService) liveAdmission(c *circle.Circle, now time.Time) *circle.Admission {
 	if a := s.homeAdmission(c); a != nil && a.Valid(now) == nil && !c.Revoked(a, now) {
 		return a
@@ -560,7 +543,6 @@ type CircleInfo struct {
 	Devices     int        `json:"devices"`           // live devices in the roster (this one excluded)
 	Admitted    bool       `json:"attested"`          // holds a currently valid, unrevoked admission
 	Expiry      *time.Time `json:"expiry,omitempty"`  // of this device's admission, if any
-	Legacy      bool       `json:"legacy,omitempty"`  // admission predates validity windows
 	Revoked     bool       `json:"revoked,omitempty"` // the circle revoked this device
 	Revocations int        `json:"revocations"`       // live revocations held for the circle
 }
@@ -592,7 +574,6 @@ func (s *CircleService) Info(now time.Time) []CircleInfo {
 		if a != nil {
 			exp := a.Expiry()
 			ci.Expiry = &exp
-			ci.Legacy = a.Legacy()
 			ci.Revoked = c.Revoked(a, now)
 			ci.Admitted = a.Valid(now) == nil && !ci.Revoked
 			if !c.HasKey() {
@@ -613,7 +594,7 @@ func (s *CircleService) Close() { s.stop() }
 // for the home circle, its membership cert; want.PresentingKey is set here
 // from the transport-authenticated peer key. Check runs on every call
 // (window, scope, roots still honoured, revocations); only the crypto is
-// cached. A legacy cert carries no verbs and counts as the full device set.
+// cached.
 func (s *CircleService) Verify(ctx context.Context, p peer.ID, want statement.Want) error {
 	if want.Sub == "" {
 		return errors.New("verify: circle required")
@@ -654,9 +635,6 @@ func (s *CircleService) verifyHome(p peer.ID, want statement.Want) error {
 	c, ok := s.certOf(p, want.Sub)
 	if !ok {
 		return fmt.Errorf("%s is not a member of circle %s", p, shortDID(want.Sub))
-	}
-	if c.Stmt == nil {
-		return legacyAllows(cert.VerbsForScope(c.Payload.Cmd, c.Payload.Meta.Scope), want)
 	}
 	id := c.Stmt.ID()
 	s.mu.RLock()
@@ -762,17 +740,6 @@ func (s *CircleService) AddRevocation(r *circle.Revocation) error {
 		s.sync.PublishStatements(r.Circle, nil, fresh)
 	}
 	return nil
-}
-
-// legacyAllows is the verb check for a pre-statement cert or admission:
-// no resources were ever narrowed, so it is the verb list alone.
-func legacyAllows(verbs []string, want statement.Want) error {
-	for _, v := range verbs {
-		if v == want.Verb {
-			return nil
-		}
-	}
-	return fmt.Errorf("legacy chain does not grant %s", want.Verb)
 }
 
 func shortDID(d string) string {
@@ -963,13 +930,12 @@ func (s *CircleService) Keep(p peer.ID) {
 
 // DeviceChain returns the wire bytes of a connected device's admission
 // in a circle (its membership cert for the home circle), for a data plane
-// that must re-check a holder after it has gone: a chain in statement form
-// re-verifies from its bytes alone (CheckChain). Legacy admissions have
-// no such form.
+// that must re-check a holder after it has gone: a chain re-verifies from
+// its bytes alone (CheckChain).
 func (s *CircleService) DeviceChain(p peer.ID, circleDID string) ([]byte, bool) {
 	if s.home != nil && circleDID == s.home() && s.certOf != nil {
 		c, ok := s.certOf(p, circleDID)
-		if !ok || c.Stmt == nil {
+		if !ok {
 			return nil, false
 		}
 		b, err := c.Stmt.Bytes()
@@ -1239,7 +1205,7 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) (fresh [
 			// Not held here: only the home circle matters (a gate hosts
 			// and verifies for it without a circle directory). Anything
 			// else is noise a member could flood us with.
-			if r.Stmt == nil || s.home == nil || r.Circle != s.home() || r.Spent(now) {
+			if s.home == nil || r.Circle != s.home() || r.Spent(now) {
 				continue
 			}
 			s.mu.Lock()

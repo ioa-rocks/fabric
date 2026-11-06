@@ -442,9 +442,10 @@ Expiry is the backstop. A revocation kills the device's admissions
 issued up to that moment; admitting the device again afterwards is a
 deliberate re-admission and stands. `fabric status` warns loudly about
 expired, expiring and revoked admissions, as it does for certs.
-Admissions minted before 2026-10-31 carry no window and count as
-valid for one year from issue; nodes older than that verify newer
-admissions but enforce neither expiry nor revocation until upgraded.
+Admissions, certs and revocations are statements (since 2026-11-02); the
+bespoke pre-statement forms no longer decode (2026-11-06) — a device
+still holding one is re-admitted (`circle admit`) or renewed (`fabric
+renew`) by an owner.
 
 ## The TUN bridge — plain IP over the mesh
 

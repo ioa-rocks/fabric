@@ -201,7 +201,7 @@ func TestDelegatedAdmitAndRevoke(t *testing.T) {
 	if !c.Revoked(byDesk, now) {
 		t.Fatal("root revoking the desk did not cascade")
 	}
-	// Legacy-looking storage round trip: both forms survive the file.
+	// Storage round trip: both revocations survive the file.
 	rs, _ := c.Revocations(now)
 	if len(rs) != 2 {
 		t.Fatalf("stored %d revocations, want 2", len(rs))

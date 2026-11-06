@@ -282,9 +282,9 @@ func admitSelf(statePath string, c *circle.Circle, pass string) error {
 	// roster and strip the device of its address.
 	var prev *statement.Statement
 	firstCircle := false
-	if own, err := dir.LoadCert(); err == nil && own.Stmt != nil && own.Payload.Sub == c.Config.DID {
+	if own, err := dir.LoadCert(); err == nil && own.Payload.Sub == c.Config.DID {
 		prev, firstCircle = own.Stmt, true
-	} else if cur, err := c.LoadAdmission(); err == nil && cur.Stmt != nil {
+	} else if cur, err := c.LoadAdmission(); err == nil {
 		prev = cur.Stmt
 	}
 	now := time.Now()
@@ -516,7 +516,7 @@ func cmdCircleStatus(args []string) error {
 			fmt.Printf("  gates: %s\n", strings.Join(c.Config.Gates, " "))
 		}
 		a, err := c.LoadAdmission()
-		if (err != nil || a.Valid(now) != nil) && ownCert != nil && ownCert.Stmt != nil && ownCert.Payload.Sub == c.Config.DID {
+		if (err != nil || a.Valid(now) != nil) && ownCert != nil && ownCert.Payload.Sub == c.Config.DID {
 			if raw, merr := ownCert.Marshal(); merr == nil {
 				if fromCert, uerr := circle.UnmarshalAdmission(raw); uerr == nil {
 					a, err = fromCert, nil
@@ -545,9 +545,6 @@ func cmdCircleStatus(args []string) error {
 		default:
 			left := int(a.Expiry().Sub(now).Hours() / 24)
 			note := ""
-			if a.Legacy() {
-				note = "; legacy admission, window implied from issue date"
-			}
 			if a.PastHalfLife(now) {
 				if c.HasKey() {
 					note += "; past half-life — renew with 'fabric circle renew -expiring'"

@@ -59,7 +59,7 @@ type circleSet struct {
 	DID         string         `cbor:"did"`
 	Roots       []string       `cbor:"roots,omitempty"` // the circle DID again (older binaries listed every root they honoured)
 	Admissions  [][]byte       `cbor:"a,omitempty"`     // admissions, statement bytes (live and lapsed)
-	Revocations [][]byte       `cbor:"r,omitempty"`     // statement and legacy forms
+	Revocations [][]byte       `cbor:"r,omitempty"`     // statement bytes
 	Events      []*event.Event `cbor:"e,omitempty"`     // membership-event envelopes (first circle only)
 }
 
