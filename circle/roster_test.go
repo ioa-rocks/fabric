@@ -558,7 +558,10 @@ func TestRemovalRetiresUnacknowledgedAdmissions(t *testing.T) {
 	}
 	// Acks names the removal; a renewal carrying it is a restoration, on
 	// the remembered terms.
-	acks := r.Acks(devDID)
+	acks, err := r.Acks(devDID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	rid := removal.Stmt.ID()
 	if len(acks) != 1 || !bytes.Equal(acks[0], rid[:]) {
 		t.Fatalf("Acks = %x", acks)
@@ -577,7 +580,7 @@ func TestRemovalRetiresUnacknowledgedAdmissions(t *testing.T) {
 	}
 	// The restoration inherits the acknowledgment into the next renewal:
 	// Acks still names the removal though the device is back.
-	if acks := r.Acks(devDID); len(acks) != 1 {
+	if acks, _ := r.Acks(devDID); len(acks) != 1 {
 		t.Fatalf("Acks after restoration = %x", acks)
 	}
 	// The restoration and the memory are both kept.
@@ -636,5 +639,82 @@ func TestSlotIsAnAntichainNotARegister(t *testing.T) {
 	r, _, _ = r.Add(T.Stmt, now.Add(time.Second))
 	if n := len(r.Held(devDID)); n != 1 {
 		t.Fatalf("held %d after a dominating admission, want 1", n)
+	}
+}
+
+// A removal signed by a key later declared compromised stops applying, so
+// any retired admission may be eligible again: the retired set is an
+// antichain, not the latest alone, and the verdict does not depend on the
+// order the facts arrived in (Codex review, 2026-11-06).
+func TestRetiredAdmissionsReturnWhenARemovalsKeyIsCompromised(t *testing.T) {
+	k1Pub, k1, _ := ed25519.GenerateKey(rand.Reader)
+	k2Pub, k2, _ := ed25519.GenerateKey(rand.Reader)
+	circleDID := did.ForKey(k1Pub)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	devDID := did.ForKey(devPub)
+	t0 := time.Now().Add(-time.Hour)
+	R1, _ := Revoke(k1, devDID, t0) // the legitimate root's removal
+	r1 := R1.Stmt.ID()
+	h, _ := statement.Handover(k1, k2Pub, circleDID, false, t0.Add(time.Second), nil)
+	X, _ := Issue(k1, nil, circleDID, devPub, t0.Add(time.Second), time.Hour, Terms{Verbs: DeviceVerbs, Acks: [][]byte{r1[:]}}) // acknowledges R1, issued at the handover
+	R2, _ := RevokeAs(k2, h, circleDID, statement.Target{Aud: devDID}, t0.Add(2*time.Second))                                   // K2's removal
+	r2 := R2.Stmt.ID()
+	Y, _ := Issue(k2, h, circleDID, devPub, t0.Add(3*time.Second), time.Hour, Terms{Verbs: DeviceVerbs, Acks: [][]byte{r2[:]}}) // acknowledges R2 only
+	k3Pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	comp, _ := statement.Handover(k2, k3Pub, circleDID, true, t0.Add(4*time.Second), h) // K2 compromised
+	now := t0.Add(5 * time.Second)
+	run := func(order ...string) *Roster {
+		r := NewRoster(statement.NewDIDRoot(circleDID))
+		for _, o := range order {
+			switch o {
+			case "R1":
+				r, _, _ = r.AddRevocation(R1.Stmt)
+			case "R2":
+				r, _, _ = r.AddRevocation(R2.Stmt)
+			case "X":
+				r, _, _ = r.Add(X.Stmt, now)
+			case "Y":
+				r, _, _ = r.Add(Y.Stmt, now)
+			case "C":
+				r, _, _ = r.AddHandover(comp)
+			}
+		}
+		return r
+	}
+	// Before the compromise both X and Y are retired (each misses one
+	// removal) and both are kept.
+	r := run("R1", "X", "R2", "Y")
+	if _, ok := r.Live(devDID, now); ok {
+		t.Fatal("live with a removal unacknowledged")
+	}
+	if n := len(r.Held(devDID)); n != 2 {
+		t.Fatalf("retired %d, want both X and Y", n)
+	}
+	// After the compromise R2 and Y are no facts; X acknowledges R1 and is
+	// live — whichever order the facts came in.
+	for _, order := range [][]string{{"R1", "X", "R2", "Y", "C"}, {"C", "R1", "X", "R2", "Y"}, {"X", "Y", "R2", "R1", "C"}, {"Y", "R2", "C", "X", "R1"}} {
+		r := run(order...)
+		live, ok := r.Live(devDID, now)
+		if !ok || live.Stmt.ID() != X.Stmt.ID() {
+			t.Fatalf("order %v: X is not live after the compromise", order)
+		}
+	}
+}
+
+// Acks refuses to answer past MaxAcks instead of returning an empty set
+// an admission would be signed with (Codex review, 2026-11-06).
+func TestAcksRefusesToOverflow(t *testing.T) {
+	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
+	circleDID := did.ForKey(rootPub)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	devDID := did.ForKey(devPub)
+	r := NewRoster(statement.NewDIDRoot(circleDID))
+	t0 := time.Now().Add(-time.Hour)
+	for i := 0; i <= statement.MaxAcks; i++ {
+		rm, _ := Revoke(rootPriv, devDID, t0.Add(time.Duration(i)*time.Second))
+		r, _, _ = r.AddRevocation(rm.Stmt)
+	}
+	if acks, err := r.Acks(devDID); err == nil || acks != nil {
+		t.Fatalf("Acks over %d removals = %d, %v; want an error", statement.MaxAcks+1, len(acks), err)
 	}
 }

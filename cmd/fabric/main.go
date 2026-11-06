@@ -1183,7 +1183,11 @@ func cmdRevoke(args []string) error {
 	if err != nil {
 		return err
 	}
-	ev, err := event.NewRevoked(rootPriv, ed25519.PublicKey(m.DevicePub), time.Now())
+	circleDID, _, err := daemon.HomeSigner(dir, rootPriv)
+	if err != nil {
+		return err
+	}
+	ev, err := event.NewRevokedIn(rootPriv, circleDID, ed25519.PublicKey(m.DevicePub), time.Now())
 	if err != nil {
 		return err
 	}

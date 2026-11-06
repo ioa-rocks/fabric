@@ -343,9 +343,15 @@ func (s *EventSync) setsFor(p peer.ID, evs []*event.Event, full bool) []circleSe
 					set.Handovers = append(set.Handovers, raw)
 				}
 			}
+			// Every admission the roster keeps for a device, not its
+			// entry alone: a restoration held beside a stale renewal is
+			// what a peer needs when the removal reaches it later (Codex
+			// review, 2026-11-06).
 			for _, dev := range r.Devices() {
-				if raw, err := dev.Stmt.Bytes(); err == nil {
-					set.Admissions = append(set.Admissions, raw)
+				for _, d := range r.Held(dev.DID) {
+					if raw, err := d.Stmt.Bytes(); err == nil {
+						set.Admissions = append(set.Admissions, raw)
+					}
 				}
 			}
 			if hooks.OwnAdmissions != nil {
@@ -511,13 +517,15 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 		// must reach the roster on its own.
 		for _, raw := range set.Handovers {
 			st, err := statement.Decode(raw)
-			if err != nil {
+			if err != nil || len(st.Handovers()) <= len(roster.Roots().Handovers(set.DID)) {
 				continue
 			}
-			if grew, err := s.store.AddHandover(set.DID, st); err != nil {
+			// Pushed before it applies here: a compromise retires the
+			// devices the old key admitted, and they must still hear of
+			// it while the view counts them (Codex review, 2026-11-06).
+			s.publishSets([]circleSet{{DID: set.DID, Handovers: [][]byte{raw}}}, from)
+			if _, err := s.store.AddHandover(set.DID, st); err != nil {
 				log.Printf("sync: key handover from %s for circle %s: %v", from, shortDID(set.DID), err)
-			} else if grew {
-				delta.Handovers = append(delta.Handovers, raw)
 			}
 		}
 		event.Sort(set.Events)

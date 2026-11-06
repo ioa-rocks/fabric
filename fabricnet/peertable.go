@@ -313,16 +313,19 @@ func (t *PeerTable) AddAdmission(st *statement.Statement, now time.Time) (fresh 
 			return fmt.Errorf("roster: circle %s is not honoured here", shortDID(st.Payload.Sub))
 		}
 		nr, f, err := s.rosters[i].Add(st, now)
+		// The roster is adopted whatever the verdict on the statement: a
+		// refused admission may still have taught the roster the circle's
+		// key history, which its roots now hold and its slots must reflect
+		// (Codex review, 2026-11-06).
+		if nr != s.rosters[i] {
+			if rerr := s.replace(i, nr, true); rerr != nil && err == nil {
+				err = rerr
+			}
+		}
 		if err != nil {
 			return err
 		}
-		if !f {
-			return nil
-		}
-		if err := s.replace(i, nr, true); err != nil {
-			return err
-		}
-		fresh = true
+		fresh = f
 		return nil
 	})
 	return fresh, err
@@ -337,13 +340,13 @@ func (t *PeerTable) AddRevocation(circleDID string, st *statement.Statement) (fr
 			return fmt.Errorf("roster: circle %s is not honoured here", shortDID(circleDID))
 		}
 		nr, f, err := s.rosters[i].AddRevocation(st)
+		if nr != s.rosters[i] {
+			_ = s.replace(i, nr, false) // adopted whatever the verdict, as in AddAdmission
+		}
 		if err != nil {
 			return err
 		}
-		if f {
-			fresh = true
-			_ = s.replace(i, nr, false)
-		}
+		fresh = f
 		return nil
 	})
 	return fresh, err

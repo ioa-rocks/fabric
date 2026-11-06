@@ -419,15 +419,27 @@ func (s *CircleService) Handover(raw []byte) (bool, error) {
 	if s.circleByDID(st.Payload.Sub) == nil {
 		return false, fmt.Errorf("circle %s is not held by this node", shortDID(st.Payload.Sub))
 	}
+	r, ok := s.table.RosterFor(st.Payload.Sub)
+	if !ok {
+		return false, fmt.Errorf("no roster for circle %s", shortDID(st.Payload.Sub))
+	}
+	if len(st.Handovers()) <= len(r.Roots().Handovers(st.Payload.Sub)) {
+		return false, nil
+	}
+	// Pushed before it applies here: a compromise retires the devices the
+	// old key admitted, and the push reaches only devices the view still
+	// counts — they must hear that they are out (Codex review,
+	// 2026-11-06). The handover is on disk already (Rotate), so a crash
+	// in between loses nothing.
+	if s.sync != nil {
+		s.sync.PublishHandover(st.Payload.Sub, raw)
+	}
 	grew, err := s.table.AddHandover(st.Payload.Sub, st)
 	if err != nil {
 		return false, err
 	}
 	if grew {
 		s.forgetAll()
-		if s.sync != nil {
-			s.sync.PublishHandover(st.Payload.Sub, raw)
-		}
 	}
 	return grew, nil
 }

@@ -709,3 +709,45 @@ func TestOneHolderPerOverlayAddress(t *testing.T) {
 		}
 	}
 }
+
+// A refused admission may still have taught the roster the circle's key
+// history; the table adopts that roster, or the devices the retired key
+// admitted after its handover would stay live until the next change, and
+// replaying the handover would change nothing (Codex review, 2026-11-06).
+func TestTableAdoptsHistoryFromARefusedAdmission(t *testing.T) {
+	k1Pub, k1, _ := ed25519.GenerateKey(rand.Reader)
+	k2Pub, k2, _ := ed25519.GenerateKey(rand.Reader)
+	circleDID := cert.DIDForKey(k1Pub)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	p, _ := PeerOfDID(cert.DIDForKey(devPub))
+	t0 := time.Now().Add(-time.Hour)
+	h, _ := statement.Handover(k1, k2Pub, circleDID, false, t0, nil)
+	table := NewMemberStore(statement.NewDIDRoot(circleDID))
+	defer table.Close()
+	late, _ := circle.AdmitFor(k1, devPub, t0.Add(time.Minute), time.Hour) // K1 after its handover
+	if _, err := table.AddAdmission(late.Stmt, t0.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if !table.IsMember(p, t0.Add(2*time.Minute)) {
+		t.Fatal("without the history the late admission is live")
+	}
+	// K2's statement carries the handover but is no admission (no member
+	// verb): refused — and the history learned on the way must apply.
+	other, _, _ := ed25519.GenerateKey(rand.Reader)
+	grant, err := statement.Sign(k2, statement.Payload{Aud: cert.DIDForKey(other), Sub: circleDID,
+		Res: []statement.Resource{{Kind: statement.KindSubject, Name: "jobs/*"}}, Verbs: []string{statement.VerbClaim},
+		Iat: t0.Add(time.Minute).Unix(), Nbf: t0.Add(time.Minute).Unix(), Exp: t0.Add(time.Hour).Unix()}, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := table.AddAdmission(grant, t0.Add(2*time.Minute)); err == nil {
+		t.Fatal("a grant was recorded as an admission")
+	}
+	if table.IsMember(p, t0.Add(2*time.Minute)) {
+		t.Fatal("the late admission of the retired key is still live after the history was learned")
+	}
+	r, _ := table.RosterFor(circleDID)
+	if r.Roots().CurrentDID() != cert.DIDForKey(k2Pub) {
+		t.Fatal("the table's roster did not learn the handover")
+	}
+}

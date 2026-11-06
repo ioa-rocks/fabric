@@ -234,3 +234,60 @@ func TestLogKeepsLapsedAdmission(t *testing.T) {
 		t.Fatal("tampered lapsed admission accepted")
 	}
 }
+
+// Events of a circle whose key rotated: they name the circle, not the
+// signing key; the current key signs; a retired key's event counts only up
+// to its handover, a compromised key's never (Codex review, 2026-11-06).
+func TestEventsFollowTheKeyHistory(t *testing.T) {
+	k1Pub, k1 := testKeys(t)
+	k2Pub, k2 := testKeys(t)
+	circleDID := cert.DIDForKey(k1Pub)
+	now := time.Now()
+	rotated := now.Add(time.Hour)
+	h, err := statement.Handover(k1, k2Pub, circleDID, false, rotated, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := statement.NewDIDRoot(circleDID)
+	roots.Learn(h)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	// K2 issues a cert riding the handover; its added-event names the circle.
+	c, err := cert.IssueAs(k2, h, circleDID, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, rotated.Add(time.Minute), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	added, err := NewAdded(k2, c, rotated.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added.Payload.Ns != circleDID {
+		t.Fatalf("event names %s, want the circle", added.Payload.Ns)
+	}
+	if err := Verify(added, roots, rotated.Add(2*time.Minute)); err != nil {
+		t.Fatalf("K2's added-event: %v", err)
+	}
+	// K2 revokes in the circle.
+	rev, err := NewRevokedIn(k2, circleDID, devPub, rotated.Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(rev, roots, rotated.Add(4*time.Minute)); err != nil {
+		t.Fatalf("K2's revoked-event: %v", err)
+	}
+	// K1's revoked-event before the handover counts; after it does not.
+	early, _ := NewRevoked(k1, devPub, now)
+	if err := Verify(early, roots, now); err != nil {
+		t.Fatalf("K1 before the handover: %v", err)
+	}
+	late, _ := NewRevoked(k1, devPub, rotated.Add(time.Minute))
+	if err := Verify(late, roots, rotated.Add(2*time.Minute)); err == nil {
+		t.Fatal("K1's revoked-event after its handover verified")
+	}
+	// Compromised: nothing K1 signed counts.
+	comp := statement.NewDIDRoot(circleDID)
+	bad, _ := statement.Handover(k1, k2Pub, circleDID, true, rotated, nil)
+	comp.Learn(bad)
+	if err := Verify(early, comp, now); err == nil {
+		t.Fatal("a compromised key's revoked-event verified")
+	}
+}

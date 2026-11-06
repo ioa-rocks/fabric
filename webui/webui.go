@@ -308,7 +308,12 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, err)
 		return
 	}
-	ev, err := event.NewRevoked(rootPriv, ed25519.PublicKey(match.DevicePub), time.Now())
+	circleDID, _, err := daemon.HomeSigner(s.dir, rootPriv)
+	if err != nil {
+		httpError(w, http.StatusForbidden, err)
+		return
+	}
+	ev, err := event.NewRevokedIn(rootPriv, circleDID, ed25519.PublicKey(match.DevicePub), time.Now())
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return

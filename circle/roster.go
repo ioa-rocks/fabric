@@ -57,23 +57,26 @@ type Roster struct {
 // has one element in every normal history and two for the instant
 // between a stale renewal and the removal it missed (a single register
 // diverges by arrival order: agy's S, N, R trace, ADR 0019). retired holds
-// the latest admission that missed a removal — dead, kept until it would
-// have expired past retention, whatever else is held, so what the roster
+// the admissions that missed a removal — dead, kept until they would have
+// expired past retention, whatever else is held, so what the roster
 // remembers does not depend on arrival order (the oracle's shuffled
-// phase); it is the entry when nothing is eligible, so a removed device
-// is reported revoked rather than forgotten, keeps its address, and a
-// restoration can carry its terms forward.
+// phase); retired[0] is the entry when nothing is eligible, so a removed
+// device is reported revoked rather than forgotten, keeps its address, and
+// a restoration can carry its terms forward. retired is an antichain too,
+// not the latest alone: a removal signed by a key later declared
+// compromised stops applying, and any retired admission may then be
+// eligible again — two that acknowledge different removals must both be
+// there (Codex review, 2026-11-06).
 //
 // Both are kept per key epoch — the root key (through its handovers) that
-// signed the admission's root link: an admission is dominated, or shadows
-// an older memory, only by one of its own epoch. A later key may yet be
-// declared compromised, which makes everything it signed no fact, and the
-// earlier key's admission must then still be there to stand (the oracle
-// caught this, 2026-11-06). Epochs are few (MaxHandovers), so the slot
-// stays small.
+// signed the admission's root link: an admission is dominated only by one
+// of its own epoch. A later key may yet be declared compromised, which
+// makes everything it signed no fact, and the earlier key's admission must
+// then still be there to stand (the oracle caught this, 2026-11-06).
+// Epochs are few (MaxHandovers), so the slot stays small.
 type slot struct {
 	held    []*Device
-	retired []*Device // latest per epoch, later-issued first
+	retired []*Device // per-epoch antichain, later-issued first
 }
 
 // entry is the device's standing admission: the eligible winner, else the
@@ -395,35 +398,31 @@ func (r *Roster) build(ps []*Device) *slot {
 			retired = append(retired, p)
 		}
 	}
-	var held []*Device
-	for _, p := range elig {
+	held, mem := antichain(elig), antichain(retired)
+	if len(held) == 0 && len(mem) == 0 {
+		return nil
+	}
+	return &slot{held: held, retired: mem}
+}
+
+// antichain drops every admission dominated by another of its own key
+// epoch and orders the rest later-issued first.
+func antichain(ps []*Device) []*Device {
+	var out []*Device
+	for _, p := range ps {
 		dominated := false
-		for _, q := range elig {
+		for _, q := range ps {
 			if q != p && epoch(q) == epoch(p) && Dominates(q, p) {
 				dominated = true
 				break
 			}
 		}
 		if !dominated {
-			held = append(held, p)
+			out = append(out, p)
 		}
 	}
-	sort.Slice(held, func(i, j int) bool { return Later(held[i], held[j]) })
-	latest := map[int]*Device{}
-	for _, p := range retired {
-		if cur := latest[epoch(p)]; cur == nil || Later(p, cur) {
-			latest[epoch(p)] = p
-		}
-	}
-	var mem []*Device
-	for _, p := range latest {
-		mem = append(mem, p)
-	}
-	sort.Slice(mem, func(i, j int) bool { return Later(mem[i], mem[j]) })
-	if len(held) == 0 && len(mem) == 0 {
-		return nil
-	}
-	return &slot{held: held, retired: mem}
+	sort.Slice(out, func(i, j int) bool { return Later(out[i], out[j]) })
+	return out
 }
 
 // epoch is the key epoch of an admission: how many handovers its root
@@ -515,7 +514,11 @@ func (r *Roster) eligible(dev *Device) bool {
 // knows, plus every removal its held admissions already acknowledge (a
 // restoration may reach a peer before the removal it acknowledges; a
 // renewal there must not drop it). Canonical, for statement.Payload.Acks.
-func (r *Roster) Acks(deviceDID string) [][]byte {
+// Past statement.MaxAcks it is an error: an admission signed with fewer
+// acknowledgments than the device has removals would be no admission of
+// it, so the command must stop rather than sign (Codex review,
+// 2026-11-06).
+func (r *Roster) Acks(deviceDID string) ([][]byte, error) {
 	var ids [][]byte
 	for _, rv := range r.Removals(deviceDID) {
 		id := rv.ID()
@@ -526,9 +529,9 @@ func (r *Roster) Acks(deviceDID string) [][]byte {
 	}
 	out, err := statement.CanonicalIDs(ids)
 	if err != nil {
-		return nil // past MaxAcks: the signer refuses, loudly
+		return nil, fmt.Errorf("roster: the removals of %s to acknowledge: %w", shortDID(deviceDID), err)
 	}
-	return out
+	return out, nil
 }
 
 // Removed reports whether the roster shows the device removed from the

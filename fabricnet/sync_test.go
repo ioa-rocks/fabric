@@ -364,6 +364,32 @@ func TestSyncV2SendsOnlySharedCircleSets(t *testing.T) {
 	if famSet == nil || len(famSet.Admissions) != 2 {
 		t.Fatalf("sets for a family device: %+v; want family with the device's and the owner's admissions", sets)
 	}
+	// Every admission the roster keeps for a device travels, not its entry
+	// alone: a restoration held beside an older admission is what a peer
+	// needs when the removal reaches it later (Codex review, 2026-11-06).
+	// Issued in the past so the device is in the circle right now.
+	rmB, _ := circle.Revoke(famPriv, cert.DIDForKey(bPub), time.Now().Add(-10*time.Minute))
+	rid := rmB.Stmt.ID()
+	restoredB, _ := circle.Issue(famPriv, nil, famDID, bPub, time.Now().Add(-5*time.Minute), time.Hour, circle.Terms{Verbs: circle.DeviceVerbs, Acks: [][]byte{rid[:]}})
+	if _, err := a.store.AddAdmission(restoredB.Stmt, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := a.store.RosterFor(famDID); len(r.Held(cert.DIDForKey(bPub))) != 2 {
+		t.Fatalf("roster holds %d admissions of the device, want the original and the restoration", len(r.Held(cert.DIDForKey(bPub))))
+	}
+	sets = a.sync.setsFor(b.host.ID(), nil, true)
+	famSet = nil
+	for i := range sets {
+		if sets[i].DID == famDID {
+			famSet = &sets[i]
+		}
+	}
+	if famSet == nil {
+		t.Fatalf("no family set: %+v", sets)
+	}
+	if got := len(famSet.Admissions); got != 3 {
+		t.Fatalf("full sync carries %d family admissions, want the owner's and both of the device's", got)
+	}
 
 	// Live: the device dials the owner (main handshake), gossip brings it
 	// the owner's family admission; the master, connected too, has no roster

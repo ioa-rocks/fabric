@@ -419,7 +419,11 @@ func admitSelfWith(statePath string, c *circle.Circle, pass string, restore bool
 	} else if cur, err := c.LoadAdmission(); err == nil {
 		prev = cur.Stmt
 	}
-	a, err := circle.RenewWith(priv, proof, prev, c.Config.DID, ed25519.PublicKey(raw), now, circle.DefaultValidity, roster.Acks(selfDID))
+	acks, err := roster.Acks(selfDID)
+	if err != nil {
+		return err
+	}
+	a, err := circle.RenewWith(priv, proof, prev, c.Config.DID, ed25519.PublicKey(raw), now, circle.DefaultValidity, acks)
 	if err != nil {
 		return err
 	}
@@ -1116,7 +1120,11 @@ func cmdCircleAdmit(args []string) error {
 	if err != nil {
 		return err
 	}
-	a, err := circle.Issue(priv, proof, c.Config.DID, devicePub, now, *validity, circle.Terms{Verbs: verbs, Meta: meta, Acks: roster.Acks(deviceDID)})
+	acks, err := roster.Acks(deviceDID)
+	if err != nil {
+		return err
+	}
+	a, err := circle.Issue(priv, proof, c.Config.DID, devicePub, now, *validity, circle.Terms{Verbs: verbs, Meta: meta, Acks: acks})
 	if err != nil {
 		return err
 	}
@@ -1265,7 +1273,11 @@ func cmdCircleRestore(args []string) error {
 	if err != nil {
 		return err
 	}
-	a, err := circle.RenewWith(priv, proof, prev.Stmt, c.Config.DID, devicePub, now, *validity, roster.Acks(deviceDID))
+	acks, err := roster.Acks(deviceDID)
+	if err != nil {
+		return err
+	}
+	a, err := circle.RenewWith(priv, proof, prev.Stmt, c.Config.DID, devicePub, now, *validity, acks)
 	if err != nil {
 		return err
 	}

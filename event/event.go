@@ -59,26 +59,68 @@ func init() {
 	}
 }
 
-// NewAdded signs a MemberAdded event announcing a freshly issued certificate.
+// NewAdded signs a MemberAdded event announcing a freshly issued
+// certificate, in the cert's circle (whose key may have rotated: the
+// signer is then the circle's current key, not its DID key).
 func NewAdded(rootPriv ed25519.PrivateKey, c *cert.Cert, at time.Time) (*Event, error) {
 	certBytes, err := c.Marshal()
 	if err != nil {
 		return nil, err
 	}
-	return sign(rootPriv, Payload{Kind: KindAdded, Cert: certBytes, At: at.Unix()})
+	return sign(rootPriv, c.Payload.Sub, Payload{Kind: KindAdded, Cert: certBytes, At: at.Unix()})
 }
 
 // NewRevoked signs a MemberRevoked event cutting a device key out of the
-// circle.
+// circle whose DID is the signing key's own. NewRevokedIn is the form for
+// a circle whose key has rotated.
 func NewRevoked(rootPriv ed25519.PrivateKey, devicePub ed25519.PublicKey, at time.Time) (*Event, error) {
+	return NewRevokedIn(rootPriv, cert.DIDForKey(rootPriv.Public().(ed25519.PublicKey)), devicePub, at)
+}
+
+// NewRevokedIn signs a MemberRevoked event in circleDID with the circle's
+// current key.
+func NewRevokedIn(rootPriv ed25519.PrivateKey, circleDID string, devicePub ed25519.PublicKey, at time.Time) (*Event, error) {
 	if len(devicePub) != ed25519.PublicKeySize {
 		return nil, errors.New("device key is not an ed25519 public key")
 	}
-	return sign(rootPriv, Payload{Kind: KindRevoked, Device: devicePub, At: at.Unix()})
+	return sign(rootPriv, circleDID, Payload{Kind: KindRevoked, Device: devicePub, At: at.Unix()})
 }
 
-func sign(rootPriv ed25519.PrivateKey, p Payload) (*Event, error) {
-	p.Ns = cert.DIDForKey(rootPriv.Public().(ed25519.PublicKey))
+// signingKeys is the set of keys an event of circle ns signed at `at` may
+// carry: the circle's keys through its history, under the statement rule
+// — a retired key only for an event no later than its handover, never a
+// key the handover declared compromised (Codex review, 2026-11-06: the
+// legacy log has no proof to carry, so the history is applied here).
+func signingKeys(roots statement.Roots, ns string, anchor []ed25519.PublicKey, at int64) []ed25519.PublicKey {
+	h, ok := roots.(statement.RootHistory)
+	if !ok {
+		return anchor
+	}
+	hs := h.Handovers(ns)
+	if len(hs) == 0 {
+		return anchor
+	}
+	var out []ed25519.PublicKey
+	epochKeys := [][]ed25519.PublicKey{anchor}
+	for _, ho := range hs {
+		if k, err := did.KeyFor(ho.Payload.Aud); err == nil {
+			epochKeys = append(epochKeys, []ed25519.PublicKey{k})
+		}
+	}
+	for i, ks := range epochKeys {
+		if i < len(hs) {
+			retiring := hs[i]
+			if retiring.Payload.Compromised || at > retiring.Payload.Iat {
+				continue
+			}
+		}
+		out = append(out, ks...)
+	}
+	return out
+}
+
+func sign(rootPriv ed25519.PrivateKey, circleDID string, p Payload) (*Event, error) {
+	p.Ns = circleDID
 	msg, err := encMode.Marshal(p)
 	if err != nil {
 		return nil, fmt.Errorf("encoding event payload: %w", err)
@@ -96,17 +138,7 @@ func Verify(e *Event, roots statement.Roots, now time.Time) error {
 	if len(keys) == 0 {
 		return fmt.Errorf("event is signed by %s, a root this node does not honour", e.Payload.Ns)
 	}
-	// A circle whose key rotated signs its events with the new key; the
-	// legacy log has no place for the handover, so every key of the
-	// known history signs (the event's cert carries the proof and is
-	// judged with it).
-	if h, ok := roots.(statement.RootHistory); ok {
-		for _, ho := range h.Handovers(e.Payload.Ns) {
-			if k, err := did.KeyFor(ho.Payload.Aud); err == nil {
-				keys = append(keys, k)
-			}
-		}
-	}
+	keys = signingKeys(roots, e.Payload.Ns, keys, e.Payload.At)
 	msg, err := encMode.Marshal(e.Payload)
 	if err != nil {
 		return fmt.Errorf("encoding event payload: %w", err)
