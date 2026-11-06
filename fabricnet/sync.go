@@ -20,29 +20,23 @@ import (
 	"github.com/libp2p/go-libp2p/core/record"
 )
 
-// Gossip protocols (spec §5 + connectivity-model memo). Two motions on one
+// Gossip protocol (spec §5 + connectivity-model memo). Two motions on one
 // channel: anti-entropy — after every successful membership handshake (and
 // on reconnect between known members) peers swap full state — and rumor
 // mill: newly learned items are pushed on to other connected members.
 // Members only; strangers are reset.
 //
-// SyncProtocolID carries membership events plus signed peer address
-// records (the knowledge plane's WHERE, self-admitted by each device's
-// key). EventsProtocolID is the events-only predecessor, still served so
-// a mixed-version mesh keeps its membership gossip during rolling
-// upgrades.
-//
 // SyncProtocolV2ID (step 5, slice C; memo l0-overlapping-circles §17) carries
 // one set per circle *both* peers are verified in — the circle's device
-// admissions and revocations as statements, plus the legacy event envelopes of
-// the first circle for one release — and the address records. A device
-// never learns another circle's roster; a circle's set is relayed only to
-// peers verified in it.
-const (
-	SyncProtocolV2ID = "/fabric/sync/2"
-	SyncProtocolID   = "/fabric/sync/1"
-	EventsProtocolID = "/fabric/events/1"
-)
+// admissions and revocations as statements, plus the membership-event
+// envelopes of the first circle (its admission path) — and the signed peer
+// address records (the knowledge plane's WHERE, self-admitted by each
+// device's key). A device never learns another circle's roster; a circle's
+// set is relayed only to peers verified in it. The predecessors
+// /fabric/sync/1 (events plus records, first circle only) and
+// /fabric/events/1 were served for one release and retired in slice G
+// (2026-11-06).
+const SyncProtocolV2ID = "/fabric/sync/2"
 
 // A log entry or address record is a few hundred bytes; even a large mesh
 // with a deep history stays far under this.
@@ -60,19 +54,13 @@ const addrRecordTTL = 48 * time.Hour
 // addresses they hold for each other or for anyone else.
 const recordRepublishInterval = 6 * time.Hour
 
-// syncPayload is one direction of a /fabric/sync/1 exchange.
-type syncPayload struct {
-	Events  []*event.Event `cbor:"events,omitempty"`
-	Records [][]byte       `cbor:"records,omitempty"` // marshaled signed peer-record envelopes
-}
-
 // circleSet is one circle's anti-entropy set in a v2 exchange.
 type circleSet struct {
 	DID         string         `cbor:"did"`
 	Roots       []string       `cbor:"roots,omitempty"` // the circle DID again (older binaries listed every root they honoured)
 	Admissions  [][]byte       `cbor:"a,omitempty"`     // admissions, statement bytes (live and lapsed)
 	Revocations [][]byte       `cbor:"r,omitempty"`     // statement and legacy forms
-	Events      []*event.Event `cbor:"e,omitempty"`     // legacy envelopes (first circle only), one release
+	Events      []*event.Event `cbor:"e,omitempty"`     // membership-event envelopes (first circle only)
 }
 
 // syncPayloadV2 is one direction of a /fabric/sync/2 exchange.
@@ -128,8 +116,6 @@ func NewEventSync(h host.Host, log *event.Log, store *MemberStore, onApply Event
 	cab, _ := h.Peerstore().(peerstore.CertifiedAddrBook)
 	s := &EventSync{h: h, log: log, store: store, onApply: onApply, cab: cab, lastSeq: map[peer.ID]uint64{}}
 	h.SetStreamHandler(SyncProtocolV2ID, s.handleSyncV2)
-	h.SetStreamHandler(SyncProtocolID, s.handleSync)
-	h.SetStreamHandler(EventsProtocolID, s.handleV1)
 	// A roster change — a device admitted here, a verdict flipped — is
 	// news for every peer in that circle: re-run anti-entropy with the
 	// connected members shortly. Converges because a second exchange that
@@ -221,8 +207,6 @@ func (s *EventSync) kick() {
 
 func (s *EventSync) Close() {
 	s.h.RemoveStreamHandler(SyncProtocolV2ID)
-	s.h.RemoveStreamHandler(SyncProtocolID)
-	s.h.RemoveStreamHandler(EventsProtocolID)
 	for _, f := range s.stop {
 		f()
 	}
@@ -389,8 +373,7 @@ func (s *EventSync) publishExcept(evs []*event.Event, except peer.ID) {
 	}
 }
 
-// pushRecordsExcept sends address records to connected members (sync/1
-// speakers only — v1 peers have no record support). Fire-and-forget: the
+// pushRecordsExcept sends address records to connected members. Fire-and-forget: the
 // responder's reply is drained but NOT re-applied — pushes must never
 // trigger further pushes, or the mesh feeds itself forever (anti-entropy
 // on connect covers whatever a drained reply might have carried).
@@ -420,7 +403,7 @@ func (s *EventSync) pushRecordsExcept(recs [][]byte, except peer.ID) {
 		go func(p peer.ID, recs [][]byte) {
 			ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout)
 			defer cancel()
-			str, err := s.h.NewStream(ctx, p, SyncProtocolV2ID, SyncProtocolID)
+			str, err := s.h.NewStream(ctx, p, SyncProtocolV2ID)
 			if err != nil {
 				return
 			}
@@ -428,26 +411,18 @@ func (s *EventSync) pushRecordsExcept(recs [][]byte, except peer.ID) {
 			if deadline, ok := ctx.Deadline(); ok {
 				_ = str.SetDeadline(deadline)
 			}
-			if str.Protocol() == SyncProtocolV2ID {
-				if writeSyncV2(str, syncPayloadV2{Records: recs}) == nil {
-					_, _ = readSyncV2(str)
-				}
-				return
-			}
-			if writeSync(str, syncPayload{Records: recs}) == nil {
-				_, _ = readSync(str) // drain so the responder isn't left hanging
+			if writeSyncV2(str, syncPayloadV2{Records: recs}) == nil {
+				_, _ = readSyncV2(str) // drain so the responder isn't left hanging
 			}
 		}(p, mine)
 	}
 }
 
 // exchange sends state to a peer and applies whatever it answers with.
-// sync/2 is preferred (per-circle sets); sync/1 and events/1 keep
-// membership gossip alive with older nodes. full says whether the
-// per-circle sets carry the whole roster (anti-entropy) or only the given
-// events (a push).
+// full says whether the per-circle sets carry the whole roster
+// (anti-entropy) or only the given events (a push).
 func (s *EventSync) exchange(ctx context.Context, p peer.ID, evs []*event.Event, recs [][]byte, full bool) error {
-	str, err := s.h.NewStream(ctx, p, SyncProtocolV2ID, SyncProtocolID, EventsProtocolID)
+	str, err := s.h.NewStream(ctx, p, SyncProtocolV2ID)
 	if err != nil {
 		return err
 	}
@@ -455,51 +430,18 @@ func (s *EventSync) exchange(ctx context.Context, p peer.ID, evs []*event.Event,
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = str.SetDeadline(deadline)
 	}
-	if str.Protocol() == SyncProtocolV2ID {
-		if full {
-			recs = s.knownRecordsFor(p)
-		}
-		if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(p, evs, full), Records: recs}); err != nil {
-			return err
-		}
-		theirs, err := readSyncV2(str)
-		if err != nil {
-			str.Reset()
-			return err
-		}
-		s.applyV2(theirs, p)
-		return nil
-	}
-	if !s.inFirstCircle(p) {
-		// An old-binary peer outside the first circle: nothing the legacy
-		// payloads carry is its business.
-		str.Reset()
-		return fmt.Errorf("peer %s is in none of the circles the legacy sync speaks for", p)
-	}
-	if str.Protocol() == EventsProtocolID {
-		if err := writeEventsV1(str, evs); err != nil {
-			return err
-		}
-		theirs, err := readEventsV1(str)
-		if err != nil {
-			str.Reset()
-			return err
-		}
-		s.applyPayload(syncPayload{Events: theirs}, p)
-		return nil
-	}
-	if recs != nil {
+	if full {
 		recs = s.knownRecordsFor(p)
 	}
-	if err := writeSync(str, syncPayload{Events: evs, Records: recs}); err != nil {
+	if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(p, evs, full), Records: recs}); err != nil {
 		return err
 	}
-	theirs, err := readSync(str)
+	theirs, err := readSyncV2(str)
 	if err != nil {
 		str.Reset()
 		return err
 	}
-	s.applyPayload(theirs, p)
+	s.applyV2(theirs, p)
 	return nil
 }
 
@@ -587,87 +529,6 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 	}
 	s.publishExcept(freshEvents, from)
 	s.publishSets(deltas, from)
-
-	var freshRecords [][]byte
-	for _, data := range pl.Records {
-		if s.consumeRecord(data, now) {
-			freshRecords = append(freshRecords, data)
-		}
-	}
-	s.pushRecordsExcept(freshRecords, from)
-}
-
-// inFirstCircle reports whether the peer is a live device of the first
-// circle — the only one the legacy protocols know how to talk about. A
-// device of another circle is a member of this node but must not be served
-// /fabric/sync/1 or /fabric/events/1: they would hand it the first circle's
-// whole event log (Codex review, 2026-11-04).
-func (s *EventSync) inFirstCircle(p peer.ID) bool {
-	rosters := s.store.Rosters()
-	return len(rosters) > 0 && s.store.In(p, rosters[0].CircleDID(), time.Now())
-}
-
-// handleSync is the responder side of /fabric/sync/1: apply theirs, answer
-// with our full state.
-func (s *EventSync) handleSync(str network.Stream) {
-	defer str.Close()
-	_ = str.SetDeadline(time.Now().Add(exchangeTimeout))
-	p := str.Conn().RemotePeer()
-	if !s.inFirstCircle(p) {
-		str.Reset()
-		return
-	}
-	theirs, err := readSync(str)
-	if err != nil {
-		str.Reset()
-		return
-	}
-	if err := writeSync(str, syncPayload{Events: s.log.All(), Records: s.knownRecordsFor(p)}); err != nil {
-		str.Reset()
-		return
-	}
-	s.applyPayload(theirs, p)
-}
-
-// handleV1 is the responder side of the events-only predecessor.
-func (s *EventSync) handleV1(str network.Stream) {
-	defer str.Close()
-	_ = str.SetDeadline(time.Now().Add(exchangeTimeout))
-	p := str.Conn().RemotePeer()
-	if !s.inFirstCircle(p) {
-		str.Reset()
-		return
-	}
-	theirs, err := readEventsV1(str)
-	if err != nil {
-		str.Reset()
-		return
-	}
-	if err := writeEventsV1(str, s.log.All()); err != nil {
-		str.Reset()
-		return
-	}
-	s.applyPayload(syncPayload{Events: theirs}, p)
-}
-
-// applyPayload adds a batch to the log and address book, relaying what was
-// genuinely new to the other connected members. Dedup (event IDs, record
-// seq numbers) terminates the relay.
-func (s *EventSync) applyPayload(pl syncPayload, from peer.ID) {
-	now := time.Now()
-	event.Sort(pl.Events)
-	var freshEvents []*event.Event
-	for _, e := range pl.Events {
-		isNew, err := s.log.Add(e, now)
-		if err != nil || !isNew {
-			continue // invalid or stale events are dropped, duplicates ignored
-		}
-		freshEvents = append(freshEvents, e)
-		if s.onApply != nil {
-			s.onApply(e)
-		}
-	}
-	s.publishExcept(freshEvents, from)
 
 	var freshRecords [][]byte
 	for _, data := range pl.Records {
@@ -836,26 +697,6 @@ func recordSubject(data []byte) (peer.ID, bool) {
 	return rec.PeerID, true
 }
 
-func writeSync(str network.Stream, pl syncPayload) error {
-	data, err := cbor.Marshal(pl)
-	if err != nil {
-		return err
-	}
-	return wire.WriteFrame(str, data)
-}
-
-func readSync(str network.Stream) (syncPayload, error) {
-	data, err := wire.ReadFrame(str, maxEventsWireSize)
-	if err != nil {
-		return syncPayload{}, fmt.Errorf("reading sync payload: %w", err)
-	}
-	var pl syncPayload
-	if err := cbor.Unmarshal(data, &pl); err != nil {
-		return syncPayload{}, fmt.Errorf("decoding sync payload: %w", err)
-	}
-	return pl, nil
-}
-
 func writeSyncV2(str network.Stream, pl syncPayloadV2) error {
 	data, err := cbor.Marshal(pl)
 	if err != nil {
@@ -874,24 +715,4 @@ func readSyncV2(str network.Stream) (syncPayloadV2, error) {
 		return syncPayloadV2{}, fmt.Errorf("decoding sync payload: %w", err)
 	}
 	return pl, nil
-}
-
-func writeEventsV1(str network.Stream, evs []*event.Event) error {
-	data, err := cbor.Marshal(evs)
-	if err != nil {
-		return err
-	}
-	return wire.WriteFrame(str, data)
-}
-
-func readEventsV1(str network.Stream) ([]*event.Event, error) {
-	data, err := wire.ReadFrame(str, maxEventsWireSize)
-	if err != nil {
-		return nil, fmt.Errorf("reading events: %w", err)
-	}
-	var evs []*event.Event
-	if err := cbor.Unmarshal(data, &evs); err != nil {
-		return nil, fmt.Errorf("decoding events: %w", err)
-	}
-	return evs, nil
 }

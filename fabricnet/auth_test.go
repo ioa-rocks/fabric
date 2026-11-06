@@ -2,7 +2,6 @@ package fabricnet
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -226,14 +225,10 @@ func TestDelegatedCertAcceptedAndCascades(t *testing.T) {
 	}
 	store := NewMemberStore(statement.NewDIDRoot(circleDID))
 	p, _ := PeerIDForKey(devPub)
-	var buf bytes.Buffer
-	if err := writeCert(&buf, delegated); err != nil {
-		t.Fatal(err)
+	if _, _, live, err := store.Verify(p, delegated.Stmt); err != nil || !live {
+		t.Fatalf("delegated cert on transport: live=%v %v", live, err)
 	}
-	got, err := readAndValidateCert(&buf, store.Roots(), p)
-	if err != nil {
-		t.Fatalf("delegated cert on transport: %v", err)
-	}
+	got := delegated
 	if err := store.Admit(p, got); err != nil {
 		t.Fatalf("admitting the delegated cert: %v", err)
 	}
@@ -388,33 +383,30 @@ func TestScopedMemberIsGatedPerProtocolFamily(t *testing.T) {
 	}
 }
 
-// A peer on the previous binary speaks /fabric/auth/1 only; a v2 dialer
-// falls back to it and both still record each other as members.
-func TestHandshakeFallsBackToV1(t *testing.T) {
+// The handshake records the circle each side verified the other in, on
+// both ends.
+func TestHandshakeRecordsTheCircle(t *testing.T) {
 	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
-	a := newNode(t, nsPub, nsPriv, "new", true, 5*time.Second)
-	b := newNode(t, nsPub, nsPriv, "old", true, 5*time.Second)
-	b.auth.DisableV2()
-	connect(t, a, b)
+	a := newNode(t, nsPub, nsPriv, "a", true, 5*time.Second)
+	c := newNode(t, nsPub, nsPriv, "c", true, 5*time.Second)
+	connect(t, a, c)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := a.auth.Authenticate(ctx, b.host.ID()); err != nil {
-		t.Fatalf("Authenticate against a v1-only peer: %v", err)
-	}
-	if hs, ok := a.auth.Handshake(b.host.ID()); !ok || hs.Version != 1 {
-		t.Fatalf("handshake = %+v, want v1", hs)
-	}
-	if !a.store.IsMember(b.host.ID(), time.Now()) || !b.store.IsMember(a.host.ID(), time.Now()) {
-		t.Fatal("v1 fallback did not settle membership both ways")
-	}
-	// And v2 between two new nodes records the circle verified.
-	c := newNode(t, nsPub, nsPriv, "new-2", true, 5*time.Second)
-	connect(t, a, c)
 	if err := a.auth.Authenticate(ctx, c.host.ID()); err != nil {
 		t.Fatal(err)
 	}
-	if hs, ok := c.auth.Handshake(a.host.ID()); !ok || hs.Version != 2 || len(hs.Circles) != 1 || hs.Circles[0] != cert.DIDForKey(nsPub) {
-		t.Fatalf("responder's handshake = %+v, want v2 in the one circle", hs)
+	for _, side := range []struct {
+		name string
+		auth *AuthService
+		peer peer.ID
+	}{{"dialer", a.auth, c.host.ID()}, {"responder", c.auth, a.host.ID()}} {
+		hs, ok := side.auth.Handshake(side.peer)
+		if !ok || len(hs.Circles) != 1 || hs.Circles[0] != cert.DIDForKey(nsPub) {
+			t.Fatalf("%s's handshake = %+v, want the one circle", side.name, hs)
+		}
+	}
+	if !a.store.IsMember(c.host.ID(), time.Now()) || !c.store.IsMember(a.host.ID(), time.Now()) {
+		t.Fatal("membership not settled both ways")
 	}
 }
 
@@ -439,26 +431,5 @@ func TestOwnScopeSpansCircles(t *testing.T) {
 	b.auth.SetOwnAllows(func(family string) bool { return true })
 	if got, err := echoOn(a, b.host.ID(), vaultEchoProtocol, "x"); err != nil || got != "x" {
 		t.Fatalf("vault echo with a full admission in another circle: %v %q", err, got)
-	}
-}
-
-// v1 is dialed toward an unknown peer only when it is a configured
-// bootstrap: the v1 dialer sends the first-circle cert before anything is
-// verified (Codex review, 2026-11-05).
-func TestV1DialedOnlyTowardBootstraps(t *testing.T) {
-	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
-	a := newNode(t, nsPub, nsPriv, "new", true, 5*time.Second)
-	b := newNode(t, nsPub, nsPriv, "old", true, 5*time.Second)
-	b.auth.DisableV2()
-	a.auth.SetV1Dialable(func(peer.ID) bool { return false })
-	connect(t, a, b)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := a.auth.Authenticate(ctx, b.host.ID()); err == nil {
-		t.Fatal("v1 dialed toward an unknown non-bootstrap peer")
-	}
-	a.auth.SetV1Dialable(func(p peer.ID) bool { return p == b.host.ID() })
-	if err := a.auth.Authenticate(ctx, b.host.ID()); err != nil {
-		t.Fatalf("v1 toward a bootstrap: %v", err)
 	}
 }

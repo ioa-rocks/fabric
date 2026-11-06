@@ -401,11 +401,11 @@ func TestVerifyRejectsAssertForAnotherDevice(t *testing.T) {
 	}
 }
 
-// The legacy protocols speak for the first circle alone: a device of
-// another circle is a member here, but /fabric/sync/1 and /fabric/auth/1
-// must not hand it the first circle's event log or cert (Codex review,
-// 2026-11-04).
-func TestLegacyProtocolsServeFirstCircleOnly(t *testing.T) {
+// A device of another circle is a member here through that circle alone:
+// it never joins the first circle's roster, and address records of members
+// that share no circle with it never reach it (Codex review, 2026-11-04;
+// the legacy-protocol half of this test retired with them in slice G).
+func TestOtherCircleDeviceIsAMemberThroughItAlone(t *testing.T) {
 	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
 	a := newSyncNode(t, nsPub, nsPriv, "desk")
 	fam, _ := circle.Init(t.TempDir(), "family", "pw")
@@ -454,22 +454,6 @@ func TestLegacyProtocolsServeFirstCircleOnly(t *testing.T) {
 	}
 	if !a.store.IsMember(bHost.ID(), time.Now()) || a.store.In(bHost.ID(), cert.DIDForKey(nsPub), time.Now()) {
 		t.Fatal("B should be a member of A through family only")
-	}
-	// /fabric/sync/1 from B: reset, no log.
-	str, err := bHost.NewStream(ctx, a.host.ID(), SyncProtocolID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = str.SetDeadline(time.Now().Add(3 * time.Second))
-	_ = writeSync(str, syncPayload{})
-	if pl, err := readSync(str); err == nil {
-		t.Fatalf("a family-only device was served the first circle's sync: %d events", len(pl.Events))
-	}
-	str.Close()
-	// /fabric/auth/1 from B: A must not answer with its main cert.
-	bAuth.DisableV2()
-	if err := bAuth.Authenticate(ctx, a.host.ID()); err == nil {
-		t.Fatal("v1 handshake from a family-only device succeeded — A showed its first-circle cert")
 	}
 	if _, ok := bStore.RosterFor(cert.DIDForKey(nsPub)); ok {
 		t.Fatal("B grew a main roster")

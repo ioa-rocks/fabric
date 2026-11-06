@@ -19,7 +19,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/protocol"
 )
 
 // The mutual membership handshake, spec §4. Possession of the device key is
@@ -34,17 +33,12 @@ import (
 // the circles it knows the peer in (its rosters, or the gate hints that
 // named the peer); the responder answers with its admissions for exactly the
 // circles it verified the dialer in. Nothing about a circle the peer is not
-// in ever crosses the wire. Version 1 carries one membership cert each way
-// (the device's first circle) and is served and dialed for one release.
-const (
-	ProtocolV2ID = "/fabric/auth/2"
-	ProtocolID   = "/fabric/auth/1"
-)
+// in ever crosses the wire. Version 1 (one membership cert each way, the
+// device's first circle) was served and dialed for one release and retired
+// in slice G (2026-11-06).
+const ProtocolV2ID = "/fabric/auth/2"
 
-const (
-	maxCertWireSize  = 16 * 1024
-	maxHelloWireSize = 64 * 1024
-)
+const maxHelloWireSize = 64 * 1024
 
 // Hello is one direction of a v2 handshake: the admissions the sender shows
 // for the circles it believes it shares with the peer, and the live
@@ -74,8 +68,7 @@ type JoinObserver func(p peer.ID, c *cert.Cert)
 
 // Handshake is what the last handshake with a peer established.
 type Handshake struct {
-	Version int      // 1 or 2
-	Circles []string // circles (primary DIDs) the peer verified in here; v1: the cert's circle
+	Circles []string // circles (DIDs) the peer verified in here
 	At      time.Time
 }
 
@@ -95,17 +88,14 @@ type AuthService struct {
 	presenter Presenter
 	sink      RevocationSink
 	ownAllows func(family string) bool // any own admission admits the family; nil = the own cert alone
-	v1To      func(peer.ID) bool       // may v1 be dialed toward a peer in no roster (a bootstrap)? nil = yes
-	v2        bool                     // dial v2 (tests turn it off to exercise the v1 path)
 }
 
 // NewAuthService wires the handshake handlers and the grace-period watchdog
 // onto the host. ownCert may be nil on a not-yet-admitted node (it can still
 // verify others, e.g. while waiting in the pending queue). onJoin may be nil.
 func NewAuthService(h host.Host, store *PeerTable, ownCert *cert.Cert, grace time.Duration, onJoin JoinObserver) *AuthService {
-	a := &AuthService{h: h, store: store, own: ownCert, grace: grace, onJoin: onJoin, kept: map[peer.ID]struct{}{}, shook: map[peer.ID]Handshake{}, v2: true}
+	a := &AuthService{h: h, store: store, own: ownCert, grace: grace, onJoin: onJoin, kept: map[peer.ID]struct{}{}, shook: map[peer.ID]Handshake{}}
 	h.SetStreamHandler(ProtocolV2ID, a.handleInboundV2)
-	h.SetStreamHandler(ProtocolID, a.handleInbound)
 	nb := &network.NotifyBundle{ConnectedF: a.onConnected, DisconnectedF: func(n network.Network, c network.Conn) {
 		if p := c.RemotePeer(); n.Connectedness(p) != network.Connected {
 			a.mu.Lock()
@@ -208,25 +198,6 @@ func (a *AuthService) ownScopeAllows(family string) bool {
 	return own == nil || own.Allows(family)
 }
 
-// SetV1Dialable narrows whom the v1 handshake may be *dialed* toward when
-// the peer is in no roster here: v1 sends this node's first-circle cert
-// before anything is verified, so only a configured bootstrap qualifies
-// (Codex review, 2026-11-05). Peers known in the own cert's circle always
-// qualify; peers known only in other circles never do.
-func (a *AuthService) SetV1Dialable(f func(peer.ID) bool) {
-	a.mu.Lock()
-	a.v1To = f
-	a.mu.Unlock()
-}
-
-// DisableV2 makes this node dial v1 only (tests: a peer on the old binary).
-func (a *AuthService) DisableV2() {
-	a.mu.Lock()
-	a.v2 = false
-	a.mu.Unlock()
-	a.h.RemoveStreamHandler(ProtocolV2ID)
-}
-
 // Handshake reports the last handshake with a connected peer.
 func (a *AuthService) Handshake(p peer.ID) (Handshake, bool) {
 	a.mu.RLock()
@@ -248,7 +219,6 @@ func (a *AuthService) OnAuthenticated() func(peer.ID) { return a.onAuth }
 // Close detaches the service from the host.
 func (a *AuthService) Close() {
 	a.h.RemoveStreamHandler(ProtocolV2ID)
-	a.h.RemoveStreamHandler(ProtocolID)
 	a.stopWatch()
 }
 
@@ -297,23 +267,13 @@ func (a *AuthService) Drop(p peer.ID) {
 // Authenticate runs the handshake with a peer as the initiator and records
 // the peer in the circles it verified in on success.
 func (a *AuthService) Authenticate(ctx context.Context, p peer.ID) error {
-	a.mu.RLock()
-	v2 := a.v2
-	a.mu.RUnlock()
-	protocols := []protocol.ID{ProtocolV2ID, ProtocolID}
-	if !v2 {
-		protocols = protocols[1:]
-	}
-	s, err := a.h.NewStream(ctx, p, protocols...)
+	s, err := a.h.NewStream(ctx, p, ProtocolV2ID)
 	if err != nil {
 		return fmt.Errorf("opening auth stream: %w", err)
 	}
 	defer s.Close()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = s.SetDeadline(deadline)
-	}
-	if s.Protocol() == ProtocolID {
-		return a.authenticateV1(s, p)
 	}
 	hello := a.present(p, nil)
 	if len(hello.Admissions) == 0 {
@@ -334,45 +294,7 @@ func (a *AuthService) Authenticate(ctx context.Context, p peer.ID) error {
 		s.Reset()
 		return fmt.Errorf("peer %s: %w", p, err)
 	}
-	a.noteMember(p, first, known, Handshake{Version: 2, Circles: verified, At: time.Now()})
-	return nil
-}
-
-// authenticateV1 is the initiator's side of the one-cert handshake.
-func (a *AuthService) authenticateV1(s network.Stream, p peer.ID) error {
-	own := a.ownCert()
-	if own == nil {
-		s.Reset()
-		return errors.New("this node holds no membership certificate yet")
-	}
-	// v1 speaks for the own cert's circle alone: a peer this node knows
-	// only from other circles must not be shown that cert.
-	if known := a.store.Circles(p, time.Now()); len(known) > 0 && !a.store.In(p, own.Payload.Sub, time.Now()) {
-		s.Reset()
-		return fmt.Errorf("peer %s is in none of the circles the v1 handshake speaks for", p)
-	} else if len(known) == 0 {
-		a.mu.RLock()
-		v1To := a.v1To
-		a.mu.RUnlock()
-		if v1To != nil && !v1To(p) {
-			s.Reset()
-			return fmt.Errorf("peer %s is unknown here and not a bootstrap: not showing it the first-circle cert on v1", p)
-		}
-	}
-	if err := writeCert(s, own); err != nil {
-		return err
-	}
-	theirs, err := readAndValidateCert(s, a.store.Roots(), p)
-	if err != nil {
-		s.Reset()
-		return err
-	}
-	_, known := a.store.Cert(p)
-	if err := a.store.Admit(p, theirs); err != nil {
-		s.Reset()
-		return fmt.Errorf("peer %s: %w", p, err)
-	}
-	a.noteMember(p, theirs, known, Handshake{Version: 1, Circles: []string{theirs.Payload.Sub}, At: time.Now()})
+	a.noteMember(p, first, known, Handshake{Circles: verified, At: time.Now()})
 	return nil
 }
 
@@ -397,40 +319,7 @@ func (a *AuthService) handleInboundV2(s network.Stream) {
 		s.Reset()
 		return
 	}
-	a.noteMember(p, first, known, Handshake{Version: 2, Circles: verified, At: time.Now()})
-}
-
-// handleInbound is the v1 responder side: validate theirs, answer with ours.
-func (a *AuthService) handleInbound(s network.Stream) {
-	defer s.Close()
-	_ = s.SetDeadline(time.Now().Add(30 * time.Second))
-	p := s.Conn().RemotePeer()
-	theirs, err := readAndValidateCert(s, a.store.Roots(), p)
-	if err != nil {
-		s.Reset()
-		return
-	}
-	// The peer table has the last word: a chain that verifies but is
-	// revoked along its lineage — or whose device the circle swept — is
-	// refused here, before this node shows its own cert.
-	_, known := a.store.Cert(p)
-	if err := a.store.Admit(p, theirs); err != nil {
-		s.Reset()
-		return
-	}
-	// Answer with the own cert only to a peer of its circle: a device of
-	// another circle presenting on v1 would otherwise learn this node's
-	// first circle, DID and all (Codex review, 2026-11-04).
-	own := a.ownCert()
-	if own == nil || theirs.Payload.Sub != own.Payload.Sub && !a.store.In(p, own.Payload.Sub, time.Now()) {
-		s.Reset()
-		return
-	}
-	if err := writeCert(s, own); err != nil {
-		s.Reset()
-		return
-	}
-	a.noteMember(p, theirs, known, Handshake{Version: 1, Circles: []string{theirs.Payload.Sub}, At: time.Now()})
+	a.noteMember(p, first, known, Handshake{Circles: verified, At: time.Now()})
 }
 
 // present builds this node's hello for a peer: the presenter's choice, plus
@@ -587,37 +476,6 @@ func (a *AuthService) Allows(p peer.ID, protocolID string) bool {
 	return a.store.Allows(p, protocolID, time.Now())
 }
 
-// readAndValidateCert reads one v1 cert frame and checks both chain
-// validity against the honoured roots and the binding to the remote peer's
-// identity key. Delegated certs (issued under an admin admission) pass: since
-// step 5 the peer table re-checks revocations along the whole chain, so
-// revoking the issuer reaches what it issued.
-func readAndValidateCert(r io.Reader, roots statement.Roots, remote peer.ID) (*cert.Cert, error) {
-	data, err := wire.ReadFrame(r, maxCertWireSize)
-	if err != nil {
-		return nil, fmt.Errorf("reading cert: %w", err)
-	}
-	c, err := cert.Unmarshal(data)
-	if err != nil {
-		return nil, err
-	}
-	if err := cert.VerifyRoots(c, roots, time.Now()); err != nil {
-		return nil, fmt.Errorf("invalid membership cert: %w", err)
-	}
-	devKey, err := c.DeviceKey()
-	if err != nil {
-		return nil, err
-	}
-	expected, err := PeerIDForKey(devKey)
-	if err != nil {
-		return nil, err
-	}
-	if expected != remote {
-		return nil, fmt.Errorf("cert is issued to %s, not to connected peer %s", expected, remote)
-	}
-	return c, nil
-}
-
 // PeerIDForKey maps a raw ed25519 public key to its libp2p peer ID.
 func PeerIDForKey(pub ed25519.PublicKey) (peer.ID, error) {
 	pk, err := crypto.UnmarshalEd25519PublicKey(pub)
@@ -625,14 +483,6 @@ func PeerIDForKey(pub ed25519.PublicKey) (peer.ID, error) {
 		return "", err
 	}
 	return peer.IDFromPublicKey(pk)
-}
-
-func writeCert(w io.Writer, c *cert.Cert) error {
-	data, err := c.Marshal()
-	if err != nil {
-		return err
-	}
-	return wire.WriteFrame(w, data)
 }
 
 func writeHello(w io.Writer, h Hello) error {

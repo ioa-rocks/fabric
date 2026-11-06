@@ -199,7 +199,7 @@ func TestDarkNodeRefusesUnknownUntilGossip(t *testing.T) {
 	}
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel2()
-	if s, err := stranger.host.NewStream(ctx2, dark.host.ID(), ProtocolID); err != nil {
+	if s, err := stranger.host.NewStream(ctx2, dark.host.ID(), ProtocolV2ID); err != nil {
 		t.Fatalf("stranger from a member's IP could not open a stream: %v", err)
 	} else {
 		s.Reset()
@@ -221,7 +221,7 @@ func assertRefused(t *testing.T, from, to *node, who string) {
 	_ = tryConnect(from, to) // the dialer's view of the handshake is not the verdict
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if s, err := from.host.NewStream(ctx, to.host.ID(), ProtocolID); err == nil {
+	if s, err := from.host.NewStream(ctx, to.host.ID(), ProtocolV2ID); err == nil {
 		s.Reset()
 		t.Fatalf("%s opened a stream to a dark node", who)
 	}

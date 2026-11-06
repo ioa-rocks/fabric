@@ -389,8 +389,7 @@ func (s *CircleService) tableCircles(p peer.ID) ([]string, bool) {
 	if s.table == nil || s.auth == nil {
 		return nil, false
 	}
-	hs, ok := s.auth.Handshake(p)
-	if !ok || hs.Version < 2 {
+	if _, ok := s.auth.Handshake(p); !ok {
 		return nil, false
 	}
 	return s.table.Circles(p, time.Now()), true
@@ -1346,7 +1345,7 @@ func (s *CircleService) Refresh(ctx context.Context) int {
 		}
 		// A v2 peer gets a fresh handshake: it re-presents, and the
 		// revocations of every shared circle ride the hello.
-		if hs, ok := s.auth.Handshake(p); ok && hs.Version >= 2 {
+		if _, ok := s.auth.Handshake(p); ok {
 			_ = s.auth.Authenticate(ctx, p)
 		}
 		if _, err := s.Ensure(ctx, p); err == nil {

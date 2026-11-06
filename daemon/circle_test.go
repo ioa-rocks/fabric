@@ -536,7 +536,7 @@ func TestHandshakeV2PresentsOnlySharedCircles(t *testing.T) {
 	meshConnect(t, nas, desk)
 	for _, pair := range [][2]*circleTestNode{{nas, desk}, {desk, nas}} {
 		hs, ok := pair[0].auth.Handshake(pair[1].h.ID())
-		if !ok || hs.Version != 2 {
+		if !ok {
 			t.Fatalf("handshake %+v", hs)
 		}
 		slices.Sort(hs.Circles)

@@ -289,7 +289,6 @@ func New(dir state.Dir) (*Daemon, error) {
 	d.Auth = fabricnet.NewAuthService(h, store, d.OwnCert(), AuthGrace, func(p peer.ID, c *cert.Cert) {
 		log.Printf("member joined: %q (%s)", c.Payload.Meta.Name, p)
 	})
-	d.Auth.SetV1Dialable(d.isConfiguredBootstrap)
 	d.Sync = fabricnet.NewEventSync(h, evLog, store, d.applyEvent)
 	d.Auth.SetOnAuthenticated(d.Sync.ExchangeAsync)
 

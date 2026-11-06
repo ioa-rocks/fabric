@@ -433,10 +433,11 @@ fabric circle revoke her-pc -circle family # an owner device signs a device out
 
 Revocation is a circle-signed record kept beside the circle
 (`circles/<name>/revocations.cbor`). Devices of the circle swap their
-revocation sets on every circle exchange (`/fabric/circle/3`), and the
-daemon on the revoking node pushes the new one to every member connected
-right now, so the revoked device drops out of that circle's sync at
-once wherever the news reaches, and at the next connect elsewhere.
+revocation sets on every handshake and gossip exchange (`/fabric/auth/2`,
+`/fabric/sync/2`), and the daemon on the revoking node pushes the new one
+to every member connected right now, so the revoked device drops out of
+that circle's sync at once wherever the news reaches, and at the next
+connect elsewhere.
 Expiry is the backstop. A revocation kills the device's admissions
 issued up to that moment; admitting the device again afterwards is a
 deliberate re-admission and stands. `fabric status` warns loudly about
@@ -807,10 +808,14 @@ user key) to skip the interactive prompts (CI, scripts).
   a connection gater (hard-denies revoked peers; dark by default, so a
   node refuses inbound peers outside its member store before any
   protocol runs, and listed on lighthouses so joiners and not-yet-gossiped
-  members can authenticate), the `/fabric/auth/1` mutual certificate
-  handshake, per-protocol member checks (`RequireMember`), revocation
-  that closes live connections, and `/fabric/events/1` gossip — full-log
-  anti-entropy on every connect plus rumor-mill relay of fresh events.
+  members can authenticate), the `/fabric/auth/2` mutual admission
+  handshake (one admission per shared circle each way, revocations
+  riding along), per-protocol member checks (`RequireMember`), revocation
+  that closes live connections, and `/fabric/sync/2` gossip — per-circle
+  anti-entropy on every connect plus rumor-mill relay of fresh admissions,
+  revocations, events and address records. The one-cert `/fabric/auth/1`
+  and the `/fabric/sync/1` / `/fabric/events/1` predecessors were retired
+  2026-11-06; a node on an older binary cannot authenticate.
   First-contact join notifications (admission transparency) surface
   through `JoinObserver`.
 - `admission` — the `/fabric/join/1` protocol and the pending queue
