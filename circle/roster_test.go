@@ -44,7 +44,10 @@ func TestRosterLifecycle(t *testing.T) {
 	if before.Len() != 0 {
 		t.Fatal("Add mutated the roster it was called on — a roster is a value")
 	}
-	if _, fresh, _ := roster.Add(short.Stmt, now); fresh {
+	// The shorter admission is kept as a fact (nothing is dropped for
+	// being beaten) but the longer one stays the entry.
+	withShort, fresh, _ := roster.Add(short.Stmt, now)
+	if d, _ := withShort.Device(devDID); !fresh || d.Stmt.ID() != long.Stmt.ID() {
 		t.Fatal("a shorter admission replaced a longer one")
 	}
 	if _, fresh, _ := roster.Add(long.Stmt, now); fresh {
@@ -583,17 +586,18 @@ func TestRemovalRetiresUnacknowledgedAdmissions(t *testing.T) {
 	if acks, _ := r.Acks(devDID); len(acks) != 1 {
 		t.Fatalf("Acks after restoration = %x", acks)
 	}
-	// The restoration and the memory are both kept.
-	if n := len(r.Held(devDID)); n != 2 {
-		t.Fatalf("held %d, want the restoration and the memory", n)
+	// The restoration and both remembered admissions are kept: nothing is
+	// dropped for being beaten.
+	if n := len(r.Held(devDID)); n != 3 {
+		t.Fatalf("held %d, want the restoration and both remembered admissions", n)
 	}
 }
 
-// The device slot is an antichain, not a register: with removal R,
+// The device slot keeps every admission, not one register: with removal R,
 // restoration S (acks {R}) and a stale renewal N (acks ∅, later issue
 // time), a peer receiving S, N, R and one receiving R, S, N must agree
 // (agy's trace, ADR 0019).
-func TestSlotIsAnAntichainNotARegister(t *testing.T) {
+func TestSlotKeepsEveryAdmissionNotARegister(t *testing.T) {
 	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
 	circleDID := did.ForKey(rootPub)
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
@@ -625,8 +629,7 @@ func TestSlotIsAnAntichainNotARegister(t *testing.T) {
 			t.Fatalf("order %v: the restoration is not the entry", order)
 		}
 	}
-	// Before R arrives both S and N are held — neither dominates the other,
-	// since S acknowledges something N does not; N is the entry meanwhile.
+	// Before R arrives both S and N are held; N is the entry meanwhile.
 	r := run("S", "N")
 	if n := len(r.Held(devDID)); n != 2 {
 		t.Fatalf("held %d before the removal, want 2", n)
@@ -634,11 +637,15 @@ func TestSlotIsAnAntichainNotARegister(t *testing.T) {
 	if entry, _ := r.Device(devDID); entry.Stmt.ID() != N.Stmt.ID() {
 		t.Fatal("the later renewal is not the entry before the removal is known")
 	}
-	// A later admission acknowledging R dominates S and N alike: one held.
+	// A later admission acknowledging R becomes the entry; S and N stay,
+	// since nothing is dropped for being beaten (Codex review, 2026-11-07).
 	T, _ := Issue(rootPriv, nil, circleDID, devPub, t0.Add(4*time.Second), time.Hour, Terms{Verbs: DeviceVerbs, Acks: [][]byte{rid[:]}})
 	r, _, _ = r.Add(T.Stmt, now.Add(time.Second))
-	if n := len(r.Held(devDID)); n != 1 {
-		t.Fatalf("held %d after a dominating admission, want 1", n)
+	if n := len(r.Held(devDID)); n != 3 {
+		t.Fatalf("held %d after a later admission, want 3", n)
+	}
+	if entry, _ := r.Device(devDID); entry.Stmt.ID() != T.Stmt.ID() {
+		t.Fatal("the latest eligible admission is not the entry")
 	}
 }
 
@@ -773,5 +780,76 @@ func TestSweepsOfACompromisedKeyAreVoid(t *testing.T) {
 	r, _ = r.Sweep(devDID, now)
 	if _, ok := r.Live(devDID, now); ok {
 		t.Fatal("a local cut was unmade by the key history")
+	}
+}
+
+// Nothing is dropped because another admission currently beats it: a
+// clean rotation turns a later renewal by the retired key into no fact,
+// and the earlier admission it seemed to supersede must still be there,
+// whichever order the facts arrived in (Codex review, 2026-11-07).
+func TestEarlierAdmissionSurvivesALaterOneTheHistoryVoids(t *testing.T) {
+	k0Pub, k0, _ := ed25519.GenerateKey(rand.Reader)
+	k1Pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	circleDID := did.ForKey(k0Pub)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	devDID := did.ForKey(devPub)
+	t0 := time.Now().Add(-time.Hour)
+	a1, _ := AdmitFor(k0, devPub, t0, 24*time.Hour)
+	h, _ := statement.Handover(k0, k1Pub, circleDID, false, t0.Add(10*time.Second), nil)
+	a2, _ := AdmitFor(k0, devPub, t0.Add(20*time.Second), 24*time.Hour) // the retired key, signing on
+	now := t0.Add(30 * time.Second)
+	for _, order := range [][]string{{"A1", "A2", "H"}, {"A2", "A1", "H"}, {"H", "A1", "A2"}, {"A1", "H", "A2"}} {
+		r := NewRoster(statement.NewDIDRoot(circleDID))
+		for _, o := range order {
+			switch o {
+			case "A1":
+				r, _, _ = r.Add(a1.Stmt, now)
+			case "A2":
+				r, _, _ = r.Add(a2.Stmt, now)
+			case "H":
+				r, _, _ = r.AddHandover(h)
+			}
+		}
+		live, ok := r.Live(devDID, now)
+		if !ok || live.Stmt.ID() != a1.Stmt.ID() {
+			t.Fatalf("order %v: the admission the clean rotation keeps is not the entry", order)
+		}
+	}
+}
+
+// Two keys swept the same device; the later sweep does not erase the
+// earlier one, so declaring the later key compromised leaves the device
+// swept by the earlier (Codex review, 2026-11-07).
+func TestEarlierSweepSurvivesALaterSignersCompromise(t *testing.T) {
+	k0Pub, k0, _ := ed25519.GenerateKey(rand.Reader)
+	k1Pub, k1, _ := ed25519.GenerateKey(rand.Reader)
+	k2Pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	circleDID := did.ForKey(k0Pub)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	devDID := did.ForKey(devPub)
+	t0 := time.Now().Add(-time.Hour)
+	adm, _ := AdmitFor(k0, devPub, t0, 24*time.Hour)
+	h0, _ := statement.Handover(k0, k1Pub, circleDID, false, t0.Add(10*time.Second), nil)
+	comp, _ := statement.Handover(k1, k2Pub, circleDID, true, t0.Add(30*time.Second), h0)
+	now := t0.Add(40 * time.Second)
+	for _, order := range [][]string{{"A", "H0", "S0", "S1", "C"}, {"A", "H0", "S1", "S0", "C"}, {"C", "S1", "S0", "A"}, {"S0", "S1", "A", "H0", "C"}} {
+		r := NewRoster(statement.NewDIDRoot(circleDID))
+		for _, o := range order {
+			switch o {
+			case "A":
+				r, _, _ = r.Add(adm.Stmt, now)
+			case "H0":
+				r, _, _ = r.AddHandover(h0)
+			case "S0":
+				r, _ = r.SweepBy(devDID, t0.Add(5*time.Second), did.ForKey(k0Pub), t0.Add(5*time.Second).Unix()) // K0, before its handover
+			case "S1":
+				r, _ = r.SweepBy(devDID, t0.Add(20*time.Second), did.ForKey(k1Pub), t0.Add(20*time.Second).Unix())
+			case "C":
+				r, _, _ = r.AddHandover(comp)
+			}
+		}
+		if _, ok := r.Live(devDID, now); ok {
+			t.Fatalf("order %v: live although the uncompromised key's sweep stands", order)
+		}
 	}
 }

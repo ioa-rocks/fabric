@@ -349,7 +349,13 @@ func (a *AuthService) handleInboundV2(s network.Stream) {
 		s.Reset()
 		return
 	}
-	if err := writeHello(s, a.present(p, verified)); err != nil {
+	// The reply carries the history of a circle whose admission was
+	// refused even when another circle let the peer in: a stale admission
+	// for A beside a live one for B must still teach A's compromise
+	// (Codex review, 2026-11-07).
+	reply := a.present(p, verified)
+	reply.Handovers = a.historyFor(a.circlesOf(reply, behind))
+	if err := writeHello(s, reply); err != nil {
 		s.Reset()
 		return
 	}
@@ -409,14 +415,24 @@ func (a *AuthService) present(p peer.ID, verified []string) Hello {
 // admissions name, so the peer learns a rotation it missed on the
 // handshake itself.
 func (a *AuthService) withHistory(hello Hello) Hello {
+	hello.Handovers = a.historyFor(a.circlesOf(hello, nil))
+	return hello
+}
+
+// circlesOf is the circles a hello's admissions name plus extra, each once.
+func (a *AuthService) circlesOf(hello Hello, extra []string) []string {
 	var circles []string
 	for _, raw := range hello.Admissions {
 		if st, err := statement.Decode(raw); err == nil && !slices.Contains(circles, st.Payload.Sub) {
 			circles = append(circles, st.Payload.Sub)
 		}
 	}
-	hello.Handovers = a.historyFor(circles)
-	return hello
+	for _, c := range extra {
+		if !slices.Contains(circles, c) {
+			circles = append(circles, c)
+		}
+	}
+	return circles
 }
 
 // historyFor is the key handovers, as statement bytes, of the circles

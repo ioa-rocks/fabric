@@ -140,15 +140,32 @@ func (s *state) replace(i int, nr *circle.Roster, persist bool) error {
 			// here and has grown already; the slots must follow it, or the
 			// devices a compromise retired stay admitted while a retry
 			// reports the handover already learned (Codex review,
-			// 2026-11-07). Adopted in memory, reported; the history is
-			// written with the next save that succeeds.
+			// 2026-11-07). Adopted in memory, reported; the roster stays
+			// marked unsaved (Learned) so the next change, or a retry of
+			// the handover, writes the history.
 			s.rosters[i] = nr
 			s.dirty = true
 			return err
 		}
+		nr.MarkSaved()
 	}
 	s.rosters[i] = nr
 	s.dirty = true
+	return nil
+}
+
+// flush writes a roster whose key history is still unsaved after a failed
+// save, when a retry finds nothing new to apply (Codex review,
+// 2026-11-07: a restart in between would have lost the compromise).
+func (s *state) flush(i int) error {
+	r := s.rosters[i]
+	if !r.Learned() {
+		return nil
+	}
+	if err := r.Save(); err != nil {
+		return fmt.Errorf("roster: %s not written: %w", r.Path(), err)
+	}
+	r.MarkSaved()
 	return nil
 }
 
@@ -387,7 +404,7 @@ func (t *PeerTable) AddHandover(circleDID string, st *statement.Statement) (grew
 			grew = true
 			return s.replace(i, nr, true)
 		}
-		return nil
+		return s.flush(i)
 	})
 	return grew, err
 }

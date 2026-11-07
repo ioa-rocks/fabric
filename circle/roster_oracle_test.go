@@ -42,20 +42,53 @@ import (
 //     and, when the oracle knows a later handover retiring that key, it
 //     was issued no later than that handover — never, when the handover
 //     declared the key compromised. Revocations are statements too: a
-//     retired key's late revocation revokes nothing.
+//     retired key's late revocation revokes nothing. A legacy sweep from
+//     the event log (a mark: device, cut, signer, time) is judged the same
+//     way by its signer at its time; a device it swept whose admissions
+//     are all gone or expired is reported revoked for sweepTombstone, so
+//     the gater keeps refusing it meanwhile.
 //
-// A roster keeps, per device, the antichain of its eligible admissions
-// and forgets the dominated ones, so once GC has dropped an entry a
-// forgotten admission can be replayed and stand as the roster's memory of
-// the device. The membership verdict must not move for that — the
+// A roster keeps every admission that is a fact until its retention ends,
+// so inside the retention it is held to the oracle exactly, memory
+// included; past it, GC may have dropped what a replayed statement puts
+// back as memory, so there the roster is held on membership (live,
+// revoked) only. The membership verdict must not move for that: the
 // retention is at least the longest window, so anything revivable has
-// expired — but the memory may: inside the retention the roster is held
-// to the oracle exactly, past it on membership (live, revoked) only.
+// expired.
 type oracle struct {
 	circle    string
 	adms      []*Admission
 	revs      []*Revocation          // every revocation seen, judged by honoured at query time
 	handovers []*statement.Statement // the key history, oldest first
+	marks     []mark                 // legacy event sweeps
+}
+
+// mark is a member-revoked event as the roster records it: the device,
+// the cut, and who signed when.
+type mark struct {
+	dev      string
+	cut      time.Time
+	signer   string
+	signedAt int64
+}
+
+// keyHonoured is rule 5 for a key named by DID at an instant: the current
+// key, or a retired key up to its handover, never a compromised one.
+func (o *oracle) keyHonoured(signer string, at int64) bool {
+	keys := []string{o.circle}
+	for _, h := range o.handovers {
+		keys = append(keys, h.Payload.Aud)
+	}
+	for i, k := range keys {
+		if k != signer {
+			continue
+		}
+		if i == len(o.handovers) {
+			return true
+		}
+		return !o.handovers[i].Payload.Compromised && at <= o.handovers[i].Payload.Iat
+	}
+	return false
 }
 
 func newOracle(circleDID string) *oracle {
@@ -117,6 +150,11 @@ func (o *oracle) sweptUpTo(dev string) int64 {
 	for _, r := range o.revs {
 		if r.Stmt.IsSweep() && r.Device == dev && r.At > cut && o.honoured(r.Stmt) {
 			cut = r.At
+		}
+	}
+	for _, m := range o.marks {
+		if m.dev == dev && m.cut.Unix() > cut && o.keyHonoured(m.signer, m.signedAt) {
+			cut = m.cut.Unix()
 		}
 	}
 	return cut
@@ -247,6 +285,18 @@ func (o *oracle) entry(dev string, now time.Time) *Admission {
 }
 
 func (o *oracle) standing(dev string, now time.Time) standing {
+	s := o.standingByAdmissions(dev, now)
+	if s == absent || s == expired {
+		for _, m := range o.marks {
+			if m.dev == dev && o.keyHonoured(m.signer, m.signedAt) && now.Before(m.cut.Add(sweepTombstone)) {
+				return revoked
+			}
+		}
+	}
+	return s
+}
+
+func (o *oracle) standingByAdmissions(dev string, now time.Time) standing {
 	a := o.pick(dev, now)
 	if a == nil {
 		m := o.memory(dev, now)
@@ -317,6 +367,7 @@ type op struct {
 	sweep    *Revocation // legacy: aud + before
 	removal  *Revocation // aud
 	handover *statement.Statement
+	mark     *mark // legacy event sweep
 	tick     bool
 }
 
@@ -340,6 +391,8 @@ func (o op) String() string {
 			mode = "compromised"
 		}
 		return fmt.Sprintf("handover to %s (%s, #%d)", shortDID(o.handover.Payload.Aud), mode, len(o.handover.Handovers()))
+	case o.mark != nil:
+		return fmt.Sprintf("mark %s cut=%d by %s at %d", shortDID(o.mark.dev), o.mark.cut.Unix(), shortDID(o.mark.signer), o.mark.signedAt)
 	default:
 		return "tick"
 	}
@@ -363,6 +416,8 @@ func apply(r *Roster, o op) *Roster {
 		r, _, _ = r.Add(o.admit.Stmt, o.at)
 	case o.handover != nil:
 		r, _, _ = r.AddHandover(o.handover)
+	case o.mark != nil:
+		r, _ = r.SweepBy(o.mark.dev, o.mark.cut, o.mark.signer, o.mark.signedAt)
 	default:
 		if rv := o.revocation(); rv != nil {
 			r, _, _ = r.AddRevocation(rv.Stmt)
@@ -377,6 +432,8 @@ func (o *oracle) apply(p op) {
 		o.admit(p.admit)
 	case p.handover != nil:
 		o.learn(p.handover)
+	case p.mark != nil:
+		o.marks = append(o.marks, *p.mark)
 	default:
 		if rv := p.revocation(); rv != nil {
 			o.revoke(rv)
@@ -526,6 +583,14 @@ func script(rng *mrand.Rand, c *cast, t0 time.Time, steps int) []op {
 		case k < 22:
 			retired, retiredProof = c.rootPriv, c.proof
 			o.handover = c.rotate(clock, rng.Intn(4) == 0)
+		case k < 24:
+			// A member-revoked event of the legacy log, signed by the
+			// current key or by the stale one.
+			target := devDID
+			if rng.Intn(4) == 0 {
+				target = c.deskDID
+			}
+			o.mark = &mark{dev: target, cut: clock, signer: did.ForKey(signer.Public().(ed25519.PublicKey)), signedAt: clock.Unix()}
 		default:
 			o.tick = true
 		}
@@ -597,14 +662,20 @@ func TestRosterAgreesWithTheOracle(t *testing.T) {
 						fail("%s: device %s: the roster's entry is not the oracle's", where, shortDID(dev))
 					}
 				}
-				// The held set is an antichain of eligible admissions within
-				// each key epoch.
+				// Every admission the oracle still counts is in the slot.
 				held := r.Held(dev)
-				for i, p := range held {
-					for j, q := range held {
-						if i != j && epoch(q) == epoch(p) && Dominates(q, p) && r.eligible(p) && r.eligible(q) {
-							fail("%s: device %s holds a dominated admission", where, shortDID(dev))
+				for _, a := range o.adms {
+					if a.Stmt.Payload.Aud != dev || !o.fact(a, now) {
+						continue
+					}
+					found := false
+					for _, d := range held {
+						if d.Stmt.ID() == a.Stmt.ID() {
+							found = true
 						}
+					}
+					if !found {
+						fail("%s: device %s: the roster dropped an admission that is still a fact (iat=%d)", where, shortDID(dev), a.Stmt.Payload.Iat)
 					}
 				}
 			}
@@ -681,6 +752,13 @@ func TestRosterAgreesWithTheOracle(t *testing.T) {
 			reloaded, err := OpenRoster(c, now)
 			if err != nil {
 				fail("reload: %v", err)
+			}
+			// Marks live in memory only; the daemon replays the event
+			// log into the store at startup (hydrateStore).
+			for _, p := range ops {
+				if p.mark != nil {
+					reloaded, _ = reloaded.SweepBy(p.mark.dev, p.mark.cut, p.mark.signer, p.mark.signedAt)
+				}
 			}
 			compare(reloaded, o, now, false, fmt.Sprintf("+%s after reload", now.Sub(end).Round(time.Hour)))
 			for _, k := range rng.Perm(len(ops)) {

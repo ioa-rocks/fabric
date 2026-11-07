@@ -470,7 +470,12 @@ history, and a member that refuses a stale admission answers with the
 history alone — and its daemon logs that its admission is void. A legacy
 sweep (`fabric revoke`, the member-revoked event) remembers which key
 signed it and stops applying once that key is declared compromised,
-whichever arrived first.
+whichever arrived first. Two limits, by design: a dark node refuses
+non-members before any protocol runs, so a device that missed a
+compromise learns it at a listed gate, which every device can reach; and
+a key that hands over twice (a fork in the history) is refused loudly,
+the handover learned first stands, and the recovery is an owner's fresh
+`circle export` — there is no higher authority to settle it.
 Admissions, certs and revocations are statements (since 2026-11-02); the
 bespoke pre-statement forms no longer decode (2026-11-06) — a device
 still holding one is re-admitted (`circle admit`) or renewed (`fabric

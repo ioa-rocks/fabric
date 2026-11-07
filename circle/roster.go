@@ -45,7 +45,7 @@ type Roster struct {
 
 	slots  map[string]*slot // by device DID; never mutated in place
 	revs   *statement.RevocationSet
-	sweeps map[string]sweepMark // device DID -> the sweep that cuts it (see sweptAt)
+	sweeps map[string][]sweepMark // device DID -> every sweep naming it (see sweptAt)
 	// learned marks a roster whose roots' key history grew when it was
 	// made (a handover learned from a statement or the gossip): the owner
 	// saves such a roster even when nothing else about it persists.
@@ -66,28 +66,32 @@ type sweepMark struct {
 	signedAt int64
 }
 
-// slot is one device's admissions. held is the antichain of the eligible
-// ones under Dominates, later-issued first, so held[0] is the entry; it
-// has one element in every normal history and two for the instant
-// between a stale renewal and the removal it missed (a single register
-// diverges by arrival order: agy's S, N, R trace, ADR 0019). retired holds
-// the admissions that missed a removal — dead, kept until they would have
-// expired past retention, whatever else is held, so what the roster
-// remembers does not depend on arrival order (the oracle's shuffled
-// phase); retired[0] is the entry when nothing is eligible, so a removed
-// device is reported revoked rather than forgotten, keeps its address, and
-// a restoration can carry its terms forward. retired is an antichain too,
-// not the latest alone: a removal signed by a key later declared
-// compromised stops applying, and any retired admission may then be
-// eligible again — two that acknowledge different removals must both be
-// there (Codex review, 2026-11-06).
+// slot is one device's admissions: every one that is a fact under the
+// roster's key history and not yet past its retention, split by
+// eligibility. held is the eligible ones, later-issued first, so held[0]
+// is the entry; retired is the rest — admissions that missed a removal,
+// kept as memory so a removed device is reported revoked rather than
+// forgotten, keeps its address, and a restoration can carry its terms
+// forward; retired[0] is the entry when nothing is eligible.
 //
-// Both are kept per key epoch — the root key (through its handovers) that
-// signed the admission's root link: an admission is dominated only by one
-// of its own epoch. A later key may yet be declared compromised, which
-// makes everything it signed no fact, and the earlier key's admission must
-// then still be there to stand (the oracle caught this, 2026-11-06).
-// Epochs are few (MaxHandovers), so the slot stays small.
+// Nothing is dropped because another admission currently beats it. The
+// first build of ADR 0019 kept only the antichain under "p2 acknowledges
+// every removal p1 does and is later", on the argument that removals never
+// go away; key compromise broke that argument (a compromised key's
+// removals stop applying), and a clean rotation turns a later admission
+// by the retired key into no fact while the earlier one it beat stands.
+// Each time, the admission the roster had thrown away was the one a later
+// trust change made the answer (Codex reviews, 2026-11-06/07). So the
+// slot keeps every fact and derives: expiry is the only forgetting, and it
+// is safe under every trust change, since an expired admission can never
+// be live again. A device has a few admissions a year; the slot stays
+// small without help.
+//
+// What is dropped on build is an admission the key history no longer
+// honours (signed by a retired key after its handover, or by a compromised
+// one). That is safe the other way round: the history only grows (a
+// handover learned is never unlearned; a fork is refused, not resolved),
+// so a statement that is no fact never becomes one again.
 type slot struct {
 	held    []*Device
 	retired []*Device // per-epoch antichain, later-issued first
@@ -186,7 +190,7 @@ func NewRoster(roots *statement.DIDRoot) *Roster {
 		roots:  roots,
 		slots:  map[string]*slot{},
 		revs:   statement.NewRevocationSet(),
-		sweeps: map[string]sweepMark{},
+		sweeps: map[string][]sweepMark{},
 	}
 }
 
@@ -277,6 +281,12 @@ func (r *Roster) Path() string { return r.path }
 // otherwise lives in memory.
 func (r *Roster) Learned() bool { return r.learned }
 
+// MarkSaved clears Learned after a successful Save. The owner calls it on
+// a roster it is about to publish; a roster whose save failed keeps the
+// flag — through clone, so every roster derived from it carries the debt
+// — until a save succeeds (Codex review, 2026-11-07).
+func (r *Roster) MarkSaved() { r.learned = false }
+
 // Roots is the roster's root: the circle's key as statement.Roots.
 func (r *Roster) Roots() *statement.DIDRoot { return r.roots }
 
@@ -293,9 +303,9 @@ func (r *Roster) Revocations() *statement.RevocationSet { return r.revs }
 // clone is a shallow copy: the maps are new, the slots and entries shared.
 // A mutation replaces slots in the copy and never touches a shared one.
 func (r *Roster) clone() *Roster {
-	nr := &Roster{roots: r.roots, path: r.path, revs: r.revs,
+	nr := &Roster{roots: r.roots, path: r.path, revs: r.revs, learned: r.learned,
 		slots:  make(map[string]*slot, len(r.slots)),
-		sweeps: make(map[string]sweepMark, len(r.sweeps))}
+		sweeps: make(map[string][]sweepMark, len(r.sweeps))}
 	for k, v := range r.slots {
 		nr.slots[k] = v
 	}
@@ -395,15 +405,21 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, err
 }
 
 // build derives a device's slot from a set of its admissions under the
-// roster's current removals, revocations and sweeps: verdicts are
-// re-derived, the eligible ones are reduced to their antichain and ordered
-// by Later, and the latest of the rest is the memory. Entries whose
-// verdict did not change are shared, never copied.
+// roster's key history, removals, revocations and sweeps: what the history
+// no longer honours is left out, verdicts are re-derived, and the rest is
+// split by eligibility and ordered by Later. Entries whose verdict did not
+// change are shared, never copied.
 func (r *Roster) build(ps []*Device) *slot {
 	var elig, retired []*Device
+	seen := map[[32]byte]bool{}
 	for _, p := range ps {
+		id := p.Stmt.ID()
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
 		if p.Chain.RootsHonoured(r.roots) != nil {
-			continue // signed by a retired key after its handover (or a compromised one): no fact
+			continue // signed by a retired key after its handover (or a compromised one): no fact, for good
 		}
 		p = r.judged(p)
 		if r.eligible(p) {
@@ -412,31 +428,17 @@ func (r *Roster) build(ps []*Device) *slot {
 			retired = append(retired, p)
 		}
 	}
-	held, mem := antichain(elig), antichain(retired)
-	if len(held) == 0 && len(mem) == 0 {
+	if len(elig) == 0 && len(retired) == 0 {
 		return nil
 	}
-	return &slot{held: held, retired: mem}
+	byLater(elig)
+	byLater(retired)
+	return &slot{held: elig, retired: retired}
 }
 
-// antichain drops every admission dominated by another of its own key
-// epoch and orders the rest later-issued first.
-func antichain(ps []*Device) []*Device {
-	var out []*Device
-	for _, p := range ps {
-		dominated := false
-		for _, q := range ps {
-			if q != p && epoch(q) == epoch(p) && Dominates(q, p) {
-				dominated = true
-				break
-			}
-		}
-		if !dominated {
-			out = append(out, p)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return Later(out[i], out[j]) })
-	return out
+// byLater orders admissions later-issued first.
+func byLater(ps []*Device) {
+	sort.Slice(ps, func(i, j int) bool { return Later(ps[i], ps[j]) })
 }
 
 // epoch is the key epoch of an admission: how many handovers its root
@@ -464,26 +466,6 @@ func sameSlot(a, b *slot) bool {
 	}
 	for i := range as {
 		if as[i] != bs[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// Dominates reports whether p2 makes p1 redundant for good: p2 acknowledges
-// every removal p1 does and is the later word, so under any future removal
-// set p1 is eligible only when p2 is, and p2 wins (ADR 0019). Removals
-// never go away, so a dominated admission never comes back; dropping it on
-// arrival is what keeps a slot small. The slot applies it within one key
-// epoch only (see slot).
-func Dominates(p2, p1 *Device) bool {
-	if !Later(p2, p1) {
-		return false
-	}
-	for _, id := range p1.Stmt.Payload.Acks {
-		var k [32]byte
-		copy(k[:], id)
-		if !p2.Stmt.Acknowledges(k) {
 			return false
 		}
 	}
@@ -798,12 +780,17 @@ func (r *Roster) Sweep(deviceDID string, at time.Time) (*Roster, bool) {
 // (sweepMark). A sweep that is no stronger than one already applying is
 // nothing new.
 func (r *Roster) SweepBy(deviceDID string, at time.Time, signer string, signedAt int64) (*Roster, bool) {
-	cut := at.Unix()
-	if old, ok := r.sweeps[deviceDID]; ok && cut <= old.cut && r.honoursSweep(old) {
-		return r, false
+	m := sweepMark{cut: at.Unix(), signer: signer, signedAt: signedAt}
+	for _, old := range r.sweeps[deviceDID] {
+		if old == m || (m.signer == "" && old.signer == "" && m.cut <= old.cut) {
+			return r, false
+		}
 	}
+	// Every sweep is kept, not the strongest: the strongest may be the one
+	// a compromise later voids, and the earlier one must still apply
+	// (Codex review, 2026-11-07).
 	nr := r.clone()
-	nr.sweeps[deviceDID] = sweepMark{cut: cut, signer: signer, signedAt: signedAt}
+	nr.sweeps[deviceDID] = append(append([]sweepMark(nil), r.sweeps[deviceDID]...), m)
 	nr.reslotAll()
 	return nr, true
 }
@@ -816,12 +803,13 @@ func (r *Roster) honoursSweep(m sweepMark) bool {
 
 // sweptAt is the cut applying to a device — admissions issued up to it are
 // dead — if a sweep the history honours names it.
-func (r *Roster) sweptAt(deviceDID string) (int64, bool) {
-	m, ok := r.sweeps[deviceDID]
-	if !ok || !r.honoursSweep(m) {
-		return 0, false
+func (r *Roster) sweptAt(deviceDID string) (cut int64, ok bool) {
+	for _, m := range r.sweeps[deviceDID] {
+		if r.honoursSweep(m) && (!ok || m.cut > cut) {
+			cut, ok = m.cut, true
+		}
 	}
-	return m.cut, true
+	return cut, ok
 }
 
 // Live returns the device's entry if it is admitted right now — inside its
@@ -895,7 +883,7 @@ func (r *Roster) Device(deviceDID string) (*Device, bool) {
 }
 
 // Held lists every admission the roster keeps for a device, entry first:
-// the eligible antichain, or the memory alone.
+// the eligible ones, then the memory.
 func (r *Roster) Held(deviceDID string) []*Device {
 	return append([]*Device(nil), r.slots[deviceDID].all()...)
 }
@@ -939,7 +927,9 @@ func (r *Roster) UsedIPs() []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, s := range r.slots {
-		for _, dev := range s.all() {
+		// The entry's address alone: an earlier admission the slot keeps
+		// as a fact may have granted one the renewal took away.
+		if dev := s.entry(); dev != nil {
 			if m := dev.Stmt.Payload.Meta; m != nil && m.IP != "" && !seen[m.IP] {
 				seen[m.IP] = true
 				out = append(out, m.IP)
@@ -993,10 +983,21 @@ func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
 			nr.slots[did] = ns
 		}
 	}
-	for did, m := range nr.sweeps {
-		if !now.Before(time.Unix(m.cut, 0).Add(statement.MaxValidity)) {
+	for did, ms := range nr.sweeps {
+		var keep []sweepMark
+		for _, m := range ms {
+			if now.Before(time.Unix(m.cut, 0).Add(statement.MaxValidity)) {
+				keep = append(keep, m)
+			}
+		}
+		if len(keep) == len(ms) {
+			continue
+		}
+		changed = true
+		if len(keep) == 0 {
 			delete(nr.sweeps, did)
-			changed = true
+		} else {
+			nr.sweeps[did] = keep
 		}
 	}
 	if !changed {

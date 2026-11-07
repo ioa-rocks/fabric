@@ -795,16 +795,24 @@ func TestHandoverIsAdoptedWhenTheSaveFails(t *testing.T) {
 	if _, err := table.AddAdmission(a.Stmt, time.Now()); err == nil {
 		t.Fatal("the retired key's admission was accepted after the compromise")
 	}
-	// The disk comes back: the handover is old news, and the next save
-	// that succeeds writes the history with it.
+	// The disk comes back: the retry finds the handover already learned
+	// and writes the history it still owes, so a restart in between no
+	// longer loses the compromise (Codex review, 2026-11-07).
 	if err := os.MkdirAll(c.Path, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if grew, err := table.AddHandover(c.Config.DID, comp); err != nil || grew {
 		t.Fatalf("retry: grew=%v err=%v; want already learned, no error", grew, err)
 	}
-	if hs, err := c.Handovers(); err != nil || len(hs) != 0 {
-		t.Fatalf("handovers.cbor before any successful save: %d, %v", len(hs), err)
+	if hs, err := c.Handovers(); err != nil || len(hs) != 1 {
+		t.Fatalf("handovers.cbor after the retry: %d, %v; want 1", len(hs), err)
+	}
+	reopened, err := circle.OpenRoster(c, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reopened.Live(cert.DIDForKey(devPub), time.Now()); ok {
+		t.Fatal("reopening the roster admits the compromised key's device again")
 	}
 	other, _, _ := ed25519.GenerateKey(rand.Reader)
 	fresh, _ := circle.Issue(k2, comp, c.Config.DID, other, time.Now().Add(-time.Second), time.Hour, circle.Terms{Verbs: circle.DeviceVerbs})

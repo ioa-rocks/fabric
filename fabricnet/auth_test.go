@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -496,5 +497,64 @@ func TestReturningDeviceLearnsTheRotationOnTheHandshake(t *testing.T) {
 	}
 	if tablet.store.IsMember(tablet.host.ID(), time.Now()) {
 		t.Fatal("the tablet still counts itself a member")
+	}
+}
+
+// A device presenting a stale admission for one circle and a live one for
+// another authenticates through the live one — and is still told the
+// refused circle's key history (Codex review, 2026-11-07: the history
+// went only with an outright refusal).
+func TestMixedHandshakeStillTeachesTheRefusedCirclesHistory(t *testing.T) {
+	aPub, aPriv, _ := ed25519.GenerateKey(rand.Reader)
+	bPub, bPriv, _ := ed25519.GenerateKey(rand.Reader)
+	aDID, bDID := cert.DIDForKey(aPub), cert.DIDForKey(bPub)
+	gate := newNode(t, aPub, aPriv, "gate", true, time.Second)
+	device := newNode(t, aPub, aPriv, "device", true, time.Second)
+	both := func(n *node) {
+		n.store.AddRoster(circle.NewRoster(statement.NewDIDRoot(bDID)))
+		pub, _ := n.host.Peerstore().PubKey(n.host.ID()).Raw()
+		inB, err := cert.Issue(bPriv, ed25519.PublicKey(pub), cert.CmdMember, cert.Meta{Name: "x"}, time.Now(), time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rawA, _ := n.own.Stmt.Bytes()
+		rawB, _ := inB.Stmt.Bytes()
+		// As the daemon's presenter: the dialer shows everything, the
+		// responder only the circles the dialer verified in — so the
+		// gate's reply names B alone, and A's history must ride on the
+		// refusal, not on an admission of A.
+		n.auth.SetPresenter(func(_ peer.ID, verified []string) Hello {
+			if verified == nil {
+				return Hello{Admissions: [][]byte{rawA, rawB}}
+			}
+			var h Hello
+			for did, raw := range map[string][]byte{aDID: rawA, bDID: rawB} {
+				if slices.Contains(verified, did) {
+					h.Admissions = append(h.Admissions, raw)
+				}
+			}
+			return h
+		})
+	}
+	both(gate)
+	both(device)
+	time.Sleep(1100 * time.Millisecond)
+	k1Pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	comp, _ := statement.Handover(aPriv, k1Pub, aDID, true, time.Now(), nil)
+	if _, err := gate.store.AddHandover(aDID, comp); err != nil {
+		t.Fatal(err)
+	}
+	connect(t, device, gate)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := device.auth.Authenticate(ctx, gate.host.ID()); err != nil {
+		t.Fatalf("the live admission in the other circle did not authenticate: %v", err)
+	}
+	now := time.Now()
+	if gate.store.In(device.host.ID(), aDID, now) || !gate.store.In(device.host.ID(), bDID, now) {
+		t.Fatal("the gate's view of the device is not: out of A, in B")
+	}
+	if r, _ := device.store.RosterFor(aDID); r.Roots().CurrentDID() != cert.DIDForKey(k1Pub) {
+		t.Fatal("the device was not told A's compromise beside its success in B")
 	}
 }
