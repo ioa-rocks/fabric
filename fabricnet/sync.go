@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/internal/wire"
 	"ioa.rocks/fabric/statement"
 
@@ -28,19 +27,20 @@ import (
 //
 // SyncProtocolV2ID (step 5, slice C; memo l0-overlapping-circles §17) carries
 // one set per circle *both* peers are verified in — the circle's device
-// admissions and revocations as statements, plus the membership-event
-// envelopes of the first circle (its admission path) — and the signed peer
+// admissions and revocations as statements — and the signed peer
 // address records (the knowledge plane's WHERE, self-admitted by each
 // device's key). A device never learns another circle's roster; a circle's
 // set is relayed only to peers verified in it. The predecessors
 // /fabric/sync/1 (events plus records, first circle only) and
 // /fabric/events/1 were served for one release and retired in slice G
-// (2026-11-06).
+// (2026-11-06); the first circle's membership-event envelopes (a set's
+// `e` field) were retired on 2026-11-07 and are ignored when an older
+// binary still sends them.
 const SyncProtocolV2ID = "/fabric/sync/2"
 
-// A log entry or address record is a few hundred bytes; even a large mesh
+// A statement or address record is a few hundred bytes; even a large mesh
 // with a deep history stays far under this.
-const maxEventsWireSize = 1 << 20
+const maxSyncWireSize = 1 << 20
 
 const exchangeTimeout = 15 * time.Second
 
@@ -56,12 +56,11 @@ const recordRepublishInterval = 6 * time.Hour
 
 // circleSet is one circle's anti-entropy set in a v2 exchange.
 type circleSet struct {
-	DID         string         `cbor:"did"`
-	Roots       []string       `cbor:"roots,omitempty"` // the circle DID again (older binaries listed every root they honoured)
-	Admissions  [][]byte       `cbor:"a,omitempty"`     // admissions, statement bytes (live and lapsed)
-	Revocations [][]byte       `cbor:"r,omitempty"`     // statement bytes
-	Handovers   [][]byte       `cbor:"h,omitempty"`     // the circle's key history, statement bytes, oldest first
-	Events      []*event.Event `cbor:"e,omitempty"`     // membership-event envelopes (first circle only)
+	DID         string   `cbor:"did"`
+	Roots       []string `cbor:"roots,omitempty"` // the circle DID again (older binaries listed every root they honoured)
+	Admissions  [][]byte `cbor:"a,omitempty"`     // admissions, statement bytes (live and lapsed)
+	Revocations [][]byte `cbor:"r,omitempty"`     // statement bytes
+	Handovers   [][]byte `cbor:"h,omitempty"`     // the circle's key history, statement bytes, oldest first
 }
 
 // syncPayloadV2 is one direction of a /fabric/sync/2 exchange.
@@ -78,23 +77,21 @@ type CircleHooks struct {
 	OwnAdmissions func(circleDID string) [][]byte
 	Revocations   func(circleDID string) [][]byte
 	Ingest        func(from peer.ID, revocations [][]byte) (fresh [][]byte, err error)
+	// Admitted is told of every admission that was new to the table —
+	// learned from a peer (from) or recorded here (from == "") — once it
+	// is in: the daemon adopts its own renewed cert from it and logs the
+	// member added / renewed notifications.
+	Admitted func(from peer.ID, st *statement.Statement)
 }
 
 // kickDelay debounces the anti-entropy kick a roster change triggers.
 const kickDelay = 300 * time.Millisecond
 
-// EventApplied is invoked once per newly learned event, in apply order,
-// after it entered the log. The daemon uses it to update the member store,
-// persist the log, and surface the spec-§5 notifications.
-type EventApplied func(e *event.Event)
-
-// EventSync gossips membership events and member address records.
+// EventSync gossips circle statements and member address records.
 type EventSync struct {
-	h       host.Host
-	log     *event.Log
-	store   *MemberStore
-	onApply EventApplied
-	cab     peerstore.CertifiedAddrBook
+	h     host.Host
+	store *MemberStore
+	cab   peerstore.CertifiedAddrBook
 
 	mu       sync.Mutex
 	ownRec   []byte                // this host's latest signed peer record
@@ -106,16 +103,15 @@ type EventSync struct {
 	stop []func()
 }
 
-// NewEventSync wires the gossip protocols onto the host. onApply may be
-// nil. Call (*AuthService).SetOnAuthenticated with s.ExchangeAsync to
+// NewEventSync wires the gossip protocols onto the host. Call (*AuthService).SetOnAuthenticated with s.ExchangeAsync to
 // complete the anti-entropy wiring — freshly authenticated peers exchange
 // state; already-known members exchange on reconnect via the Connected
 // notification here. The host's own signed address record is tracked via
 // the event bus and re-pushed to connected members whenever it changes
 // (network transitions).
-func NewEventSync(h host.Host, log *event.Log, store *MemberStore, onApply EventApplied) *EventSync {
+func NewEventSync(h host.Host, store *MemberStore) *EventSync {
 	cab, _ := h.Peerstore().(peerstore.CertifiedAddrBook)
-	s := &EventSync{h: h, log: log, store: store, onApply: onApply, cab: cab, lastSeq: map[peer.ID]uint64{}}
+	s := &EventSync{h: h, store: store, cab: cab, lastSeq: map[peer.ID]uint64{}}
 	h.SetStreamHandler(SyncProtocolV2ID, s.handleSyncV2)
 	// A roster change — a device admitted here, a verdict flipped — is
 	// news for every peer in that circle: re-run anti-entropy with the
@@ -258,7 +254,7 @@ func (s *EventSync) ExchangeAsync(p peer.ID) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout)
 		defer cancel()
-		_ = s.exchange(ctx, p, s.log.All(), s.knownRecords(), true)
+		_ = s.exchange(ctx, p)
 	}()
 }
 
@@ -319,25 +315,21 @@ func (s *EventSync) publishSets(sets []circleSet, except peer.ID) {
 	}
 }
 
-// setsFor builds the per-circle sets for one peer: a set for every circle
-// the peer is a live device of here, with the given events (the
-// membership-event log belongs to the first circle, the one it was always
-// about) and — for a full exchange — every admission the roster holds, this
-// node's own, and the circle's live revocations.
-func (s *EventSync) setsFor(p peer.ID, evs []*event.Event, full bool) []circleSet {
+// setsFor builds the per-circle sets for one peer — a set for every circle
+// the peer is a live device of here, with the circle's key history, every
+// admission the roster holds, this node's own, and the circle's live
+// revocations.
+func (s *EventSync) setsFor(p peer.ID) []circleSet {
 	now := time.Now()
 	hooks := s.circleHooks()
 	var out []circleSet
-	for i, r := range s.store.Rosters() {
+	for _, r := range s.store.Rosters() {
 		did := r.CircleDID()
 		if !s.store.In(p, did, now) {
 			continue
 		}
 		set := circleSet{DID: did, Roots: []string{did}}
-		if i == 0 {
-			set.Events = evs
-		}
-		if full {
+		{
 			for _, h := range r.Roots().Handovers(did) {
 				if raw, err := h.Bytes(); err == nil {
 					set.Handovers = append(set.Handovers, raw)
@@ -361,35 +353,9 @@ func (s *EventSync) setsFor(p peer.ID, evs []*event.Event, full bool) []circleSe
 				set.Revocations = hooks.Revocations(did)
 			}
 		}
-		if full || len(set.Events) > 0 {
-			out = append(out, set)
-		}
+		out = append(out, set)
 	}
 	return out
-}
-
-// Publish sends events to every connected member — the rumor-mill push for
-// locally created events (approve/revoke on the master). The events must
-// already be in the log.
-func (s *EventSync) Publish(evs []*event.Event) {
-	s.publishExcept(evs, "")
-}
-
-func (s *EventSync) publishExcept(evs []*event.Event, except peer.ID) {
-	if len(evs) == 0 {
-		return
-	}
-	now := time.Now()
-	for _, p := range s.h.Network().Peers() {
-		if p == except || !s.store.IsMember(p, now) {
-			continue
-		}
-		go func(p peer.ID) {
-			ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout)
-			defer cancel()
-			_ = s.exchange(ctx, p, evs, nil, false)
-		}(p)
-	}
 }
 
 // pushRecordsExcept sends address records to connected members. Fire-and-forget: the
@@ -437,10 +403,9 @@ func (s *EventSync) pushRecordsExcept(recs [][]byte, except peer.ID) {
 	}
 }
 
-// exchange sends state to a peer and applies whatever it answers with.
-// full says whether the per-circle sets carry the whole roster
-// (anti-entropy) or only the given events (a push).
-func (s *EventSync) exchange(ctx context.Context, p peer.ID, evs []*event.Event, recs [][]byte, full bool) error {
+// exchange sends state to a peer (anti-entropy: the whole roster of every
+// shared circle) and applies whatever it answers with.
+func (s *EventSync) exchange(ctx context.Context, p peer.ID) error {
 	str, err := s.h.NewStream(ctx, p, SyncProtocolV2ID)
 	if err != nil {
 		return err
@@ -449,10 +414,7 @@ func (s *EventSync) exchange(ctx context.Context, p peer.ID, evs []*event.Event,
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = str.SetDeadline(deadline)
 	}
-	if full {
-		recs = s.knownRecordsFor(p)
-	}
-	if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(p, evs, full), Records: recs}); err != nil {
+	if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(p), Records: s.knownRecordsFor(p)}); err != nil {
 		return err
 	}
 	theirs, err := readSyncV2(str)
@@ -479,7 +441,7 @@ func (s *EventSync) handleSyncV2(str network.Stream) {
 		str.Reset()
 		return
 	}
-	if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(p, s.log.All(), true), Records: s.knownRecordsFor(p)}); err != nil {
+	if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(p), Records: s.knownRecordsFor(p)}); err != nil {
 		str.Reset()
 		return
 	}
@@ -487,17 +449,13 @@ func (s *EventSync) handleSyncV2(str network.Stream) {
 }
 
 // applyV2 ingests per-circle sets: each into the roster of its circle (a
-// set for a circle not held here is dropped unread), events through the
-// log as in v1, revocations through the circle hooks. What was genuinely
-// new is relayed on — events to every member, admissions and revocations only
-// to the members verified in that circle.
+// set for a circle not held here is dropped unread), revocations through
+// the circle hooks. What was genuinely new is relayed on, only to the
+// members verified in that circle.
 func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 	now := time.Now()
 	hooks := s.circleHooks()
-	var (
-		freshEvents []*event.Event
-		deltas      []circleSet
-	)
+	var deltas []circleSet
 	for _, set := range pl.Circles {
 		// The set is keyed by the circle DID; Roots repeats it (a peer on
 		// an older binary may list more than one).
@@ -543,20 +501,6 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 				log.Printf("sync: key handover from %s for circle %s: %v", from, shortDID(set.DID), err)
 			}
 		}
-		event.Sort(set.Events)
-		for _, e := range set.Events {
-			if !roster.Honours(e.Payload.Ns) {
-				continue
-			}
-			isNew, err := s.log.Add(e, now)
-			if err != nil || !isNew {
-				continue
-			}
-			freshEvents = append(freshEvents, e)
-			if s.onApply != nil {
-				s.onApply(e)
-			}
-		}
 		for _, raw := range set.Admissions {
 			st, err := statement.Decode(raw)
 			if err != nil {
@@ -564,6 +508,9 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 			}
 			if fresh, err := s.store.AddAdmission(st, now); err == nil && fresh {
 				delta.Admissions = append(delta.Admissions, raw)
+				if hooks.Admitted != nil {
+					hooks.Admitted(from, st)
+				}
 			}
 		}
 		if hooks.Ingest != nil && len(set.Revocations) > 0 {
@@ -577,7 +524,6 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 			deltas = append(deltas, delta)
 		}
 	}
-	s.publishExcept(freshEvents, from)
 	s.publishSets(deltas, from)
 
 	var freshRecords [][]byte
@@ -756,7 +702,7 @@ func writeSyncV2(str network.Stream, pl syncPayloadV2) error {
 }
 
 func readSyncV2(str network.Stream) (syncPayloadV2, error) {
-	data, err := wire.ReadFrame(str, maxEventsWireSize)
+	data, err := wire.ReadFrame(str, maxSyncWireSize)
 	if err != nil {
 		return syncPayloadV2{}, fmt.Errorf("reading sync payload: %w", err)
 	}

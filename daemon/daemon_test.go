@@ -10,7 +10,6 @@ import (
 	"ioa.rocks/fabric/admission"
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
-	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/fabricnet"
 	"ioa.rocks/fabric/state"
 	"ioa.rocks/fabric/statement"
@@ -22,14 +21,14 @@ import (
 
 // newTestDaemon fabricates a member's state dir — cert, device key, and an
 // event log holding exactly the given events — and assembles a daemon on it.
-func newTestDaemon(t *testing.T, nsPriv ed25519.PrivateKey, name string, events []*event.Event) *Daemon {
+func newTestDaemon(t *testing.T, nsPriv ed25519.PrivateKey, name string, roster []*cert.Cert) *Daemon {
 	t.Helper()
-	return newTestDaemonCfg(t, nsPriv, name, events, nil)
+	return newTestDaemonCfg(t, nsPriv, name, roster, nil)
 }
 
 // newTestDaemonCfg is newTestDaemon with a hook over the saved config (queue
 // host, listed, …).
-func newTestDaemonCfg(t *testing.T, nsPriv ed25519.PrivateKey, name string, events []*event.Event, tweak func(*state.Config)) *Daemon {
+func newTestDaemonCfg(t *testing.T, nsPriv ed25519.PrivateKey, name string, roster []*cert.Cert, tweak func(*state.Config)) *Daemon {
 	t.Helper()
 	dir, err := state.Open(t.TempDir())
 	if err != nil {
@@ -50,9 +49,7 @@ func newTestDaemonCfg(t *testing.T, nsPriv ed25519.PrivateKey, name string, even
 	if err := dir.SaveCert(own); err != nil {
 		t.Fatal(err)
 	}
-	if err := dir.SaveEvents(events); err != nil {
-		t.Fatal(err)
-	}
+	seedRoster(t, dir, nsPriv, roster...)
 	cfg := state.Config{
 		Name:        name,
 		ListenAddrs: []string{"/ip4/127.0.0.1/udp/0/quic-v1", "/ip4/127.0.0.1/tcp/0"},
@@ -94,15 +91,11 @@ func TestSelfHealOneWayKnownPair(t *testing.T) {
 
 	b := newTestDaemon(t, nsPriv, "node-b", nil)
 	b.Gater.SetListed(true) // gate-hetz was a lighthouse: unknown inbound admitted for the handshake
-	bAdded, err := event.NewAdded(nsPriv, b.OwnCert(), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	a := newTestDaemon(t, nsPriv, "node-a", []*event.Event{bAdded})
+	a := newTestDaemon(t, nsPriv, "node-a", []*cert.Cert{b.OwnCert()})
 
 	// The asymmetry under test: A knows B, B does not know A.
 	if !a.Store.IsMember(b.Host.ID(), time.Now()) {
-		t.Fatal("precondition: A's replayed event log should already know B")
+		t.Fatal("precondition: A's seeded roster should already know B")
 	}
 	if b.Store.IsMember(a.Host.ID(), time.Now()) {
 		t.Fatal("precondition: B must not know A")
@@ -135,11 +128,7 @@ func TestDarkNodeAdmitsMemberOnlyAfterGossip(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := newTestDaemon(t, nsPriv, "node-b", nil)
-	bAdded, err := event.NewAdded(nsPriv, b.OwnCert(), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	a := newTestDaemon(t, nsPriv, "node-a", []*event.Event{bAdded})
+	a := newTestDaemon(t, nsPriv, "node-a", []*cert.Cert{b.OwnCert()})
 	if b.Gater.Listed() {
 		t.Fatal("precondition: a plain member daemon should be dark")
 	}
@@ -158,15 +147,8 @@ func TestDarkNodeAdmitsMemberOnlyAfterGossip(t *testing.T) {
 		t.Fatal("B learned A without any gossip")
 	}
 
-	// Gossip arrives.
-	aAdded, err := event.NewAdded(nsPriv, a.OwnCert(), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := b.Log.Add(aAdded, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	b.applyEvent(aAdded)
+	// Gossip arrives: A's admission reaches B's roster.
+	b.Store.AddMember(a.Host.ID(), a.OwnCert())
 	if err := a.Host.Connect(ctx, peer.AddrInfo{ID: b.Host.ID(), Addrs: b.Host.Addrs()}); err != nil {
 		t.Fatalf("A → B after gossip: %v", err)
 	}
@@ -227,16 +209,20 @@ func TestRemoteQueueDrivenByMasterDevice(t *testing.T) {
 	}
 	master := newTestDaemon(t, nsPriv, "desk", nil)
 	other := newTestDaemon(t, nsPriv, "nas", nil)
+	// The gate's roster holds the master's admission as the earliest: the
+	// device the root admitted first is the master.
 	t0 := time.Now().Add(-2 * time.Second)
-	masterAdded, err := event.NewAdded(nsPriv, master.OwnCert(), t0)
+	masterKey, _ := master.OwnCert().DeviceKey()
+	otherKey, _ := other.OwnCert().DeviceKey()
+	masterAt, err := cert.Issue(nsPriv, masterKey, cert.CmdMember, cert.Meta{Name: "desk"}, t0, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	otherAdded, err := event.NewAdded(nsPriv, other.OwnCert(), t0.Add(time.Second))
+	otherAt, err := cert.Issue(nsPriv, otherKey, cert.CmdMember, cert.Meta{Name: "nas"}, t0.Add(time.Second), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	gate := newTestDaemonCfg(t, nsPriv, "gate", []*event.Event{otherAdded, masterAdded}, func(c *state.Config) { c.QueueHost = true })
+	gate := newTestDaemonCfg(t, nsPriv, "gate", []*cert.Cert{otherAt, masterAt}, func(c *state.Config) { c.QueueHost = true })
 	if gate.Queue == nil {
 		t.Fatal("precondition: the gate runs the queue")
 	}
@@ -274,6 +260,58 @@ func attachCircles(d *Daemon) {
 	d.Circle.SetHome(d.CircleDID, d.Roots, d.Store.CertIn)
 	d.Circle.SetPeerTable(d.Store)
 	d.Circle.AttachSync(d.Sync)
+	d.Circle.OnAdmitted(d.Admitted)
+}
+
+// A renewal is an admission like any other (spec §5): recorded on the
+// master through the circle service, it reaches the renewed device by
+// gossip, and that device adopts it as its own cert — the path `fabric
+// renew` takes since the membership-event log was retired (2026-11-07).
+func TestRenewedCertIsAdoptedFromTheRoster(t *testing.T) {
+	_, nsPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	master := newTestDaemon(t, nsPriv, "desk", nil)
+	nas := newTestDaemon(t, nsPriv, "nas", []*cert.Cert{master.OwnCert()})
+	master.Store.AddMember(nas.Host.ID(), nas.OwnCert())
+	attachCircles(master)
+	attachCircles(nas)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := nas.Host.Connect(ctx, peer.AddrInfo{ID: master.Host.ID(), Addrs: master.Host.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !(master.Store.IsMember(nas.Host.ID(), time.Now()) && nas.Store.IsMember(master.Host.ID(), time.Now())) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	old := nas.OwnCert()
+	renewed, err := cert.Renew(nsPriv, old, time.Now(), cert.DefaultValidity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !renewed.Expiry().After(old.Expiry()) {
+		t.Fatal("precondition: the renewal is not later")
+	}
+	raw, err := renewed.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh, err := master.Circle.Admit(raw); err != nil || !fresh {
+		t.Fatalf("recording the renewal on the master: fresh=%v err=%v", fresh, err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if nas.OwnCert().Expiry().Equal(renewed.Expiry()) {
+			if saved, err := nas.Dir.LoadCert(); err != nil || !saved.Expiry().Equal(renewed.Expiry()) {
+				t.Fatalf("renewed cert adopted in memory but not persisted: %v", err)
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("nas still presents the old cert (expires %s); the renewal did not reach it", nas.OwnCert().Expiry().Format(time.RFC3339))
 }
 
 func addrOf(t *testing.T, d *Daemon) string {
@@ -309,14 +347,8 @@ func TestColdStartDeviceJoinsOneCircleThroughGate(t *testing.T) {
 	mainDID := cert.DIDForKey(nsPub)
 	desk := newTestDaemon(t, nsPriv, "desk", nil)
 	gate := newTestDaemonCfg(t, nsPriv, "gate", nil, func(c *state.Config) { c.Listed = true })
-	deskAdded, _ := event.NewAdded(nsPriv, desk.OwnCert(), time.Now())
-	gateAdded, _ := event.NewAdded(nsPriv, gate.OwnCert(), time.Now())
-	if err := desk.Ingest(gateAdded); err != nil {
-		t.Fatal(err)
-	}
-	if err := gate.Ingest(deskAdded); err != nil {
-		t.Fatal(err)
-	}
+	desk.Store.AddMember(gate.Host.ID(), gate.OwnCert())
+	gate.Store.AddMember(desk.Host.ID(), desk.OwnCert())
 	attachCircles(desk)
 	attachCircles(gate)
 
@@ -487,5 +519,29 @@ func TestFirstCircleAdmissionSurvivesRestart(t *testing.T) {
 	t.Cleanup(func() { again.Host.Close(); again.Stop() })
 	if !again.Store.IsMember(p, time.Now()) {
 		t.Fatal("admission into the first circle was lost on restart")
+	}
+}
+
+// seedRoster writes admissions into the node's home-circle roster on disk —
+// what the gossip would have taught it (before 2026-11-07 fixtures wrote
+// them as events.cbor).
+func seedRoster(t *testing.T, dir state.Dir, root ed25519.PrivateKey, certs ...*cert.Cert) {
+	t.Helper()
+	now := time.Now()
+	c, err := circle.Hold(circle.Root(dir.Path), cert.DIDForKey(root.Public().(ed25519.PublicKey)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := circle.OpenRoster(c, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ct := range certs {
+		if r, _, err = r.Add(ct.Stmt, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Save(); err != nil {
+		t.Fatal(err)
 	}
 }

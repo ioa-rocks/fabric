@@ -22,7 +22,6 @@ import (
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/did"
-	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/fabricdns"
 	"ioa.rocks/fabric/fabricnet"
 	"ioa.rocks/fabric/state"
@@ -60,7 +59,6 @@ type Daemon struct {
 	Store  *fabricnet.MemberStore
 	Gater  *fabricnet.Gater // dark (default) or listed posture; see fabricnet.Gater
 	Auth   *fabricnet.AuthService
-	Log    *event.Log // membership events: admissions + revocations (spec §5)
 	// Roots is the home circle's root (config namespace_did), shared by
 	// Store and Log.
 	Roots *statement.DIDRoot
@@ -139,18 +137,30 @@ func New(dir state.Dir) (*Daemon, error) {
 		return nil, err
 	}
 	cfg.CircleDID = first // in memory only: a cold-start config names no circle
+	// The first circle persists in a directory like every other one; a
+	// device joined through the queue, or a gate hosting the circle, gets a
+	// key-less one here (the membership-event log was that persistence
+	// until 2026-11-07).
+	held := false
+	for _, c := range circles {
+		held = held || c.Config.DID == first
+	}
+	if !held {
+		c, err := circle.Hold(circle.Root(dir.Path), first)
+		if err != nil {
+			return nil, fmt.Errorf("holding the first circle: %w", err)
+		}
+		circles = append(circles, c)
+	}
 	roots := statement.NewDIDRoot(first)
 	store := fabricnet.NewMemberStore(roots)
-	evLog := event.NewLog(roots)
 	// Every other circle this node holds brings its own roster into the
 	// union (memo §17: transport is the union of circles): a device
 	// admitted only into `family` is admitted here because `family` is.
 	// Dirs whose DID the log-fed roster already honours are that roster.
 	for _, c := range circles {
 		if roots.Honours(c.Config.DID) {
-			// The first circle's directory: the log-fed roster persists
-			// there too, so an admission the log never carries (a `circle
-			// admit` into this circle) survives a restart.
+			// The first circle's directory: its roster persists there.
 			if err := store.Attach(c, time.Now()); err != nil {
 				log.Printf("circle %q: devices.cbor unreadable: %v", c.Config.Name, err)
 			}
@@ -166,23 +176,17 @@ func New(dir state.Dir) (*Daemon, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Daemon{
-		Dir: dir, Config: cfg, Store: store, Gater: fabricnet.NewGater(store), Log: evLog, Roots: roots,
+		Dir: dir, Config: cfg, Store: store, Gater: fabricnet.NewGater(store), Roots: roots,
 		ownCert: own, ctx: ctx, cancel: cancel,
 		rtt: make(map[peer.ID]time.Duration), reachability: "unknown",
 		lastDial:        make(map[peer.ID]time.Time),
 		pinnedBootstrap: make(map[string]bool),
 	}
 
-	// The persisted event log is the durable membership view: it survives
-	// restarts, so a revocation learned yesterday still holds today even if
-	// the master is offline.
-	if evs, err := dir.LoadEvents(); err != nil {
-		log.Printf("event log unreadable, starting empty: %v", err)
-	} else {
-		now := time.Now()
-		for _, e := range evs {
-			_, _ = evLog.Add(e, now) // stale/invalid entries drop out here
-		}
+	if had, err := dir.RetireEventLog(); err != nil {
+		log.Printf("retiring the membership-event log: %v", err)
+	} else if had {
+		log.Printf("membership-event log retired (events.cbor.retired): the circle's roster is the ledger now; a revocation made with the old 'fabric revoke' must be re-issued on the master")
 	}
 	for _, addr := range append(append([]string{}, cfg.Bootstrap...), cfg.DiscoveredBootstrap...) {
 		if _, err := peerInfo(addr); err != nil {
@@ -281,15 +285,19 @@ func New(dir state.Dir) (*Daemon, error) {
 		h.Close()
 		return nil, fmt.Errorf("starting hole punching: %w", err)
 	}
-	d.hydrateStore()
+	// A renewal of this device's cert that reached the roster while
+	// cert.cbor lagged behind (a crash between learning and adoption).
+	if c, ok := store.Cert(h.ID()); ok {
+		d.adoptOwnCert(c)
+	}
 
 	// Hard-coded admission transparency (spec §5): every join is announced.
-	// OwnCert, not the loaded `own`: hydrateStore may have adopted a newer
-	// (renewed) cert from the replayed event log.
+	// OwnCert, not the loaded `own`: the roster may hold a newer (renewed)
+	// cert.
 	d.Auth = fabricnet.NewAuthService(h, store, d.OwnCert(), AuthGrace, func(p peer.ID, c *cert.Cert) {
 		log.Printf("member joined: %q (%s)", c.Payload.Meta.Name, p)
 	})
-	d.Sync = fabricnet.NewEventSync(h, evLog, store, d.applyEvent)
+	d.Sync = fabricnet.NewEventSync(h, store)
 	d.Auth.SetOnAuthenticated(d.Sync.ExchangeAsync)
 
 	// The dialer proves itself on every outbound connection. This is the
@@ -343,15 +351,12 @@ func New(dir state.Dir) (*Daemon, error) {
 			log.Printf("join request pending: %q fingerprint=%s (fabric approve %s)", p.Name, p.Fingerprint, p.Fingerprint)
 		})
 		admission.Attach(h, d.Queue, d.CircleDID)
-		admission.AttachQueue(h, d.Queue, d.Auth.RequireMember, d.isMasterDevice, func(eventBytes []byte) error {
-			e, err := event.Unmarshal(eventBytes)
-			if err != nil {
-				return err
+		admission.AttachQueue(h, d.Queue, d.Auth.RequireMember, d.isMasterDevice, func(certBytes []byte) error {
+			if d.Circle == nil {
+				return errors.New("no circle service attached")
 			}
-			if e.Payload.Kind != event.KindAdded {
-				return fmt.Errorf("queue approve carried a %s event", e.Payload.Kind)
-			}
-			return d.Ingest(e)
+			_, err := d.Circle.Admit(certBytes)
+			return err
 		})
 	}
 	return d, nil
@@ -404,8 +409,8 @@ func firstCircle(cfg state.Config, own *cert.Cert, circles []*circle.Circle, now
 }
 
 // isMasterDevice reports whether a peer is the master's device: the one the
-// root admitted first, at `fabric init`, whose MemberAdded event every node
-// carries. The remote queue (list/approve/deny) is driven by that device
+// root admitted first, at `fabric init`, whose admission every node of the
+// circle carries. The remote queue (list/approve/deny) is driven by that device
 // alone. This is a local identity check, not a verb on the peer's cert: an
 // `admin` verb on a hot device key was the only reason the master's cert
 // differed from a member's, and it stopped the master from signing sub-keys
@@ -416,24 +421,94 @@ func (d *Daemon) isMasterDevice(p peer.ID) bool {
 	return ok && m == p
 }
 
-// masterDevice derives the master's peer ID from the event log: the
-// earliest MemberAdded (apply order: time, then ID).
+// masterDevice derives the master's peer ID from the home roster: the
+// device of the earliest-issued admission it holds (issue time, then ID).
 func (d *Daemon) masterDevice() (peer.ID, bool) {
-	for _, e := range d.Log.All() {
-		if e.Payload.Kind != event.KindAdded {
-			continue
-		}
-		devKey, err := e.DeviceKey()
-		if err != nil {
-			continue
-		}
-		p, err := fabricnet.PeerIDForKey(devKey)
-		if err != nil {
-			continue
-		}
-		return p, true
+	r, ok := d.Store.RosterFor(d.CircleDID())
+	if !ok {
+		return "", false
 	}
-	return "", false
+	var first *circle.Device
+	for _, dev := range r.Devices() {
+		for _, h := range r.Held(dev.DID) {
+			if first == nil || h.Issued().Before(first.Issued()) {
+				first = h
+				continue
+			}
+			if hid, fid := h.Stmt.ID(), first.Stmt.ID(); h.Issued().Equal(first.Issued()) && bytes.Compare(hid[:], fid[:]) < 0 {
+				first = h
+			}
+		}
+	}
+	if first == nil {
+		return "", false
+	}
+	c, err := cert.FromStatement(first.Stmt)
+	if err != nil {
+		return "", false
+	}
+	devKey, err := c.DeviceKey()
+	if err != nil {
+		return "", false
+	}
+	p, err := fabricnet.PeerIDForKey(devKey)
+	if err != nil {
+		return "", false
+	}
+	return p, true
+}
+
+// Admitted is the roster's word that an admission is new here — recorded
+// by the owner's CLI (from == "") or learned from a peer: this device
+// adopts its own renewed cert from it, and the spec-§5 notifications are
+// logged for the home circle's devices.
+func (d *Daemon) Admitted(from peer.ID, st *statement.Statement) {
+	c, err := cert.FromStatement(st)
+	if err != nil {
+		return
+	}
+	devKey, err := c.DeviceKey()
+	if err != nil {
+		return
+	}
+	p, err := fabricnet.PeerIDForKey(devKey)
+	if err != nil {
+		return
+	}
+	if p == d.Host.ID() {
+		d.adoptOwnCert(c)
+		return
+	}
+	if c.Payload.Sub != d.CircleDID() {
+		return
+	}
+	now := time.Now()
+	name := c.Payload.Meta.Name
+	if !now.Before(c.Expiry()) {
+		log.Printf("roster: %q (%s) lapsed — its cert expired %s; it needs a fresh 'fabric join'", name, p, c.Expiry().Format(time.RFC3339))
+		return
+	}
+	// Renewals and restorations are admissions too (spec §5) but must not
+	// fire the "new member" notification: what else the roster holds for
+	// the device tells them apart.
+	earlier, liveBefore := false, false
+	if r, ok := d.Store.RosterFor(c.Payload.Sub); ok {
+		for _, h := range r.Held(cert.DIDForKey(devKey)) {
+			if h.Stmt.ID() == st.ID() {
+				continue
+			}
+			earlier = true
+			liveBefore = liveBefore || now.Before(h.Exp)
+		}
+	}
+	switch {
+	case !earlier:
+		log.Printf("member added: %q (%s), approved by master", name, p)
+	case !liveBefore:
+		log.Printf("member re-admitted: %q (%s), approved by master", name, p)
+	default:
+		log.Printf("member cert renewed: %q (%s), now expires %s", name, p, c.Expiry().Format(time.RFC3339))
+	}
 }
 
 // queueHosts returns the connected members that serve the remote queue
@@ -868,122 +943,11 @@ func (d *Daemon) representCert() {
 	}
 }
 
-// hydrateStore replays the event log into the member store at startup, in
-// apply order: the roster (including offline members) and standing
-// revocations exist before the first connection does.
-func (d *Daemon) hydrateStore() {
-	now := time.Now()
-	for _, e := range d.Log.All() {
-		devKey, err := e.DeviceKey()
-		if err != nil {
-			continue
-		}
-		p, err := fabricnet.PeerIDForKey(devKey)
-		if err != nil {
-			continue
-		}
-		switch e.Payload.Kind {
-		case event.KindAdded:
-			if c, err := e.AddedCert(); err == nil {
-				if p == d.Host.ID() {
-					// A renewal gossiped while cert.cbor lagged behind
-					// (e.g. crash between ingest and adoption).
-					d.adoptOwnCert(c)
-				} else {
-					d.Store.AddMember(p, c)
-				}
-			}
-		case event.KindRevoked:
-			// The sweep remembers the event's signer: a key the history
-			// later declares compromised takes its sweeps with it.
-			if err := d.Store.SweepEvent(e, now); err != nil {
-				log.Printf("roster: member-revoked event for %s not applied: %v", p, err)
-			}
-		}
-	}
-}
-
-// applyEvent reacts to one newly learned membership event: update the member
-// store (revocations also cut live connections), surface the spec-§5
-// notification, and persist the log.
-func (d *Daemon) applyEvent(e *event.Event) {
-	devKey, err := e.DeviceKey()
-	if err != nil {
-		return
-	}
-	p, err := fabricnet.PeerIDForKey(devKey)
-	if err != nil {
-		return
-	}
-	switch e.Payload.Kind {
-	case event.KindAdded:
-		if c, err := e.AddedCert(); err == nil {
-			if p == d.Host.ID() {
-				d.adoptOwnCert(c)
-				break
-			}
-			old, known := d.Store.Cert(p)
-			_, wasLapsed := d.Store.LapsedCert(p)
-			d.Store.AddMember(p, c)
-			// Renewals reuse MemberAdded (spec §5) but must not fire the
-			// "new member" admission-transparency notification.
-			switch {
-			case !time.Now().Before(c.Expiry()):
-				if !known && !wasLapsed {
-					log.Printf("roster: %q (%s) lapsed — its cert expired %s; it needs a fresh 'fabric join'", c.Payload.Meta.Name, p, c.Expiry().Format(time.RFC3339))
-				}
-			case wasLapsed:
-				log.Printf("member re-admitted: %q (%s), approved by master", c.Payload.Meta.Name, p)
-			case !known:
-				log.Printf("member added: %q (%s), approved by master", c.Payload.Meta.Name, p)
-			case c.Expiry().After(old.Expiry()):
-				log.Printf("member cert renewed: %q (%s), now expires %s", c.Payload.Meta.Name, p, c.Expiry().Format(time.RFC3339))
-			}
-		}
-	case event.KindRevoked:
-		name := "?"
-		if c, ok := d.Store.Cert(p); ok {
-			name = c.Payload.Meta.Name
-		}
-		if err := d.Auth.RevokeByEvent(e); err != nil {
-			log.Printf("roster: member-revoked event for %s not applied: %v", p, err)
-			break
-		}
-		if p == d.Host.ID() {
-			log.Printf("THIS DEVICE'S MEMBERSHIP WAS REVOKED — the mesh will refuse it from now on")
-		} else {
-			log.Printf("member revoked: %q (%s)", name, p)
-		}
-	}
-	d.persistEvents()
-}
-
-// Ingest records a locally created, root-signed membership event: verify
-// into the log, apply, persist, and push to the connected members.
-func (d *Daemon) Ingest(e *event.Event) error {
-	fresh, err := d.Log.Add(e, time.Now())
-	if err != nil {
-		return err
-	}
-	if !fresh {
-		return nil
-	}
-	d.applyEvent(e)
-	d.Sync.Publish([]*event.Event{e})
-	return nil
-}
-
 // CircleDID is the home circle's DID.
 func (d *Daemon) CircleDID() string {
 	d.cfgMu.Lock()
 	defer d.cfgMu.Unlock()
 	return d.Config.CircleDID
-}
-
-func (d *Daemon) persistEvents() {
-	if err := d.Dir.SaveEvents(d.Log.All()); err != nil {
-		log.Printf("persisting event log: %v", err)
-	}
 }
 
 // persistRecords keeps the on-disk address-record cache in step with the
@@ -1039,7 +1003,6 @@ func (d *Daemon) reconnectLoop() {
 		d.pinQueueHosts()
 		now = time.Now()
 		d.Store.GC(now)
-		d.Log.GC(now)
 		select {
 		case <-d.ctx.Done():
 			return

@@ -10,7 +10,6 @@ import (
 
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
-	"ioa.rocks/fabric/event"
 	fabricstate "ioa.rocks/fabric/state"
 	"ioa.rocks/fabric/vault/daemon"
 )
@@ -22,7 +21,6 @@ type meshNode struct {
 	statePath string
 	dir       fabricstate.Dir
 	cert      *cert.Cert
-	event     *event.Event
 	bundle    *circle.Bundle    // this node's circle, for a second device to join
 	devPub    ed25519.PublicKey // the fabric device key (for admitting later circles)
 }
@@ -61,11 +59,7 @@ func newMeshNode(t *testing.T, root ed25519.PrivateKey, shared *circle.Bundle, c
 	if err := dir.SaveCert(c); err != nil {
 		t.Fatalf("SaveCert: %v", err)
 	}
-	ev, err := event.NewAdded(root, c, time.Now().Add(-time.Minute))
-	if err != nil {
-		t.Fatalf("event.NewAdded: %v", err)
-	}
-	return &meshNode{statePath: statePath, dir: dir, cert: c, event: ev, bundle: bundle, devPub: ed25519.PublicKey(pubRaw)}
+	return &meshNode{statePath: statePath, dir: dir, cert: c, bundle: bundle, devPub: ed25519.PublicKey(pubRaw)}
 }
 
 // admits seeds this node's roster of the circle with other's admission —
@@ -111,11 +105,9 @@ func (n *meshNode) initAlso(t *testing.T, name string) *circle.Bundle {
 	return exportCircle(t, n.statePath, name)
 }
 
-func (n *meshNode) writeConfig(t *testing.T, root ed25519.PrivateKey, name string, bootstrap []string, roster ...*event.Event) {
+func (n *meshNode) writeConfig(t *testing.T, root ed25519.PrivateKey, name string, bootstrap []string, roster ...*cert.Cert) {
 	t.Helper()
-	if err := n.dir.SaveEvents(roster); err != nil {
-		t.Fatalf("SaveEvents: %v", err)
-	}
+	seedRoster(t, n.dir, root, roster...)
 	if err := n.dir.SaveConfig(fabricstate.Config{
 		Name:        name,
 		ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"},
@@ -139,7 +131,7 @@ func TestTwoNodeMesh(t *testing.T) {
 
 	a := newMeshNode(t, root, nil, "alex", "a-vault")
 	b := newMeshNode(t, root, nil, "wife", "b-vault")
-	roster := []*event.Event{a.event, b.event}
+	roster := []*cert.Cert{a.cert, b.cert}
 
 	a.writeConfig(t, root, "a-vault", nil, roster...)
 	da := startDaemon(t, a.statePath)
@@ -195,7 +187,7 @@ func TestForeignCircleIsNotSynced(t *testing.T) {
 	}
 	a := newMeshNode(t, root, nil, "alex", "a-vault")
 	b := newMeshNode(t, root, nil, "wife", "b-vault")
-	roster := []*event.Event{a.event, b.event}
+	roster := []*cert.Cert{a.cert, b.cert}
 	a.writeConfig(t, root, "a-vault", nil, roster...)
 	da := startDaemon(t, a.statePath)
 	addrs := da.Fabric.Host.Addrs()
@@ -249,7 +241,7 @@ func TestSharedCircleBesidePersonal(t *testing.T) {
 	family := desk.initAlso(t, "family")
 	hers := newMeshNode(t, root, family, "family", "her-pc")
 	desk.admits(t, hers, "family")
-	roster := []*event.Event{desk.event, hers.event}
+	roster := []*cert.Cert{desk.cert, hers.cert}
 	desk.writeConfig(t, root, "desk", nil, roster...)
 	dd := startDaemon(t, desk.statePath)
 	addrs := dd.Fabric.Host.Addrs()
@@ -316,4 +308,28 @@ func TestSharedCircleBesidePersonal(t *testing.T) {
 		}
 	}
 	t.Fatalf("her pc not in desk's peers: %+v", st.Peers)
+}
+
+// seedRoster writes admissions into the node's home-circle roster on disk —
+// what the gossip would have taught it (before 2026-11-07 fixtures wrote
+// them as events.cbor).
+func seedRoster(t *testing.T, dir fabricstate.Dir, root ed25519.PrivateKey, certs ...*cert.Cert) {
+	t.Helper()
+	now := time.Now()
+	c, err := circle.Hold(circle.Root(dir.Path), cert.DIDForKey(root.Public().(ed25519.PublicKey)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := circle.OpenRoster(c, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ct := range certs {
+		if r, _, err = r.Add(ct.Stmt, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Save(); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -9,7 +9,7 @@ synchronized personal object store, as a subsystem of the same daemon
 this README is the connectivity layer.
 
 Status: **pre-alpha** — daemon, CLI, the join-then-approve admission
-flow, revocation with membership-event gossip, the topology/admin web
+flow, revocation gossiped as circle statements, the topology/admin web
 UI, the optional TUN bridge (existing TCP/UDP apps over overlay IPs),
 self-forming mesh (address gossip), and NAT traversal (members-only
 relay through lighthouses + hole-punching) work end-to-end. Vault:
@@ -106,7 +106,7 @@ inbound connection from a peer ID it holds no current cert for is
 refused right after the transport handshake, before multistream,
 identify or the auth protocol run. Members are learned by gossip from
 the lighthouses first, so a freshly admitted member may be refused by a
-dark node for one reconnect tick until its `MemberAdded` event arrives;
+dark node for one reconnect tick until its admission arrives;
 `fabric status` shows the posture and a count of refused unknown
 inbound connections. A queue host is *listed* (strangers must reach it
 to join); `"listed": true` in `config.json` lists any other node that
@@ -179,7 +179,7 @@ fabric up
 The tunnel is only for admission. From there the mesh forms itself:
 every member gossips a **self-signed address record** (its current
 dialable multiaddrs, sequence-numbered) on the same anti-entropy
-channel as membership events, and every daemon opportunistically dials
+channel as the circle rosters, and every daemon opportunistically dials
 members it knows addresses for but isn't connected to. libp2p races
 all known addresses, so the best real path wins — LAN beats WAN,
 whichever side *can* dial does, and one connection carries both
@@ -345,10 +345,10 @@ fabric renew -ip 100.64.0.2 nas      # renumber: move a member to a free overlay
 ```
 
 or the "Renew cert" button on any peer (and on the master's own card)
-in the web UI. The re-signed cert travels as a regular MemberAdded
-event on the existing gossip: every store keeps the latest-issued
-cert regardless of arrival order, and the renewed node adopts its new
-cert live — persisted and presented in handshakes immediately, no
+in the web UI. The re-signed cert is the device's new admission in the
+home circle's roster, gossiped like every other statement: every store
+keeps the latest-issued cert regardless of arrival order, and the renewed
+node adopts its new cert live — persisted and presented in handshakes immediately, no
 restart. Renewals log as `cert renewed`, not as a new member joining,
 so the admission-transparency alarm stays meaningful. Expiry is loud
 before it bites: anything expired or expiring within 30 days raises a
@@ -386,10 +386,14 @@ the old `config.json` back (same circle; it carries `queue_host`,
 fabric revoke nas    # on the master; also takes a peer ID or fingerprint
 ```
 
-Revocation signs a `MemberRevoked` event with the root key (passphrase
-prompt, same custody as approval) and gossips it: every member that
-hears it drops the peer's live connections and refuses new ones, and
-relays the event on to members the master can't reach directly. Nodes
+Revocation signs a *removal* statement of the home circle with the root
+key (passphrase prompt, same custody as approval) and gossips it: every
+member that hears it drops the peer's live connections and refuses new
+ones, and relays it on to members the master can't reach directly. Every
+admission of the device that does not acknowledge the removal is dead,
+whenever it was issued; putting the device back is `fabric circle
+restore`. (Until 2026-11-07 this was a `MemberRevoked` event cutting
+admissions issued up to its time; the event log is retired — ADR 0019.) Nodes
 that were offline catch up on their next connect — admissions and
 revocations are exchanged peer-to-peer on every connect and persisted,
 so a revocation holds even when the master is asleep. Cert expiry
@@ -467,10 +471,7 @@ pushed to the members before it applies, so the devices a compromise
 retires hear of it while the view still counts them; a device that was
 offline hears of it on its next handshake — the hello carries the key
 history, and a member that refuses a stale admission answers with the
-history alone — and its daemon logs that its admission is void. A legacy
-sweep (`fabric revoke`, the member-revoked event) remembers which key
-signed it and stops applying once that key is declared compromised,
-whichever arrived first. Two limits, by design: a dark node refuses
+history alone — and its daemon logs that its admission is void. Two limits, by design: a dark node refuses
 non-members before any protocol runs, so a device that missed a
 compromise learns it at a listed gate, which every device can reach; and
 a key that hands over twice (a fork in the history) is refused loudly,
@@ -622,7 +623,7 @@ A local web view of the mesh *as this node sees it*: the peer graph
 with per-link telemetry (direct vs relayed, transport, who dialed whom,
 RTT, the multiaddr that won), membership states (member / pending /
 offline / revoked / stranger), this node's NAT reachability verdict
-(autonat), cert-expiry warnings, and the membership-event activity
+(autonat), cert-expiry warnings, and the membership activity
 feed. On the master it is also the admin surface: approve/deny pending
 joins (with the fingerprint displayed for comparison) and revoke
 members. Its Astral card shows hosted and remotely placed names, backlog,
@@ -788,7 +789,7 @@ the UI and daemon use a non-default Astral state directory.
 | `fabric pending` | master | list join requests |
 | `fabric approve [-scope tun,vault,astral\|mesh] [-no-overlay] <fingerprint>` | master | sign a membership cert for a pending request. `-scope` signs a protocol scope into the cert: the control plane plus only the listed families (`mesh` = connectivity only); `-no-overlay` = everything but TUN. Every node enforces it in both directions, so the member cannot opt back in (semi-trusted hardware; fabric ADR 0005) |
 | `fabric deny <fingerprint>` | master | reject a pending request |
-| `fabric revoke <name \| peer-id \| fingerprint>` | master | revoke a member and gossip the cut-off |
+| `fabric revoke <name \| peer-id \| fingerprint>` | master | remove a member from the home circle (a removal statement) and gossip it |
 | `fabric ui [-listen 127.0.0.1:4518]` | any member | serve the topology/admin web UI |
 | `fabric queue on\|off` | any member | run the admission queue (lighthouse role) |
 | `fabric peer add <multiaddr>` | any member | add a bootstrap peer |
@@ -834,13 +835,6 @@ user key) to skip the interactive prompts (CI, scripts).
   (passphrase / scrypt). The seed exists in memory only during a signing
   session — approval happens in the CLI process; the daemon never holds
   the root key.
-- `event` — signed membership events (`MemberAdded` / `MemberRevoked`)
-  and the deduplicating, expiry-GC'd event log they accumulate in: the
-  durable membership view every node carries. Verified against the home
-  circle's root (`namespace_did` in config). Logs written before
-  2026-11-05 may still hold `root-moved` / `root-retired` records from the
-  one-time mesh-root → circle-main migration; they fail verification as
-  unknown kinds and drop out like any stale entry.
 - `fabricnet` — membership enforcement on a libp2p host, layered:
   a connection gater (hard-denies revoked peers; dark by default, so a
   node refuses inbound peers outside its member store before any
@@ -850,7 +844,7 @@ user key) to skip the interactive prompts (CI, scripts).
   key histories riding along), per-protocol member checks (`RequireMember`), revocation
   that closes live connections, and `/fabric/sync/2` gossip — per-circle
   anti-entropy on every connect plus rumor-mill relay of fresh admissions,
-  revocations, events and address records. The one-cert `/fabric/auth/1`
+  revocations and address records. The one-cert `/fabric/auth/1`
   and the `/fabric/sync/1` / `/fabric/events/1` predecessors were retired
   2026-11-06; a node on an older binary cannot authenticate.
   First-contact join notifications (admission transparency) surface
@@ -858,7 +852,7 @@ user key) to skip the interactive prompts (CI, scripts).
 - `admission` — the `/fabric/join/1` protocol and the pending queue
   (holds no signing material; certs are handed to it only for delivery).
 - `daemon` — the node process: host wiring, bootstrap reconnect/reauth
-  loop, event-log persistence/replay, link telemetry (member-gated ping
+  loop, link telemetry (member-gated ping
   RTT, autonat reachability), control API over a unix socket for the
   CLI and UI.
 - `webui` — the topology/admin UI: an embedded no-build-step web app

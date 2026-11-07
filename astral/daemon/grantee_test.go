@@ -17,7 +17,6 @@ import (
 	"ioa.rocks/fabric/circle"
 	fabricdaemon "ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/did"
-	"ioa.rocks/fabric/event"
 	fabricstate "ioa.rocks/fabric/state"
 	"ioa.rocks/fabric/statement"
 )
@@ -72,13 +71,11 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	}
 	gate := newMeshNode(t, root, "gate")
 	desk := newMeshNode(t, root, "desk")
-	roster := []*event.Event{gate.event, desk.event}
+	roster := []*cert.Cert{gate.cert, desk.cert}
 
 	// The gate is listed: strangers reach the handshake and may present a
 	// chain on a stream (memo §17 item 1).
-	if err := gate.dir.SaveEvents(roster); err != nil {
-		t.Fatal(err)
-	}
+	seedRoster(t, gate.dir, root, roster...)
 	if err := gate.dir.SaveConfig(fabricstate.Config{
 		Name: "gate", ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"},
 		CircleDID: cert.DIDForKey(root.Public().(ed25519.PublicKey)), Listed: true,

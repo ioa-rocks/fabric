@@ -102,14 +102,14 @@ func TestReplaySeafileIncident(t *testing.T) {
 	a := newMeshNode(t, root, nil, "alex", "a-vault")
 	b := newMeshNode(t, root, a.bundle, "alex", "b-vault")
 	a.admits(t, b, "alex")
-	a.writeConfig(t, root, "a-vault", nil, a.event, b.event)
+	a.writeConfig(t, root, "a-vault", nil, a.cert, b.cert)
 	da, stopA := runDaemon(t, a.statePath)
 	addrs := da.Fabric.Host.Addrs()
 	if len(addrs) == 0 {
 		t.Fatal("A has no listen addrs")
 	}
 	bootstrap := addrs[0].String() + "/p2p/" + da.Fabric.Host.ID().String()
-	b.writeConfig(t, root, "b-vault", []string{bootstrap}, a.event, b.event)
+	b.writeConfig(t, root, "b-vault", []string{bootstrap}, a.cert, b.cert)
 	_, stopB := runDaemon(t, b.statePath)
 
 	clA, clB := daemon.NewClient(a.statePath), daemon.NewClient(b.statePath)
@@ -172,7 +172,7 @@ func TestReplaySeafileIncident(t *testing.T) {
 	da, _ = runDaemon(t, a.statePath)
 	addrs = da.Fabric.Host.Addrs()
 	bootstrap = addrs[0].String() + "/p2p/" + da.Fabric.Host.ID().String()
-	b.writeConfig(t, root, "b-vault", []string{bootstrap}, a.event, b.event)
+	b.writeConfig(t, root, "b-vault", []string{bootstrap}, a.cert, b.cert)
 	runDaemon(t, b.statePath)
 
 	// The edit: two heads, same winner, one conflict copy on both sides.

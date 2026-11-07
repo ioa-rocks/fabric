@@ -3,6 +3,7 @@ package daemon
 import (
 	"crypto/ed25519"
 	"fmt"
+	"time"
 
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/did"
@@ -35,4 +36,27 @@ func HomeSigner(dir state.Dir, rootPriv ed25519.PrivateKey) (circleDID string, p
 		return "", nil, fmt.Errorf("the root key container holds a key circle %q has handed over from — rotate rewrote it; restore the container from a device holding the current key", c.Config.Name)
 	}
 	return c.Config.DID, roots.RootProof(), nil
+}
+
+// RevokeDevice signs the home circle's removal of a device with the root
+// key — what `fabric revoke` and the web UI's revoke do (before 2026-11-07
+// they signed a member-revoked event) — and records it in the circle
+// directory. The caller has the daemon push it (Client.CircleRefresh).
+func RevokeDevice(dir state.Dir, rootPriv ed25519.PrivateKey, deviceDID string, now time.Time) (*circle.Revocation, error) {
+	circleDID, proof, err := HomeSigner(dir, rootPriv)
+	if err != nil {
+		return nil, err
+	}
+	c, err := circle.ByDID(circle.Root(dir.Path), circleDID)
+	if err != nil {
+		return nil, fmt.Errorf("this node holds no directory for circle %s (start the daemon once): %w", circleDID, err)
+	}
+	r, err := circle.RevokeIn(rootPriv, proof, circleDID, deviceDID, now)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := c.AddRevocations(now, r); err != nil {
+		return nil, err
+	}
+	return r, nil
 }

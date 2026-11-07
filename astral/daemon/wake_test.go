@@ -3,12 +3,12 @@ package daemon_test
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"ioa.rocks/fabric/cert"
 	"testing"
 	"time"
 
 	"ioa.rocks/fabric/astral"
 	"ioa.rocks/fabric/astral/daemon"
-	"ioa.rocks/fabric/event"
 )
 
 func TestWaitWakesOnMailAndTimesOut(t *testing.T) {
@@ -122,7 +122,7 @@ func TestRemoteWaitAndMonitor(t *testing.T) {
 	}
 	nas := newMeshNode(t, root, "nas")
 	desk := newMeshNode(t, root, "desk")
-	roster := []*event.Event{nas.event, desk.event}
+	roster := []*cert.Cert{nas.cert, desk.cert}
 
 	fnas := nas.fabric(t, root, "nas", nil, roster...)
 	dnas := startDaemon(t, nas.statePath, fnas)

@@ -27,7 +27,6 @@ import (
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/did"
-	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/fabricnet"
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
@@ -467,15 +466,11 @@ func renewOwnCertFrom(dir state.Dir, root ed25519.PrivateKey, a *circle.Admissio
 	}
 	client := daemon.NewClient(dir)
 	if _, err := client.Status(); err == nil {
-		ev, err := event.NewAdded(root, view, now)
+		raw, err := view.Marshal()
 		if err != nil {
 			return err
 		}
-		raw, err := ev.Marshal()
-		if err != nil {
-			return err
-		}
-		if err := client.Renew(raw); err != nil {
+		if _, err := client.CircleAdmit(raw); err != nil {
 			return fmt.Errorf("renewing the membership cert through the daemon: %w", err)
 		}
 		fmt.Println("membership cert renewed with it (the daemon presents the new one and gossips it)")

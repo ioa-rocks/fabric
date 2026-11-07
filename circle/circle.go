@@ -390,6 +390,30 @@ func ReadBundle(src string) (*Bundle, error) {
 	return &b, nil
 }
 
+// Hold makes sure the node holds a directory for a circle it is in without
+// a key or an admission file — the first circle of a device joined through
+// the queue, or a gate hosting it — so the roster, revocations and key
+// history persist there as they do for every other circle (before
+// 2026-11-07 the membership-event log was that persistence). Returns the
+// existing directory when one honours the DID.
+func Hold(root, did string) (*Circle, error) {
+	if c, err := ByDID(root, did); err == nil {
+		return c, nil
+	}
+	name := "home"
+	if Exists(filepath.Join(root, name)) {
+		name = "home-" + did[len(did)-6:]
+	}
+	path := filepath.Join(root, name)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return nil, err
+	}
+	if err := writeConfig(path, Config{Name: name, DID: did}); err != nil {
+		return nil, err
+	}
+	return Open(path)
+}
+
 // Join installs a bundle as a circle this node holds: the key when the
 // bundle carries one (an owner device), the admission when it carries
 // that (a device without the key), the config with its gate hints either

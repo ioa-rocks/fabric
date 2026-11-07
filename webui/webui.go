@@ -21,7 +21,6 @@ import (
 	astraldaemon "ioa.rocks/fabric/astral/daemon"
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/daemon"
-	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/fabricnet"
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
@@ -249,17 +248,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
-	ev, err := event.NewAdded(rootPriv, c, now)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, err)
-		return
-	}
-	signedEv, err := ev.Marshal()
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := s.client.Approve(match.Fingerprint, signed, signedEv); err != nil {
+	if err := s.client.Approve(match.Fingerprint, signed); err != nil {
 		httpError(w, http.StatusBadGateway, err)
 		return
 	}
@@ -308,23 +297,12 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, err)
 		return
 	}
-	circleDID, _, err := daemon.HomeSigner(s.dir, rootPriv)
-	if err != nil {
-		httpError(w, http.StatusForbidden, err)
-		return
-	}
-	ev, err := event.NewRevokedIn(rootPriv, circleDID, ed25519.PublicKey(match.DevicePub), time.Now())
-	if err != nil {
+	if _, err := daemon.RevokeDevice(s.dir, rootPriv, cert.DIDForKey(ed25519.PublicKey(match.DevicePub)), time.Now()); err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
-	signedEv, err := ev.Marshal()
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := s.client.Revoke(signedEv); err != nil {
-		httpError(w, http.StatusBadGateway, err)
+	if _, err := s.client.CircleRefresh(); err != nil {
+		httpError(w, http.StatusBadGateway, fmt.Errorf("revocation recorded, but the daemon did not push it: %w", err))
 		return
 	}
 	writeJSON(w, map[string]string{"result": "revoked", "name": match.Name})
@@ -333,7 +311,7 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 // handleRenew re-signs an existing member's cert with a fresh validity
 // window (spec §5): payload preserved verbatim — the raw cert from the
 // roster is re-signed, so name, role, and overlay IP cannot drift — and
-// delivered as a MemberAdded event. Works on any member, this node
+// recorded as the device's admission and gossiped. Works on any member, this node
 // included.
 func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	var req signedRequest
@@ -377,17 +355,12 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
-	ev, err := event.NewAdded(rootPriv, renewed, now)
+	signed, err := renewed.Marshal()
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
-	signedEv, err := ev.Marshal()
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := s.client.Renew(signedEv); err != nil {
+	if _, err := s.client.CircleAdmit(signed); err != nil {
 		httpError(w, http.StatusBadGateway, err)
 		return
 	}

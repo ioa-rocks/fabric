@@ -10,7 +10,6 @@ import (
 
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
-	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/statement"
 
 	"github.com/libp2p/go-libp2p"
@@ -28,23 +27,58 @@ func issueTestCert(nsPriv ed25519.PrivateKey, devPub ed25519.PublicKey, name str
 
 type syncNode struct {
 	*node
-	log  *event.Log
 	sync *EventSync
 }
 
-// newSyncNode is newNode plus the daemon's gossip wiring: an event log, an
-// EventSync, exchange-on-auth, and revoked events acted on via auth.Revoke.
+// newSyncNode is newNode plus the daemon's gossip wiring: an EventSync,
+// exchange-on-auth, and revocations taken into the store (the daemon's
+// CircleService does that through the same hook).
 func newSyncNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.PrivateKey, name string) *syncNode {
 	t.Helper()
 	n := &syncNode{node: newNode(t, nsPub, nsPriv, name, true, 5*time.Second)}
-	n.log = event.NewLog(statement.NewDIDRoot(cert.DIDForKey(nsPub)))
-	n.sync = NewEventSync(n.host, n.log, n.store, func(e *event.Event) {
-		if e.Payload.Kind == event.KindRevoked {
-			_ = n.auth.RevokeByEvent(e)
-		}
-	})
+	n.sync = NewEventSync(n.host, n.store)
+	n.sync.SetCircleHooks(storeHooks(n.store))
 	n.auth.SetOnAuthenticated(n.sync.ExchangeAsync)
 	return n
+}
+
+// storeHooks are circle hooks over a bare peer table: revocations go into
+// the roster of their circle and the fresh ones are relayed.
+func storeHooks(store *PeerTable) CircleHooks {
+	return CircleHooks{Ingest: func(_ peer.ID, revs [][]byte) (fresh [][]byte, err error) {
+		for _, raw := range revs {
+			r, err := circle.UnmarshalRevocation(raw)
+			if err != nil {
+				return fresh, err
+			}
+			if isNew, err := store.AddRevocation(r.Circle, r.Stmt); err == nil && isNew {
+				fresh = append(fresh, raw)
+			}
+		}
+		return fresh, nil
+	}}
+}
+
+// revokeDevice records the circle's removal of a peer's device in the
+// store — what `fabric revoke` signs — and returns its wire form.
+func revokeDevice(t *testing.T, store *PeerTable, nsPriv ed25519.PrivateKey, p peer.ID) []byte {
+	t.Helper()
+	deviceDID, err := DeviceDID(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rv, err := circle.Revoke(nsPriv, deviceDID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddRevocation(rv.Circle, rv.Stmt); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := rv.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func authenticate(t *testing.T, from, to *syncNode) {
@@ -69,15 +103,6 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-func hasEvent(l *event.Log, id string) bool {
-	for _, e := range l.All() {
-		if e.ID() == id {
-			return true
-		}
-	}
-	return false
-}
-
 // A freshly authenticated peer must receive the other side's whole event log
 // (anti-entropy on connect, spec §5).
 func TestAuthTriggersLogExchange(t *testing.T) {
@@ -88,23 +113,18 @@ func TestAuthTriggersLogExchange(t *testing.T) {
 	m := newSyncNode(t, nsPub, nsPriv, "master")
 	j := newSyncNode(t, nsPub, nsPriv, "joiner")
 
-	// The master has history: an admission event for some third device.
+	// The master has history: the admission of some third device.
 	thirdPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	c, err := issueTestCert(nsPriv, thirdPub, "third")
 	if err != nil {
 		t.Fatal(err)
 	}
-	added, err := event.NewAdded(nsPriv, c, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := m.log.Add(added, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	third, _ := PeerIDForKey(thirdPub)
+	m.store.AddMember(third, c)
 
 	authenticate(t, j, m)
-	waitFor(t, "joiner to receive the master's log", func() bool {
-		return hasEvent(j.log, added.ID())
+	waitFor(t, "joiner to receive the master's roster", func() bool {
+		return j.store.IsMember(third, time.Now())
 	})
 }
 
@@ -228,20 +248,9 @@ func TestRevocationPropagatesAndCuts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Master revokes b: local apply + log + publish (the daemon's ingest).
-	bKeyRaw, err := b.host.Peerstore().PubKey(b.host.ID()).Raw()
-	if err != nil {
-		t.Fatal(err)
-	}
-	revoked, err := event.NewRevoked(nsPriv, bKeyRaw, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := m.log.Add(revoked, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	m.auth.Revoke(b.host.ID())
-	m.sync.Publish([]*event.Event{revoked})
+	// Master removes b: local apply + push (the daemon's revoke path).
+	raw := revokeDevice(t, m.store, nsPriv, b.host.ID())
+	m.sync.PublishStatements(cert.DIDForKey(nsPub), nil, [][]byte{raw})
 
 	waitFor(t, "relay to apply the revocation", func() bool {
 		return a.store.IsRevoked(b.host.ID(), time.Now())
@@ -344,11 +353,11 @@ func TestSyncV2SendsOnlySharedCircleSets(t *testing.T) {
 	}})
 
 	// The wire guarantee: what the owner would send each peer.
-	sets := a.sync.setsFor(m.host.ID(), nil, true)
+	sets := a.sync.setsFor(m.host.ID())
 	if len(sets) != 1 || sets[0].DID != mainDID {
 		t.Fatalf("sets for a main-only node: %d, first %s; want main alone", len(sets), sets[0].DID)
 	}
-	sets = a.sync.setsFor(b.host.ID(), nil, true)
+	sets = a.sync.setsFor(b.host.ID())
 	var famSet *circleSet
 	for i := range sets {
 		if sets[i].DID == famDID {
@@ -371,7 +380,7 @@ func TestSyncV2SendsOnlySharedCircleSets(t *testing.T) {
 	if r, _ := a.store.RosterFor(famDID); len(r.Held(cert.DIDForKey(bPub))) != 2 {
 		t.Fatalf("roster holds %d admissions of the device, want the original and the restoration", len(r.Held(cert.DIDForKey(bPub))))
 	}
-	sets = a.sync.setsFor(b.host.ID(), nil, true)
+	sets = a.sync.setsFor(b.host.ID())
 	famSet = nil
 	for i := range sets {
 		if sets[i].DID == famDID {

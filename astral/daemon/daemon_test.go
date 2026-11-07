@@ -11,8 +11,8 @@ import (
 	"ioa.rocks/fabric/astral"
 	"ioa.rocks/fabric/astral/daemon"
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/circle"
 	fabricdaemon "ioa.rocks/fabric/daemon"
-	"ioa.rocks/fabric/event"
 	fabricstate "ioa.rocks/fabric/state"
 )
 
@@ -119,7 +119,6 @@ type meshNode struct {
 	statePath string
 	dir       fabricstate.Dir
 	cert      *cert.Cert
-	event     *event.Event
 }
 
 func newMeshNode(t *testing.T, root ed25519.PrivateKey, memberName string) *meshNode {
@@ -145,18 +144,12 @@ func newMeshNode(t *testing.T, root ed25519.PrivateKey, memberName string) *mesh
 	if err := dir.SaveCert(c); err != nil {
 		t.Fatal(err)
 	}
-	ev, err := event.NewAdded(root, c, time.Now().Add(-time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &meshNode{statePath: statePath, dir: dir, cert: c, event: ev}
+	return &meshNode{statePath: statePath, dir: dir, cert: c}
 }
 
-func (n *meshNode) fabric(t *testing.T, root ed25519.PrivateKey, name string, bootstrap []string, roster ...*event.Event) *fabricdaemon.Daemon {
+func (n *meshNode) fabric(t *testing.T, root ed25519.PrivateKey, name string, bootstrap []string, roster ...*cert.Cert) *fabricdaemon.Daemon {
 	t.Helper()
-	if err := n.dir.SaveEvents(roster); err != nil {
-		t.Fatal(err)
-	}
+	seedRoster(t, n.dir, root, roster...)
 	if err := n.dir.SaveConfig(fabricstate.Config{
 		Name:        name,
 		ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"},
@@ -225,7 +218,7 @@ func TestCastAcrossMesh(t *testing.T) {
 	}
 	nas := newMeshNode(t, root, "nas")
 	desk := newMeshNode(t, root, "desk")
-	roster := []*event.Event{nas.event, desk.event}
+	roster := []*cert.Cert{nas.cert, desk.cert}
 
 	fnas := nas.fabric(t, root, "nas", nil, roster...)
 	dnas := startDaemon(t, nas.statePath, fnas)
@@ -322,5 +315,29 @@ func TestCastAcrossMesh(t *testing.T) {
 	r, _, _ = clNas.Get("register:concierge/status")
 	if r.Value != "from-desk" || r.By != "desk" {
 		t.Fatalf("remote register write: %+v", r)
+	}
+}
+
+// seedRoster writes admissions into the node's home-circle roster on disk —
+// what the gossip would have taught it (before 2026-11-07 fixtures wrote
+// them as events.cbor).
+func seedRoster(t *testing.T, dir fabricstate.Dir, root ed25519.PrivateKey, certs ...*cert.Cert) {
+	t.Helper()
+	now := time.Now()
+	c, err := circle.Hold(circle.Root(dir.Path), cert.DIDForKey(root.Public().(ed25519.PublicKey)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := circle.OpenRoster(c, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ct := range certs {
+		if r, _, err = r.Add(ct.Stmt, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Save(); err != nil {
+		t.Fatal(err)
 	}
 }

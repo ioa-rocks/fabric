@@ -18,7 +18,6 @@ import (
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/did"
-	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/statement"
 )
 
@@ -410,46 +409,6 @@ func (t *PeerTable) AddHandover(circleDID string, st *statement.Statement) (grew
 	return grew, err
 }
 
-// SweepEvent applies a member-revoked event: the device's admissions
-// issued up to now in the event's circle are dead for as long as the key
-// history honours the event's signer at the event's time
-// (circle.Roster.SweepBy); an event no honoured key signed is refused.
-func (t *PeerTable) SweepEvent(e *event.Event, now time.Time) error {
-	if e == nil || e.Payload.Kind != event.KindRevoked {
-		return errors.New("roster: not a member-revoked event")
-	}
-	devKey, err := e.DeviceKey()
-	if err != nil {
-		return err
-	}
-	signer, err := event.Signer(e, tableRoots{t})
-	if err != nil {
-		return err
-	}
-	deviceDID := cert.DIDForKey(devKey)
-	return t.apply(func(s *state) error {
-		i := s.index(e.Payload.Ns)
-		if i < 0 {
-			return fmt.Errorf("roster: circle %s is not honoured here", shortDID(e.Payload.Ns))
-		}
-		nr, _ := s.rosters[i].SweepBy(deviceDID, now, signer, e.Payload.At)
-		return s.replace(i, nr, false)
-	})
-}
-
-// SweepIn kills a device's admissions issued up to at in one circle: the
-// local cut, which no key history unmakes. A member-revoked event goes
-// through SweepEvent.
-func (t *PeerTable) SweepIn(circleDID, deviceDID string, at time.Time) {
-	_ = t.apply(func(s *state) error {
-		if i := s.index(circleDID); i >= 0 {
-			nr, _ := s.rosters[i].Sweep(deviceDID, at)
-			_ = s.replace(i, nr, false)
-		}
-		return nil
-	})
-}
-
 // Admit records a cert a peer presented on the handshake: it must name the
 // connected peer, be in a circle this node holds, and
 // leave the device live there — a revoked or expired chain is refused and
@@ -514,38 +473,11 @@ func (t *PeerTable) Verify(p peer.ID, st *statement.Statement) (circleDID string
 	return r.CircleDID(), true, r.Judge(st, now) == nil, nil // the presented admission itself, see Admit
 }
 
-// AddMember records a verified certificate learned from the event log or
-// gossip. A cert that has already expired is kept as roster memory
-// (lapsed), not as membership; one for a circle not held here, or that
-// fails the chain check, is dropped silently — the caller validated it as
-// far as it could.
+// AddMember records a verified certificate for a peer: AddAdmission over
+// the cert's statement, whatever the verdict (the caller validated it as
+// far as it could).
 func (t *PeerTable) AddMember(p peer.ID, c *cert.Cert) {
 	_, _ = t.AddAdmission(c.Stmt, time.Now())
-}
-
-// Revoke sweeps the peer out of every circle held here as of now: the
-// legacy member-revoked path and the CLI's local cut. Revoking a lapsed
-// device is how the operator forgets it.
-func (t *PeerTable) Revoke(p peer.ID, now time.Time) {
-	deviceDID, err := DeviceDID(p)
-	if err != nil {
-		return
-	}
-	_ = t.apply(func(s *state) error {
-		for i, r := range s.rosters {
-			nr, _ := r.Sweep(deviceDID, now)
-			_ = s.replace(i, nr, false)
-		}
-		return nil
-	})
-}
-
-// RevokeIn sweeps the peer out of one circle (a member-revoked event signed
-// by that circle's root).
-func (t *PeerTable) RevokeIn(circleDID string, p peer.ID, now time.Time) {
-	if deviceDID, err := DeviceDID(p); err == nil {
-		t.SweepIn(circleDID, deviceDID, now)
-	}
 }
 
 // GC moves expired devices to lapsed memory, drops lapsed entries past

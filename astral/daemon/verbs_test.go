@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"ioa.rocks/fabric/cert"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +13,6 @@ import (
 	"ioa.rocks/fabric/astral/daemon"
 	"ioa.rocks/fabric/circle"
 	fabricdaemon "ioa.rocks/fabric/daemon"
-	"ioa.rocks/fabric/event"
 )
 
 // joinCircle puts a mesh node into a circle (from the owner's bundle) and
@@ -94,7 +94,7 @@ func TestVerbsCheckedAgainstCircle(t *testing.T) {
 	desk := newMeshNode(t, root, "desk")
 	carbon := newMeshNode(t, root, "carbon")
 	guest := newMeshNode(t, root, "guest")
-	roster := []*event.Event{nas.event, desk.event, carbon.event, guest.event}
+	roster := []*cert.Cert{nas.cert, desk.cert, carbon.cert, guest.cert}
 
 	// Circle X is minted on nas; desk joins and admits; carbon holds no X.
 	x, err := circle.Init(nas.circleRoot(), "x", "pw")

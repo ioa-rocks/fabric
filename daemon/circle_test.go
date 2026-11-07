@@ -18,7 +18,6 @@ import (
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/did"
-	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/fabricnet"
 	"ioa.rocks/fabric/statement"
 )
@@ -31,14 +30,13 @@ type circleTestNode struct {
 	devPub ed25519.PublicKey
 	root   string
 	svc    *CircleService
-	log    *event.Log
 	sync   *fabricnet.EventSync
 }
 
 // newCircleTestNode is a mesh member (cert from root) holding the given
 // circles under its own circle root — joined from bundles, as a second
 // device would — and admitted into each when admit is true. It carries
-// the daemon's gossip wiring (event log, /fabric/sync, exchange on auth)
+// the daemon's gossip wiring (/fabric/sync, exchange on auth)
 // so per-circle rosters fill the way they do in the field.
 func newCircleTestNode(t *testing.T, nsPub ed25519.PublicKey, nsRoot ed25519.PrivateKey, name string, circles []*circle.Bundle, admit bool) *circleTestNode {
 	t.Helper()
@@ -64,25 +62,7 @@ func newCircleTestNode(t *testing.T, nsPub ed25519.PublicKey, nsRoot ed25519.Pri
 	}
 	n := &circleTestNode{h: h, store: store, own: own, devPub: ed25519.PublicKey(raw), root: t.TempDir()}
 	n.auth = fabricnet.NewAuthService(h, store, own, 5*time.Second, nil)
-	n.log = event.NewLog(roots)
-	n.sync = fabricnet.NewEventSync(h, n.log, store, func(e *event.Event) {
-		devKey, err := e.DeviceKey()
-		if err != nil {
-			return
-		}
-		p, err := fabricnet.PeerIDForKey(devKey)
-		if err != nil {
-			return
-		}
-		switch e.Payload.Kind {
-		case event.KindAdded:
-			if c, err := e.AddedCert(); err == nil && p != h.ID() {
-				store.AddMember(p, c)
-			}
-		case event.KindRevoked:
-			n.auth.RevokeIn(e.Payload.Ns, p)
-		}
-	})
+	n.sync = fabricnet.NewEventSync(h, store)
 	n.auth.SetOnAuthenticated(n.sync.ExchangeAsync)
 	for _, b := range circles {
 		c, err := circle.Join(n.root, b)

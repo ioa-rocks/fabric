@@ -309,12 +309,12 @@ func TestRevocationCutsExistingConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b.auth.Revoke(a.host.ID())
+	revokeDevice(t, b.store, nsPriv, a.host.ID())
 
 	// The live connection must be gone (gaters only stop new ones)…
-	if b.host.Network().Connectedness(a.host.ID()) == network.Connected {
-		t.Fatal("revoked peer still connected")
-	}
+	waitFor(t, "revoked peer's connection to be cut", func() bool {
+		return b.host.Network().Connectedness(a.host.ID()) != network.Connected
+	})
 	// …and the revoked peer cannot re-establish membership: the gater
 	// denies it at dial/secured time.
 	if err := connect2(a, b); err == nil {

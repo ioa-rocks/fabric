@@ -32,8 +32,7 @@ import (
 // order-independent (ADR 0019): a device's eligible admissions are those
 // acknowledging every root removal of the device the roster knows; its
 // entry is the latest-issued of them whichever arrived first; a revocation
-// set only grows and removals are kept for good; a legacy sweep is a
-// monotone cut-off; GC drops the expired. Revocation, the chain check and
+// set only grows and removals are kept for good; GC drops the expired. Revocation, the chain check and
 // the window are verdicts on the entry — a device whose entry fails is
 // out, with no fallback to an older admission.
 //
@@ -43,27 +42,12 @@ type Roster struct {
 	roots *statement.DIDRoot // the circle's root
 	path  string             // devices.cbor the admissions are saved to; "" = memory only
 
-	slots  map[string]*slot // by device DID; never mutated in place
-	revs   *statement.RevocationSet
-	sweeps map[string][]sweepMark // device DID -> every sweep naming it (see sweptAt)
+	slots map[string]*slot // by device DID; never mutated in place
+	revs  *statement.RevocationSet
 	// learned marks a roster whose roots' key history grew when it was
 	// made (a handover learned from a statement or the gossip): the owner
 	// saves such a roster even when nothing else about it persists.
 	learned bool
-}
-
-// sweepMark is one legacy sweep (a member-revoked event of the first
-// circle's log, or the CLI's local cut): admissions of the device issued
-// up to cut are dead. signer is the did:key of the circle key that signed
-// the event and signedAt the event's time, so the sweep applies only while
-// the key history honours that key at that instant (sweptAt): what a key
-// later declared compromised swept comes back, whether the sweep or the
-// compromise arrived first (Codex review, 2026-11-07). A local cut has no
-// signer and always applies.
-type sweepMark struct {
-	cut      int64
-	signer   string
-	signedAt int64
 }
 
 // slot is one device's admissions: every one that is a fact under the
@@ -176,10 +160,6 @@ func (d *Device) Standing() bool { return d.dead == nil && !d.lapsed }
 // admission superseded by a one-second one revived for 35 days).
 const LapsedRetention = statement.MaxValidity
 
-// sweepTombstone is how long a sweep of a device the roster never saw an
-// admission for is reported as a revocation (the gater refuses it meanwhile).
-const sweepTombstone = 24 * time.Hour
-
 const devicesFile = "devices.cbor"
 
 var memberRes = statement.Resource{Kind: statement.KindRole, Name: statement.VerbMember}
@@ -187,10 +167,9 @@ var memberRes = statement.Resource{Kind: statement.KindRole, Name: statement.Ver
 // NewRoster returns an empty, memory-only roster of the circle roots names.
 func NewRoster(roots *statement.DIDRoot) *Roster {
 	return &Roster{
-		roots:  roots,
-		slots:  map[string]*slot{},
-		revs:   statement.NewRevocationSet(),
-		sweeps: map[string][]sweepMark{},
+		roots: roots,
+		slots: map[string]*slot{},
+		revs:  statement.NewRevocationSet(),
 	}
 }
 
@@ -304,13 +283,9 @@ func (r *Roster) Revocations() *statement.RevocationSet { return r.revs }
 // A mutation replaces slots in the copy and never touches a shared one.
 func (r *Roster) clone() *Roster {
 	nr := &Roster{roots: r.roots, path: r.path, revs: r.revs, learned: r.learned,
-		slots:  make(map[string]*slot, len(r.slots)),
-		sweeps: make(map[string][]sweepMark, len(r.sweeps))}
+		slots: make(map[string]*slot, len(r.slots))}
 	for k, v := range r.slots {
 		nr.slots[k] = v
-	}
-	for k, v := range r.sweeps {
-		nr.sweeps[k] = v
 	}
 	return nr
 }
@@ -405,7 +380,7 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, err
 }
 
 // build derives a device's slot from a set of its admissions under the
-// roster's key history, removals, revocations and sweeps: what the history
+// roster's key history, removals and revocations: what the history
 // no longer honours is left out, verdicts are re-derived, and the rest is
 // split by eligibility and ordered by Later. Entries whose verdict did not
 // change are shared, never copied.
@@ -638,27 +613,15 @@ func prefer(cur, next *Device) bool {
 }
 
 // verdict is the time-independent half of the §6 checklist for one
-// device: sweeps, presenting key, member verb, and revocations over the
-// chain (Check at the window's start, so only the window is skipped) —
-// removals among them, which kill every link that does not acknowledge
-// its own device's removal (the cascade: removing an admin kills what it
-// admitted). A sweep is checked against every link of the chain, not the
-// leaf alone: sweeping an admin desk kills what the desk admitted, as a
-// statement revocation of the desk would through Check (agy review,
-// 2026-11-06 — the web UI's revoke and `fabric revoke` arrive as sweeps).
+// device: presenting key, member verb, and revocations over the chain
+// (Check at the window's start, so only the window is skipped) — removals
+// among them, which kill every link that does not acknowledge its own
+// device's removal (the cascade: removing an admin desk kills what the
+// desk admitted, whichever link of the chain the desk is; agy review,
+// 2026-11-06).
 func (r *Roster) verdict(dev *Device) error {
 	if !r.eligible(dev) {
 		return errors.New("device removed from the circle; this admission does not acknowledge the removal (restore the device on an owner device)")
-	}
-	for _, links := range [][]statement.Link{dev.Chain.Auth, dev.Chain.Ident} {
-		for _, l := range links {
-			if at, ok := r.sweptAt(l.Aud); ok && l.Iat <= at {
-				if l.Aud == dev.DID {
-					return errors.New("device swept by the circle")
-				}
-				return fmt.Errorf("issuer %s swept by the circle", shortDID(l.Aud))
-			}
-		}
 	}
 	return dev.Chain.Check(r.roots, r.revs, statement.Want{
 		Sub: dev.Sub(), Res: memberRes, Verb: statement.VerbMember,
@@ -668,10 +631,9 @@ func (r *Roster) verdict(dev *Device) error {
 
 // Cap holds a presented chain — a sub-key's, or an admission a peer
 // presented — to the roster. Check knows roots and revocations; the roster
-// also knows sweeps and which admission is each device's current word, so
-// (1) a link issued to a swept device up to the cut is refused, whatever
-// the chain, and (2) a link that is a device's admission but not the
-// roster's entry for that device is capped by the entry: the entry must
+// also knows which admission is each device's current word, so a link
+// that is a device's admission but not the roster's entry for that device
+// is capped by the entry: the entry must
 // admit the device now and allow what is asked — a sub-key under an
 // admission that a narrower renewal superseded loses the verb the renewal
 // dropped; one under a lapsed or revoked admission ends with it. A chain
@@ -681,17 +643,13 @@ func (r *Roster) verdict(dev *Device) error {
 func (r *Roster) Cap(c *statement.Compiled, want statement.Want) error {
 	for _, links := range [][]statement.Link{c.Auth, c.Ident} {
 		for _, l := range links {
-			if at, ok := r.sweptAt(l.Aud); ok && l.Iat <= at {
-				return fmt.Errorf("%s swept by the circle", shortDID(l.Aud))
-			}
 			// The entry comparison is this circle's judgement of its own
 			// admissions. An identity chain anchored in another circle (a
 			// grant to that circle, presented by one of its members) has
 			// links issued there; they are that circle's roster's business
 			// (capByRoster asks it), not this one's — a device that is a
 			// member of both would be judged against the wrong entry (agy,
-			// 2026-11-06). Sweeps above stay over every link: this circle's
-			// word that a key is not to be trusted holds whoever admitted it.
+			// 2026-11-06).
 			if l.Sub != r.CircleDID() {
 				continue
 			}
@@ -722,7 +680,7 @@ func (r *Roster) Cap(c *statement.Compiled, want statement.Want) error {
 }
 
 // reslotAll rebuilds every slot in a cloned roster after its removals,
-// revocations or sweeps changed: verdicts move, an admission that missed
+// or revocations changed: verdicts move, an admission that missed
 // a removal that just arrived retires to memory. Shared slots are replaced,
 // never touched.
 func (r *Roster) reslotAll() {
@@ -765,53 +723,6 @@ func (r *Roster) AddRevocation(st *statement.Statement) (*Roster, bool, error) {
 	return nr, true, nil
 }
 
-// Sweep kills every admission of a device issued up to at — the
-// member-revoked event of the first circle's log — and,
-// through their chains, the admissions that device issued up to then. A
-// device the roster never saw is remembered as a tombstone for
-// sweepTombstone so the gater refuses it meanwhile.
-func (r *Roster) Sweep(deviceDID string, at time.Time) (*Roster, bool) {
-	return r.SweepBy(deviceDID, at, "", 0)
-}
-
-// SweepBy is Sweep for a member-revoked event: signer is the did:key of
-// the circle key that signed it and signedAt the event's time; the sweep
-// applies only while the key history honours that key at that instant
-// (sweepMark). A sweep that is no stronger than one already applying is
-// nothing new.
-func (r *Roster) SweepBy(deviceDID string, at time.Time, signer string, signedAt int64) (*Roster, bool) {
-	m := sweepMark{cut: at.Unix(), signer: signer, signedAt: signedAt}
-	for _, old := range r.sweeps[deviceDID] {
-		if old == m || (m.signer == "" && old.signer == "" && m.cut <= old.cut) {
-			return r, false
-		}
-	}
-	// Every sweep is kept, not the strongest: the strongest may be the one
-	// a compromise later voids, and the earlier one must still apply
-	// (Codex review, 2026-11-07).
-	nr := r.clone()
-	nr.sweeps[deviceDID] = append(append([]sweepMark(nil), r.sweeps[deviceDID]...), m)
-	nr.reslotAll()
-	return nr, true
-}
-
-// honoursSweep reports whether a sweep's signer is honoured by the key
-// history at the instant it signed; a local cut always is.
-func (r *Roster) honoursSweep(m sweepMark) bool {
-	return m.signer == "" || statement.KeyHonouredAt(r.roots, r.CircleDID(), m.signer, m.signedAt)
-}
-
-// sweptAt is the cut applying to a device — admissions issued up to it are
-// dead — if a sweep the history honours names it.
-func (r *Roster) sweptAt(deviceDID string) (cut int64, ok bool) {
-	for _, m := range r.sweeps[deviceDID] {
-		if r.honoursSweep(m) && (!ok || m.cut > cut) {
-			cut, ok = m.cut, true
-		}
-	}
-	return cut, ok
-}
-
 // Live returns the device's entry if it is admitted right now — inside its
 // window, not lapsed, not dead.
 func (r *Roster) Live(deviceDID string, now time.Time) (*Device, bool) {
@@ -833,10 +744,9 @@ func (r *Roster) Lapsed(deviceDID string, now time.Time) (*Device, bool) {
 }
 
 // Revoked reports whether the device is refused as revoked right now, and
-// until when: a dead entry (revoked, swept, or removed without an eligible
-// admission) until it would have expired, or a bare sweep for
-// sweepTombstone. An entry that is not dead — live or merely lapsed —
-// means not revoked.
+// until when: a dead entry (revoked, or removed without an eligible
+// admission) until it would have expired. An entry that is not dead — live
+// or merely lapsed — means not revoked.
 func (r *Roster) Revoked(deviceDID string, now time.Time) (time.Time, bool) {
 	if dev := r.slots[deviceDID].entry(); dev != nil {
 		if dev.dead == nil {
@@ -844,12 +754,6 @@ func (r *Roster) Revoked(deviceDID string, now time.Time) (time.Time, bool) {
 		}
 		if now.Before(dev.Exp) {
 			return dev.Exp, true
-		}
-	}
-	if at, ok := r.sweptAt(deviceDID); ok {
-		until := time.Unix(at, 0).Add(sweepTombstone)
-		if now.Before(until) {
-			return until, true
 		}
 	}
 	return time.Time{}, false
@@ -860,14 +764,6 @@ func (r *Roster) Revoked(deviceDID string, now time.Time) (time.Time, bool) {
 func (r *Roster) Tombstones(now time.Time) map[string]time.Time {
 	out := map[string]time.Time{}
 	for did := range r.slots {
-		if until, ok := r.Revoked(did, now); ok {
-			out[did] = until
-		}
-	}
-	for did := range r.sweeps {
-		if _, seen := out[did]; seen {
-			continue
-		}
 		if until, ok := r.Revoked(did, now); ok {
 			out[did] = until
 		}
@@ -944,7 +840,7 @@ func (r *Roster) UsedIPs() []string {
 func (r *Roster) Len() int { return len(r.slots) }
 
 // GC marks devices whose window closed as lapsed, drops lapsed entries past
-// their retention, and drops sweeps and revocations that can no longer kill
+// their retention, and drops revocations that can no longer kill
 // anything (statement.Spent, as the circle directory does on load).
 // dropped says whether an entry left (the saved form changed).
 func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
@@ -981,23 +877,6 @@ func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
 			delete(nr.slots, did)
 		} else {
 			nr.slots[did] = ns
-		}
-	}
-	for did, ms := range nr.sweeps {
-		var keep []sweepMark
-		for _, m := range ms {
-			if now.Before(time.Unix(m.cut, 0).Add(statement.MaxValidity)) {
-				keep = append(keep, m)
-			}
-		}
-		if len(keep) == len(ms) {
-			continue
-		}
-		changed = true
-		if len(keep) == 0 {
-			delete(nr.sweeps, did)
-		} else {
-			nr.sweeps[did] = keep
 		}
 	}
 	if !changed {

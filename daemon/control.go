@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"ioa.rocks/fabric/circle"
 	"log"
 	"net"
 	"net/http"
@@ -17,7 +18,6 @@ import (
 
 	"ioa.rocks/fabric/admission"
 	"ioa.rocks/fabric/cert"
-	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/fabricnet"
 	"ioa.rocks/fabric/state"
 
@@ -146,19 +146,10 @@ type EventInfo struct {
 type approveBody struct {
 	Fingerprint string `json:"fingerprint"`
 	CertB64     string `json:"cert_b64"`
-	EventB64    string `json:"event_b64"` // signed MemberAdded event, gossiped
 }
 
 type denyBody struct {
 	Fingerprint string `json:"fingerprint"`
-}
-
-type revokeBody struct {
-	EventB64 string `json:"event_b64"` // signed MemberRevoked event
-}
-
-type renewBody struct {
-	EventB64 string `json:"event_b64"` // signed MemberAdded event carrying the re-signed cert
 }
 
 func (d *Daemon) serveControl() (func(), error) {
@@ -181,9 +172,6 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("GET /v0/pending", d.handlePending)
 	mux.HandleFunc("POST /v0/approve", d.handleApprove)
 	mux.HandleFunc("POST /v0/deny", d.handleDeny)
-	mux.HandleFunc("POST /v0/revoke", d.handleRevoke)
-	mux.HandleFunc("POST /v0/renew", d.handleRenew)
-	mux.HandleFunc("POST /v0/publish", d.handlePublish)
 	mux.HandleFunc("POST /v0/circle/refresh", d.handleCircleRefresh)
 	mux.HandleFunc("POST /v0/circle/admit", d.handleCircleAdmit)
 	mux.HandleFunc("POST /v0/circle/handover", d.handleCircleHandover)
@@ -369,34 +357,41 @@ func (d *Daemon) addrConflict(p peer.ID) string {
 	return ""
 }
 
-// handleEvents returns the membership-event feed, newest first — the
-// admission-transparency surface of spec §5.
+// handleEvents returns the membership feed of the home circle, newest
+// first — the admission-transparency surface of spec §5, read from the
+// roster: every admission it holds (renewals included) and every removal.
 func (d *Daemon) handleEvents(w http.ResponseWriter, _ *http.Request) {
-	all := d.Log.All()
-	// Names for revoked devices come from their admission events.
-	names := map[string]string{}
-	for _, e := range all {
-		if e.Payload.Kind == event.KindAdded {
-			if c, err := e.AddedCert(); err == nil {
-				if k, err := c.DeviceKey(); err == nil {
-					names[string(k)] = c.Payload.Meta.Name
+	out := []EventInfo{}
+	r, ok := d.Store.RosterFor(d.CircleDID())
+	if !ok {
+		writeJSON(w, out)
+		return
+	}
+	names, peers := map[string]string{}, map[string]string{}
+	for _, dev := range r.Devices() {
+		for _, h := range r.Held(dev.DID) {
+			c, err := cert.FromStatement(h.Stmt)
+			if err != nil {
+				continue
+			}
+			info := EventInfo{Kind: "member-added", Name: c.Payload.Meta.Name, At: h.Issued()}
+			if k, err := c.DeviceKey(); err == nil {
+				if p, err := fabricnet.PeerIDForKey(k); err == nil {
+					info.PeerID = p.String()
 				}
 			}
+			names[dev.DID], peers[dev.DID] = info.Name, info.PeerID
+			out = append(out, info)
 		}
 	}
-	out := make([]EventInfo, 0, len(all))
-	for i := len(all) - 1; i >= 0; i-- {
-		e := all[i]
-		devKey, err := e.DeviceKey()
-		if err != nil {
+	for _, st := range r.Revocations().All() {
+		rv, err := circle.RevocationFromStatement(st)
+		if err != nil || rv.Device == "" || rv.Circle != r.CircleDID() {
 			continue
 		}
-		info := EventInfo{Kind: e.Payload.Kind, Name: names[string(devKey)], At: e.Time()}
-		if p, err := fabricnet.PeerIDForKey(devKey); err == nil {
-			info.PeerID = p.String()
-		}
-		out = append(out, info)
+		out = append(out, EventInfo{Kind: "member-revoked", Name: names[rv.Device], PeerID: peers[rv.Device], At: time.Unix(rv.At, 0)})
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].At.After(out[j].At) })
 	writeJSON(w, out)
 }
 
@@ -461,86 +456,6 @@ func transportOf(addr ma.Multiaddr) (transport string, relayed bool) {
 		}
 	}
 	return transport, relayed
-}
-
-func (d *Daemon) handleRevoke(w http.ResponseWriter, r *http.Request) {
-	var body revokeBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	e, err := decodeEvent(body.EventB64, event.KindRevoked)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	// Ingest verifies the root-key signature — the daemon takes orders about
-	// membership only from the root key, never from the socket.
-	if err := d.Ingest(e); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	writeJSON(w, map[string]string{"result": "revoked"})
-}
-
-// handleRenew ingests a re-signed cert for an existing member, wrapped in a
-// MemberAdded event (spec §5: renewal reuses the admission event — stores
-// keep the latest-issued cert, the renewed node adopts its own). Like
-// revoke, the daemon only checks the root-key signature; signing happened
-// in the CLI/UI process.
-func (d *Daemon) handleRenew(w http.ResponseWriter, r *http.Request) {
-	var body renewBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	e, err := decodeEvent(body.EventB64, event.KindAdded)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if err := d.Ingest(e); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	writeJSON(w, map[string]string{"result": "renewed"})
-}
-
-// handlePublish ingests any signed membership event. As everywhere, Ingest
-// verifies the signature against the root; the socket carries no authority
-// of its own.
-func (d *Daemon) handlePublish(w http.ResponseWriter, r *http.Request) {
-	var body renewBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	e, err := decodeEvent(body.EventB64, "")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if err := d.Ingest(e); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	writeJSON(w, map[string]string{"result": "published", "kind": e.Payload.Kind})
-}
-
-// decodeEvent decodes a base64 event; wantKind "" accepts any kind.
-func decodeEvent(b64, wantKind string) (*event.Event, error) {
-	raw, err := base64.StdEncoding.DecodeString(b64)
-	if err != nil {
-		return nil, fmt.Errorf("event_b64: %w", err)
-	}
-	e, err := event.Unmarshal(raw)
-	if err != nil {
-		return nil, err
-	}
-	if wantKind != "" && e.Payload.Kind != wantKind {
-		return nil, fmt.Errorf("expected a %s event, got %q", wantKind, e.Payload.Kind)
-	}
-	return e, nil
 }
 
 // handlePending aggregates the local queue (if this node runs one) with
@@ -624,11 +539,6 @@ func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cert_b64: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	ev, err := decodeEvent(body.EventB64, event.KindAdded)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
 	target, found := d.routeToQueue(body.Fingerprint)
 	if !found {
 		http.Error(w, fmt.Sprintf("no pending request %q on any reachable queue", body.Fingerprint), http.StatusNotFound)
@@ -640,25 +550,23 @@ func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		evBytes, err := base64.StdEncoding.DecodeString(body.EventB64)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
 		ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
-		err = admission.RemoteApprove(ctx, d.Host, target, body.Fingerprint, certBytes, evBytes)
+		err = admission.RemoteApprove(ctx, d.Host, target, body.Fingerprint, certBytes)
 		cancel()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 	}
-	// Gossip the admission (spec §5 normal path; the auth-handshake
-	// notification remains the suppression backstop). On the remote path
-	// the queue host ingests too — the event log deduplicates.
-	if err := d.Ingest(ev); err != nil {
-		http.Error(w, "cert delivered, but announcing the admission failed: "+err.Error(), http.StatusInternalServerError)
-		return
+	// The cert is the device's admission: into the home roster and out to
+	// the circle (spec §5 normal path; the auth-handshake notification
+	// remains the suppression backstop). On the remote path the queue host
+	// records it too — the roster deduplicates.
+	if d.Circle != nil {
+		if _, err := d.Circle.Admit(certBytes); err != nil {
+			http.Error(w, "cert delivered, but recording the admission failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	writeJSON(w, map[string]string{"result": "approved"})
 }
@@ -789,28 +697,12 @@ func (c *Client) Members() ([]MemberInfo, error) {
 	return m, nil
 }
 
-func (c *Client) Approve(fingerprint string, signedCert, signedEvent []byte) error {
+// Approve delivers a cert the owner signed for a pending join request; the
+// daemon records it as the device's admission and gossips it.
+func (c *Client) Approve(fingerprint string, signedCert []byte) error {
 	return c.post("/v0/approve", approveBody{
 		Fingerprint: fingerprint,
 		CertB64:     base64.StdEncoding.EncodeToString(signedCert),
-		EventB64:    base64.StdEncoding.EncodeToString(signedEvent),
-	}, nil)
-}
-
-func (c *Client) Revoke(signedEvent []byte) error {
-	return c.post("/v0/revoke", revokeBody{
-		EventB64: base64.StdEncoding.EncodeToString(signedEvent),
-	}, nil)
-}
-
-// Publish delivers any signed event for ingest and gossip.
-func (c *Client) Publish(signedEvent []byte) error {
-	return c.post("/v0/publish", renewBody{EventB64: base64.StdEncoding.EncodeToString(signedEvent)}, nil)
-}
-
-func (c *Client) Renew(signedEvent []byte) error {
-	return c.post("/v0/renew", renewBody{
-		EventB64: base64.StdEncoding.EncodeToString(signedEvent),
 	}, nil)
 }
 

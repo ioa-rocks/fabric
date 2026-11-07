@@ -135,11 +135,12 @@ func TestExpiredMemberIsLapsedNotMember(t *testing.T) {
 		t.Fatal("lapsed entry survived its retention")
 	}
 
-	// Revoking a lapsed device forgets it.
+	// Removing a lapsed device: no member, and nothing to refuse either —
+	// its cert has expired. The memory stays until its retention ends.
 	s.AddMember(p, expired)
-	s.Revoke(p, now)
-	if _, ok := s.LapsedCert(p); ok || !s.IsRevoked(p, now) {
-		t.Fatal("revoked lapsed device still remembered")
+	revokeDevice(t, s, nsPriv, p)
+	if s.IsMember(p, now) {
+		t.Fatal("removed lapsed device is a member")
 	}
 }
 
@@ -223,30 +224,50 @@ func TestUnionAdmitsDeviceOfAnyHeldCircle(t *testing.T) {
 	}
 }
 
-// A legacy member-revoked sweep kills the admissions issued up to it and
-// nothing after: a cert issued later is a deliberate re-admission.
-func TestSweepThenReadmission(t *testing.T) {
+// A removal kills the admissions that do not acknowledge it, whenever they
+// were issued: a cert re-issued afterwards blind to the removal is no
+// re-admission; a restoration (an admission carrying the removal's ID) is.
+func TestRemovalThenRestoration(t *testing.T) {
 	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
 	p, _ := PeerIDForKey(devPub)
-	s := NewMemberStore(statement.NewDIDRoot(cert.DIDForKey(nsPub)))
+	circleDID := cert.DIDForKey(nsPub)
+	s := NewMemberStore(statement.NewDIDRoot(circleDID))
 	then := time.Now().Add(-time.Hour)
 	old, _ := cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, then, 2*time.Hour)
 	s.AddMember(p, old)
-	s.Revoke(p, then.Add(time.Minute))
+	revokeDevice(t, s, nsPriv, p)
 	if s.IsMember(p, time.Now()) || !s.IsRevoked(p, time.Now()) {
-		t.Fatal("sweep did not revoke the device")
+		t.Fatal("removal did not revoke the device")
 	}
 	// The same cert, re-presented: still dead.
 	if err := s.Admit(p, old); err == nil {
-		t.Fatal("swept cert re-admitted")
+		t.Fatal("removed cert re-admitted")
 	}
+	// A fresh cert blind to the removal: no re-admission.
 	fresh, _ := cert.Issue(nsPriv, devPub, cert.CmdMember, cert.Meta{Name: "nas"}, time.Now(), time.Hour)
-	if err := s.Admit(p, fresh); err != nil {
-		t.Fatalf("re-admission after a sweep: %v", err)
+	if err := s.Admit(p, fresh); err == nil {
+		t.Fatal("a cert blind to the removal re-admitted the device")
+	}
+	// The restoration acknowledges it.
+	r, _ := s.RosterFor(circleDID)
+	acks, err := r.Acks(cert.DIDForKey(devPub))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := circle.Issue(nsPriv, nil, circleDID, devPub, time.Now(), time.Hour, circle.Terms{Verbs: circle.DeviceVerbs, Meta: &statement.Meta{Name: "nas"}, Acks: acks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := cert.FromStatement(a.Stmt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Admit(p, view); err != nil {
+		t.Fatalf("restoration after a removal: %v", err)
 	}
 	if !s.IsMember(p, time.Now()) || s.IsRevoked(p, time.Now()) {
-		t.Fatal("re-admitted device is not a plain member")
+		t.Fatal("restored device is not a plain member")
 	}
 }
 

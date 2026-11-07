@@ -29,14 +29,14 @@ func TestReplySlots(t *testing.T) {
 	nas := newMeshNode(t, root, "nas")
 	desk := newMeshNode(t, root, "desk")
 
-	fnas := nas.fabric(t, root, "nas", nil, nas.event, desk.event)
+	fnas := nas.fabric(t, root, "nas", nil, nas.cert, desk.cert)
 	dnas := startDaemon(t, nas.statePath, fnas)
 	clNas := daemon.NewClient(nas.statePath)
 	if err := clNas.Declare("subject:queues/work", astral.DeliveryShared, nil); err != nil {
 		t.Fatal(err)
 	}
 
-	fdesk := desk.fabric(t, root, "desk", nil, nas.event, desk.event)
+	fdesk := desk.fabric(t, root, "desk", nil, nas.cert, desk.cert)
 	startDaemon(t, desk.statePath, fdesk)
 	clDesk := daemon.NewClient(desk.statePath)
 	addrs := dnas.Fabric.Host.Addrs()

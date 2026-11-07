@@ -14,7 +14,6 @@ import (
 	"github.com/fxamacker/cbor/v2"
 
 	"ioa.rocks/fabric/cert"
-	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/internal/wire"
 	"ioa.rocks/fabric/statement"
 
@@ -557,50 +556,6 @@ func (a *AuthService) noteMember(p peer.ID, c *cert.Cert, known bool, hs Handsha
 	if a.onAuth != nil {
 		a.onAuth(p)
 	}
-}
-
-// Revoke revokes a peer's membership and — critically — closes its live
-// connections: the gater only stops *new* connections (spec §4).
-func (a *AuthService) Revoke(p peer.ID) {
-	a.store.Revoke(p, time.Now())
-	a.h.ConnManager().Unprotect(p, "fabric-member")
-	_ = a.h.Network().ClosePeer(p)
-}
-
-// RevokeByEvent applies a member-revoked event (PeerTable.SweepEvent) and
-// closes the device's connections when no circle held here still admits
-// it. An event no honoured key signed changes nothing.
-func (a *AuthService) RevokeByEvent(e *event.Event) error {
-	now := time.Now()
-	if err := a.store.SweepEvent(e, now); err != nil {
-		return err
-	}
-	devKey, err := e.DeviceKey()
-	if err != nil {
-		return err
-	}
-	p, err := PeerIDForKey(devKey)
-	if err != nil {
-		return err
-	}
-	if a.store.IsMember(p, now) {
-		return nil
-	}
-	a.h.ConnManager().Unprotect(p, "fabric-member")
-	_ = a.h.Network().ClosePeer(p)
-	return nil
-}
-
-// RevokeIn revokes a peer's membership in one circle; its connections are
-// closed only when no other circle held here still admits it.
-func (a *AuthService) RevokeIn(circleDID string, p peer.ID) {
-	now := time.Now()
-	a.store.RevokeIn(circleDID, p, now)
-	if a.store.IsMember(p, now) {
-		return
-	}
-	a.h.ConnManager().Unprotect(p, "fabric-member")
-	_ = a.h.Network().ClosePeer(p)
 }
 
 // RequireMember wraps a stream handler so that only authenticated members

@@ -48,7 +48,7 @@ func TestGaterDecisions(t *testing.T) {
 	member := mkPeer("member", true)
 	stranger := mkPeer("stranger", false)
 	revoked := mkPeer("revoked", true)
-	store.Revoke(revoked, time.Now())
+	revokeDevice(t, store, nsPriv, revoked)
 
 	cases := []struct {
 		name   string

@@ -27,7 +27,6 @@ import (
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/did"
-	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/keystore"
 	"ioa.rocks/fabric/state"
 	"ioa.rocks/fabric/tunbridge"
@@ -242,7 +241,7 @@ func cmdInit(args []string) error {
 		return err
 	}
 	if _, err := dir.LoadConfig(); err == nil {
-		return fmt.Errorf("state dir %s is already initialized — remove %s/config.json (and the old cert.cbor/events.cbor/namespace.key.age) to re-init; the device key is kept", dir.Path, dir.Path)
+		return fmt.Errorf("state dir %s is already initialized — remove %s/config.json (and the old cert.cbor/namespace.key.age) to re-init; the device key is kept", dir.Path, dir.Path)
 	}
 
 	priv, reused, err := dir.EnsureDeviceKey()
@@ -291,16 +290,6 @@ func cmdInit(args []string) error {
 		return err
 	}
 	if err := dir.SaveCert(own); err != nil {
-		return err
-	}
-	// The master's own admission event: nodes that enter through a
-	// lighthouse and never handshake the master directly still learn the
-	// full roster (and the master's overlay IP) from gossip.
-	selfAdded, err := event.NewAdded(rootPriv, own, time.Now())
-	if err != nil {
-		return err
-	}
-	if err := dir.SaveEvents([]*event.Event{selfAdded}); err != nil {
 		return err
 	}
 
@@ -363,6 +352,7 @@ func cmdUp(args []string) error {
 		d.Circle.SetHome(d.CircleDID, d.Roots, d.Store.CertIn)
 		d.Circle.SetPeerTable(d.Store)
 		d.Circle.AttachSync(d.Sync)
+		d.Circle.OnAdmitted(d.Admitted)
 	}
 	if !*noVault {
 		root := circle.Root(*statePath)
@@ -698,7 +688,7 @@ func cmdJoin(args []string) error {
 		return err
 	}
 	if _, err := dir.LoadConfig(); err == nil {
-		return fmt.Errorf("state dir %s already belongs to a circle — to re-join a new one, remove %s/config.json (and the old cert.cbor/events.cbor) first; the device key is kept", dir.Path, dir.Path)
+		return fmt.Errorf("state dir %s already belongs to a circle — to re-join a new one, remove %s/config.json (and the old cert.cbor) first; the device key is kept", dir.Path, dir.Path)
 	}
 	priv, reused, err := dir.EnsureDeviceKey()
 	if err != nil {
@@ -1101,17 +1091,10 @@ func cmdApprove(args []string) error {
 	if err != nil {
 		return err
 	}
-	// The admission is also a signed membership event, gossiped to every
-	// node (spec §5 admission transparency).
-	ev, err := event.NewAdded(rootPriv, c, now)
-	if err != nil {
-		return err
-	}
-	signedEv, err := ev.Marshal()
-	if err != nil {
-		return err
-	}
-	if err := client.Approve(match.Fingerprint, signed, signedEv); err != nil {
+	// The cert is the device's admission: the daemon records it in the
+	// home roster and gossips it to every node (spec §5 admission
+	// transparency).
+	if err := client.Approve(match.Fingerprint, signed); err != nil {
 		return err
 	}
 	fmt.Printf("approved: %q is now a member (cert valid %s)\n", match.Name, certValidity)
@@ -1183,20 +1166,16 @@ func cmdRevoke(args []string) error {
 	if err != nil {
 		return err
 	}
-	circleDID, _, err := daemon.HomeSigner(dir, rootPriv)
-	if err != nil {
+	// A removal statement of the home circle, signed by the root: every
+	// admission of the device that does not acknowledge it is dead, and
+	// the daemon pushes it to the connected members.
+	if _, err := daemon.RevokeDevice(dir, rootPriv, cert.DIDForKey(ed25519.PublicKey(m.DevicePub)), time.Now()); err != nil {
 		return err
 	}
-	ev, err := event.NewRevokedIn(rootPriv, circleDID, ed25519.PublicKey(m.DevicePub), time.Now())
-	if err != nil {
-		return err
-	}
-	signedEv, err := ev.Marshal()
-	if err != nil {
-		return err
-	}
-	if err := client.Revoke(signedEv); err != nil {
-		return err
+	if n, err := client.CircleRefresh(); err != nil {
+		return fmt.Errorf("revocation recorded, but the daemon did not push it: %w", err)
+	} else {
+		fmt.Printf("pushed to %d connected member(s); others learn it at their next connect\n", n)
 	}
 	fmt.Printf("revoked: %q is out of the circle\n", m.Name)
 	return nil
@@ -1210,9 +1189,9 @@ func memberMatches(m daemon.MemberInfo, target string) bool {
 
 // cmdRenew re-signs membership certs with a fresh validity window (spec §5).
 // The payload is preserved verbatim — same device key, name, role, overlay
-// IP — so renewal never renumbers a node. The re-signed cert travels as a
-// MemberAdded event; stores keep the later expiry and the renewed node
-// adopts its own cert live.
+// IP — so renewal never renumbers a node. The re-signed cert is recorded
+// as the device's admission and gossiped; the renewed node adopts its own
+// cert live.
 // mustDeviceKey is the device key of a roster cert that already verified.
 func mustDeviceKey(c *cert.Cert) ed25519.PublicKey {
 	k, err := c.DeviceKey()
@@ -1362,15 +1341,11 @@ func cmdRenew(args []string) error {
 		if err != nil {
 			return fmt.Errorf("renewing %q: %w", m.Name, err)
 		}
-		ev, err := event.NewAdded(rootPriv, renewed, now)
+		signed, err := renewed.Marshal()
 		if err != nil {
 			return err
 		}
-		signedEv, err := ev.Marshal()
-		if err != nil {
-			return err
-		}
-		if err := client.Renew(signedEv); err != nil {
+		if _, err := client.CircleAdmit(signed); err != nil {
 			return fmt.Errorf("delivering renewal for %q: %w", m.Name, err)
 		}
 		fmt.Printf("renewed: %q now expires %s\n", m.Name, renewed.Expiry().Format(time.RFC3339))

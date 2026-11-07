@@ -13,7 +13,6 @@ import (
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
 	fabricdaemon "ioa.rocks/fabric/daemon"
-	"ioa.rocks/fabric/event"
 )
 
 func signerFor(t *testing.T, k *fabricdaemon.IssuedKey) *astral.Signer {
@@ -45,7 +44,7 @@ func TestSubKeyActsWithinItsVerbs(t *testing.T) {
 	nas := newMeshNode(t, root, "nas")
 	desk := newMeshNode(t, root, "desk")
 	ghost := newMeshNode(t, root, "ghost") // on the roster, never started
-	roster := []*event.Event{nas.event, desk.event, ghost.event}
+	roster := []*cert.Cert{nas.cert, desk.cert, ghost.cert}
 	x, err := circle.Init(nas.circleRoot(), "x", "pw")
 	if err != nil {
 		t.Fatal(err)
@@ -173,7 +172,7 @@ func TestRevocationPushesLeasesAndWaits(t *testing.T) {
 	}
 	nas := newMeshNode(t, root, "nas")
 	desk := newMeshNode(t, root, "desk")
-	roster := []*event.Event{nas.event, desk.event}
+	roster := []*cert.Cert{nas.cert, desk.cert}
 	x, err := circle.Init(nas.circleRoot(), "x", "pw")
 	if err != nil {
 		t.Fatal(err)
@@ -270,7 +269,7 @@ func TestOfflineDeviceHoldRecheckedAgainstCircle(t *testing.T) {
 	}
 	nas := newMeshNode(t, root, "nas")
 	desk := newMeshNode(t, root, "desk")
-	roster := []*event.Event{nas.event, desk.event}
+	roster := []*cert.Cert{nas.cert, desk.cert}
 	x, err := circle.Init(nas.circleRoot(), "x", "pw")
 	if err != nil {
 		t.Fatal(err)

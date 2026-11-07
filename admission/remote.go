@@ -30,7 +30,6 @@ type queueReq struct {
 	Op          string `cbor:"op"` // "list" | "approve" | "deny"
 	Fingerprint string `cbor:"fp,omitempty"`
 	Cert        []byte `cbor:"cert,omitempty"`
-	Event       []byte `cbor:"event,omitempty"` // signed MemberAdded, gossiped by the queue host
 }
 
 type queueResp struct {
@@ -39,10 +38,10 @@ type queueResp struct {
 }
 
 // AttachQueue serves the queue to remote admins. gate wraps the handler
-// with the membership check; isAdmin narrows it to admin-role certs;
-// ingest records the admission event into the local log (and gossip) after
-// a successful approve.
-func AttachQueue(h host.Host, q *Queue, gate func(network.StreamHandler) network.StreamHandler, isAdmin func(peer.ID) bool, ingest func(eventBytes []byte) error) {
+// with the membership check; isAdmin narrows it to the master's device;
+// admit records the delivered cert (a device admission) in the local roster
+// (and gossip) after a successful approve.
+func AttachQueue(h host.Host, q *Queue, gate func(network.StreamHandler) network.StreamHandler, isAdmin func(peer.ID) bool, admit func(certBytes []byte) error) {
 	h.SetStreamHandler(QueueProtocolID, gate(func(s network.Stream) {
 		defer s.Close()
 		_ = s.SetDeadline(time.Now().Add(30 * time.Second))
@@ -66,8 +65,8 @@ func AttachQueue(h host.Host, q *Queue, gate func(network.StreamHandler) network
 			resp.Pending = q.List()
 		case "approve":
 			err := q.Approve(req.Fingerprint, req.Cert)
-			if err == nil && len(req.Event) > 0 {
-				err = ingest(req.Event)
+			if err == nil && admit != nil {
+				err = admit(req.Cert)
 			}
 			if err != nil {
 				resp.Err = err.Error()
@@ -127,10 +126,9 @@ func RemoteList(ctx context.Context, h host.Host, target peer.ID) ([]PendingInfo
 	return resp.Pending, nil
 }
 
-// RemoteApprove hands a locally signed cert (and its MemberAdded event) to
-// a queue host for delivery.
-func RemoteApprove(ctx context.Context, h host.Host, target peer.ID, fingerprint string, certBytes, eventBytes []byte) error {
-	_, err := queueRoundTrip(ctx, h, target, queueReq{Op: "approve", Fingerprint: fingerprint, Cert: certBytes, Event: eventBytes})
+// RemoteApprove hands a locally signed cert to a queue host for delivery.
+func RemoteApprove(ctx context.Context, h host.Host, target peer.ID, fingerprint string, certBytes []byte) error {
+	_, err := queueRoundTrip(ctx, h, target, queueReq{Op: "approve", Fingerprint: fingerprint, Cert: certBytes})
 	return err
 }
 

@@ -4,7 +4,6 @@
 //	config.json        — name, listen addrs, circle DID, bootstrap peers
 //	device.key         — libp2p ed25519 identity (protobuf), 0600
 //	cert.cbor          — this node's membership certificate
-//	events.cbor        — membership-event log (admissions, revocations)
 //	records.cbor       — cached signed peer address records (restart warm-up)
 //	namespace.key.age  — root key seed, master only (see keystore)
 //	control.sock       — daemon control socket, runtime only
@@ -22,7 +21,6 @@ import (
 	"path/filepath"
 
 	"ioa.rocks/fabric/cert"
-	"ioa.rocks/fabric/event"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -78,7 +76,6 @@ func Open(path string) (Dir, error) {
 func (d Dir) configPath() string    { return filepath.Join(d.Path, "config.json") }
 func (d Dir) deviceKeyPath() string { return filepath.Join(d.Path, "device.key") }
 func (d Dir) certPath() string      { return filepath.Join(d.Path, "cert.cbor") }
-func (d Dir) eventsPath() string    { return filepath.Join(d.Path, "events.cbor") }
 func (d Dir) recordsPath() string   { return filepath.Join(d.Path, "records.cbor") }
 
 // KeystorePath is where the master's root key seed lives.
@@ -170,15 +167,6 @@ func (d Dir) SaveCert(c *cert.Cert) error {
 	return os.WriteFile(d.certPath(), data, 0o600)
 }
 
-// SaveEvents persists the membership-event log.
-func (d Dir) SaveEvents(evs []*event.Event) error {
-	data, err := cbor.Marshal(evs)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(d.eventsPath(), data, 0o600)
-}
-
 // SaveRecords persists gossiped signed address-record envelopes, so a
 // restarted node can dial members straight away instead of waiting to
 // re-learn WHERE everyone is. The envelopes are signed by their subjects;
@@ -208,21 +196,18 @@ func (d Dir) LoadRecords() ([][]byte, error) {
 	return recs, nil
 }
 
-// LoadEvents returns (nil, nil) when no event log exists yet. Events are
-// untrusted until they pass verification into an event.Log.
-func (d Dir) LoadEvents() ([]*event.Event, error) {
-	data, err := os.ReadFile(d.eventsPath())
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+// RetireEventLog renames the membership-event log an older binary left
+// (events.cbor, retired 2026-11-07) to events.cbor.retired, so nothing reads
+// it again. Reports whether there was one.
+func (d Dir) RetireEventLog() (bool, error) {
+	p := filepath.Join(d.Path, "events.cbor")
+	if _, err := os.Stat(p); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
 	}
-	if err != nil {
-		return nil, err
-	}
-	var evs []*event.Event
-	if err := cbor.Unmarshal(data, &evs); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", d.eventsPath(), err)
-	}
-	return evs, nil
+	return true, os.Rename(p, p+".retired")
 }
 
 // LoadCert returns (nil, nil) when no certificate exists yet.

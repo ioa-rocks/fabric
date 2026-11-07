@@ -74,6 +74,7 @@ type CircleService struct {
 	presented    map[peer.ID]map[presentKey]presentedChain // chains presented on a connection (sub-keys, grantees)
 	extraRevs    map[string]*statement.RevocationSet       // revocations for the home circle when not held here (a gate)
 	onInvalidate []func()
+	admitted     func(from peer.ID, st *statement.Statement)
 	stop         func()
 }
 
@@ -202,7 +203,25 @@ func (s *CircleService) AttachSync(sync *fabricnet.EventSync) {
 		Ingest: func(_ peer.ID, revs [][]byte) ([][]byte, error) {
 			return s.ingestRevocations(revs, time.Now())
 		},
+		Admitted: s.noteAdmitted,
 	})
+}
+
+// OnAdmitted registers the daemon's observer of admissions new to the
+// table — recorded here or learned from a peer (fabricnet.CircleHooks).
+func (s *CircleService) OnAdmitted(f func(from peer.ID, st *statement.Statement)) {
+	s.mu.Lock()
+	s.admitted = f
+	s.mu.Unlock()
+}
+
+func (s *CircleService) noteAdmitted(from peer.ID, st *statement.Statement) {
+	s.mu.RLock()
+	f := s.admitted
+	s.mu.RUnlock()
+	if f != nil {
+		f(from, st)
+	}
 }
 
 // ownAllows reports whether any of this node's own admissions carries a verb
@@ -393,18 +412,18 @@ func (s *CircleService) Admit(raw []byte) (bool, error) {
 	if s.table == nil {
 		return false, errors.New("no peer table attached")
 	}
-	if s.circleByDID(a.Circle) == nil {
-		return false, fmt.Errorf("circle %s is not held by this node", shortDID(a.Circle))
-	}
 	if _, ok := s.table.RosterFor(a.Circle); !ok {
-		return false, fmt.Errorf("no roster for circle %s", shortDID(a.Circle))
+		return false, fmt.Errorf("circle %s is not held by this node", shortDID(a.Circle))
 	}
 	fresh, err := s.table.AddAdmission(a.Stmt, time.Now())
 	if err != nil {
 		return false, err
 	}
-	if fresh && s.sync != nil {
-		s.sync.PublishStatements(a.Circle, [][]byte{raw}, nil)
+	if fresh {
+		if s.sync != nil {
+			s.sync.PublishStatements(a.Circle, [][]byte{raw}, nil)
+		}
+		s.noteAdmitted("", a.Stmt)
 	}
 	return fresh, nil
 }

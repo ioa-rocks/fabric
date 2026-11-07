@@ -127,47 +127,6 @@ func TestRosterLifecycle(t *testing.T) {
 	}
 }
 
-// A sweep (device, before) kills admissions issued up to it, leaves later
-// ones, and tombstones an unknown device for a day.
-func TestRosterSweep(t *testing.T) {
-	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
-	roster := NewRoster(statement.NewDIDRoot(did.ForKey(rootPub)))
-	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	devDID := did.ForKey(devPub)
-	then := time.Now().Add(-time.Hour)
-	old, _ := AdmitFor(rootPriv, devPub, then, 2*time.Hour)
-	roster, _, err := roster.Add(old.Stmt, then)
-	if err != nil {
-		t.Fatal(err)
-	}
-	roster, _ = roster.Sweep(devDID, then.Add(time.Minute))
-	if _, ok := roster.Live(devDID, time.Now()); ok {
-		t.Fatal("swept admission still live")
-	}
-	if _, ok := roster.Revoked(devDID, time.Now()); !ok {
-		t.Fatal("swept device not reported revoked")
-	}
-	fresh, _ := AdmitFor(rootPriv, devPub, time.Now(), time.Hour)
-	if roster, _, err = roster.Add(fresh.Stmt, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := roster.Live(devDID, time.Now()); !ok {
-		t.Fatal("admission issued after the sweep not live")
-	}
-	if _, ok := roster.Revoked(devDID, time.Now()); ok {
-		t.Fatal("re-admitted device still reported revoked")
-	}
-
-	unknown := did.ForKey(must(ed25519.GenerateKey(rand.Reader)))
-	roster, _ = roster.Sweep(unknown, time.Now())
-	if until, ok := roster.Revoked(unknown, time.Now()); !ok || until.Before(time.Now().Add(23*time.Hour)) {
-		t.Fatalf("bare sweep tombstone = %v, %v", until, ok)
-	}
-	if _, ok := roster.Revoked(unknown, time.Now().Add(25*time.Hour)); ok {
-		t.Fatal("bare sweep tombstone outlived its day")
-	}
-}
-
 func must(pub ed25519.PublicKey, _ ed25519.PrivateKey, err error) ed25519.PublicKey {
 	if err != nil {
 		panic(err)
@@ -322,12 +281,11 @@ func TestRevokedLatestAdmissionConvergesWhateverTheOrder(t *testing.T) {
 	}
 }
 
-// A sweep of an admin desk — how the web UI's revoke and the legacy CLI
-// reach the roster — kills the admissions the desk issued, as a statement
-// revocation of the desk does through Check. Before 2026-11-06 the sweep
-// was checked against the leaf only, so revoking an admin desk from the UI
-// left its devices admitted (agy review).
-func TestSweepCascadesAlongDelegatedChains(t *testing.T) {
+// A removal of an admin desk kills the admissions the desk issued: the
+// desk's link in their chains does not acknowledge its own removal, so
+// every chain through the desk dies with it (the cascade; agy review,
+// 2026-11-06 — the web UI's revoke and `fabric revoke` arrive this way).
+func TestRemovalCascadesAlongDelegatedChains(t *testing.T) {
 	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
 	deskPub, deskPriv, _ := ed25519.GenerateKey(rand.Reader)
 	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
@@ -351,16 +309,22 @@ func TestSweepCascadesAlongDelegatedChains(t *testing.T) {
 	if _, ok := r.Live(devDID, time.Now()); !ok {
 		t.Fatal("device under the desk is not live")
 	}
-	// Sweep the desk as of now: the desk and everything it issued die.
-	r, _ = r.Sweep(deskDID, time.Now())
+	// Remove the desk as of now: the desk and everything it issued die.
+	rv, err := Revoke(rootPriv, deskDID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, _, err = r.AddRevocation(rv.Stmt); err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := r.Live(deskDID, time.Now()); ok {
-		t.Fatal("swept desk still live")
+		t.Fatal("removed desk still live")
 	}
 	if _, ok := r.Live(devDID, time.Now()); ok {
-		t.Fatal("device admitted by the swept desk still live")
+		t.Fatal("device admitted by the removed desk still live")
 	}
 	if _, ok := r.Revoked(devDID, time.Now()); !ok {
-		t.Fatal("device admitted by the swept desk not reported revoked")
+		t.Fatal("device admitted by the removed desk not reported revoked")
 	}
 	// The root re-admits the device directly, later: it stands.
 	later := time.Now().Add(time.Second)
@@ -369,16 +333,15 @@ func TestSweepCascadesAlongDelegatedChains(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, ok := r.Live(devDID, later); !ok {
-		t.Fatal("root re-admission after the desk's sweep not live")
+		t.Fatal("root re-admission after the desk's removal not live")
 	}
 }
 
-// Cap holds a presented sub-key chain to the roster where Check cannot: a
-// sweep of the device kills the chain though the chain's own admission is
-// the roster's entry; after a re-admission the old swept chain stays dead
-// while a sub-key under the new admission passes (Codex review,
-// 2026-11-06).
-func TestCapRefusesSweptChains(t *testing.T) {
+// Cap holds a presented sub-key chain to the roster: a removal of the
+// device kills the chain under its admission; after a restoration (an
+// admission acknowledging the removal) the old chain stays dead while a
+// sub-key under the new admission passes (Codex review, 2026-11-06).
+func TestCapRefusesRemovedChains(t *testing.T) {
 	rootPub, rootPriv, _ := ed25519.GenerateKey(rand.Reader)
 	devPub, devPriv, _ := ed25519.GenerateKey(rand.Reader)
 	keyPub, _, _ := ed25519.GenerateKey(rand.Reader)
@@ -412,28 +375,29 @@ func TestCapRefusesSweptChains(t *testing.T) {
 	if err := r.Cap(s1, want); err != nil {
 		t.Fatalf("sub-key under the device's current admission: %v", err)
 	}
-	// Sweep the device: Check still passes (sweeps are not revocations),
-	// Cap refuses.
-	r, _ = r.Sweep(devDID, now.Add(time.Second))
-	if err := s1.Check(roots, r.Revocations(), want); err != nil {
-		t.Fatalf("Check is expected to pass without the cap: %v", err)
-	}
+	// Remove the device: the chain under its admission is dead for the cap.
+	rv, _ := Revoke(rootPriv, devDID, now.Add(time.Second))
+	r, _, _ = r.AddRevocation(rv.Stmt)
 	if err := r.Cap(s1, want); err == nil {
-		t.Fatal("sub-key of a swept device passes the cap")
+		t.Fatal("sub-key of a removed device passes the cap")
 	}
-	// Re-admit the device: the old chain stays dead, a new sub-key stands.
+	// Restore the device: the old chain stays dead, a new sub-key stands.
 	at := now.Add(2 * time.Second)
-	a2, _ := AdmitFor(rootPriv, devPub, at, time.Hour)
+	acks, err := r.Acks(devDID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a2, _ := Issue(rootPriv, nil, circleDID, devPub, at, time.Hour, Terms{Verbs: DeviceVerbs, Acks: acks})
 	r, _, _ = r.Add(a2.Stmt, at)
 	want.Now = at.Add(time.Second)
 	if _, ok := r.Live(devDID, want.Now); !ok {
-		t.Fatal("re-admitted device not live")
+		t.Fatal("restored device not live")
 	}
 	if err := r.Cap(s1, want); err == nil {
-		t.Fatal("the swept chain is usable again after the re-admission")
+		t.Fatal("the removed chain is usable again after the restoration")
 	}
 	if err := r.Cap(subKey(a2.Stmt, at), want); err != nil {
-		t.Fatalf("sub-key under the re-admission: %v", err)
+		t.Fatalf("sub-key under the restoration: %v", err)
 	}
 }
 
@@ -491,18 +455,21 @@ func TestCapJudgesLinksByTheirOwnCircle(t *testing.T) {
 	if err := ry.Cap(c, standing); err != nil {
 		t.Fatalf("Y's roster over its own link: %v", err)
 	}
-	// X sweeping the device's key still ends the presentation: a sweep is
-	// about the key, whoever admitted it.
-	swept, _ := rx.Sweep(devDID, at)
-	if err := swept.Cap(c, want); err == nil {
-		t.Fatal("X's sweep of the key ignored on Y's link")
-	}
-	// Y's roster is what judges Y's admission: sweep the device there and
+	// Y's roster is what judges Y's admission: remove the device there and
 	// the identity link is dead for Y's cap, while X's cap (its own links
-	// only) is unchanged.
-	ySwept, _ := ry.Sweep(devDID, at)
-	if err := ySwept.Cap(c, standing); err == nil {
-		t.Fatal("Y's sweep ignored on Y's link")
+	// only) is unchanged. X removing the device from X touches no link of
+	// this chain — the grant names circle Y, the identity is Y's word — so
+	// X ends Y members' access by revoking the grant, not by removing one
+	// of Y's devices from X.
+	yRemoval, _ := Revoke(yPriv, devDID, at)
+	yRemoved, _, _ := ry.AddRevocation(yRemoval.Stmt)
+	if err := yRemoved.Cap(c, standing); err == nil {
+		t.Fatal("Y's removal ignored on Y's link")
+	}
+	xRemoval, _ := Revoke(xPriv, devDID, at)
+	xRemoved, _, _ := rx.AddRevocation(xRemoval.Stmt)
+	if err := xRemoved.Cap(c, want); err != nil {
+		t.Fatalf("X's removal of the device from X reached Y's identity link: %v", err)
 	}
 	if err := rx.Cap(c, want); err != nil {
 		t.Fatal(err)
@@ -726,63 +693,6 @@ func TestAcksRefusesToOverflow(t *testing.T) {
 	}
 }
 
-// A legacy sweep (a member-revoked event) remembers the key that signed
-// it: once the history declares that key compromised the sweep is void,
-// whether the sweep or the compromise arrived first (Codex review,
-// 2026-11-07). A sweep of the live key stands.
-func TestSweepsOfACompromisedKeyAreVoid(t *testing.T) {
-	k0Pub, k0, _ := ed25519.GenerateKey(rand.Reader)
-	k1Pub, k1, _ := ed25519.GenerateKey(rand.Reader)
-	k2Pub, _, _ := ed25519.GenerateKey(rand.Reader)
-	circleDID := did.ForKey(k0Pub)
-	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	devDID := did.ForKey(devPub)
-	t0 := time.Now().Add(-time.Hour)
-	adm, _ := AdmitFor(k0, devPub, t0, 24*time.Hour)                                        // the DID key admits the device
-	clean, _ := statement.Handover(k0, k1Pub, circleDID, false, t0.Add(time.Second), nil)   // K0 -> K1, clean: the admission stands
-	swept := t0.Add(2 * time.Second)                                                        // K1's member-revoked event
-	comp, _ := statement.Handover(k1, k2Pub, circleDID, true, t0.Add(3*time.Second), clean) // K1 compromised
-	now := t0.Add(4 * time.Second)
-	run := func(order ...string) *Roster {
-		r := NewRoster(statement.NewDIDRoot(circleDID))
-		for _, o := range order {
-			switch o {
-			case "A":
-				r, _, _ = r.Add(adm.Stmt, now)
-			case "H":
-				r, _, _ = r.AddHandover(clean)
-			case "S":
-				r, _ = r.SweepBy(devDID, now, did.ForKey(k1Pub), swept.Unix())
-			case "C":
-				r, _, _ = r.AddHandover(comp)
-			}
-		}
-		return r
-	}
-	r := run("A", "H", "S")
-	if _, ok := r.Live(devDID, now); ok {
-		t.Fatal("swept by the live key, still live")
-	}
-	if _, ok := r.Revoked(devDID, now); !ok {
-		t.Fatal("swept device is not reported revoked")
-	}
-	for _, order := range [][]string{{"A", "H", "S", "C"}, {"A", "H", "C", "S"}, {"C", "S", "A"}, {"S", "A", "H", "C"}} {
-		r := run(order...)
-		if _, ok := r.Live(devDID, now); !ok {
-			t.Fatalf("order %v: the sweep of a compromised key still applies", order)
-		}
-		if _, ok := r.Revoked(devDID, now); ok {
-			t.Fatalf("order %v: reported revoked by a void sweep", order)
-		}
-	}
-	// A local cut (no signer) is the operator's own hand and stands.
-	r = run("A", "H", "C")
-	r, _ = r.Sweep(devDID, now)
-	if _, ok := r.Live(devDID, now); ok {
-		t.Fatal("a local cut was unmade by the key history")
-	}
-}
-
 // Nothing is dropped because another admission currently beats it: a
 // clean rotation turns a later renewal by the retired key into no fact,
 // and the earlier admission it seemed to supersede must still be there,
@@ -813,43 +723,6 @@ func TestEarlierAdmissionSurvivesALaterOneTheHistoryVoids(t *testing.T) {
 		live, ok := r.Live(devDID, now)
 		if !ok || live.Stmt.ID() != a1.Stmt.ID() {
 			t.Fatalf("order %v: the admission the clean rotation keeps is not the entry", order)
-		}
-	}
-}
-
-// Two keys swept the same device; the later sweep does not erase the
-// earlier one, so declaring the later key compromised leaves the device
-// swept by the earlier (Codex review, 2026-11-07).
-func TestEarlierSweepSurvivesALaterSignersCompromise(t *testing.T) {
-	k0Pub, k0, _ := ed25519.GenerateKey(rand.Reader)
-	k1Pub, k1, _ := ed25519.GenerateKey(rand.Reader)
-	k2Pub, _, _ := ed25519.GenerateKey(rand.Reader)
-	circleDID := did.ForKey(k0Pub)
-	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
-	devDID := did.ForKey(devPub)
-	t0 := time.Now().Add(-time.Hour)
-	adm, _ := AdmitFor(k0, devPub, t0, 24*time.Hour)
-	h0, _ := statement.Handover(k0, k1Pub, circleDID, false, t0.Add(10*time.Second), nil)
-	comp, _ := statement.Handover(k1, k2Pub, circleDID, true, t0.Add(30*time.Second), h0)
-	now := t0.Add(40 * time.Second)
-	for _, order := range [][]string{{"A", "H0", "S0", "S1", "C"}, {"A", "H0", "S1", "S0", "C"}, {"C", "S1", "S0", "A"}, {"S0", "S1", "A", "H0", "C"}} {
-		r := NewRoster(statement.NewDIDRoot(circleDID))
-		for _, o := range order {
-			switch o {
-			case "A":
-				r, _, _ = r.Add(adm.Stmt, now)
-			case "H0":
-				r, _, _ = r.AddHandover(h0)
-			case "S0":
-				r, _ = r.SweepBy(devDID, t0.Add(5*time.Second), did.ForKey(k0Pub), t0.Add(5*time.Second).Unix()) // K0, before its handover
-			case "S1":
-				r, _ = r.SweepBy(devDID, t0.Add(20*time.Second), did.ForKey(k1Pub), t0.Add(20*time.Second).Unix())
-			case "C":
-				r, _, _ = r.AddHandover(comp)
-			}
-		}
-		if _, ok := r.Live(devDID, now); ok {
-			t.Fatalf("order %v: live although the uncompromised key's sweep stands", order)
 		}
 	}
 }

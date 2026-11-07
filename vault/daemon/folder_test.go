@@ -37,11 +37,11 @@ func TestFolderReplicaOverMesh(t *testing.T) {
 	a := newMeshNode(t, root, nil, "alex", "a-vault")
 	b := newMeshNode(t, root, a.bundle, "alex", "b-vault")
 	a.admits(t, b, "alex")
-	a.writeConfig(t, root, "a-vault", nil, a.event, b.event)
+	a.writeConfig(t, root, "a-vault", nil, a.cert, b.cert)
 	da := startDaemon(t, a.statePath)
 	addrs := da.Fabric.Host.Addrs()
 	bootstrap := addrs[0].String() + "/p2p/" + da.Fabric.Host.ID().String()
-	b.writeConfig(t, root, "b-vault", []string{bootstrap}, a.event, b.event)
+	b.writeConfig(t, root, "b-vault", []string{bootstrap}, a.cert, b.cert)
 	startDaemon(t, b.statePath)
 	clA, clB := daemon.NewClient(a.statePath), daemon.NewClient(b.statePath)
 

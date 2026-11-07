@@ -62,15 +62,15 @@ func TestRemoteQueueRoundTrip(t *testing.T) {
 		t.Fatal("non-admin listed the queue")
 	}
 
-	// …approve delivers the cert and ingests the event.
-	if err := RemoteApprove(ctx, master, queueHost.ID(), fp, []byte("signed-cert"), []byte("added-event")); err != nil {
+	// …approve delivers the cert and records it as the admission.
+	if err := RemoteApprove(ctx, master, queueHost.ID(), fp, []byte("signed-cert")); err != nil {
 		t.Fatalf("RemoteApprove: %v", err)
 	}
 	status, certBytes := q.Submit(JoinRequest{DevicePub: devPub, Name: "cloudbox"})
 	if status != StatusApproved || string(certBytes) != "signed-cert" {
 		t.Fatalf("joiner poll after approve: %s %q", status, certBytes)
 	}
-	if len(ingested) != 1 || string(ingested[0]) != "added-event" {
+	if len(ingested) != 1 || string(ingested[0]) != "signed-cert" {
 		t.Fatalf("ingested = %q", ingested)
 	}
 
