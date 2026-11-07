@@ -17,6 +17,7 @@ import (
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/did"
+	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/statement"
 )
 
@@ -131,7 +132,19 @@ func (s *state) replace(i int, nr *circle.Roster, persist bool) error {
 	}
 	if persist || nr.Learned() {
 		if err := nr.Save(); err != nil {
-			return fmt.Errorf("roster: not recorded, %s not written: %w", nr.Path(), err)
+			err = fmt.Errorf("roster: not recorded, %s not written: %w", nr.Path(), err)
+			if !nr.Learned() {
+				return err
+			}
+			// The key history is shared by everyone judging the circle
+			// here and has grown already; the slots must follow it, or the
+			// devices a compromise retired stay admitted while a retry
+			// reports the handover already learned (Codex review,
+			// 2026-11-07). Adopted in memory, reported; the history is
+			// written with the next save that succeeds.
+			s.rosters[i] = nr
+			s.dirty = true
+			return err
 		}
 	}
 	s.rosters[i] = nr
@@ -379,7 +392,36 @@ func (t *PeerTable) AddHandover(circleDID string, st *statement.Statement) (grew
 	return grew, err
 }
 
-// SweepIn kills a device's admissions issued up to at in one circle.
+// SweepEvent applies a member-revoked event: the device's admissions
+// issued up to now in the event's circle are dead for as long as the key
+// history honours the event's signer at the event's time
+// (circle.Roster.SweepBy); an event no honoured key signed is refused.
+func (t *PeerTable) SweepEvent(e *event.Event, now time.Time) error {
+	if e == nil || e.Payload.Kind != event.KindRevoked {
+		return errors.New("roster: not a member-revoked event")
+	}
+	devKey, err := e.DeviceKey()
+	if err != nil {
+		return err
+	}
+	signer, err := event.Signer(e, tableRoots{t})
+	if err != nil {
+		return err
+	}
+	deviceDID := cert.DIDForKey(devKey)
+	return t.apply(func(s *state) error {
+		i := s.index(e.Payload.Ns)
+		if i < 0 {
+			return fmt.Errorf("roster: circle %s is not honoured here", shortDID(e.Payload.Ns))
+		}
+		nr, _ := s.rosters[i].SweepBy(deviceDID, now, signer, e.Payload.At)
+		return s.replace(i, nr, false)
+	})
+}
+
+// SweepIn kills a device's admissions issued up to at in one circle: the
+// local cut, which no key history unmakes. A member-revoked event goes
+// through SweepEvent.
 func (t *PeerTable) SweepIn(circleDID, deviceDID string, at time.Time) {
 	_ = t.apply(func(s *state) error {
 		if i := s.index(circleDID); i >= 0 {

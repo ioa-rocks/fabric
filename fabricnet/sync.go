@@ -517,7 +517,20 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 		// must reach the roster on its own.
 		for _, raw := range set.Handovers {
 			st, err := statement.Decode(raw)
-			if err != nil || len(st.Handovers()) <= len(roster.Roots().Handovers(set.DID)) {
+			if err != nil || st.Payload.Typ != statement.TypeHandover {
+				continue
+			}
+			// Verified before it is pushed: a handover that does not
+			// extend the history here — unsigned by the circle's key,
+			// conflicting, or old news — is dropped on the spot, never
+			// relayed (an invalid one would otherwise circle a mesh for
+			// good, since no node records it; Codex review, 2026-11-07).
+			grew, err := roster.Roots().Extends(st)
+			if err != nil {
+				log.Printf("sync: key handover from %s for circle %s refused: %v", from, shortDID(set.DID), err)
+				continue
+			}
+			if !grew {
 				continue
 			}
 			// Pushed before it applies here: a compromise retires the

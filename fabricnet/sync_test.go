@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,15 +39,8 @@ func newSyncNode(t *testing.T, nsPub ed25519.PublicKey, nsPriv ed25519.PrivateKe
 	n := &syncNode{node: newNode(t, nsPub, nsPriv, name, true, 5*time.Second)}
 	n.log = event.NewLog(statement.NewDIDRoot(cert.DIDForKey(nsPub)))
 	n.sync = NewEventSync(n.host, n.log, n.store, func(e *event.Event) {
-		if e.Payload.Kind != event.KindRevoked {
-			return
-		}
-		devKey, err := e.DeviceKey()
-		if err != nil {
-			return
-		}
-		if p, err := PeerIDForKey(devKey); err == nil {
-			n.auth.Revoke(p)
+		if e.Payload.Kind == event.KindRevoked {
+			_ = n.auth.RevokeByEvent(e)
 		}
 	})
 	n.auth.SetOnAuthenticated(n.sync.ExchangeAsync)
@@ -494,5 +488,79 @@ func TestOtherCircleDeviceIsAMemberThroughItAlone(t *testing.T) {
 	// other members' records only.)
 	if !a.sync.sharesCircle(m.host.ID(), m.host.ID()) {
 		t.Fatal("sharesCircle: a member shares with itself")
+	}
+}
+
+// A handover is verified before it is relayed: one that does not extend
+// the circle's history here — signed by a stranger, say — is dropped on
+// the spot, since a relayed-then-refused handover would circle a mesh for
+// good (no node records it; Codex review, 2026-11-07). A valid one is
+// pushed on before it applies.
+func TestInvalidHandoverIsNotRelayed(t *testing.T) {
+	nsPub, nsPriv, _ := ed25519.GenerateKey(rand.Reader)
+	mainDID := cert.DIDForKey(nsPub)
+	a := newSyncNode(t, nsPub, nsPriv, "a")
+	b := newSyncNode(t, nsPub, nsPriv, "b")
+	c := newSyncNode(t, nsPub, nsPriv, "c")
+	hydrate(a, b, c)
+	// c records what b pushes at it instead of applying it.
+	var relayed atomic.Int32
+	c.host.SetStreamHandler(SyncProtocolV2ID, func(s network.Stream) {
+		defer s.Close()
+		pl, err := readSyncV2(s)
+		if err != nil {
+			return
+		}
+		for _, set := range pl.Circles {
+			// A pushed delta carries the handover alone; a periodic full
+			// exchange carries admissions too and is not what is counted.
+			if len(set.Admissions) == 0 {
+				relayed.Add(int32(len(set.Handovers)))
+			}
+		}
+		_ = writeSyncV2(s, syncPayloadV2{})
+	})
+	connect(t, b.node, c.node)
+	connect(t, a.node, b.node)
+	send := func(h *statement.Statement) {
+		t.Helper()
+		raw, _ := h.Bytes()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s, err := a.host.NewStream(ctx, b.host.ID(), SyncProtocolV2ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		_ = s.SetDeadline(time.Now().Add(5 * time.Second))
+		if err := writeSyncV2(s, syncPayloadV2{Circles: []circleSet{{DID: mainDID, Roots: []string{mainDID}, Handovers: [][]byte{raw}}}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readSyncV2(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	k2Pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	_, stranger, _ := ed25519.GenerateKey(rand.Reader)
+	bogus, _ := statement.Handover(stranger, k2Pub, mainDID, false, time.Now(), nil)
+	send(bogus)
+	send(bogus)
+	time.Sleep(300 * time.Millisecond)
+	if n := relayed.Load(); n != 0 {
+		t.Fatalf("b relayed %d handovers no key of the circle signed", n)
+	}
+	if r, _ := b.store.RosterFor(mainDID); r.Roots().CurrentDID() != mainDID {
+		t.Fatal("b learned a handover signed by a stranger")
+	}
+	real, _ := statement.Handover(nsPriv, k2Pub, mainDID, false, time.Now(), nil)
+	send(real)
+	waitFor(t, "the valid handover to reach c", func() bool { return relayed.Load() == 1 })
+	if r, _ := b.store.RosterFor(mainDID); r.Roots().CurrentDID() != cert.DIDForKey(k2Pub) {
+		t.Fatal("b did not learn the valid handover")
+	}
+	send(real) // old news: not relayed again
+	time.Sleep(300 * time.Millisecond)
+	if n := relayed.Load(); n != 1 {
+		t.Fatalf("b relayed a known handover again (%d)", n)
 	}
 }

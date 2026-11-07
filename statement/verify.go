@@ -604,6 +604,57 @@ func historyAllows(roots Roots, sub string, hs []*Statement, st *Statement) erro
 	return nil
 }
 
+// SigningKeys is the set of keys that may sign for circle sub at the
+// instant at, under the key history roots knows: the current key, and a
+// retired key for what it signed no later than its handover — never a key
+// the handover declared compromised. The rule historyAllows applies to a
+// statement, for records that carry no proof of their own (the
+// membership-event log; the roster's sweeps, which remember their
+// signer).
+func SigningKeys(roots Roots, sub string, at int64) []ed25519.PublicKey {
+	anchor := roots.RootKeys(sub)
+	h, ok := roots.(RootHistory)
+	if !ok {
+		return anchor
+	}
+	hs := h.Handovers(sub)
+	if len(hs) == 0 {
+		return anchor
+	}
+	var out []ed25519.PublicKey
+	epochKeys := [][]ed25519.PublicKey{anchor}
+	for _, ho := range hs {
+		if k, err := did.KeyFor(ho.Payload.Aud); err == nil {
+			epochKeys = append(epochKeys, []ed25519.PublicKey{k})
+		}
+	}
+	for i, ks := range epochKeys {
+		if i < len(hs) {
+			retiring := hs[i]
+			if retiring.Payload.Compromised || at > retiring.Payload.Iat {
+				continue
+			}
+		}
+		out = append(out, ks...)
+	}
+	return out
+}
+
+// KeyHonouredAt reports whether the key keyDID (a did:key) is one of
+// SigningKeys for circle sub at the instant at.
+func KeyHonouredAt(roots Roots, sub, keyDID string, at int64) bool {
+	k, err := did.KeyFor(keyDID)
+	if err != nil {
+		return false
+	}
+	for _, c := range SigningKeys(roots, sub, at) {
+		if c.Equal(k) {
+			return true
+		}
+	}
+	return false
+}
+
 // honourRoot is the whole root check for a root-issued statement st of
 // circle sub: its lineage's handovers hs run from anchorKeys to its
 // signer, and the node's history allows it. sigs re-verifies the

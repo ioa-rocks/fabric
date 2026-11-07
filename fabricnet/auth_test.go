@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/statement"
 
 	"github.com/libp2p/go-libp2p"
@@ -431,5 +432,69 @@ func TestOwnScopeSpansCircles(t *testing.T) {
 	b.auth.SetOwnAllows(func(family string) bool { return true })
 	if got, err := echoOn(a, b.host.ID(), vaultEchoProtocol, "x"); err != nil || got != "x" {
 		t.Fatalf("vault echo with a full admission in another circle: %v %q", err, got)
+	}
+}
+
+// The handshake carries the circle's key history both ways, and a
+// responder that refuses a stale admission answers with the history alone:
+// a device that missed a rotation while offline learns it on its first
+// handshake, which the gossip — members only — could never tell it (Codex
+// review, 2026-11-07).
+func TestReturningDeviceLearnsTheRotationOnTheHandshake(t *testing.T) {
+	k0Pub, k0, _ := ed25519.GenerateKey(rand.Reader)
+	mainDID := cert.DIDForKey(k0Pub)
+	gate := newNode(t, k0Pub, k0, "gate", true, time.Second)
+	laptop := newNode(t, k0Pub, k0, "laptop", true, time.Second)
+	tablet := newNode(t, k0Pub, k0, "tablet", true, time.Second)
+	// Issue times are whole seconds: the laptop's cert must predate the
+	// handover for a clean rotation to keep it.
+	time.Sleep(1100 * time.Millisecond)
+	k1Pub, k1, _ := ed25519.GenerateKey(rand.Reader)
+	clean, _ := statement.Handover(k0, k1Pub, mainDID, false, time.Now(), nil)
+	if _, err := gate.store.AddHandover(mainDID, clean); err != nil {
+		t.Fatal(err)
+	}
+	// The laptop knows nothing of the rotation; its cert stands and the
+	// gate's hello teaches it the history.
+	connect(t, laptop, gate)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := laptop.auth.Authenticate(ctx, gate.host.ID()); err != nil {
+		t.Fatalf("a cert the clean rotation keeps was refused: %v", err)
+	}
+	if r, _ := laptop.store.RosterFor(mainDID); r.Roots().CurrentDID() != cert.DIDForKey(k1Pub) {
+		t.Fatal("the laptop did not learn the clean handover from the gate's hello")
+	}
+
+	// The tablet was admitted by the new key — and that key leaks while the
+	// tablet is offline. On its return the gate refuses its cert, and tells
+	// it why: the tablet learns both handovers from the refusal.
+	tabletPub, _ := tablet.host.Peerstore().PubKey(tablet.host.ID()).Raw()
+	adm, err := circle.Issue(k1, clean, mainDID, ed25519.PublicKey(tabletPub), time.Now(), time.Hour, circle.Terms{Verbs: circle.DeviceVerbs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	own, _ := cert.FromStatement(adm.Stmt)
+	tablet.auth.SetOwn(own)
+	time.Sleep(1100 * time.Millisecond)
+	k2Pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	comp, _ := statement.Handover(k1, k2Pub, mainDID, true, time.Now(), clean)
+	if _, err := gate.store.AddHandover(mainDID, comp); err != nil {
+		t.Fatal(err)
+	}
+	connect(t, tablet, gate)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	if err := tablet.auth.Authenticate(ctx2, gate.host.ID()); err == nil {
+		t.Fatal("a cert the compromised key signed authenticated")
+	}
+	if gate.store.IsMember(tablet.host.ID(), time.Now()) {
+		t.Fatal("the gate counts the tablet a member")
+	}
+	if r, _ := tablet.store.RosterFor(mainDID); r.Roots().CurrentDID() != cert.DIDForKey(k2Pub) {
+		t.Fatal("the refused tablet did not learn the compromise from the gate")
+	}
+	if tablet.store.IsMember(tablet.host.ID(), time.Now()) {
+		t.Fatal("the tablet still counts itself a member")
 	}
 }

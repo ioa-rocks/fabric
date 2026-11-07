@@ -116,31 +116,62 @@ func (r *DIDRoot) RootProof() *Statement {
 // other is refused, loudly.
 var ErrConflictingHandover = errors.New("conflicting key handover: the same key already handed over to a different key")
 
+// Extends is Learn without learning: whether h — with the lineage it
+// carries — verifies and would grow the history known here, or why not. A
+// relay asks this before it forwards a handover (fabricnet: a handover is
+// pushed before it applies, so the push must not be the check — Codex
+// review, 2026-11-07).
+func (r *DIDRoot) Extends(h *Statement) (bool, error) {
+	lineage, err := r.lineage(h)
+	if err != nil {
+		return false, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.extends(lineage)
+}
+
 // Learn adds a handover — with the lineage it carries — to the history:
 // every handover must be signed by the key it retires, chain from the DID
 // key, and extend what is known; a lineage that is a prefix of the known
 // history is nothing new. Reports whether the history grew.
 func (r *DIDRoot) Learn(h *Statement) (bool, error) {
-	if h == nil || h.Payload.Typ != TypeHandover {
-		return false, errors.New("not a handover")
-	}
-	if !r.Honours(h.Payload.Sub) {
-		return false, fmt.Errorf("handover is for circle %s, not %s", short(h.Payload.Sub), short(r.did))
-	}
-	lineage := h.Handovers() // ends with h
-	if _, err := walkHandovers(lineage, r.RootKeys(r.did), r.did, true); err != nil {
+	lineage, err := r.lineage(h)
+	if err != nil {
 		return false, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	grew, err := r.extends(lineage)
+	if err != nil || !grew {
+		return false, err
+	}
+	r.handovers = append(r.handovers, lineage[len(r.handovers):]...)
+	return true, nil
+}
+
+// lineage is h's verified handover chain from the DID key, ending with h.
+func (r *DIDRoot) lineage(h *Statement) ([]*Statement, error) {
+	if h == nil || h.Payload.Typ != TypeHandover {
+		return nil, errors.New("not a handover")
+	}
+	if !r.Honours(h.Payload.Sub) {
+		return nil, fmt.Errorf("handover is for circle %s, not %s", short(h.Payload.Sub), short(r.did))
+	}
+	lineage := h.Handovers() // ends with h
+	if _, err := walkHandovers(lineage, r.RootKeys(r.did), r.did, true); err != nil {
+		return nil, err
+	}
+	return lineage, nil
+}
+
+// extends compares a verified lineage with the known history; the caller
+// holds the lock.
+func (r *DIDRoot) extends(lineage []*Statement) (bool, error) {
 	for i := 0; i < len(r.handovers) && i < len(lineage); i++ {
 		if r.handovers[i].ID() != lineage[i].ID() {
 			return false, ErrConflictingHandover
 		}
 	}
-	if len(lineage) <= len(r.handovers) {
-		return false, nil
-	}
-	r.handovers = append(r.handovers, lineage[len(r.handovers):]...)
-	return true, nil
+	return len(lineage) > len(r.handovers), nil
 }

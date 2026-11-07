@@ -976,3 +976,37 @@ func (m multiRoots) Handovers(circleDID string) []*Statement {
 	}
 	return nil
 }
+
+// Extends answers what Learn would do without doing it: a relay checks a
+// handover before it forwards one (Codex review, 2026-11-07).
+func TestExtendsDoesNotLearn(t *testing.T) {
+	h := newHome(t)
+	k2 := newKey(t)
+	hand, err := Handover(h.root.priv, k2.pub, h.did, false, t0.Add(time.Hour), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := NewDIDRoot(h.did)
+	if grew, err := roots.Extends(hand); err != nil || !grew {
+		t.Fatalf("Extends(new handover) = %v, %v; want true", grew, err)
+	}
+	if len(roots.Handovers(h.did)) != 0 {
+		t.Fatal("Extends learned the handover")
+	}
+	// Signed by a key that is not the circle's: refused, and never relayed.
+	bogus, _ := Handover(newKey(t).priv, k2.pub, h.did, false, t0.Add(time.Hour), nil)
+	if _, err := roots.Extends(bogus); err == nil {
+		t.Fatal("a handover signed by a stranger extends the history")
+	}
+	if grew, err := roots.Learn(hand); err != nil || !grew {
+		t.Fatalf("Learn after Extends: %v, %v", grew, err)
+	}
+	if grew, err := roots.Extends(hand); err != nil || grew {
+		t.Fatalf("Extends(known handover) = %v, %v; want false", grew, err)
+	}
+	// A second handover by the same key: a conflict, not an extension.
+	other, _ := Handover(h.root.priv, newKey(t).pub, h.did, false, t0.Add(2*time.Hour), nil)
+	if _, err := roots.Extends(other); !errors.Is(err, ErrConflictingHandover) {
+		t.Fatalf("Extends(conflicting) = %v; want ErrConflictingHandover", err)
+	}
+}

@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
 
 	"ioa.rocks/fabric/cert"
+	"ioa.rocks/fabric/event"
 	"ioa.rocks/fabric/internal/wire"
 	"ioa.rocks/fabric/statement"
 
@@ -41,12 +44,16 @@ const ProtocolV2ID = "/fabric/auth/2"
 const maxHelloWireSize = 64 * 1024
 
 // Hello is one direction of a v2 handshake: the admissions the sender shows
-// for the circles it believes it shares with the peer, and the live
+// for the circles it believes it shares with the peer, the live
 // revocations of those circles (so a freshly signed revocation reaches a
-// device the moment it reconnects).
+// device the moment it reconnects), and their key histories (so a device
+// that missed a rotation learns it on its first handshake — a responder
+// that refuses a stale admission answers with the history alone, since
+// the gossip reaches members only; Codex review, 2026-11-07).
 type Hello struct {
 	Admissions  [][]byte `cbor:"a"`
 	Revocations [][]byte `cbor:"r,omitempty"`
+	Handovers   [][]byte `cbor:"h,omitempty"`
 }
 
 // Presenter chooses what this node shows a peer. verified is nil on the
@@ -59,6 +66,13 @@ type Presenter func(p peer.ID, verified []string) Hello
 // RevocationSink ingests the revocations a peer sent in its hello, before
 // its admissions are judged (one of them may name the very device talking).
 type RevocationSink func(p peer.ID, revocations [][]byte) error
+
+// HandoverSink ingests the key handovers a peer sent in its hello, each
+// one decoded, verified and new to the circle's roster here, before its
+// admissions are judged. The daemon's sink pushes a handover to the
+// members before it applies (CircleService.Handover); without one the
+// service applies it to the peer table itself.
+type HandoverSink func(p peer.ID, handovers [][]byte)
 
 // JoinObserver is notified when a never-before-seen member authenticates —
 // the hard-coded admission-transparency backstop of spec §5: even if the
@@ -81,13 +95,14 @@ type AuthService struct {
 	onAuth    func(peer.ID)
 	stopWatch func()
 
-	mu        sync.RWMutex
-	own       *cert.Cert           // presented in handshakes; swapped on renewal (SetOwn)
-	kept      map[peer.ID]struct{} // non-members kept past the grace: they presented a verified chain
-	shook     map[peer.ID]Handshake
-	presenter Presenter
-	sink      RevocationSink
-	ownAllows func(family string) bool // any own admission admits the family; nil = the own cert alone
+	mu           sync.RWMutex
+	own          *cert.Cert           // presented in handshakes; swapped on renewal (SetOwn)
+	kept         map[peer.ID]struct{} // non-members kept past the grace: they presented a verified chain
+	shook        map[peer.ID]Handshake
+	presenter    Presenter
+	sink         RevocationSink
+	handoverSink HandoverSink
+	ownAllows    func(family string) bool // any own admission admits the family; nil = the own cert alone
 }
 
 // NewAuthService wires the handshake handlers and the grace-period watchdog
@@ -170,6 +185,13 @@ func (a *AuthService) SetPresenter(f Presenter) {
 func (a *AuthService) SetRevocationSink(f RevocationSink) {
 	a.mu.Lock()
 	a.sink = f
+	a.mu.Unlock()
+}
+
+// SetHandoverSink installs where the handovers of a peer's hello go.
+func (a *AuthService) SetHandoverSink(f HandoverSink) {
+	a.mu.Lock()
+	a.handoverSink = f
 	a.mu.Unlock()
 }
 
@@ -289,7 +311,8 @@ func (a *AuthService) Authenticate(ctx context.Context, p peer.ID) error {
 		return err
 	}
 	_, known := a.store.Cert(p)
-	verified, first, err := a.verifyHello(p, theirs)
+	a.learnHandovers(p, theirs.Handovers)
+	verified, first, _, err := a.verifyHello(p, theirs)
 	if err != nil {
 		s.Reset()
 		return fmt.Errorf("peer %s: %w", p, err)
@@ -310,8 +333,19 @@ func (a *AuthService) handleInboundV2(s network.Stream) {
 		return
 	}
 	_, known := a.store.Cert(p)
-	verified, first, err := a.verifyHello(p, theirs)
+	a.learnHandovers(p, theirs.Handovers)
+	verified, first, behind, err := a.verifyHello(p, theirs)
 	if err != nil {
+		// A device whose admission a circle held here no longer honours
+		// is told the circle's key history before the door closes: a
+		// device that missed a compromise while offline presents a dead
+		// cert and the gossip would never reach it (Codex review,
+		// 2026-11-07). The history is what every bundle of the circle
+		// carries; the peer showed an admission for that circle.
+		if hs := a.historyFor(behind); len(hs) > 0 {
+			_ = writeHello(s, Hello{Handovers: hs})
+			return
+		}
 		s.Reset()
 		return
 	}
@@ -337,12 +371,12 @@ func (a *AuthService) present(p peer.ID, verified []string) Hello {
 		hello = presenter(p, verified)
 	}
 	if own == nil {
-		return hello
+		return a.withHistory(hello)
 	}
 	ownCircle := own.Payload.Sub
 	for _, raw := range hello.Admissions {
 		if st, err := statement.Decode(raw); err == nil && st.Payload.Sub == ownCircle {
-			return hello
+			return a.withHistory(hello)
 		}
 	}
 	if verified != nil {
@@ -353,15 +387,15 @@ func (a *AuthService) present(p peer.ID, verified []string) Hello {
 			}
 		}
 		if !found {
-			return hello
+			return a.withHistory(hello)
 		}
 	} else if len(hello.Admissions) > 0 {
-		return hello
+		return a.withHistory(hello)
 	}
 	if raw, err := own.Stmt.Bytes(); err == nil {
 		hello.Admissions = append(hello.Admissions, raw)
 	}
-	return hello
+	return a.withHistory(hello)
 }
 
 // verifyHello ingests the peer's revocations, then judges every admission: a
@@ -371,30 +405,109 @@ func (a *AuthService) present(p peer.ID, verified []string) Hello {
 // is skipped too, since an honest device can lag a renewal. At least one
 // must leave the device live in a circle held here. Returns the circles
 // verified and the cert view of the first.
-func (a *AuthService) verifyHello(p peer.ID, hello Hello) ([]string, *cert.Cert, error) {
+// withHistory adds to a hello the key history of every circle its
+// admissions name, so the peer learns a rotation it missed on the
+// handshake itself.
+func (a *AuthService) withHistory(hello Hello) Hello {
+	var circles []string
+	for _, raw := range hello.Admissions {
+		if st, err := statement.Decode(raw); err == nil && !slices.Contains(circles, st.Payload.Sub) {
+			circles = append(circles, st.Payload.Sub)
+		}
+	}
+	hello.Handovers = a.historyFor(circles)
+	return hello
+}
+
+// historyFor is the key handovers, as statement bytes, of the circles
+// named that are held here.
+func (a *AuthService) historyFor(circles []string) [][]byte {
+	var out [][]byte
+	view := a.store.View()
+	for _, did := range circles {
+		r, ok := view.RosterFor(did)
+		if !ok {
+			continue
+		}
+		for _, h := range r.Roots().Handovers(did) {
+			if raw, err := h.Bytes(); err == nil {
+				out = append(out, raw)
+			}
+		}
+	}
+	return out
+}
+
+// learnHandovers takes the key handovers a peer's hello carries: each one
+// that decodes, verifies along its lineage and extends the history of a
+// circle held here goes to the handover sink — or straight into the peer
+// table when there is none. The peer is not yet judged; a handover is
+// signed by the circle's own key and proves itself.
+func (a *AuthService) learnHandovers(p peer.ID, raws [][]byte) {
+	if len(raws) == 0 {
+		return
+	}
+	a.mu.RLock()
+	sink := a.handoverSink
+	a.mu.RUnlock()
+	var fresh [][]byte
+	view := a.store.View()
+	for _, raw := range raws {
+		st, err := statement.Decode(raw)
+		if err != nil || st.Payload.Typ != statement.TypeHandover {
+			continue
+		}
+		r, ok := view.RosterFor(st.Payload.Sub)
+		if !ok {
+			continue
+		}
+		if grew, err := r.Roots().Extends(st); err != nil || !grew {
+			continue
+		}
+		if sink != nil {
+			fresh = append(fresh, raw)
+			continue
+		}
+		if _, err := a.store.AddHandover(st.Payload.Sub, st); err != nil {
+			log.Printf("auth: key handover from %s for circle %s: %v", p, shortDID(st.Payload.Sub), err)
+		}
+	}
+	if sink != nil && len(fresh) > 0 {
+		sink(p, fresh)
+	}
+}
+
+// verifyHello judges a peer's hello: the circles its admissions verify in
+// here, the first verified cert, and `behind` — the circles held here
+// whose admission for the peer was refused, which the responder answers
+// with their key history.
+func (a *AuthService) verifyHello(p peer.ID, hello Hello) (verified []string, first *cert.Cert, behind []string, err error) {
 	a.mu.RLock()
 	sink := a.sink
 	a.mu.RUnlock()
 	if sink != nil && len(hello.Revocations) > 0 {
 		if err := sink(p, hello.Revocations); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 	if len(hello.Admissions) == 0 {
-		return nil, nil, errors.New("peer presented no admission")
+		return nil, nil, nil, errors.New("peer presented no admission")
 	}
-	var (
-		verified []string
-		first    *cert.Cert
-	)
+	var firstErr error
 	for _, raw := range hello.Admissions {
 		st, err := statement.Decode(raw)
 		if err != nil {
-			return nil, nil, fmt.Errorf("presented admission: %w", err)
+			return nil, nil, nil, fmt.Errorf("presented admission: %w", err)
 		}
 		circleDID, held, live, err := a.store.Verify(p, st)
+		if held && !live && !slices.Contains(behind, st.Payload.Sub) {
+			behind = append(behind, st.Payload.Sub)
+		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("presented admission: %w", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("presented admission: %w", err)
+			}
+			continue
 		}
 		if !held || !live {
 			continue
@@ -405,9 +518,12 @@ func (a *AuthService) verifyHello(p peer.ID, hello Hello) ([]string, *cert.Cert,
 		}
 	}
 	if len(verified) == 0 {
-		return nil, nil, errors.New("no presented admission verifies for a circle held here")
+		if firstErr != nil {
+			return nil, nil, behind, firstErr
+		}
+		return nil, nil, behind, errors.New("no presented admission verifies for a circle held here")
 	}
-	return verified, first, nil
+	return verified, first, behind, nil
 }
 
 // noteMember records a handshake the peer table has already admitted:
@@ -431,6 +547,30 @@ func (a *AuthService) Revoke(p peer.ID) {
 	a.store.Revoke(p, time.Now())
 	a.h.ConnManager().Unprotect(p, "fabric-member")
 	_ = a.h.Network().ClosePeer(p)
+}
+
+// RevokeByEvent applies a member-revoked event (PeerTable.SweepEvent) and
+// closes the device's connections when no circle held here still admits
+// it. An event no honoured key signed changes nothing.
+func (a *AuthService) RevokeByEvent(e *event.Event) error {
+	now := time.Now()
+	if err := a.store.SweepEvent(e, now); err != nil {
+		return err
+	}
+	devKey, err := e.DeviceKey()
+	if err != nil {
+		return err
+	}
+	p, err := PeerIDForKey(devKey)
+	if err != nil {
+		return err
+	}
+	if a.store.IsMember(p, now) {
+		return nil
+	}
+	a.h.ConnManager().Unprotect(p, "fabric-member")
+	_ = a.h.Network().ClosePeer(p)
+	return nil
 }
 
 // RevokeIn revokes a peer's membership in one circle; its connections are

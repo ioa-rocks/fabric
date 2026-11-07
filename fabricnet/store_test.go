@@ -751,3 +751,67 @@ func TestTableAdoptsHistoryFromARefusedAdmission(t *testing.T) {
 		t.Fatal("the table's roster did not learn the handover")
 	}
 }
+
+// A handover whose roster cannot be saved is adopted in memory all the
+// same: the key history is shared and has grown already, so the slots must
+// follow, or the devices a compromise retired stay admitted while a retry
+// finds the handover already learned (Codex review, 2026-11-07).
+func TestHandoverIsAdoptedWhenTheSaveFails(t *testing.T) {
+	c, _ := circle.Init(t.TempDir(), "p", "pw")
+	k1, _ := c.Unlock("pw")
+	c.Path = filepath.Join(t.TempDir(), "missing", "p") // devices.cbor's directory does not exist yet
+	table := NewPeerTable()
+	defer table.Close()
+	r, _ := circle.NewRoster(statement.NewDIDRoot(c.Config.DID)).WithPath(circle.DevicesPath(c), time.Now())
+	table.AddRoster(r)
+	// Make the roster save once so the table has a devices.cbor to fail on.
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	p, _ := PeerOfDID(cert.DIDForKey(devPub))
+	if err := os.MkdirAll(c.Path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := circle.Admit(k1, devPub, time.Now().Add(-time.Minute))
+	if _, err := table.AddAdmission(a.Stmt, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if !table.IsMember(p, time.Now()) {
+		t.Fatal("admitted device is not a member")
+	}
+	if err := os.RemoveAll(c.Path); err != nil {
+		t.Fatal(err)
+	}
+	k2Pub, k2, _ := ed25519.GenerateKey(rand.Reader)
+	comp, _ := statement.Handover(k1, k2Pub, c.Config.DID, true, time.Now(), nil)
+	grew, err := table.AddHandover(c.Config.DID, comp)
+	if err == nil {
+		t.Fatal("AddHandover reported success although nothing could be written")
+	}
+	if !grew {
+		t.Fatal("the history did not grow")
+	}
+	if table.IsMember(p, time.Now()) {
+		t.Fatal("a device the compromised key admitted is still a member after a failed save")
+	}
+	if _, err := table.AddAdmission(a.Stmt, time.Now()); err == nil {
+		t.Fatal("the retired key's admission was accepted after the compromise")
+	}
+	// The disk comes back: the handover is old news, and the next save
+	// that succeeds writes the history with it.
+	if err := os.MkdirAll(c.Path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if grew, err := table.AddHandover(c.Config.DID, comp); err != nil || grew {
+		t.Fatalf("retry: grew=%v err=%v; want already learned, no error", grew, err)
+	}
+	if hs, err := c.Handovers(); err != nil || len(hs) != 0 {
+		t.Fatalf("handovers.cbor before any successful save: %d, %v", len(hs), err)
+	}
+	other, _, _ := ed25519.GenerateKey(rand.Reader)
+	fresh, _ := circle.Issue(k2, comp, c.Config.DID, other, time.Now().Add(-time.Second), time.Hour, circle.Terms{Verbs: circle.DeviceVerbs})
+	if _, err := table.AddAdmission(fresh.Stmt, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if hs, err := c.Handovers(); err != nil || len(hs) != 1 {
+		t.Fatalf("handovers.cbor after the disk came back: %d, %v; want 1", len(hs), err)
+	}
+}

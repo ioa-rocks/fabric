@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"ioa.rocks/fabric/cert"
-	"ioa.rocks/fabric/did"
 	"ioa.rocks/fabric/statement"
 
 	"github.com/fxamacker/cbor/v2"
@@ -86,37 +85,26 @@ func NewRevokedIn(rootPriv ed25519.PrivateKey, circleDID string, devicePub ed255
 	return sign(rootPriv, circleDID, Payload{Kind: KindRevoked, Device: devicePub, At: at.Unix()})
 }
 
-// signingKeys is the set of keys an event of circle ns signed at `at` may
-// carry: the circle's keys through its history, under the statement rule
-// — a retired key only for an event no later than its handover, never a
-// key the handover declared compromised (Codex review, 2026-11-06: the
-// legacy log has no proof to carry, so the history is applied here).
-func signingKeys(roots statement.Roots, ns string, anchor []ed25519.PublicKey, at int64) []ed25519.PublicKey {
-	h, ok := roots.(statement.RootHistory)
-	if !ok {
-		return anchor
+// Signer is the did:key of the circle key that signed the event, judged
+// under roots' key history at the event's own time (statement.SigningKeys:
+// a retired key only for an event no later than its handover, never a
+// key the handover declared compromised — Codex review, 2026-11-06: the
+// legacy log has no proof to carry, so the history is applied here). An
+// error means no honoured key signed it.
+func Signer(e *Event, roots statement.Roots) (string, error) {
+	if len(roots.RootKeys(e.Payload.Ns)) == 0 {
+		return "", fmt.Errorf("event is signed by %s, a root this node does not honour", e.Payload.Ns)
 	}
-	hs := h.Handovers(ns)
-	if len(hs) == 0 {
-		return anchor
+	msg, err := encMode.Marshal(e.Payload)
+	if err != nil {
+		return "", fmt.Errorf("encoding event payload: %w", err)
 	}
-	var out []ed25519.PublicKey
-	epochKeys := [][]ed25519.PublicKey{anchor}
-	for _, ho := range hs {
-		if k, err := did.KeyFor(ho.Payload.Aud); err == nil {
-			epochKeys = append(epochKeys, []ed25519.PublicKey{k})
+	for _, k := range statement.SigningKeys(roots, e.Payload.Ns, e.Payload.At) {
+		if ed25519.Verify(k, msg, e.Sig) {
+			return cert.DIDForKey(k), nil
 		}
 	}
-	for i, ks := range epochKeys {
-		if i < len(hs) {
-			retiring := hs[i]
-			if retiring.Payload.Compromised || at > retiring.Payload.Iat {
-				continue
-			}
-		}
-		out = append(out, ks...)
-	}
-	return out
+	return "", errors.New("event signature verification failed")
 }
 
 func sign(rootPriv ed25519.PrivateKey, circleDID string, p Payload) (*Event, error) {
@@ -134,24 +122,8 @@ func sign(rootPriv ed25519.PrivateKey, circleDID string, p Payload) (*Event, err
 // membership proof. An added event whose cert has already expired fails
 // verification — it is stale, not dangerous, and callers simply drop it.
 func Verify(e *Event, roots statement.Roots, now time.Time) error {
-	keys := roots.RootKeys(e.Payload.Ns)
-	if len(keys) == 0 {
-		return fmt.Errorf("event is signed by %s, a root this node does not honour", e.Payload.Ns)
-	}
-	keys = signingKeys(roots, e.Payload.Ns, keys, e.Payload.At)
-	msg, err := encMode.Marshal(e.Payload)
-	if err != nil {
-		return fmt.Errorf("encoding event payload: %w", err)
-	}
-	signed := false
-	for _, k := range keys {
-		if ed25519.Verify(k, msg, e.Sig) {
-			signed = true
-			break
-		}
-	}
-	if !signed {
-		return errors.New("event signature verification failed")
+	if _, err := Signer(e, roots); err != nil {
+		return err
 	}
 	switch e.Payload.Kind {
 	case KindAdded:

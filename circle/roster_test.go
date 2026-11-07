@@ -718,3 +718,60 @@ func TestAcksRefusesToOverflow(t *testing.T) {
 		t.Fatalf("Acks over %d removals = %d, %v; want an error", statement.MaxAcks+1, len(acks), err)
 	}
 }
+
+// A legacy sweep (a member-revoked event) remembers the key that signed
+// it: once the history declares that key compromised the sweep is void,
+// whether the sweep or the compromise arrived first (Codex review,
+// 2026-11-07). A sweep of the live key stands.
+func TestSweepsOfACompromisedKeyAreVoid(t *testing.T) {
+	k0Pub, k0, _ := ed25519.GenerateKey(rand.Reader)
+	k1Pub, k1, _ := ed25519.GenerateKey(rand.Reader)
+	k2Pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	circleDID := did.ForKey(k0Pub)
+	devPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	devDID := did.ForKey(devPub)
+	t0 := time.Now().Add(-time.Hour)
+	adm, _ := AdmitFor(k0, devPub, t0, 24*time.Hour)                                        // the DID key admits the device
+	clean, _ := statement.Handover(k0, k1Pub, circleDID, false, t0.Add(time.Second), nil)   // K0 -> K1, clean: the admission stands
+	swept := t0.Add(2 * time.Second)                                                        // K1's member-revoked event
+	comp, _ := statement.Handover(k1, k2Pub, circleDID, true, t0.Add(3*time.Second), clean) // K1 compromised
+	now := t0.Add(4 * time.Second)
+	run := func(order ...string) *Roster {
+		r := NewRoster(statement.NewDIDRoot(circleDID))
+		for _, o := range order {
+			switch o {
+			case "A":
+				r, _, _ = r.Add(adm.Stmt, now)
+			case "H":
+				r, _, _ = r.AddHandover(clean)
+			case "S":
+				r, _ = r.SweepBy(devDID, now, did.ForKey(k1Pub), swept.Unix())
+			case "C":
+				r, _, _ = r.AddHandover(comp)
+			}
+		}
+		return r
+	}
+	r := run("A", "H", "S")
+	if _, ok := r.Live(devDID, now); ok {
+		t.Fatal("swept by the live key, still live")
+	}
+	if _, ok := r.Revoked(devDID, now); !ok {
+		t.Fatal("swept device is not reported revoked")
+	}
+	for _, order := range [][]string{{"A", "H", "S", "C"}, {"A", "H", "C", "S"}, {"C", "S", "A"}, {"S", "A", "H", "C"}} {
+		r := run(order...)
+		if _, ok := r.Live(devDID, now); !ok {
+			t.Fatalf("order %v: the sweep of a compromised key still applies", order)
+		}
+		if _, ok := r.Revoked(devDID, now); ok {
+			t.Fatalf("order %v: reported revoked by a void sweep", order)
+		}
+	}
+	// A local cut (no signer) is the operator's own hand and stands.
+	r = run("A", "H", "C")
+	r, _ = r.Sweep(devDID, now)
+	if _, ok := r.Live(devDID, now); ok {
+		t.Fatal("a local cut was unmade by the key history")
+	}
+}

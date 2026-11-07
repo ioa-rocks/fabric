@@ -894,7 +894,11 @@ func (d *Daemon) hydrateStore() {
 				}
 			}
 		case event.KindRevoked:
-			d.Store.RevokeIn(e.Payload.Ns, p, now)
+			// The sweep remembers the event's signer: a key the history
+			// later declares compromised takes its sweeps with it.
+			if err := d.Store.SweepEvent(e, now); err != nil {
+				log.Printf("roster: member-revoked event for %s not applied: %v", p, err)
+			}
 		}
 	}
 }
@@ -941,7 +945,10 @@ func (d *Daemon) applyEvent(e *event.Event) {
 		if c, ok := d.Store.Cert(p); ok {
 			name = c.Payload.Meta.Name
 		}
-		d.Auth.RevokeIn(e.Payload.Ns, p)
+		if err := d.Auth.RevokeByEvent(e); err != nil {
+			log.Printf("roster: member-revoked event for %s not applied: %v", p, err)
+			break
+		}
 		if p == d.Host.ID() {
 			log.Printf("THIS DEVICE'S MEMBERSHIP WAS REVOKED — the mesh will refuse it from now on")
 		} else {

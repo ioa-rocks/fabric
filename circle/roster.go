@@ -45,11 +45,25 @@ type Roster struct {
 
 	slots  map[string]*slot // by device DID; never mutated in place
 	revs   *statement.RevocationSet
-	sweeps map[string]int64 // device DID -> cut-off (unix s): admissions issued up to it are dead
+	sweeps map[string]sweepMark // device DID -> the sweep that cuts it (see sweptAt)
 	// learned marks a roster whose roots' key history grew when it was
 	// made (a handover learned from a statement or the gossip): the owner
 	// saves such a roster even when nothing else about it persists.
 	learned bool
+}
+
+// sweepMark is one legacy sweep (a member-revoked event of the first
+// circle's log, or the CLI's local cut): admissions of the device issued
+// up to cut are dead. signer is the did:key of the circle key that signed
+// the event and signedAt the event's time, so the sweep applies only while
+// the key history honours that key at that instant (sweptAt): what a key
+// later declared compromised swept comes back, whether the sweep or the
+// compromise arrived first (Codex review, 2026-11-07). A local cut has no
+// signer and always applies.
+type sweepMark struct {
+	cut      int64
+	signer   string
+	signedAt int64
 }
 
 // slot is one device's admissions. held is the antichain of the eligible
@@ -172,7 +186,7 @@ func NewRoster(roots *statement.DIDRoot) *Roster {
 		roots:  roots,
 		slots:  map[string]*slot{},
 		revs:   statement.NewRevocationSet(),
-		sweeps: map[string]int64{},
+		sweeps: map[string]sweepMark{},
 	}
 }
 
@@ -281,7 +295,7 @@ func (r *Roster) Revocations() *statement.RevocationSet { return r.revs }
 func (r *Roster) clone() *Roster {
 	nr := &Roster{roots: r.roots, path: r.path, revs: r.revs,
 		slots:  make(map[string]*slot, len(r.slots)),
-		sweeps: make(map[string]int64, len(r.sweeps))}
+		sweeps: make(map[string]sweepMark, len(r.sweeps))}
 	for k, v := range r.slots {
 		nr.slots[k] = v
 	}
@@ -656,7 +670,7 @@ func (r *Roster) verdict(dev *Device) error {
 	}
 	for _, links := range [][]statement.Link{dev.Chain.Auth, dev.Chain.Ident} {
 		for _, l := range links {
-			if at, ok := r.sweeps[l.Aud]; ok && l.Iat <= at {
+			if at, ok := r.sweptAt(l.Aud); ok && l.Iat <= at {
 				if l.Aud == dev.DID {
 					return errors.New("device swept by the circle")
 				}
@@ -685,7 +699,7 @@ func (r *Roster) verdict(dev *Device) error {
 func (r *Roster) Cap(c *statement.Compiled, want statement.Want) error {
 	for _, links := range [][]statement.Link{c.Auth, c.Ident} {
 		for _, l := range links {
-			if at, ok := r.sweeps[l.Aud]; ok && l.Iat <= at {
+			if at, ok := r.sweptAt(l.Aud); ok && l.Iat <= at {
 				return fmt.Errorf("%s swept by the circle", shortDID(l.Aud))
 			}
 			// The entry comparison is this circle's judgement of its own
@@ -775,14 +789,39 @@ func (r *Roster) AddRevocation(st *statement.Statement) (*Roster, bool, error) {
 // device the roster never saw is remembered as a tombstone for
 // sweepTombstone so the gater refuses it meanwhile.
 func (r *Roster) Sweep(deviceDID string, at time.Time) (*Roster, bool) {
+	return r.SweepBy(deviceDID, at, "", 0)
+}
+
+// SweepBy is Sweep for a member-revoked event: signer is the did:key of
+// the circle key that signed it and signedAt the event's time; the sweep
+// applies only while the key history honours that key at that instant
+// (sweepMark). A sweep that is no stronger than one already applying is
+// nothing new.
+func (r *Roster) SweepBy(deviceDID string, at time.Time, signer string, signedAt int64) (*Roster, bool) {
 	cut := at.Unix()
-	if cut <= r.sweeps[deviceDID] {
+	if old, ok := r.sweeps[deviceDID]; ok && cut <= old.cut && r.honoursSweep(old) {
 		return r, false
 	}
 	nr := r.clone()
-	nr.sweeps[deviceDID] = cut
+	nr.sweeps[deviceDID] = sweepMark{cut: cut, signer: signer, signedAt: signedAt}
 	nr.reslotAll()
 	return nr, true
+}
+
+// honoursSweep reports whether a sweep's signer is honoured by the key
+// history at the instant it signed; a local cut always is.
+func (r *Roster) honoursSweep(m sweepMark) bool {
+	return m.signer == "" || statement.KeyHonouredAt(r.roots, r.CircleDID(), m.signer, m.signedAt)
+}
+
+// sweptAt is the cut applying to a device — admissions issued up to it are
+// dead — if a sweep the history honours names it.
+func (r *Roster) sweptAt(deviceDID string) (int64, bool) {
+	m, ok := r.sweeps[deviceDID]
+	if !ok || !r.honoursSweep(m) {
+		return 0, false
+	}
+	return m.cut, true
 }
 
 // Live returns the device's entry if it is admitted right now — inside its
@@ -819,7 +858,7 @@ func (r *Roster) Revoked(deviceDID string, now time.Time) (time.Time, bool) {
 			return dev.Exp, true
 		}
 	}
-	if at, ok := r.sweeps[deviceDID]; ok {
+	if at, ok := r.sweptAt(deviceDID); ok {
 		until := time.Unix(at, 0).Add(sweepTombstone)
 		if now.Before(until) {
 			return until, true
@@ -954,8 +993,8 @@ func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
 			nr.slots[did] = ns
 		}
 	}
-	for did, at := range nr.sweeps {
-		if !now.Before(time.Unix(at, 0).Add(statement.MaxValidity)) {
+	for did, m := range nr.sweeps {
+		if !now.Before(time.Unix(m.cut, 0).Add(statement.MaxValidity)) {
 			delete(nr.sweeps, did)
 			changed = true
 		}

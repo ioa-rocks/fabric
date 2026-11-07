@@ -178,6 +178,15 @@ func (s *CircleService) SetPeerTable(t *fabricnet.PeerTable) {
 			_, err := s.ingestRevocations(revs, time.Now())
 			return err
 		})
+		// A key history learned on the handshake goes the way of one
+		// learned from the gossip: pushed to the members, then applied.
+		s.auth.SetHandoverSink(func(p peer.ID, raws [][]byte) {
+			for _, raw := range raws {
+				if _, err := s.Handover(raw); err != nil {
+					log.Printf("auth: key handover from %s: %v", p, err)
+				}
+			}
+		})
 	}
 }
 
@@ -423,8 +432,10 @@ func (s *CircleService) Handover(raw []byte) (bool, error) {
 	if !ok {
 		return false, fmt.Errorf("no roster for circle %s", shortDID(st.Payload.Sub))
 	}
-	if len(st.Handovers()) <= len(r.Roots().Handovers(st.Payload.Sub)) {
-		return false, nil
+	// Verified before it is pushed (Codex review, 2026-11-07): a handover
+	// that does not extend the history is never relayed.
+	if grew, err := r.Roots().Extends(st); err != nil || !grew {
+		return false, err
 	}
 	// Pushed before it applies here: a compromise retires the devices the
 	// old key admitted, and the push reaches only devices the view still
@@ -435,13 +446,27 @@ func (s *CircleService) Handover(raw []byte) (bool, error) {
 		s.sync.PublishHandover(st.Payload.Sub, raw)
 	}
 	grew, err := s.table.AddHandover(st.Payload.Sub, st)
-	if err != nil {
-		return false, err
-	}
 	if grew {
 		s.forgetAll()
+		s.noteRetired(st)
 	}
-	return grew, nil
+	return grew, err
+}
+
+// noteRetired says in the log what a handover just learned did to this
+// node's own standing: an admission of its own that the history no
+// longer honours is the operator's cue to be admitted again, and the
+// device heard it, through the gossip or on a handshake a member refused.
+func (s *CircleService) noteRetired(h *statement.Statement) {
+	now := time.Now()
+	for _, o := range s.ownAdmissions(now) {
+		if !o.roster.Honours(h.Payload.Sub) {
+			continue
+		}
+		if err := o.roster.Judge(o.stmt, now); err != nil {
+			log.Printf("THIS DEVICE'S ADMISSION TO CIRCLE %s IS VOID — the circle's key was handed over (compromised=%v): %v; ask an owner to admit it again", shortDID(h.Payload.Sub), h.Payload.Compromised, err)
+		}
+	}
 }
 
 // reloadRevocations feeds every revocation on disk into the rosters: what

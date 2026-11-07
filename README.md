@@ -433,11 +433,11 @@ fabric circle revoke her-pc -circle family # an owner device signs a device out
 
 Revocation is a circle-signed record kept beside the circle
 (`circles/<name>/revocations.cbor`). Devices of the circle swap their
-revocation sets on every handshake and gossip exchange (`/fabric/auth/2`,
-`/fabric/sync/2`), and the daemon on the revoking node pushes the new one
-to every member connected right now, so the revoked device drops out of
-that circle's sync at once wherever the news reaches, and at the next
-connect elsewhere.
+revocation sets and key histories on every handshake and gossip exchange
+(`/fabric/auth/2`, `/fabric/sync/2`), and the daemon on the revoking node
+pushes the new one to every member connected right now, so the revoked
+device drops out of that circle's sync at once wherever the news reaches,
+and at the next connect elsewhere.
 Expiry is the backstop. `circle revoke` signs a **removal** (ADR 0019,
 2026-11-06): it names the device and nothing else, is kept for good, and
 kills every admission of the device that does not **acknowledge** it —
@@ -462,7 +462,15 @@ the new key. `-compromised` (a leaked key) retires everything the old key
 signed, and the command lists the devices to admit again. Other owner
 devices still hold the retired key and re-join from a fresh `circle
 export`; on the master the root key container is rewritten with the
-circle's new key.
+circle's new key. A handover is verified before it is relayed and is
+pushed to the members before it applies, so the devices a compromise
+retires hear of it while the view still counts them; a device that was
+offline hears of it on its next handshake — the hello carries the key
+history, and a member that refuses a stale admission answers with the
+history alone — and its daemon logs that its admission is void. A legacy
+sweep (`fabric revoke`, the member-revoked event) remembers which key
+signed it and stops applying once that key is declared compromised,
+whichever arrived first.
 Admissions, certs and revocations are statements (since 2026-11-02); the
 bespoke pre-statement forms no longer decode (2026-11-06) — a device
 still holding one is re-admitted (`circle admit`) or renewed (`fabric
@@ -833,8 +841,8 @@ user key) to skip the interactive prompts (CI, scripts).
   node refuses inbound peers outside its member store before any
   protocol runs, and listed on lighthouses so joiners and not-yet-gossiped
   members can authenticate), the `/fabric/auth/2` mutual admission
-  handshake (one admission per shared circle each way, revocations
-  riding along), per-protocol member checks (`RequireMember`), revocation
+  handshake (one admission per shared circle each way, revocations and
+  key histories riding along), per-protocol member checks (`RequireMember`), revocation
   that closes live connections, and `/fabric/sync/2` gossip — per-circle
   anti-entropy on every connect plus rumor-mill relay of fresh admissions,
   revocations, events and address records. The one-cert `/fabric/auth/1`
