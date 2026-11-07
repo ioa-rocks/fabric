@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"log"
 	"net/netip"
 	"sort"
 	"strings"
@@ -555,6 +556,13 @@ func (t *PeerTable) GC(now time.Time) {
 			nr, changed, dropped := r.GC(now)
 			if changed {
 				_ = s.replace(i, nr, dropped)
+				continue
+			}
+			// A history whose save failed is written on the next pass,
+			// whether or not anything else ever arrives (Codex review,
+			// 2026-11-07).
+			if err := s.flush(i); err != nil {
+				log.Printf("roster: %v", err)
 			}
 		}
 		return nil

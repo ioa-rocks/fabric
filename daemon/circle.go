@@ -433,8 +433,10 @@ func (s *CircleService) Handover(raw []byte) (bool, error) {
 		return false, fmt.Errorf("no roster for circle %s", shortDID(st.Payload.Sub))
 	}
 	// Verified before it is pushed (Codex review, 2026-11-07): a handover
-	// that does not extend the history is never relayed.
-	if grew, err := r.Roots().Extends(st); err != nil || !grew {
+	// that does not extend the history is never relayed. A known one still
+	// reaches the table, which pays a failed save's debt on the retry.
+	extends, err := r.Roots().Extends(st)
+	if err != nil {
 		return false, err
 	}
 	// Pushed before it applies here: a compromise retires the devices the
@@ -442,7 +444,7 @@ func (s *CircleService) Handover(raw []byte) (bool, error) {
 	// counts — they must hear that they are out (Codex review,
 	// 2026-11-06). The handover is on disk already (Rotate), so a crash
 	// in between loses nothing.
-	if s.sync != nil {
+	if extends && s.sync != nil {
 		s.sync.PublishHandover(st.Payload.Sub, raw)
 	}
 	grew, err := s.table.AddHandover(st.Payload.Sub, st)

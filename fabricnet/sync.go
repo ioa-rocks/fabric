@@ -530,13 +530,15 @@ func (s *EventSync) applyV2(pl syncPayloadV2, from peer.ID) {
 				log.Printf("sync: key handover from %s for circle %s refused: %v", from, shortDID(set.DID), err)
 				continue
 			}
-			if !grew {
-				continue
-			}
 			// Pushed before it applies here: a compromise retires the
 			// devices the old key admitted, and they must still hear of
 			// it while the view counts them (Codex review, 2026-11-06).
-			s.publishSets([]circleSet{{DID: set.DID, Handovers: [][]byte{raw}}}, from)
+			if grew {
+				s.publishSets([]circleSet{{DID: set.DID, Handovers: [][]byte{raw}}}, from)
+			}
+			// A known handover still goes to the table: a history whose
+			// save failed is written on the retry (Codex review,
+			// 2026-11-07).
 			if _, err := s.store.AddHandover(set.DID, st); err != nil {
 				log.Printf("sync: key handover from %s for circle %s: %v", from, shortDID(set.DID), err)
 			}

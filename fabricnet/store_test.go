@@ -801,11 +801,15 @@ func TestHandoverIsAdoptedWhenTheSaveFails(t *testing.T) {
 	if err := os.MkdirAll(c.Path, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// The periodic GC pays the debt even when no handover is ever
+	// retried (the daemon, gossip and handshake callers skip a known one
+	// before the table sees it — Codex review, 2026-11-07).
+	table.GC(time.Now())
+	if hs, err := c.Handovers(); err != nil || len(hs) != 1 {
+		t.Fatalf("handovers.cbor after GC: %d, %v; want 1", len(hs), err)
+	}
 	if grew, err := table.AddHandover(c.Config.DID, comp); err != nil || grew {
 		t.Fatalf("retry: grew=%v err=%v; want already learned, no error", grew, err)
-	}
-	if hs, err := c.Handovers(); err != nil || len(hs) != 1 {
-		t.Fatalf("handovers.cbor after the retry: %d, %v; want 1", len(hs), err)
 	}
 	reopened, err := circle.OpenRoster(c, time.Now())
 	if err != nil {

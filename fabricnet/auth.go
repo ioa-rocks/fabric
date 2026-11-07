@@ -477,9 +477,11 @@ func (a *AuthService) learnHandovers(p peer.ID, raws [][]byte) {
 		if !ok {
 			continue
 		}
-		if grew, err := r.Roots().Extends(st); err != nil || !grew {
+		if _, err := r.Roots().Extends(st); err != nil {
 			continue
 		}
+		// A known handover goes on too: the table pays a failed save's
+		// debt on the retry (Codex review, 2026-11-07).
 		if sink != nil {
 			fresh = append(fresh, raw)
 			continue
