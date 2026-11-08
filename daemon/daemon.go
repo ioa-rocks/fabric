@@ -599,12 +599,14 @@ func (d *Daemon) startTUN() {
 	// installed on change — the bridge looks each packet up in the current
 	// view (task single-writer-store).
 	d.bridgeIP = d.OwnCert().Payload.Meta.IP
-	pfx, _ := netip.ParsePrefix(d.bridgeIP)
-	d.Store.SetOverlay(pfx)
-	d.Bridge = tunbridge.New(d.Host, dev, d.Store, d.Auth.RequireMember)
-	if pfx.IsValid() {
-		d.Bridge.SetLocal(pfx.Addr())
+	pfx, err := netip.ParsePrefix(d.bridgeIP)
+	if err != nil {
+		_ = dev.Close()
+		log.Printf("tun: own overlay address %q: %v — running without the IP bridge", d.bridgeIP, err)
+		return
 	}
+	d.Store.SetOverlay(pfx)
+	d.Bridge = tunbridge.New(d.Host, dev, pfx, d.Store, d.Auth.RequireMember)
 	log.Printf("tun: fabric0 up, this node is %s", d.OwnCert().Payload.Meta.IP)
 	d.startDNS()
 }

@@ -51,22 +51,25 @@ type Bridge struct {
 	h      host.Host
 	dev    io.ReadWriteCloser
 	routes RouteSource
-
-	localMu sync.RWMutex
-	local   netip.Addr // this device's own overlay address; inbound packets go nowhere else
+	local  netip.Prefix // this device's own address in the circle's overlay range
 
 	linksMu sync.Mutex
 	links   map[peer.ID]*link
 
 	devWriteMu sync.Mutex
 	closed     chan struct{}
+
+	dropMu       sync.Mutex
+	dropLoggedAt time.Time
 }
 
-// New starts the bridge on an already-configured device. gate wraps the
-// inbound handler with the membership check.
-func New(h host.Host, dev io.ReadWriteCloser, routes RouteSource, gate func(network.StreamHandler) network.StreamHandler) *Bridge {
+// New starts the bridge on an already-configured device. local is this
+// device's own overlay address with the circle's prefix: the fence every
+// packet is held to (see handleInbound and readLoop). gate wraps the inbound
+// handler with the membership check.
+func New(h host.Host, dev io.ReadWriteCloser, local netip.Prefix, routes RouteSource, gate func(network.StreamHandler) network.StreamHandler) *Bridge {
 	b := &Bridge{
-		h: h, dev: dev, routes: routes,
+		h: h, dev: dev, routes: routes, local: local,
 		links:  map[peer.ID]*link{},
 		closed: make(chan struct{}),
 	}
@@ -75,16 +78,21 @@ func New(h host.Host, dev io.ReadWriteCloser, routes RouteSource, gate func(netw
 	return b
 }
 
-// SetRoutes replaces the overlay routing table (overlay IP per peer, from
-// the members' certs).
-// SetLocal pins the inbound side to this device's own address: a packet a
-// peer sends for any other destination is dropped, never written to the
-// kernel — the bridge is an endpoint, not a router between members or
-// between overlays (Codex review, 2026-11-05).
-func (b *Bridge) SetLocal(addr netip.Addr) {
-	b.localMu.Lock()
-	b.local = addr
-	b.localMu.Unlock()
+// inRange says whether an address lies in this bridge's overlay range.
+func (b *Bridge) inRange(a netip.Addr) bool { return b.local.Masked().Contains(a) }
+
+// logDrop notes a fenced packet at most once a minute: a steady stream of
+// them means the kernel is handing the bridge traffic it should not — a
+// LAN route into the overlay with ip_forward on, or a second overlay's
+// addresses on this box.
+func (b *Bridge) logDrop(why string, src, dst netip.Addr) {
+	b.dropMu.Lock()
+	defer b.dropMu.Unlock()
+	if time.Since(b.dropLoggedAt) < time.Minute {
+		return
+	}
+	b.dropLoggedAt = time.Now()
+	log.Printf("tun: dropped %s→%s: %s (the bridge is an endpoint of %s, never a router)", src, dst, why, b.local)
 }
 
 // Close stops the bridge and closes the device.
@@ -103,7 +111,11 @@ func (b *Bridge) Close() {
 	}
 }
 
-// readLoop moves packets from the kernel to peers.
+// readLoop moves packets from the kernel to peers. Only this device's own
+// traffic leaves: the source must be our address and the destination inside
+// the circle's range. Anything else the kernel hands us — a LAN host's
+// packet forwarded into the overlay, a packet for another overlay's range —
+// is dropped here, before any peer sees it (memo §5 item 3: no forwarding).
 func (b *Bridge) readLoop() {
 	buf := make([]byte, maxFrameSize)
 	for {
@@ -116,9 +128,18 @@ func (b *Bridge) readLoop() {
 			}
 			return
 		}
-		dst, ok := dstIPv4(buf[:n])
+		src, ok := srcIPv4(buf[:n])
 		if !ok {
 			continue // non-IPv4 (v6 not bridged yet) — drop
+		}
+		dst, _ := dstIPv4(buf[:n])
+		if src != b.local.Addr() {
+			b.logDrop("source is not this device's address", src, dst)
+			continue
+		}
+		if !b.inRange(dst) {
+			b.logDrop("destination outside this circle's range", src, dst)
+			continue
 		}
 		p, known := b.routes.Route(dst)
 		if !known {
@@ -177,11 +198,13 @@ func (b *Bridge) send(p peer.ID, pkt []byte) {
 	}
 }
 
-// handleInbound moves packets from a peer to the kernel. Source addresses
-// are pinned to the sender's own overlay IP — a member cannot inject
-// packets as somebody else — and destinations to this device's own address
-// (SetLocal), so nothing is ever routed onward (defense in depth on top of
-// the membership gate).
+// handleInbound moves packets from a peer to the kernel. The source is
+// pinned to the sender's own overlay address in this circle's range — a
+// member cannot inject packets as somebody else — and the destination to
+// this device's own address, so nothing is ever routed onward: not to
+// another member, not into another overlay this box may also sit in
+// (defense in depth on top of the membership gate; Codex review 2026-11-05,
+// fence completed 2026-11-08).
 func (b *Bridge) handleInbound(s network.Stream) {
 	defer s.Close()
 	remote := s.Conn().RemotePeer()
@@ -196,13 +219,11 @@ func (b *Bridge) handleInbound(s network.Stream) {
 		}
 		dst, _ := dstIPv4(pkt)
 		expected, known := b.routes.AddrOf(remote)
-		b.localMu.RLock()
-		local := b.local
-		b.localMu.RUnlock()
-		if !known || src != expected {
-			continue // spoofed or stale-route source — drop
+		if !known || src != expected || !b.inRange(src) {
+			continue // spoofed, stale-route or out-of-range source — drop
 		}
-		if local.IsValid() && dst != local {
+		if dst != b.local.Addr() {
+			b.logDrop("destination is not this device", src, dst)
 			continue // not for this device — the bridge never forwards
 		}
 		b.devWriteMu.Lock()

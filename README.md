@@ -503,9 +503,20 @@ Without the capability (or on non-Linux, or with `-no-tun`), the node
 logs a note and runs as a full member over the other modes — it keeps
 its overlay address, so TUN-mode peers can still name it consistently
 the moment it gains the capability. Traffic is relayed as raw IP
-packets on a member-gated stream with source-address pinning; nodes
+packets on a member-gated stream; nodes
 listen on QUIC (UDP) and TCP, IPv4 and IPv6, so the bridge rides a UDP
 underlay whenever both ends support it.
+
+**The bridge is an endpoint, never a router.** Outbound, only packets
+from this device's own overlay address to an address inside its
+circle's range leave; inbound, only a peer's own in-range address as
+source and this device's address as destination are written to the
+kernel. Anything else is dropped at the bridge and noted in the log at
+most once a minute — a LAN host's packet the kernel forwarded into
+`fabric0` with `ip_forward=1`, a packet aimed at another overlay's
+range, a frame for another member. So a dual-homed box can hold two
+networks, or later two circles' overlays, without ever bridging one
+into the other.
 
 Certs issued before the bridge existed carry no overlay IP — re-join
 (or re-init a young circle) to get addressed.

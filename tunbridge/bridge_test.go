@@ -2,10 +2,12 @@ package tunbridge
 
 import (
 	"context"
+
 	"fmt"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	ma "github.com/multiformats/go-multiaddr"
+	"ioa.rocks/fabric/internal/wire"
 	"net/netip"
 	"sync"
 	"testing"
@@ -95,9 +97,9 @@ func TestBridgeRelaysAndPinsSource(t *testing.T) {
 	ipA, ipB := netip.MustParseAddr("100.64.0.1"), netip.MustParseAddr("100.64.0.2")
 
 	rba := &fakeRoutes{}
-	ba := New(ha, devA, rba, passthrough)
+	ba := New(ha, devA, netip.MustParsePrefix("100.64.0.1/24"), rba, passthrough)
 	rbb := &fakeRoutes{}
-	bb := New(hb, devB, rbb, passthrough)
+	bb := New(hb, devB, netip.MustParsePrefix("100.64.0.2/24"), rbb, passthrough)
 	defer ba.Close()
 	defer bb.Close()
 	rba.Set(map[netip.Addr]peer.ID{ipB: hb.ID()})
@@ -132,7 +134,6 @@ func TestBridgeRelaysAndPinsSource(t *testing.T) {
 	// Transit: a frame for an address that is not B's own — even one A
 	// routes toward B — never reaches B's kernel (the bridge is an
 	// endpoint, not a router).
-	bb.SetLocal(ipB)
 	rba.Set(map[netip.Addr]peer.ID{ipB: hb.ID(), netip.MustParseAddr("100.64.0.3"): hb.ID()})
 	devA.in <- ipv4Packet("100.64.0.1", "100.64.0.3", 0x88)
 	devA.in <- ipv4Packet("100.64.0.1", "100.64.0.2", 0x44)
@@ -169,6 +170,94 @@ func TestBridgeRelaysAndPinsSource(t *testing.T) {
 	}
 }
 
+// The fence (memo §5 item 3): a dual-homed box must never bridge one
+// network into the overlay or one overlay into another. Outbound, only this
+// device's own packets to addresses in its circle's range leave; inbound,
+// only a peer's own in-range source to this device's address is written.
+// The egress side is watched on the wire, because the receiver's own source
+// pinning would hide a missing sender-side fence.
+func TestBridgeFencesToOwnAddressAndRange(t *testing.T) {
+	ha, hw := testHost(t), testHost(t)
+	ha.Peerstore().AddAddrs(hw.ID(), hw.Addrs(), time.Hour)
+	hw.Peerstore().AddAddrs(ha.ID(), ha.Addrs(), time.Hour)
+	passthrough := func(h network.StreamHandler) network.StreamHandler { return h }
+	ipA, ipB := netip.MustParseAddr("100.64.0.1"), netip.MustParseAddr("100.64.0.2")
+	otherOverlay := netip.MustParseAddr("100.65.0.2") // a second circle's range
+
+	// hw is a bare peer that records every frame A's bridge sends it.
+	onWire := make(chan []byte, 8)
+	hw.SetStreamHandler(ProtocolID, func(s network.Stream) {
+		defer s.Close()
+		for {
+			pkt, err := wire.ReadFrame(s, maxFrameSize)
+			if err != nil {
+				return
+			}
+			onWire <- pkt
+		}
+	})
+	devA := newFakeDev()
+	rba := &fakeRoutes{}
+	ba := New(ha, devA, netip.MustParsePrefix("100.64.0.1/24"), rba, passthrough)
+	defer ba.Close()
+	rba.Set(map[netip.Addr]peer.ID{ipB: hw.ID(), otherOverlay: hw.ID()})
+
+	// Outbound: the kernel forwards a LAN host's packet into fabric0
+	// (ip_forward=1 and a route for the overlay via this box) — not A's
+	// address, dropped. A packet into another overlay's range, even one the
+	// route source claims to know, never leaves either. The legitimate
+	// follow-up on the same stream proves the first two were dropped, not
+	// delayed (frames on one stream arrive in order).
+	devA.in <- ipv4Packet("192.168.0.5", "100.64.0.2", 0x11)
+	devA.in <- ipv4Packet("100.64.0.1", "100.65.0.2", 0x12)
+	devA.in <- ipv4Packet("100.64.0.1", "100.64.0.2", 0x13)
+	select {
+	case pkt := <-onWire:
+		if pkt[20] != 0x13 {
+			t.Fatalf("fenced packet %#x left the device", pkt[20])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("legitimate packet never left")
+	}
+
+	// Inbound: B's route source says the sender sits at an address outside
+	// B's range (a stale or foreign address). A frame whose source matches
+	// that belief is still dropped — B's own range is the fence, not the
+	// route source alone.
+	devB := newFakeDev()
+	rbb := &fakeRoutes{}
+	bb := New(hw, devB, netip.MustParsePrefix("100.64.0.2/24"), rbb, passthrough)
+	defer bb.Close()
+	rbb.Set(map[netip.Addr]peer.ID{otherOverlay: ha.ID()})
+	s, err := ha.NewStream(context.Background(), hw.ID(), ProtocolID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := wire.WriteFrame(s, ipv4Packet("100.65.0.2", "100.64.0.2", 0x21)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case pkt := <-devB.out:
+		t.Fatalf("out-of-range source %#x was written to the device", pkt[20])
+	case <-time.After(300 * time.Millisecond):
+	}
+	// The stream survived the drop: once B knows A's in-range address, the
+	// next frame is written.
+	rbb.Set(map[netip.Addr]peer.ID{ipA: ha.ID()})
+	if err := wire.WriteFrame(s, ipv4Packet("100.64.0.1", "100.64.0.2", 0x22)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case pkt := <-devB.out:
+		if pkt[20] != 0x22 {
+			t.Fatalf("unexpected payload %#x", pkt[20])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow-up packet never arrived")
+	}
+}
+
 // No destination listen address is given to the sender. Delivery must use
 // the relay, including after the destination loses and renews its reservation.
 func TestBridgeRelayRecovery(t *testing.T) {
@@ -199,7 +288,7 @@ func TestBridgeRelayRecovery(t *testing.T) {
 	devA, devB := newFakeDev(), newFakeDev()
 	gate := func(h network.StreamHandler) network.StreamHandler { return h }
 	rba, rbb := &fakeRoutes{}, &fakeRoutes{}
-	ba, bb := New(a, devA, rba, gate), New(b, devB, rbb, gate)
+	ba, bb := New(a, devA, netip.MustParsePrefix("100.64.0.1/24"), rba, gate), New(b, devB, netip.MustParsePrefix("100.64.0.2/24"), rbb, gate)
 	defer ba.Close()
 	defer bb.Close()
 	rba.Set(map[netip.Addr]peer.ID{netip.MustParseAddr("100.64.0.2"): b.ID()})

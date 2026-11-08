@@ -663,6 +663,36 @@ func TestExpiredEntryStopsRoutingAtOnce(t *testing.T) {
 	}
 }
 
+// An admission whose address lies outside this node's overlay range — a
+// second circle's prefix on a dual-homed box — gives its device no route,
+// no inbound address and no name here: the view is fenced to the range the
+// bridge was brought up in (the slice H fence, 2026-11-08).
+func TestOverlayViewIgnoresAddressesOutsideTheRange(t *testing.T) {
+	c, _ := circle.Init(t.TempDir(), "main", "pw")
+	priv, _ := c.Unlock("pw")
+	now := time.Now()
+	tunVerbs := append(append([]string{}, circle.DeviceVerbs...), statement.VerbTun)
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	p, _ := PeerOfDID(cert.DIDForKey(pub))
+	far := netip.MustParseAddr("100.65.0.2")
+	a, _ := circle.AdmitWith(priv, nil, c.Config.DID, pub, now, time.Hour, tunVerbs, &statement.Meta{Name: "far", IP: "100.65.0.2/24"})
+	table := NewMemberStore(statement.NewDIDRoot(c.Config.DID))
+	table.SetOverlay(netip.MustParsePrefix("100.64.0.1/24"))
+	if _, err := table.AddAdmission(a.Stmt, now); err != nil {
+		t.Fatal(err)
+	}
+	v := table.View()
+	if _, ok := v.Route(far, now); ok {
+		t.Fatal("an address outside the overlay range routes")
+	}
+	if _, ok := v.AddrOf(p, now); ok {
+		t.Fatal("a device addressed outside the range has an inbound address here")
+	}
+	if _, ok := v.Resolve("far", now); ok {
+		t.Fatal("a device addressed outside the range resolves by name here")
+	}
+}
+
 // Two devices whose admissions claim one overlay address: the later
 // admission holds it, the other gets neither route nor inbound address, so
 // Route and AddrOf never disagree about who is behind an address, and the
