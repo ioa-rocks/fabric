@@ -200,6 +200,31 @@ func (c *Client) Get(bucket, ref string) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
+// Content forwards one content request to the daemon and returns its
+// response as it stands, status and headers included: the caller is itself
+// an HTTP server (the web UI) passing a browser's Range and conditional
+// headers through. The caller closes the body.
+func (c *Client) Content(ctx context.Context, bucket, ref, blob string, header http.Header) (*http.Response, error) {
+	query := "?ref=" + url.QueryEscape(ref)
+	if blob != "" {
+		query += "&blob=" + url.QueryEscape(blob)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://vault"+bucketPath(bucket, "/content")+query, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
+		if value := header.Get(name); value != "" {
+			req.Header.Set(name, value)
+		}
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("is the daemon running? %w", err)
+	}
+	return resp, nil
+}
+
 // GetRange reads length bytes of an object's content from offset (to the
 // end when length is negative). blob selects one head, as in GetBlob; empty
 // means the rendered one.

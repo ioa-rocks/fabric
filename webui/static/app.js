@@ -534,6 +534,43 @@ function openObjects(b) {
   loadObjects(view, "", []);
 }
 
+const MEDIA_EXT = {
+  image: ["jpg", "jpeg", "png", "gif", "webp", "avif", "bmp"],
+  video: ["mp4", "m4v", "webm", "mov", "mkv"],
+  audio: ["mp3", "m4a", "ogg", "opus", "flac", "wav"],
+};
+
+function mediaKind(name) {
+  const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+  return Object.keys(MEDIA_EXT).find(kind => MEDIA_EXT[kind].includes(ext)) || "";
+}
+
+function formatBytes(n) {
+  if (!n) return "";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return (i && n < 10 ? n.toFixed(1) : Math.round(n)) + " " + units[i];
+}
+
+// One preview per row; clicking the name again closes it. Removing the
+// element ends the download of a video that is still buffering.
+function togglePreview(li, media, src, name) {
+  const open = li.querySelector(".object-preview");
+  if (open) { open.remove(); return; }
+  const el = document.createElement(media === "image" ? "img" : media);
+  el.className = "object-preview";
+  el.src = src;
+  if (media === "image") {
+    el.alt = name;
+    el.loading = "lazy";
+  } else {
+    el.controls = true;
+    el.preload = "metadata";
+  }
+  li.append(el);
+}
+
 async function loadObjects(view, after, history) {
   view.controller?.abort();
   const controller = new AbortController();
@@ -552,7 +589,24 @@ async function loadObjects(view, after, history) {
     view.list.replaceChildren();
     for (const o of page.objects) {
       const li = document.createElement("li");
-      li.append(mono(o.id.slice(0, 12)), " ", o.name);
+      li.append(mono(o.id.slice(0, 12)), " ");
+      const kind = o.kind || "file";
+      if (kind !== "file" || !o.blob) {
+        li.append(o.name + (kind === "dir" ? "/" : ""));
+      } else {
+        const src = "/api/vault/content?" + new URLSearchParams({ bucket: view.bucket, ref: o.id });
+        const link = document.createElement("a");
+        link.href = src;
+        link.textContent = o.name;
+        const media = mediaKind(o.name);
+        // Media opens in place (the server sends ranges, so video seeks);
+        // anything else the server hands over as a download.
+        if (media) link.onclick = event => { event.preventDefault(); togglePreview(li, media, src, o.name); };
+        const size = document.createElement("span");
+        size.className = "tags";
+        size.textContent = "  " + formatBytes(o.size);
+        li.append(link, size);
+      }
       if (o.tags && o.tags.length) {
         const t = document.createElement("span");
         t.className = "tags";

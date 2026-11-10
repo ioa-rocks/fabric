@@ -12,8 +12,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"mime"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -65,6 +68,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/revoke", s.handleRevoke)
 	mux.HandleFunc("POST /api/renew", s.handleRenew)
 	mux.HandleFunc("GET /api/vault/objects", s.handleVaultObjects)
+	mux.HandleFunc("GET /api/vault/content", s.handleVaultContent)
 	mux.HandleFunc("POST /api/vault/sub", s.handleVaultSub)
 	return mux
 }
@@ -395,6 +399,71 @@ func (s *Server) handleVaultObjects(writer http.ResponseWriter, req *http.Reques
 		return
 	}
 	writeJSON(writer, objs)
+}
+
+// handleVaultContent serves one object's bytes (?bucket=<ref>&ref=<object>
+// [&blob=<head>]), passing Range and the conditional headers through so a
+// <video> element seeks.
+//
+// Bucket content is arbitrary files, and this origin also answers
+// /api/approve and /api/revoke: a synced .html or .svg rendered here would
+// run its script with the admin UI's authority. So nothing is ever served
+// as a document of this origin: only raster images, video and audio are
+// shown inline, everything else is a download, the type is never sniffed,
+// and the response is sandboxed in case a browser renders it anyway.
+func (s *Server) handleVaultContent(writer http.ResponseWriter, req *http.Request) {
+	cl := vaultdaemon.TryClient(s.vaultPath)
+	if cl == nil {
+		httpError(writer, http.StatusBadGateway, errors.New("vault daemon not running"))
+		return
+	}
+	query := req.URL.Query()
+	if query.Get("bucket") == "" || query.Get("ref") == "" {
+		httpError(writer, http.StatusBadRequest, errors.New("bucket and ref query parameters are required"))
+		return
+	}
+	resp, err := cl.Content(req.Context(), query.Get("bucket"), query.Get("ref"), query.Get("blob"), req.Header)
+	if err != nil {
+		httpError(writer, http.StatusBadGateway, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		httpError(writer, resp.StatusCode, errors.New(strings.TrimSpace(string(msg))))
+		return
+	}
+	header := writer.Header()
+	for _, name := range []string{"Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
+		if value := resp.Header.Get(name); value != "" {
+			header.Set(name, value)
+		}
+	}
+	mediaType := resp.Header.Get("Content-Type")
+	disposition := "attachment"
+	if inlineMedia(mediaType) {
+		disposition = "inline"
+	} else {
+		mediaType = "application/octet-stream"
+	}
+	header.Set("Content-Type", mediaType)
+	header.Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": path.Base(resp.Header.Get("X-Vault-Name"))}))
+	header.Set("X-Content-Type-Options", "nosniff")
+	header.Set("Content-Security-Policy", "sandbox; default-src 'none'")
+	header.Set("Cache-Control", "private, no-cache") // revalidated by ETag: the object may be replaced
+	writer.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(writer, resp.Body)
+}
+
+// inlineMedia reports whether a type may be shown in the page: formats a
+// browser decodes as pixels or sound and never executes. SVG is an image
+// that carries script, so it is not one of them.
+func inlineMedia(mediaType string) bool {
+	base, _, err := mime.ParseMediaType(mediaType)
+	if err != nil || base == "image/svg+xml" {
+		return false
+	}
+	return strings.HasPrefix(base, "image/") || strings.HasPrefix(base, "video/") || strings.HasPrefix(base, "audio/")
 }
 
 // handleVaultSub sets this device's placement commitment for a bucket —

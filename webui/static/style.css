@@ -276,3 +276,6 @@ a:hover { color: var(--good); }
 .objects-controls button { border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; background: var(--card); color: var(--ink); cursor: pointer; }
 .objects-controls button:disabled { opacity: .5; cursor: default; }
 @media (max-width: 700px) { .bucket-panels { grid-template-columns: 1fr; } }
+.objects-list a { color: inherit; }
+.object-preview { display: block; max-width: 100%; max-height: 70vh; margin: 6px 0 8px; border-radius: 6px; background: #000; }
+audio.object-preview { background: none; width: min(100%, 480px); }
