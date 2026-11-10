@@ -29,6 +29,13 @@ type Placement struct {
 	// (it remains a read fallback; blobs are shared across buckets, so
 	// nothing is moved — relocation is GC's business).
 	Root string `json:"root,omitempty"`
+
+	// Keep is a cache placement's budget in bytes: when the bucket's
+	// content on this device exceeds it, the least recently read blobs are
+	// dropped, each only after a device that holds the bucket in full has
+	// confirmed it still has that blob. Zero = no budget, nothing is ever
+	// dropped. It means nothing on a full placement and is cleared there.
+	Keep int64 `json:"keep,omitempty"`
 }
 
 // UnmarshalJSON accepts the pre-2026-10 shape (a bare mode string) as well
@@ -114,6 +121,12 @@ func (c *Store) SetSubscription(bucketID, mode string) error {
 func (c *Store) SetPlacement(bucketID string, placement Placement) error {
 	if placement.Mode != SubFull && placement.Mode != SubCache && placement.Mode != SubNone {
 		return fmt.Errorf("unknown subscription mode %q (full, cache, or none)", placement.Mode)
+	}
+	if placement.Keep < 0 {
+		return fmt.Errorf("a cache budget cannot be negative")
+	}
+	if placement.Mode != SubCache {
+		placement.Keep = 0
 	}
 	if placement.Root != "" {
 		if !filepath.IsAbs(placement.Root) {
@@ -245,6 +258,32 @@ func (h *rootedHolder) Commit(hash string) error {
 		return h.primaryErr
 	}
 	return h.primary.Commit(hash)
+}
+
+// Drop removes the blob from every store this holder reads, so that it is
+// gone for the bucket and not merely from the primary.
+func (h *rootedHolder) Drop(hash string) (err error) {
+	h.each(func(blobs *blobstore.Store) bool {
+		if dropErr := blobs.Drop(hash); dropErr != nil && err == nil {
+			err = dropErr
+		}
+		return false
+	})
+	return err
+}
+
+// BlobStores lists the default blob store and every placement root that
+// can be opened.
+func (c *Store) BlobStores() []*blobstore.Store {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	stores := []*blobstore.Store{c.Blobs}
+	for _, root := range c.sortedRootsLocked() {
+		if blobs, err := c.rootStore(root); err == nil {
+			stores = append(stores, blobs)
+		}
+	}
+	return stores
 }
 
 func (h *rootedHolder) each(fn func(s *blobstore.Store) bool) {

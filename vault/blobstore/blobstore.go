@@ -11,6 +11,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/zeebo/blake3"
 )
@@ -110,6 +112,52 @@ func (s *Store) Commit(hash string) error {
 		return err
 	}
 	return os.Rename(partialPath, dst)
+}
+
+// Drop removes a held blob. Whether it is safe to — another copy exists,
+// nothing else here needs it — is the caller's to establish first.
+func (s *Store) Drop(hash string) error {
+	err := os.Remove(s.path(hash))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// SweepPartials removes the files of blobs that were received in part and
+// not touched since before the cutoff, except those inUse names. It
+// returns how many blobs it gave up on.
+func (s *Store) SweepPartials(cutoff time.Time, inUse func(hash string) bool) (int, error) {
+	dir := filepath.Join(s.root, "partial")
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, entry := range entries {
+		hash := entry.Name()
+		if strings.HasSuffix(hash, ".map") || inUse(hash) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		// The map is written after the content it describes, so its time
+		// is the later of the two.
+		if mapInfo, err := os.Stat(filepath.Join(dir, hash+".map")); err == nil && mapInfo.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, hash)); err != nil {
+			continue
+		}
+		os.Remove(filepath.Join(dir, hash+".map"))
+		removed++
+	}
+	return removed, nil
 }
 
 // PutFile is Put from a file path.

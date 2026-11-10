@@ -4,6 +4,7 @@
 //	o/<objectID>            -> Object (CBOR)
 //	l/<blobHash>/<nodeID>   -> Location (CBOR)
 //	r/<blobHash>/<objectID> -> "" (which objects point at a blob)
+//	a/<blobHash>            -> when this device last read the blob (never synced)
 //	m/<name>                -> index bookkeeping
 //
 // List scans are prefix iterations — fine at personal-collection scale;
@@ -11,11 +12,13 @@
 package index
 
 import (
+	"encoding/binary"
 	"fmt"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -271,7 +274,8 @@ func (s *Store) PutLocation(loc Location) error {
 	return nil
 }
 
-// Locations lists the recorded holders of a blob.
+// Locations lists the recorded holders of a blob. A record a device wrote
+// to say it no longer holds the blob (FormGone) is not a holder.
 func (s *Store) Locations(blob string) ([]Location, error) {
 	var out []Location
 	it, err := s.db.NewIter(prefixBounds("l/" + blob + "/"))
@@ -284,7 +288,69 @@ func (s *Store) Locations(blob string) ([]Location, error) {
 		if err != nil {
 			return nil, err
 		}
+		if loc.Form == FormGone {
+			continue
+		}
 		out = append(out, loc)
+	}
+	return out, nil
+}
+
+// touchEvery is how stale a last-read time may be before a read renews it:
+// eviction orders by it and does not need it finer.
+const touchEvery = int64(time.Minute)
+
+// Touch notes that this device read the blob at the given time (Unix
+// nanoseconds). It is device-local bookkeeping for cache eviction: not
+// synced, not part of the index generation.
+func (s *Store) Touch(blob string, at int64) error {
+	if last, ok := s.LastRead(blob); ok && at-last < touchEvery {
+		return nil
+	}
+	var value [8]byte
+	binary.BigEndian.PutUint64(value[:], uint64(at))
+	return s.db.Set([]byte("a/"+blob), value[:], pebble.NoSync)
+}
+
+// LastRead returns when this device last read the blob, if it ever did.
+func (s *Store) LastRead(blob string) (int64, bool) {
+	raw, closer, err := s.db.Get([]byte("a/" + blob))
+	if err != nil {
+		return 0, false
+	}
+	defer closer.Close()
+	if len(raw) != 8 {
+		return 0, false
+	}
+	return int64(binary.BigEndian.Uint64(raw)), true
+}
+
+// ForgetRead drops the last-read time of a blob that is no longer held.
+func (s *Store) ForgetRead(blob string) error {
+	return s.db.Delete([]byte("a/"+blob), pebble.NoSync)
+}
+
+// KnownBlobs lists every blob the index names: the content of every head,
+// and every blob with a location record (a superseded revision's content
+// this device may still hold).
+func (s *Store) KnownBlobs() ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, prefix := range []string{"r/", "l/"} {
+		it, err := s.db.NewIter(prefixBounds(prefix))
+		if err != nil {
+			return nil, err
+		}
+		for it.First(); it.Valid(); it.Next() {
+			blob, _, _ := strings.Cut(string(it.Key()[len(prefix):]), "/")
+			if blob != "" && !seen[blob] {
+				seen[blob] = true
+				out = append(out, blob)
+			}
+		}
+		if err := it.Close(); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }

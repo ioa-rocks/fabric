@@ -5,6 +5,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"ioa.rocks/fabric/circle"
@@ -28,7 +29,8 @@ type store_ interface {
 	Project(bucket, dir string) (int, error)
 	// Place sets the placement mode; root, when non-nil, also sets the
 	// blob store root ("" or "default" = the default store).
-	Place(bucket, mode string, root *string) error
+	// keep, when non-nil, sets a cache placement's budget in bytes.
+	Place(bucket, mode string, root *string, keep *int64) error
 	treeStore
 	Close() error
 }
@@ -54,11 +56,8 @@ type clientStore struct{ *daemon.Client }
 
 func (clientStore) Close() error { return nil }
 
-func (s clientStore) Place(bucket, mode string, root *string) error {
-	if root == nil {
-		return s.Client.Sub(bucket, mode)
-	}
-	return s.Client.SubAt(bucket, mode, *root)
+func (s clientStore) Place(bucket, mode string, root *string, keep *int64) error {
+	return s.Client.Place(bucket, mode, root, keep)
 }
 
 // directStore runs the same operations in-process.
@@ -107,7 +106,7 @@ func (s *directStore) Buckets() ([]daemon.BucketInfo, error) {
 			continue
 		}
 		pl := s.c.Placement(id)
-		info := daemon.BucketInfo{ID: id, Owner: bkt.Genesis.Owner, Name: bkt.Genesis.Name, Sub: pl.Mode, Root: pl.Root}
+		info := daemon.BucketInfo{ID: id, Owner: bkt.Genesis.Owner, Name: bkt.Genesis.Name, Sub: pl.Mode, Root: pl.Root, Keep: pl.Keep}
 		if handle, err := s.handle(id); err == nil {
 			info.Objects, info.Held, _ = handle.Stats()
 		}
@@ -130,7 +129,7 @@ func (s *directStore) CreateBucket(genesis, policy []byte) (daemon.BucketInfo, e
 	return daemon.BucketInfo{ID: handle.ID(), Owner: handle.Bucket.Genesis.Owner, Name: handle.Bucket.Genesis.Name, Sub: store.SubFull}, nil
 }
 
-func (s *directStore) Place(bucket, mode string, root *string) error {
+func (s *directStore) Place(bucket, mode string, root *string, keep *int64) error {
 	if mode == "none" {
 		mode = store.SubNone
 	}
@@ -145,6 +144,12 @@ func (s *directStore) Place(bucket, mode string, root *string) error {
 		if pl.Root == "default" {
 			pl.Root = ""
 		}
+	}
+	if keep != nil {
+		if *keep > 0 && mode != store.SubCache {
+			return errors.New("a budget applies to a cache placement")
+		}
+		pl.Keep = *keep
 	}
 	return s.c.SetPlacement(id, pl)
 }

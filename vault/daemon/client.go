@@ -303,6 +303,12 @@ func (c *Client) SubAt(bucket, mode, root string) error {
 	return c.post(bucketPath(bucket, "/sub"), subBody{Mode: mode, Root: &root}, nil)
 }
 
+// Place sets the placement mode and, where given, the blob store root and
+// a cache placement's budget in bytes (0 removes the budget).
+func (c *Client) Place(bucket, mode string, root *string, keep *int64) error {
+	return c.post(bucketPath(bucket, "/sub"), subBody{Mode: mode, Root: root, Keep: keep}, nil)
+}
+
 func (c *Client) Mounts() ([]MountInfo, error) {
 	var out []MountInfo
 	if err := c.get("/v0/mounts", &out); err != nil {

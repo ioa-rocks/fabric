@@ -152,6 +152,14 @@ func OpenOutboards(dir string) (*Outboards, error) {
 
 func (o *Outboards) path(hash string) string { return filepath.Join(o.dir, hash[:2], hash) }
 
+// Remove discards the tree of a blob this device no longer holds.
+func (o *Outboards) Remove(hash string) {
+	if len(hash) < 2 {
+		return
+	}
+	os.Remove(o.path(hash))
+}
+
 // Open returns the tree of the blob whose content is data, computing and
 // storing it on first use (one pass over the content). The pass also proves
 // data is the blob: content that hashes to anything else is refused.

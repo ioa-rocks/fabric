@@ -456,6 +456,11 @@ type Location struct {
 
 const FormWhole = "whole"
 
+// FormGone is the form a device records when it has dropped a blob it used
+// to hold (cache eviction): the newest record per device wins, so this
+// takes back its earlier claim on every replica.
+const FormGone = "gone"
+
 func (o *Object) Marshal() ([]byte, error) { return cbor.Marshal(o) }
 
 // legacyObject is the pre-ADR-0001 record: content as an LWW register.

@@ -43,13 +43,19 @@ func SocketPath(statePath string) string {
 // the local health seed: a full subscription is satisfied when Held ==
 // Objects.
 type BucketInfo struct {
-	Owner   string `json:"owner,omitempty"` // owning circle DID
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Sub     string `json:"sub,omitempty"`  // this device's subscription mode
-	Root    string `json:"root,omitempty"` // blob store root this placement names (default store when empty)
-	Objects int    `json:"objects"`        // live objects in the index
-	Held    int    `json:"held"`           // whose blobs this device holds
+	Owner string `json:"owner,omitempty"` // owning circle DID
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Sub   string `json:"sub,omitempty"`  // this device's subscription mode
+	Root  string `json:"root,omitempty"` // blob store root this placement names (default store when empty)
+	// A cache placement's budget in bytes (0: none, nothing is dropped),
+	// and what the last eviction pass found: the bucket's bytes held here
+	// and how many blobs over budget stayed for want of a confirmed copy.
+	Keep             int64 `json:"keep,omitempty"`
+	CacheBytes       int64 `json:"cache_bytes,omitempty"`
+	CacheUnconfirmed int   `json:"cache_unconfirmed,omitempty"`
+	Objects          int   `json:"objects"` // live objects in the index
+	Held             int   `json:"held"`    // whose blobs this device holds
 
 	Conflicts     int `json:"conflicts,omitempty"`      // rendered conflict copies (ADR 0001 §3)
 	HeldDeletions int `json:"held_deletions,omitempty"` // parked deletions awaiting a decision (§4)
@@ -169,6 +175,9 @@ type subBody struct {
 	// absolute directory, or "" / "default" for the device's default
 	// store. Absent keeps whatever root the placement has.
 	Root *string `json:"root,omitempty"`
+	// Keep, when present, sets a cache placement's budget in bytes (0
+	// removes it). Absent keeps the budget the placement has.
+	Keep *int64 `json:"keep,omitempty"`
 }
 
 type mountBody struct {
@@ -396,7 +405,10 @@ func (d *Daemon) handleBuckets(resp http.ResponseWriter, _ *http.Request) {
 			continue
 		}
 		pl := d.Store.Placement(id)
-		info := BucketInfo{ID: id, Owner: bkt.Genesis.Owner, Name: bkt.Genesis.Name, Sub: pl.Mode, Root: pl.Root}
+		info := BucketInfo{ID: id, Owner: bkt.Genesis.Owner, Name: bkt.Genesis.Name, Sub: pl.Mode, Root: pl.Root, Keep: pl.Keep}
+		if state, ok := d.cacheStateOf(id); ok && pl.Keep > 0 {
+			info.CacheBytes, info.CacheUnconfirmed = state.Bytes, state.Unconfirmed
+		}
 		for dir, folderDecl := range folders {
 			if folderDecl.Bucket == id {
 				info.Folder = dir
@@ -444,11 +456,22 @@ func (d *Daemon) handleSub(resp http.ResponseWriter, req *http.Request) {
 			pl.Root = ""
 		}
 	}
+	if body.Keep != nil {
+		pl.Keep = *body.Keep
+	}
+	if pl.Keep > 0 && mode != store.SubCache {
+		if body.Keep != nil {
+			httpErr(resp, errors.New("a budget applies to a cache placement"))
+			return
+		}
+		pl.Keep = 0
+	}
 	if err := d.Store.SetPlacement(id, pl); err != nil {
 		httpErr(resp, err)
 		return
 	}
 	pl = d.Store.Placement(id)
+	d.kickEvict()
 	if mode == store.SubFull {
 		if handle, err := d.handle(id); err == nil {
 			go d.fetchMissing(handle) // start honoring the commitment now
@@ -624,14 +647,17 @@ func (d *Daemon) handleGet(resp http.ResponseWriter, req *http.Request) {
 	// cache axis without the bookkeeping). The request is answered from
 	// the blob's partial file, which fetches the ranges being read: a seek
 	// into a film waits for that part of it, not for the film.
-	if blob != "" && !handle.Holder().Has(blob) && d.Fabric != nil {
-		served, err := d.serveRemote(resp, req, handle, blob, size, modified)
+	// The blob is opened rather than asked about: eviction can remove it
+	// between a check and the open.
+	file, err := handle.OpenBlob(blob)
+	if err != nil && blob != "" && d.Fabric != nil {
+		served, remoteErr := d.serveRemote(resp, req, handle, blob, size, modified)
 		if served {
 			return
 		}
-		if !errors.Is(err, errNoRangeProtocol) {
+		if !errors.Is(remoteErr, errNoRangeProtocol) {
 			clearContentHeaders(header)
-			httpErr(resp, fmt.Errorf("blob not held here and no peer served it: %w", err))
+			httpErr(resp, fmt.Errorf("blob not held here and no peer served it: %w", remoteErr))
 			return
 		}
 		if err := d.fetchWholeAnywhere(handle, blob); err != nil {
@@ -639,8 +665,8 @@ func (d *Daemon) handleGet(resp http.ResponseWriter, req *http.Request) {
 			httpErr(resp, fmt.Errorf("blob not held here and no peer served it: %w", err))
 			return
 		}
+		file, err = handle.OpenBlob(blob)
 	}
-	file, err := handle.OpenBlob(blob)
 	if err != nil {
 		clearContentHeaders(header)
 		httpErr(resp, err)

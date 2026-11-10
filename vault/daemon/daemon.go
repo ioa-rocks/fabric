@@ -88,6 +88,11 @@ type Daemon struct {
 	sparseMu  sync.Mutex
 	sparse    map[string]*sparseBlob // blob hash -> partial blob open for reading or filling
 
+	evictKick   chan struct{} // a pass over the cache budgets is wanted
+	evictMu     sync.Mutex    // one pass at a time
+	cacheMu     sync.Mutex
+	cacheStates map[string]cacheState // bucket ID -> outcome of the last pass
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -129,6 +134,7 @@ func New(vaultStore *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		outboards:    outboards,
 		flights:      make(map[string]*flight),
 		sparse:       make(map[string]*sparseBlob),
+		evictKick:    make(chan struct{}, 1),
 		handles:      make(map[string]*store.Handle),
 		liveMounts:   make(map[string]*liveMount),
 		mountErrs:    make(map[string]string),
@@ -156,6 +162,7 @@ func New(vaultStore *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		fd.Host.SetStreamHandler(SyncProtocol, fd.Circle.RequireAny(srv.handleSync))
 		fd.Host.SetStreamHandler(BlobProtocol, fd.Circle.RequireAny(srv.handleBlob))
 		fd.Host.SetStreamHandler(BlobRangeProtocol, fd.Circle.RequireAny(srv.handleBlobRange))
+		fd.Host.SetStreamHandler(HoldProtocol, fd.Circle.RequireAny(srv.handleHold))
 		// Chain onto fabric's own on-auth hook (it drives membership-event
 		// anti-entropy) rather than replacing it.
 		fd.Auth.SetOnAuthenticated(func(peerID peer.ID) {
@@ -188,6 +195,7 @@ func (d *Daemon) Run() error {
 
 	if d.Fabric != nil {
 		go d.sparseJanitor()
+		go d.evictLoop()
 		go func() { defer close(d.syncDone); d.syncLoop() }()
 	} else {
 		close(d.syncDone)

@@ -211,3 +211,60 @@ func TestGenerationMovesWithWrites(t *testing.T) {
 		t.Fatal("every write must move the generation")
 	}
 }
+
+func TestLastReadAndGoneLocations(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, ok := store.LastRead("h-film"); ok {
+		t.Fatal("a blob never read has a last-read time")
+	}
+	minute := int64(60_000_000_000)
+	for _, at := range []int64{minute, minute + 5, 3 * minute} {
+		if err := store.Touch("h-film", at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The second touch is within a minute of the first and is not kept.
+	if last, ok := store.LastRead("h-film"); !ok || last != 3*minute {
+		t.Fatalf("last read %d %v, want %d", last, ok, 3*minute)
+	}
+	generation := store.Generation()
+	if err := store.Touch("h-film", 10*minute); err != nil {
+		t.Fatal(err)
+	}
+	if store.Generation() != generation {
+		t.Fatal("a read moved the index generation: summaries would be recounted on every read")
+	}
+
+	// A device that dropped a blob takes back its claim; the record still
+	// travels, so that every replica learns it.
+	for _, location := range []Location{
+		{Blob: "h-film", Node: "desk", Form: FormWhole, TS: 1},
+		{Blob: "h-film", Node: "laptop", Form: FormWhole, TS: 1},
+		{Blob: "h-film", Node: "laptop", Form: FormGone, TS: 2},
+		{Blob: "h-film", Node: "laptop", Form: FormWhole, TS: 1}, // an old claim arriving late
+	} {
+		if err := store.PutLocation(location); err != nil {
+			t.Fatal(err)
+		}
+	}
+	holders, err := store.Locations("h-film")
+	if err != nil || len(holders) != 1 || holders[0].Node != "desk" {
+		t.Fatalf("holders %+v %v, want desk only", holders, err)
+	}
+	if all, _ := store.DumpLocations(); len(all) != 2 {
+		t.Fatalf("%d location records travel, want 2 (the gone one included)", len(all))
+	}
+
+	object := NewObject("old.mkv", Revision{Blob: "h-old", Size: 1}, 1000, "dev:a")
+	if _, err := store.PutObject(object); err != nil {
+		t.Fatal(err)
+	}
+	blobs, err := store.KnownBlobs()
+	if err != nil || len(blobs) != 2 {
+		t.Fatalf("known blobs %v %v, want h-film and h-old", blobs, err)
+	}
+}

@@ -325,3 +325,9 @@ func (r *Replica) Put(rd io.Reader) (string, int64, error) {
 func (r *Replica) Partial(hash string) (*os.File, error) { return r.shadow.Partial(hash) }
 
 func (r *Replica) Commit(hash string) error { return r.shadow.Commit(hash) }
+
+// Drop is refused: a folder replica is a full copy, and its content is the
+// user's files.
+func (r *Replica) Drop(hash string) error {
+	return fmt.Errorf("blob %.12s: a folder replica does not drop content", hash)
+}

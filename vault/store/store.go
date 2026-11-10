@@ -409,6 +409,9 @@ type Holder interface {
 	// turns the completed file into held content (blobstore.Store).
 	Partial(hash string) (*os.File, error)
 	Commit(hash string) error
+	// Drop removes held content (cache eviction). A folder replica
+	// refuses: its content is the user's files.
+	Drop(hash string) error
 }
 
 // Handle is an opened bucket: genesis + policy + index over its holder.
@@ -633,7 +636,11 @@ func (h *Handle) GetBlob(blob string) (io.ReadCloser, error) {
 	if blob == "" {
 		return nil, errors.New("no content")
 	}
-	return h.Holder().Open(blob)
+	content, err := h.Holder().Open(blob)
+	if err == nil {
+		h.Touch(blob)
+	}
+	return content, err
 }
 
 // OpenBlob opens one held blob by hash as a seekable file.
@@ -641,7 +648,11 @@ func (h *Handle) OpenBlob(blob string) (*os.File, error) {
 	if blob == "" {
 		return nil, errors.New("no content")
 	}
-	return h.Holder().OpenFile(blob)
+	file, err := h.Holder().OpenFile(blob)
+	if err == nil {
+		h.Touch(blob)
+	}
+	return file, err
 }
 
 // Get opens the current content of an object.
@@ -649,7 +660,7 @@ func (h *Handle) Get(obj *index.Object) (io.ReadCloser, error) {
 	if obj.Blob() == "" {
 		return nil, fmt.Errorf("object %s has no content (%s)", obj.ID[:8], obj.Head().KindOrFile())
 	}
-	return h.Holder().Open(obj.Blob())
+	return h.GetBlob(obj.Blob())
 }
 
 // BackfillSize repairs a head written before size metadata existed. Size

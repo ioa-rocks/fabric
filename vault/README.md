@@ -168,7 +168,9 @@ not push):
 
 ```sh
 fabric bucket place photos full          # hold a complete copy; fetch what's missing
-fabric bucket place photos cache         # hold what gets accessed (no eviction yet)
+fabric bucket place photos cache         # hold what gets accessed, without limit
+fabric bucket place photos cache -keep 20G  # ...up to 20 GiB: past it the least recently read goes,
+                                         # once a device holding the bucket in full confirms it has it
 fabric bucket place photos none          # catalog + index only
 fabric bucket place photos folder ~/Sync # keep it as a real directory (a full placement)
 fabric bucket place photos full -at /mnt/array/vault  # keep its blobs on that disk
@@ -230,7 +232,8 @@ the CLI regrammared to `fabric circle …` + `fabric bucket …` (fabric
 ADR 0006).
 Next: live two-machine rollout (desk + NAS), then capability grants
 (second user key) and
-the projection consumer. Deferred: cache eviction (LRU), drop-safety
-verify-before-drop, shard groups, health targets, delta sync. The
+the projection consumer. 2026-11-10: a cache placement takes a budget
+(`-keep`) and drops by least recent read, verify-before-drop
+(`/vault/hold/1`). Deferred: shard groups, health targets, delta sync. The
 years-old Python prototype lives at `../../vault_proto_py`
 (parts-bin).

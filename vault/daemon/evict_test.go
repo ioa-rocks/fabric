@@ -1,0 +1,161 @@
+package daemon_test
+
+import (
+	"bytes"
+	"testing"
+	"time"
+
+	"ioa.rocks/fabric/vault/daemon"
+)
+
+func (p *blobPair) readerBucket(t *testing.T) daemon.BucketInfo {
+	t.Helper()
+	buckets, err := p.readerClient.Buckets()
+	if err != nil || len(buckets) != 1 {
+		t.Fatalf("reader buckets: %+v %v", buckets, err)
+	}
+	return buckets[0]
+}
+
+func (p *blobPair) cacheWithBudget(t *testing.T, budget int64) {
+	t.Helper()
+	t.Cleanup(daemon.SetEvictGrace(0))
+	waitFor(t, "the bucket known on the reader", func() bool {
+		return p.readerClient.Place("films", "cache", nil, &budget) == nil
+	})
+}
+
+// readAll reads each object on the reader in turn, a little apart so that
+// their order of use is unambiguous.
+func (p *blobPair) readAll(t *testing.T, contents map[string][]byte, order ...daemon.ObjectInfo) {
+	t.Helper()
+	for _, object := range order {
+		got, err := p.read(t, object.ID)
+		if err != nil || !bytes.Equal(got, contents[object.ID]) {
+			t.Fatalf("read %s: %d bytes, %v", object.Name, len(got), err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A cache over its budget drops what was read longest ago, keeps the rest,
+// and what it dropped can be read again from the device that holds the
+// bucket in full.
+func TestCacheDropsLeastRecentlyRead(t *testing.T) {
+	pair := newBlobPair(t)
+	pair.cacheWithBudget(t, 3<<19) // 1.5 MiB
+	contents := map[string][]byte{}
+	var films []daemon.ObjectInfo
+	for _, name := range []string{"one.mkv", "two.mkv", "three.mkv"} {
+		content := film(1 << 20)
+		object := pair.put(t, name, content)
+		contents[object.ID] = content
+		films = append(films, object)
+	}
+	pair.readAll(t, contents, films[0], films[1], films[2])
+	pair.reader.EvictNow()
+
+	bucket := pair.readerBucket(t)
+	if bucket.Held != 1 || bucket.CacheBytes != 1<<20 || bucket.CacheUnconfirmed != 0 {
+		t.Fatalf("after eviction: held %d, %d bytes, %d unconfirmed; want the last film only", bucket.Held, bucket.CacheBytes, bucket.CacheUnconfirmed)
+	}
+	// The survivor is the one read last: it is served with the holder gone
+	// from the conversation.
+	pair.holder.Fabric.Host.RemoveStreamHandler(daemon.BlobRangeProtocol)
+	pair.holder.Fabric.Host.RemoveStreamHandler(daemon.BlobProtocol)
+	if got, err := pair.read(t, films[2].ID); err != nil || !bytes.Equal(got, contents[films[2].ID]) {
+		t.Fatalf("the most recently read film: %d bytes, %v", len(got), err)
+	}
+	if _, err := pair.read(t, films[0].ID); err == nil {
+		t.Fatal("the first film is still readable with no holder serving: it was not dropped")
+	}
+}
+
+// A dropped blob comes back on the next read, and the holder is told the
+// reader no longer has it.
+func TestDroppedBlobIsFetchedAgain(t *testing.T) {
+	pair := newBlobPair(t)
+	pair.cacheWithBudget(t, 1<<19)
+	content := film(1 << 20)
+	object := pair.put(t, "film.mkv", content)
+	contents := map[string][]byte{object.ID: content}
+	pair.readAll(t, contents, object)
+	pair.reader.EvictNow()
+	if held := pair.heldOnReader(t); held != 0 {
+		t.Fatalf("reader holds %d blobs after eviction, want 0", held)
+	}
+	pair.readAll(t, contents, object)
+	if held := pair.heldOnReader(t); held != 1 {
+		t.Fatalf("reader holds %d blobs after reading again, want 1", held)
+	}
+}
+
+// Nothing is dropped unless a device that holds the bucket in full says,
+// now, that it has the blob: not when that device is itself a cache, and
+// not when it cannot be asked.
+func TestCacheKeepsWhatNoFullHolderConfirms(t *testing.T) {
+	pair := newBlobPair(t)
+	pair.cacheWithBudget(t, 1<<19)
+	content := film(1 << 20)
+	object := pair.put(t, "film.mkv", content)
+	// The holder stops being a full copy before the reader takes the film:
+	// arriving content triggers a pass of its own.
+	if err := pair.holderClient.Sub("films", "cache"); err != nil {
+		t.Fatal(err)
+	}
+	pair.readAll(t, map[string][]byte{object.ID: content}, object)
+
+	stays := func(why string) {
+		t.Helper()
+		pair.reader.EvictNow()
+		bucket := pair.readerBucket(t)
+		if bucket.Held != 1 || bucket.CacheUnconfirmed != 1 {
+			t.Fatalf("%s: held %d, unconfirmed %d; want the film kept and reported", why, bucket.Held, bucket.CacheUnconfirmed)
+		}
+	}
+
+	stays("the other holder is a cache")
+
+	pair.holder.Fabric.Host.RemoveStreamHandler(daemon.HoldProtocol)
+	if err := pair.holderClient.Sub("films", "full"); err != nil {
+		t.Fatal(err)
+	}
+	stays("the full holder does not answer the question")
+
+	pair.stopHolder()
+	stays("the full holder is gone")
+}
+
+// A full placement and a cache without a budget are never evicted from.
+func TestOnlyABudgetedCacheEvicts(t *testing.T) {
+	pair := newBlobPair(t)
+	t.Cleanup(daemon.SetEvictGrace(0))
+	content := film(1 << 20)
+	object := pair.put(t, "film.mkv", content)
+	if err := pair.readerClient.Sub("films", "cache"); err != nil {
+		t.Fatal(err)
+	}
+	pair.readAll(t, map[string][]byte{object.ID: content}, object)
+	pair.reader.EvictNow()
+	if held := pair.heldOnReader(t); held != 1 {
+		t.Fatalf("a cache without a budget dropped content: held %d", held)
+	}
+	budget := int64(1)
+	if err := pair.readerClient.Place("films", "full", nil, &budget); err == nil {
+		t.Fatal("a budget was accepted on a full placement")
+	}
+	if err := pair.readerClient.Place("films", "cache", nil, &budget); err != nil {
+		t.Fatal(err)
+	}
+	// Setting the budget runs a pass, and the film goes; a full placement
+	// brings it back and then keeps it.
+	waitFor(t, "the film dropped under the budget", func() bool { return pair.heldOnReader(t) == 0 })
+	if err := pair.readerClient.Sub("films", "full"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the film held under the full placement", func() bool { return pair.heldOnReader(t) == 1 })
+	pair.reader.EvictNow()
+	if bucket := pair.readerBucket(t); bucket.Held != 1 || bucket.Keep != 0 {
+		t.Fatalf("after becoming full: held %d, budget %d; want the film kept and the budget gone", bucket.Held, bucket.Keep)
+	}
+}

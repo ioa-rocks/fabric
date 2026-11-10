@@ -429,7 +429,9 @@ func (b *sparseBlob) commit() error {
 	b.committed = true
 	b.mu.Unlock()
 	_ = b.handle.RecordHeld(b.hash)
-	b.daemon.kickSync() // let peers learn we hold it now
+	b.handle.Touch(b.hash)
+	b.daemon.kickSync()  // let peers learn we hold it now
+	b.daemon.kickEvict() // a cache placement may be over its budget now
 	return nil
 }
 

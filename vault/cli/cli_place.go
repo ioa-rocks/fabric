@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,7 +20,10 @@ import (
 // withdraws the folder declaration (the directory is left as it is).
 // '-at <dir>' names the blob store root a full or cache placement writes
 // to (placement-record memo: the root is local to this device and never
-// gossiped); 'default' returns to the device's own store. Mounts are a
+// gossiped); 'default' returns to the device's own store. '-keep <size>'
+// gives a cache placement a budget: past it, the least recently read
+// content is dropped, each blob only after a device holding the bucket in
+// full has confirmed it has it (vault ADR 0004). Mounts are a
 // surface over the store, not a placement, so they are declared
 // separately ('fabric bucket mount').
 
@@ -28,8 +32,9 @@ func cmdPlace(args []string) error {
 	pth := pathFlags(fs)
 	rescan := fs.Bool("rescan", false, "ask the daemon to scan the folder replica now")
 	at := fs.String("at", "", "blob store root for a full/cache placement (absolute dir, or 'default')")
+	keepFlag := fs.String("keep", "", "budget of a cache placement, e.g. 20G (K, M, G, T are powers of 1024); 'none' removes it")
 	pos := parse(fs, args, -1)
-	usage := "usage: fabric bucket place <bucket> [full|cache|none | folder <dir>] [-at <dir>|default] [-rescan]"
+	usage := "usage: fabric bucket place <bucket> [full|cache|none | folder <dir>] [-at <dir>|default] [-keep <size>|none] [-rescan]"
 	if len(pos) < 1 || len(pos) > 3 {
 		return errors.New(usage)
 	}
@@ -99,10 +104,24 @@ func cmdPlace(args []string) error {
 				}
 				root = &resolvedRoot
 			}
-			if err := st.Place(bkt.ID, mode, root); err != nil {
+			var keep *int64
+			if *keepFlag != "" {
+				if mode != "cache" {
+					return errors.New("-keep applies to a cache placement")
+				}
+				budget, err := parseSize(*keepFlag)
+				if err != nil {
+					return err
+				}
+				keep = &budget
+			}
+			if err := st.Place(bkt.ID, mode, root, keep); err != nil {
 				return err
 			}
 			fmt.Printf("placed: %s -> %s\n", bkt.Name, mode)
+			if keep != nil && *keep > 0 {
+				fmt.Printf("past %s, the least recently read content is dropped once a device holding the bucket in full confirms it has it\n", formatSize(*keep))
+			}
 			if root != nil && *root != "default" {
 				fmt.Printf("blobs for this bucket now land in %s; any already in the default store stay there, readable\n", *root)
 			}
@@ -138,6 +157,16 @@ func cmdPlace(args []string) error {
 		mode += " at " + bkt.Root
 	}
 	fmt.Printf("%s  %s: %s — holding %d/%d blobs\n", bkt.ID[:16], bkt.Name, mode, bkt.Held, bkt.Objects)
+	if bkt.Keep > 0 {
+		line := "budget " + formatSize(bkt.Keep)
+		if bkt.CacheBytes > 0 {
+			line += ", holding " + formatSize(bkt.CacheBytes)
+		}
+		fmt.Println(line)
+		if bkt.CacheUnconfirmed > 0 {
+			fmt.Printf("over budget: %d blobs stay because no device holding the bucket in full confirmed it has them\n", bkt.CacheUnconfirmed)
+		}
+	}
 	if cl == nil {
 		return nil
 	}
@@ -163,6 +192,51 @@ func cmdPlace(args []string) error {
 		}
 	}
 	return nil
+}
+
+// parseSize reads a byte count with an optional K, M, G or T suffix
+// (powers of 1024); "none" and "0" mean no budget.
+func parseSize(text string) (int64, error) {
+	text = strings.TrimSpace(text)
+	if text == "none" {
+		return 0, nil
+	}
+	upper := strings.TrimSuffix(strings.TrimSuffix(strings.ToUpper(text), "B"), "I")
+	shift := 0
+	if upper != "" {
+		switch upper[len(upper)-1] {
+		case 'K':
+			shift = 10
+		case 'M':
+			shift = 20
+		case 'G':
+			shift = 30
+		case 'T':
+			shift = 40
+		}
+	}
+	if shift > 0 {
+		upper = upper[:len(upper)-1]
+	}
+	number, err := strconv.ParseFloat(upper, 64)
+	if err != nil || number < 0 || number*float64(int64(1)<<shift) > float64(1<<62) {
+		return 0, fmt.Errorf("size %q: want a number with an optional K, M, G or T, e.g. 20G", text)
+	}
+	return int64(number * float64(int64(1)<<shift)), nil
+}
+
+// formatSize renders a byte count with a binary unit.
+func formatSize(size int64) string {
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
+	value, unit := float64(size), 0
+	for value >= 1024 && unit < len(units)-1 {
+		value /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%d B", size)
+	}
+	return fmt.Sprintf("%.1f %s", value, units[unit])
 }
 
 // findBucket resolves a name or ID prefix through the store's listing so
