@@ -394,6 +394,10 @@ func (c *Store) ResolveBucketID(ref string) (string, error) {
 type Holder interface {
 	Put(r io.Reader) (hash string, size int64, err error)
 	Open(hash string) (io.ReadCloser, error)
+	// OpenFile opens held content for seeking. The file's bytes are the
+	// blob's at the time of the call; a folder replica verifies that on the
+	// open descriptor, since its working files can change.
+	OpenFile(hash string) (*os.File, error)
 	Path(hash string) (string, error)
 	Has(hash string) bool
 	Size(hash string) (int64, error)
@@ -612,6 +616,14 @@ func (h *Handle) GetBlob(blob string) (io.ReadCloser, error) {
 		return nil, errors.New("no content")
 	}
 	return h.Holder().Open(blob)
+}
+
+// OpenBlob opens one held blob by hash as a seekable file.
+func (h *Handle) OpenBlob(blob string) (*os.File, error) {
+	if blob == "" {
+		return nil, errors.New("no content")
+	}
+	return h.Holder().OpenFile(blob)
 }
 
 // Get opens the current content of an object.

@@ -225,11 +225,15 @@ func lstat(targetPath string) (statInfo, error) {
 	if err != nil {
 		return statInfo{}, err
 	}
+	return statOf(fi), nil
+}
+
+func statOf(fi os.FileInfo) statInfo {
 	si := statInfo{size: fi.Size(), mtime: fi.ModTime().UnixNano(), mode: uint32(fi.Mode().Perm()), isDir: fi.IsDir(), isLnk: fi.Mode()&os.ModeSymlink != 0}
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 		si.inode = st.Ino
 	}
-	return si, nil
+	return si
 }
 
 // unchanged reports whether a file still matches its scan entry.
@@ -272,6 +276,27 @@ func (r *Replica) Open(hash string) (io.ReadCloser, error) {
 		return nil, err
 	}
 	return os.Open(targetPath)
+}
+
+// OpenFile opens a blob for seeking. A working file can be rewritten
+// between the stat and the open, so the scan entry is checked against the
+// open descriptor: what is returned was the blob's bytes when opened.
+func (r *Replica) OpenFile(hash string) (*os.File, error) {
+	for _, rel := range r.pathsForBlob(hash) {
+		entry, ok := r.getEntry(rel)
+		if !ok {
+			continue
+		}
+		file, err := os.OpenFile(filepath.Join(r.Dir, filepath.FromSlash(rel)), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			continue
+		}
+		if fi, err := file.Stat(); err == nil && fi.Mode().IsRegular() && entry.unchanged(statOf(fi)) {
+			return file, nil
+		}
+		file.Close()
+	}
+	return r.shadow.OpenFile(hash)
 }
 
 // Size of a held blob.

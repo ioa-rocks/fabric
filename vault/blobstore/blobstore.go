@@ -78,6 +78,11 @@ func (s *Store) PutFile(path string) (string, int64, error) {
 
 // Open returns a reader for a blob.
 func (s *Store) Open(hash string) (io.ReadCloser, error) {
+	return s.OpenFile(hash)
+}
+
+// OpenFile opens a blob as a file, for readers that seek (range requests).
+func (s *Store) OpenFile(hash string) (*os.File, error) {
 	file, err := os.Open(s.path(hash))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("blob %s: not held here", hash)

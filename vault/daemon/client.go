@@ -200,6 +200,37 @@ func (c *Client) Get(bucket, ref string) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
+// GetRange reads length bytes of an object's content from offset (to the
+// end when length is negative). blob selects one head, as in GetBlob; empty
+// means the rendered one.
+func (c *Client) GetRange(bucket, ref, blob string, offset, length int64) (io.ReadCloser, error) {
+	query := "?ref=" + url.QueryEscape(ref)
+	if blob != "" {
+		query += "&blob=" + url.QueryEscape(blob)
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://vault"+bucketPath(bucket, "/content")+query, nil)
+	if err != nil {
+		return nil, err
+	}
+	if length < 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	} else {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("is the daemon running? %w", err)
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return nil, errors.New("daemon ignored the range request (older daemon?)")
+		}
+		return nil, decodeErr(resp)
+	}
+	return resp.Body, nil
+}
+
 func (c *Client) Replace(bucket, ref string, src io.Reader) (ObjectInfo, error) {
 	var out ObjectInfo
 	req, err := http.NewRequest(http.MethodPut, "http://vault"+bucketPath(bucket, "/content")+"?ref="+url.QueryEscape(ref), io.NopCloser(src))

@@ -12,7 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -607,16 +607,52 @@ func (d *Daemon) handleGet(resp http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
-	rc, err := handle.GetBlob(blob)
+	file, err := handle.OpenBlob(blob)
 	if err != nil {
 		httpErr(resp, err)
 		return
 	}
-	defer rc.Close()
-	resp.Header().Set("Content-Type", "application/octet-stream")
-	resp.Header().Set("X-Vault-Object", obj.ID)
-	resp.Header().Set("X-Vault-Name", obj.Name.V)
-	_, _ = io.Copy(resp, rc)
+	defer file.Close()
+	// Last-Modified follows the revision being served; the blob hash is the
+	// validator, so a range resumed after the object changed starts over.
+	modified := time.Unix(0, obj.Modified())
+	for _, rev := range obj.Heads {
+		if rev.Blob == blob && rev.MTime != 0 {
+			modified = time.Unix(0, rev.MTime)
+		}
+	}
+	header := resp.Header()
+	header.Set("Content-Type", contentType(obj.Name.V))
+	header.Set("ETag", `"`+blob+`"`)
+	header.Set("X-Vault-Object", obj.ID)
+	header.Set("X-Vault-Name", obj.Name.V)
+	// ServeContent answers Range, If-Range and the conditional headers, and
+	// reads only the bytes asked for: a player seeks without a full read.
+	http.ServeContent(resp, req, "", modified, file)
+}
+
+// mediaTypes covers what a player or viewer must be told to seek and
+// render; Go's built-in table has the image and web types but no video or
+// audio, and the system's mime database is not there on every node.
+var mediaTypes = map[string]string{
+	".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
+	".mov": "video/quicktime", ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
+	".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".ogg": "audio/ogg",
+	".opus": "audio/ogg", ".flac": "audio/flac", ".wav": "audio/wav",
+	".heic": "image/heic", ".heif": "image/heif",
+}
+
+// contentType names an object's media type from its name. Unknown content
+// stays application/octet-stream: the type is never sniffed from the bytes.
+func contentType(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	if mediaType, ok := mediaTypes[ext]; ok {
+		return mediaType
+	}
+	if mediaType := mime.TypeByExtension(ext); mediaType != "" {
+		return mediaType
+	}
+	return "application/octet-stream"
 }
 
 func (d *Daemon) handleReplace(resp http.ResponseWriter, req *http.Request) {

@@ -255,6 +255,18 @@ func (h *rootedHolder) Open(hash string) (rc io.ReadCloser, err error) {
 	return rc, err
 }
 
+func (h *rootedHolder) OpenFile(hash string) (file *os.File, err error) {
+	err = fmt.Errorf("blob %s: not held here", hash)
+	h.each(func(blobs *blobstore.Store) bool {
+		if opened, openErr := blobs.OpenFile(hash); openErr == nil {
+			file, err = opened, nil
+			return true
+		}
+		return false
+	})
+	return file, err
+}
+
 func (h *rootedHolder) Path(hash string) (blobPath string, err error) {
 	err = fmt.Errorf("blob %s: not held here", hash)
 	h.each(func(blobs *blobstore.Store) bool {

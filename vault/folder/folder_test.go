@@ -465,3 +465,44 @@ func TestBulkDeleteWithConflict(t *testing.T) {
 		t.Fatalf("accepted deletion trashed %d on B, want 30", len(tr))
 	}
 }
+
+// TestOpenFileNeverServesAChangedWorkingFile: a seekable read of a blob
+// comes from the working file only while that file is still the scanned
+// one; once it is rewritten the blob is no longer served from it.
+func TestOpenFileNeverServesAChangedWorkingFile(t *testing.T) {
+	dev := newDevice(t, "solo", nil, nil)
+	target := filepath.Join(dev.dir, "clip.mp4")
+	if err := os.WriteFile(target, []byte("original bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dev.rep.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	objs, err := dev.h.Index.ListObjects()
+	if err != nil || len(objs) != 1 {
+		t.Fatalf("objects = %d, err=%v", len(objs), err)
+	}
+	blob := objs[0].Blob()
+
+	file, err := dev.rep.OpenFile(blob)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	got, _ := io.ReadAll(file)
+	file.Close()
+	if string(got) != "original bytes" {
+		t.Fatalf("read %q", got)
+	}
+
+	// Rewritten behind the replica's back, not yet rescanned.
+	if err := os.WriteFile(target, []byte("edited, longer bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if file, err := dev.rep.OpenFile(blob); err == nil {
+		got, _ := io.ReadAll(file)
+		file.Close()
+		if string(got) != "original bytes" {
+			t.Fatalf("a changed working file was served as blob %.12s: %q", blob, got)
+		}
+	}
+}
