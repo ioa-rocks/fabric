@@ -159,3 +159,82 @@ func TestOnlyABudgetedCacheEvicts(t *testing.T) {
 		t.Fatalf("after becoming full: held %d, budget %d; want the film kept and the budget gone", bucket.Held, bucket.Keep)
 	}
 }
+
+// Serving a blob to a peer is not a read: it must not make the blob look
+// recently used on the device that served it.
+func TestServingAPeerIsNotARead(t *testing.T) {
+	pair := newBlobPair(t)
+	pair.cacheWithBudget(t, 1<<30)
+	content := film(1 << 20)
+	object, err := pair.readerClient.Put("films", "mine.mkv", bytes.NewReader(content), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The holder is a full placement: it fetches the film from the reader.
+	waitFor(t, "the film held on the full placement", func() bool {
+		buckets, err := pair.holderClient.Buckets()
+		return err == nil && len(buckets) == 1 && buckets[0].Objects == 1 && buckets[0].Held == 1
+	})
+	if last, read := pair.reader.LastRead("films", object.Blob); read {
+		t.Fatalf("the cache counts serving a peer as a read (at %d)", last)
+	}
+}
+
+// A blob that another bucket merely lists is this placement's to drop; one
+// that another bucket holds in full is not.
+func TestSharedBlobFollowsTheOtherPlacement(t *testing.T) {
+	pair := newBlobPair(t)
+	genesis, policy := signBucket(t, pair.holderState, "pw", "copies")
+	if _, err := pair.holderClient.CreateBucket(genesis, policy); err != nil {
+		t.Fatal(err)
+	}
+	content := film(1 << 20)
+	if _, err := pair.holderClient.Put("copies", "same.mkv", bytes.NewReader(content), nil); err != nil {
+		t.Fatal(err)
+	}
+	object := pair.put(t, "film.mkv", content)
+	readerBucket := func(name string) daemon.BucketInfo {
+		t.Helper()
+		buckets, err := pair.readerClient.Buckets()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, bucket := range buckets {
+			if bucket.Name == name {
+				return bucket
+			}
+		}
+		return daemon.BucketInfo{}
+	}
+	waitFor(t, "both buckets listed on the reader", func() bool {
+		return readerBucket("copies").Objects == 1 && readerBucket("films").Objects == 1
+	})
+	t.Cleanup(daemon.SetEvictGrace(0))
+
+	// "copies" is held in full on the reader: the shared blob stays.
+	if err := pair.readerClient.Sub("copies", "full"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the copy held under the full placement", func() bool { return readerBucket("copies").Held == 1 })
+	budget := int64(1 << 19)
+	if err := pair.readerClient.Place("films", "cache", nil, &budget); err != nil {
+		t.Fatal(err)
+	}
+	pair.reader.EvictNow()
+	if films := readerBucket("films"); films.Held != 1 || films.CacheBytes != 0 || films.CacheUnconfirmed != 0 {
+		t.Fatalf("with the other bucket full: held %d, %d bytes counted, %d unconfirmed; want the blob kept and not counted", films.Held, films.CacheBytes, films.CacheUnconfirmed)
+	}
+
+	// "copies" promises nothing any more: the blob is the cache's to drop,
+	// and both buckets stop holding it.
+	if err := pair.readerClient.Sub("copies", "none"); err != nil {
+		t.Fatal(err)
+	}
+	pair.reader.EvictNow()
+	if films, copies := readerBucket("films"), readerBucket("copies"); films.Held != 0 || copies.Held != 0 {
+		t.Fatalf("with the other bucket unplaced: films held %d, copies held %d; want the blob dropped", films.Held, copies.Held)
+	}
+	if got, err := pair.read(t, object.ID); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("read after the drop: %d bytes, %v", len(got), err)
+	}
+}

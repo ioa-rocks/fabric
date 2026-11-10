@@ -60,6 +60,12 @@ func (h *Handle) Drop(blob string) error {
 	if err := h.Holder().Drop(blob); err != nil {
 		return err
 	}
+	return h.Forget(blob)
+}
+
+// Forget records that this device no longer holds a blob: the bucket's
+// location record for it becomes one of form gone.
+func (h *Handle) Forget(blob string) error {
 	_ = h.Index.ForgetRead(blob)
 	return h.Index.PutLocation(index.Location{Blob: blob, Node: h.store.NodeID, Form: index.FormGone, TS: time.Now().UnixNano()})
 }

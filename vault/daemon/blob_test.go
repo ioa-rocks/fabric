@@ -25,7 +25,7 @@ type blobPair struct {
 	holder, reader             *daemon.Daemon
 	stopHolder, stopReader     func()
 	holderClient, readerClient *daemon.Client
-	readerState                string
+	readerState, holderState   string
 }
 
 func newBlobPair(t *testing.T) *blobPair {
@@ -42,7 +42,7 @@ func newBlobPair(t *testing.T) *blobPair {
 	holder.admits(t, reader, "family")
 	roster := []*cert.Cert{holder.cert, reader.cert}
 	holder.writeConfig(t, root, "holder", nil, roster...)
-	pair := &blobPair{readerState: reader.statePath}
+	pair := &blobPair{readerState: reader.statePath, holderState: holder.statePath}
 	pair.holder, pair.stopHolder = runDaemon(t, holder.statePath)
 	bootstrap := pair.holder.Fabric.Host.Addrs()[0].String() + "/p2p/" + pair.holder.Fabric.Host.ID().String()
 	reader.writeConfig(t, root, "reader", []string{bootstrap}, roster...)

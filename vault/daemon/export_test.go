@@ -20,3 +20,13 @@ func SetEvictGrace(grace time.Duration) (restore func()) {
 	evictGrace = grace
 	return func() { evictGrace = old }
 }
+
+// LastRead is when this device last read a blob of the bucket, as eviction
+// sees it.
+func (d *Daemon) LastRead(bucket, hash string) (int64, bool) {
+	handle, err := d.handle(bucket)
+	if err != nil {
+		return 0, false
+	}
+	return handle.Index.LastRead(hash)
+}

@@ -476,7 +476,9 @@ func (d *Daemon) handleBlob(stream network.Stream) {
 // holder — content is shared by hash, so another bucket's folder may be
 // the only place the bytes are.
 func (d *Daemon) openBlob(handle *store.Handle, hash string) (*os.File, error) {
-	if file, err := handle.OpenBlob(hash); err == nil {
+	// Through the holder, not Handle.OpenBlob: serving a peer is not a
+	// read, and must not make the blob look recently used to eviction.
+	if file, err := handle.Holder().OpenFile(hash); err == nil {
 		return file, nil
 	}
 	if blobPath, err := d.Store.BlobPath(hash); err == nil {
@@ -495,7 +497,7 @@ func (d *Daemon) openBlob(handle *store.Handle, hash string) (*os.File, error) {
 		if err != nil {
 			continue
 		}
-		if file, err := other.OpenBlob(hash); err == nil {
+		if file, err := other.Holder().OpenFile(hash); err == nil {
 			return file, nil
 		}
 	}

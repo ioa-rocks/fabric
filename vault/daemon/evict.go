@@ -111,8 +111,8 @@ func (d *Daemon) evictBucket(handle *store.Handle, keep int64) cacheState {
 			switch {
 			case entry.LastRead > recent, d.sparseOpen(entry.Hash):
 				// in use, or just was
-			case d.heldForAnother(handle, entry.Hash):
-				// Another bucket on this device needs it; it is not this
+			case d.heldForAnother(handle, entry.Hash, recent):
+				// Another bucket on this device keeps it; it is not this
 				// placement's to count or to drop.
 				state.Bytes -= entry.Size
 			default:
@@ -142,6 +142,7 @@ func (d *Daemon) evictBucket(handle *store.Handle, keep int64) cacheState {
 				continue
 			}
 			d.outboards.Remove(entry.Hash)
+			d.forgetElsewhere(handle, entry.Hash)
 			state.Bytes -= entry.Size
 			dropped++
 			freed += entry.Size
@@ -166,10 +167,14 @@ func (d *Daemon) sparseOpen(hash string) bool {
 	return d.sparse[hash] != nil
 }
 
-// heldForAnother reports whether a bucket other than handle's, known to
-// this device, references the blob. Content is shared by hash, so dropping
-// it for one bucket would drop it for the other.
-func (d *Daemon) heldForAnother(handle *store.Handle, hash string) bool {
+// heldForAnother reports whether another bucket on this device keeps the
+// blob. Content is shared by hash, so dropping it for one bucket drops it
+// for every bucket that reads the same stores. Referencing the blob is not
+// keeping it: every device of a circle has every bucket's index. The other
+// bucket keeps it when its placement here holds content without limit (a
+// full placement, a folder, a cache with no budget), or when it is a
+// budgeted cache that read the blob since the cutoff.
+func (d *Daemon) heldForAnother(handle *store.Handle, hash string, recent int64) bool {
 	buckets, err := d.Store.Buckets()
 	if err != nil {
 		return true
@@ -179,15 +184,45 @@ func (d *Daemon) heldForAnother(handle *store.Handle, hash string) bool {
 		if err != nil || id == handle.ID() {
 			continue
 		}
+		placement := d.Store.Placement(id)
+		if placement.Mode == store.SubNone {
+			continue // it promises to hold nothing
+		}
 		other, err := d.handle(id)
 		if err != nil {
 			return true // cannot tell; keep it
 		}
-		if other.References(hash) {
+		if !other.References(hash) {
+			continue
+		}
+		if placement.Mode != store.SubCache || placement.Keep <= 0 {
+			return true
+		}
+		if last, ok := other.Index.LastRead(hash); ok && last > recent {
 			return true
 		}
 	}
 	return false
+}
+
+// forgetElsewhere takes back the claim of every other bucket that listed
+// this device as a holder of a blob that is now gone from it.
+func (d *Daemon) forgetElsewhere(handle *store.Handle, hash string) {
+	buckets, err := d.Store.Buckets()
+	if err != nil {
+		return
+	}
+	for _, bkt := range buckets {
+		id, err := bkt.ID()
+		if err != nil || id == handle.ID() {
+			continue
+		}
+		other, err := d.handle(id)
+		if err != nil || !other.References(hash) || other.Holder().Has(hash) {
+			continue
+		}
+		other.Forget(hash)
+	}
 }
 
 // cacheStateOf returns the last pass's outcome for a bucket.
