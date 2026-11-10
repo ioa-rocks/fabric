@@ -67,33 +67,33 @@ func RevokeIn(priv ed25519.PrivateKey, proof *statement.Statement, circleDID, de
 // rotated key rides) or by an admin desk under its own admission (own),
 // targeting a device (a removal) or a statement ID in circleDID.
 func RevokeAs(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, target statement.Target, now time.Time) (*Revocation, error) {
-	s, err := statement.Revoke(priv, circleDID, own, target, now)
+	stmt, err := statement.Revoke(priv, circleDID, own, target, now)
 	if err != nil {
 		return nil, err
 	}
-	return revocationFromStatement(s)
+	return revocationFromStatement(stmt)
 }
 
 // RevocationFromStatement wraps a decoded revocation statement.
-func RevocationFromStatement(s *statement.Statement) (*Revocation, error) {
-	return revocationFromStatement(s)
+func RevocationFromStatement(stmt *statement.Statement) (*Revocation, error) {
+	return revocationFromStatement(stmt)
 }
 
-func revocationFromStatement(s *statement.Statement) (*Revocation, error) {
-	p := s.Payload
-	if p.Typ != statement.TypeRevoke || p.Target == nil {
+func revocationFromStatement(stmt *statement.Statement) (*Revocation, error) {
+	payload := stmt.Payload
+	if payload.Typ != statement.TypeRevoke || payload.Target == nil {
 		return nil, errors.New("not a revocation")
 	}
-	r := &Revocation{Circle: p.Sub, At: p.Iat, Sig: s.Sig, Stmt: s}
-	if len(p.Target.ID) != 0 {
-		r.TargetID = p.Target.ID
+	revocation := &Revocation{Circle: payload.Sub, At: payload.Iat, Sig: stmt.Sig, Stmt: stmt}
+	if len(payload.Target.ID) != 0 {
+		revocation.TargetID = payload.Target.ID
 	} else {
-		r.Device = p.Target.Aud
-		if s.IsSweep() {
-			r.At = p.Target.Before
+		revocation.Device = payload.Target.Aud
+		if stmt.IsSweep() {
+			revocation.At = payload.Target.Before
 		}
 	}
-	return r, nil
+	return revocation, nil
 }
 
 // Verify checks the revocation's signatures and shape: a root-signed one
@@ -143,21 +143,21 @@ func (r *Revocation) Delegated() bool { return r.Stmt != nil && !r.Stmt.IsRootIs
 // revocation, that very statement. Only root authority is judged here; a
 // delegated revocation is applied by Circle.Revoked through the verifier,
 // since whether it reaches the admission depends on the admission's chain.
-func (r *Revocation) Kills(a *Admission) bool {
-	if a.Circle != r.Circle || r.Delegated() {
+func (r *Revocation) Kills(admission *Admission) bool {
+	if admission.Circle != r.Circle || r.Delegated() {
 		return false
 	}
 	if r.TargetID != nil {
-		id := a.Stmt.ID()
+		id := admission.Stmt.ID()
 		return bytes.Equal(r.TargetID, id[:])
 	}
-	if a.Device != r.Device {
+	if admission.Device != r.Device {
 		return false
 	}
 	if r.Stmt.IsSweep() {
-		return a.Iat <= r.At
+		return admission.Iat <= r.At
 	}
-	return !a.Stmt.Acknowledges(r.Stmt.ID())
+	return !admission.Stmt.Acknowledges(r.Stmt.ID())
 }
 
 // Removal reports whether this is a device-wide removal (as opposed to a
@@ -183,11 +183,11 @@ func (r *Revocation) Marshal() ([]byte, error) { return r.Stmt.Bytes() }
 // revocation minted before statements (2026-11-02) no longer decodes; it
 // could only have killed admissions of that age, themselves undecodable.
 func UnmarshalRevocation(data []byte) (*Revocation, error) {
-	s, err := statement.Decode(data)
+	stmt, err := statement.Decode(data)
 	if err != nil {
 		return nil, fmt.Errorf("decoding revocation: %w (a pre-statement revocation?)", err)
 	}
-	return revocationFromStatement(s)
+	return revocationFromStatement(stmt)
 }
 
 // RevocationsPath is where this node keeps the circle's revocations.
@@ -210,14 +210,14 @@ func (c *Circle) Revocations(now time.Time) ([]*Revocation, error) {
 	}
 	var out []*Revocation
 	for _, item := range list {
-		r, err := UnmarshalRevocation(item)
+		revocation, err := UnmarshalRevocation(item)
 		if err != nil {
 			return nil, err
 		}
-		if r.Circle != c.Config.DID || r.Verify() != nil || r.Spent(now) {
+		if revocation.Circle != c.Config.DID || revocation.Verify() != nil || revocation.Spent(now) {
 			continue // not ours, forged, or spent — dropped on the next write
 		}
-		out = append(out, r)
+		out = append(out, revocation)
 	}
 	sortRevocations(out)
 	return out, nil
@@ -228,12 +228,12 @@ func (c *Circle) Revocations(now time.Time) ([]*Revocation, error) {
 // duplicates and spent records are dropped. Returns the records that were
 // new. The file is the union of what the CLI and the daemon learn, so the
 // merge is read-modify-write and the write is atomic.
-func (c *Circle) AddRevocations(now time.Time, rs ...*Revocation) ([]*Revocation, error) {
-	for _, r := range rs {
-		if r.Circle != c.Config.DID {
+func (c *Circle) AddRevocations(now time.Time, revocations ...*Revocation) ([]*Revocation, error) {
+	for _, revocation := range revocations {
+		if revocation.Circle != c.Config.DID {
 			return nil, errors.New("revocation is for a different circle")
 		}
-		if err := r.Verify(); err != nil {
+		if err := revocation.Verify(); err != nil {
 			return nil, err
 		}
 	}
@@ -242,25 +242,25 @@ func (c *Circle) AddRevocations(now time.Time, rs ...*Revocation) ([]*Revocation
 		return nil, err
 	}
 	seen := map[string]bool{}
-	for _, r := range have {
-		seen[r.ID()] = true
+	for _, revocation := range have {
+		seen[revocation.ID()] = true
 	}
 	var added []*Revocation
-	for _, r := range rs {
-		if r.Spent(now) || seen[r.ID()] {
+	for _, revocation := range revocations {
+		if revocation.Spent(now) || seen[revocation.ID()] {
 			continue
 		}
-		seen[r.ID()] = true
-		have = append(have, r)
-		added = append(added, r)
+		seen[revocation.ID()] = true
+		have = append(have, revocation)
+		added = append(added, revocation)
 	}
 	if len(added) == 0 {
 		return nil, nil
 	}
 	sortRevocations(have)
 	list := make([][]byte, 0, len(have))
-	for _, r := range have {
-		raw, err := r.Marshal()
+	for _, revocation := range have {
+		raw, err := revocation.Marshal()
 		if err != nil {
 			return nil, err
 		}
@@ -283,13 +283,13 @@ func (c *Circle) AddRevocations(now time.Time, rs ...*Revocation) ([]*Revocation
 // RevocationSet indexes the circle's statement-form revocations for the
 // verifier (delegated ones included).
 func (c *Circle) RevocationSet(now time.Time) (*statement.RevocationSet, error) {
-	rs, err := c.Revocations(now)
+	revocations, err := c.Revocations(now)
 	if err != nil {
 		return nil, err
 	}
 	set := statement.NewRevocationSet()
-	for _, r := range rs {
-		if _, err := set.Add(r.Stmt); err != nil {
+	for _, revocation := range revocations {
+		if _, err := set.Add(revocation.Stmt); err != nil {
 			return nil, err
 		}
 	}
@@ -303,23 +303,23 @@ func (c *Circle) RevocationSet(now time.Time) (*statement.RevocationSet, error) 
 // desk admitted; a delegated revocation kills what lies under its chain).
 // Kills alone sees only the leaf, so the chain check runs whenever a
 // revocation exists, not only a delegated one (Codex review, 2026-11-02).
-func (c *Circle) Revoked(a *Admission, now time.Time) bool {
-	rs, err := c.Revocations(now)
-	if err != nil || len(rs) == 0 {
+func (c *Circle) Revoked(admission *Admission, now time.Time) bool {
+	revocations, err := c.Revocations(now)
+	if err != nil || len(revocations) == 0 {
 		return false
 	}
-	for _, r := range rs {
-		if r.Kills(a) {
+	for _, revocation := range revocations {
+		if revocation.Kills(admission) {
 			return true
 		}
 	}
-	compiled, err := a.compile()
+	compiled, err := admission.compile()
 	if err != nil {
 		return false // a chain that does not verify is refused elsewhere
 	}
 	set := statement.NewRevocationSet()
-	for _, r := range rs {
-		set.Add(r.Stmt)
+	for _, revocation := range revocations {
+		set.Add(revocation.Stmt)
 	}
 	return compiled.RevokedBy(c.Roots(), set) != nil
 }

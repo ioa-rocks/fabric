@@ -119,7 +119,7 @@ func (c *Store) Mounts() (map[string]MountDecl, error) {
 }
 
 // SetMount declares a mount at dir (an absolute path).
-func (c *Store) SetMount(dir string, m MountDecl) error {
+func (c *Store) SetMount(dir string, mount MountDecl) error {
 	if !filepath.IsAbs(dir) {
 		return fmt.Errorf("mountpoint must be an absolute path")
 	}
@@ -127,7 +127,7 @@ func (c *Store) SetMount(dir string, m MountDecl) error {
 	if err != nil {
 		return err
 	}
-	mounts[dir] = m
+	mounts[dir] = mount
 	return c.writeMounts(mounts)
 }
 
@@ -192,15 +192,15 @@ func (c *Store) CreateBucket(owner *circle.Circle, name, passphrase string) (*Ha
 // CLI holds the passphrase prompt) while storage happens where the state
 // is (possibly the daemon) — the daemon never sees signing material.
 func SignBucket(priv ed25519.PrivateKey, name string) (genesis, policy []byte, err error) {
-	b, err := bucket.New(priv, name, time.Now())
+	bkt, err := bucket.New(priv, name, time.Now())
 	if err != nil {
 		return nil, nil, err
 	}
-	id, err := b.ID()
+	id, err := bkt.ID()
 	if err != nil {
 		return nil, nil, err
 	}
-	if genesis, err = b.Marshal(); err != nil {
+	if genesis, err = bkt.Marshal(); err != nil {
 		return nil, nil, err
 	}
 	sp, err := bucket.SignPolicy(priv, bucket.DefaultPolicy(id))
@@ -217,14 +217,14 @@ func SignBucket(priv ed25519.PrivateKey, name string) (genesis, policy []byte, e
 // locally, or received over the control API / future sync) after verifying
 // both, then opens the bucket.
 func (c *Store) AdoptBucket(genesisRaw, policyRaw []byte) (*Handle, error) {
-	b, err := bucket.Unmarshal(genesisRaw)
+	bkt, err := bucket.Unmarshal(genesisRaw)
 	if err != nil {
 		return nil, err
 	}
-	if err := b.Verify(); err != nil {
+	if err := bkt.Verify(); err != nil {
 		return nil, fmt.Errorf("adopting bucket genesis: %w", err)
 	}
-	id, err := b.ID()
+	id, err := bkt.ID()
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +232,7 @@ func (c *Store) AdoptBucket(genesisRaw, policyRaw []byte) (*Handle, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := bucket.VerifyPolicy(sp, b); err != nil {
+	if err := bucket.VerifyPolicy(sp, bkt); err != nil {
 		return nil, fmt.Errorf("adopting bucket policy: %w", err)
 	}
 	dir := c.bucketDir(id)
@@ -315,11 +315,11 @@ func (c *Store) BucketRaw(id string) (genesis, policy []byte, err error) {
 // KnowsBucket reports whether the bucket a genesis describes is already in
 // the catalog, returning its ID either way.
 func (c *Store) KnowsBucket(genesisRaw []byte) (id string, known bool, err error) {
-	b, err := bucket.Unmarshal(genesisRaw)
+	bkt, err := bucket.Unmarshal(genesisRaw)
 	if err != nil {
 		return "", false, err
 	}
-	if id, err = b.ID(); err != nil {
+	if id, err = bkt.ID(); err != nil {
 		return "", false, err
 	}
 	_, statErr := os.Stat(filepath.Join(c.bucketDir(id), "genesis.cbor"))
@@ -336,16 +336,16 @@ func (c *Store) Buckets() ([]*bucket.Bucket, error) {
 		return nil, err
 	}
 	var out []*bucket.Bucket
-	for _, e := range entries {
-		raw, err := os.ReadFile(filepath.Join(c.bucketDir(e.Name()), "genesis.cbor"))
+	for _, entry := range entries {
+		raw, err := os.ReadFile(filepath.Join(c.bucketDir(entry.Name()), "genesis.cbor"))
 		if err != nil {
 			continue
 		}
-		b, err := bucket.Unmarshal(raw)
-		if err != nil || b.Verify() != nil {
+		bkt, err := bucket.Unmarshal(raw)
+		if err != nil || bkt.Verify() != nil {
 			continue
 		}
-		out = append(out, b)
+		out = append(out, bkt)
 	}
 	return out, nil
 }
@@ -368,12 +368,12 @@ func (c *Store) ResolveBucketID(ref string) (string, error) {
 		return "", err
 	}
 	var ids []string
-	for _, b := range all {
-		id, err := b.ID()
+	for _, bkt := range all {
+		id, err := bkt.ID()
 		if err != nil {
 			continue
 		}
-		if b.Genesis.Name == ref || (len(ref) >= 8 && len(ref) <= len(id) && id[:len(ref)] == ref) {
+		if bkt.Genesis.Name == ref || (len(ref) >= 8 && len(ref) <= len(id) && id[:len(ref)] == ref) {
 			ids = append(ids, id)
 		}
 	}
@@ -423,11 +423,11 @@ func (c *Store) OpenBucket(id string) (*Handle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bucket %s: %w", id, err)
 	}
-	b, err := bucket.Unmarshal(raw)
+	bkt, err := bucket.Unmarshal(raw)
 	if err != nil {
 		return nil, err
 	}
-	if err := b.Verify(); err != nil {
+	if err := bkt.Verify(); err != nil {
 		return nil, fmt.Errorf("bucket %s genesis: %w", id, err)
 	}
 	var sp *bucket.SignedPolicy
@@ -435,7 +435,7 @@ func (c *Store) OpenBucket(id string) (*Handle, error) {
 		if sp, err = bucket.UnmarshalPolicy(praw); err != nil {
 			return nil, err
 		}
-		if err := bucket.VerifyPolicy(sp, b); err != nil {
+		if err := bucket.VerifyPolicy(sp, bkt); err != nil {
 			return nil, fmt.Errorf("bucket %s policy: %w", id, err)
 		}
 	}
@@ -443,7 +443,7 @@ func (c *Store) OpenBucket(id string) (*Handle, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Handle{Bucket: b, Policy: sp, Index: idx, store: c, id: id}, nil
+	return &Handle{Bucket: bkt, Policy: sp, Index: idx, store: c, id: id}, nil
 }
 
 func (h *Handle) Close() error { return h.Index.Close() }
@@ -491,14 +491,14 @@ func (h *Handle) RecordHeld(hash string) error {
 
 // Put streams content in as a new file object: blob into the content
 // store, a fresh record into the index, a location record for this node.
-func (h *Handle) Put(name string, r io.Reader, tags ...string) (*index.Object, error) {
-	return h.PutEntry(name, index.Revision{Kind: index.KindFile}, r, tags...)
+func (h *Handle) Put(name string, src io.Reader, tags ...string) (*index.Object, error) {
+	return h.PutEntry(name, index.Revision{Kind: index.KindFile}, src, tags...)
 }
 
-// PutEntry creates an object of any kind. For a file, r supplies the
-// content; for a directory or symlink record r is ignored and the
+// PutEntry creates an object of any kind. For a file, src supplies the
+// content; for a directory or symlink record src is ignored and the
 // revision's Kind/Target/Mode/MTime describe the entry (ADR 0001 §6).
-func (h *Handle) PutEntry(name string, rev index.Revision, r io.Reader, tags ...string) (*index.Object, error) {
+func (h *Handle) PutEntry(name string, rev index.Revision, src io.Reader, tags ...string) (*index.Object, error) {
 	if err := checkName(name); err != nil {
 		return nil, err
 	}
@@ -506,8 +506,8 @@ func (h *Handle) PutEntry(name string, rev index.Revision, r io.Reader, tags ...
 	if rev.KindOrFile() == index.KindFile {
 		// A nil reader with a preset blob means the holder already has the
 		// content (a folder scan found it in place).
-		if r != nil {
-			hash, size, err := h.Holder().Put(r)
+		if src != nil {
+			hash, size, err := h.Holder().Put(src)
 			if err != nil {
 				return nil, err
 			}
@@ -521,11 +521,11 @@ func (h *Handle) PutEntry(name string, rev index.Revision, r io.Reader, tags ...
 	if rev.Kind == index.KindSymlink && rev.Target == "" {
 		return nil, errors.New("symlink record needs a target")
 	}
-	o := index.NewObject(name, rev, now, h.store.NodeID)
-	for _, t := range tags {
-		o.Tags.Add(t, now)
+	obj := index.NewObject(name, rev, now, h.store.NodeID)
+	for _, tag := range tags {
+		obj.Tags.Add(tag, now)
 	}
-	o, err := h.Index.PutObject(o)
+	obj, err := h.Index.PutObject(obj)
 	if err != nil {
 		return nil, err
 	}
@@ -534,7 +534,7 @@ func (h *Handle) PutEntry(name string, rev index.Revision, r io.Reader, tags ...
 			return nil, err
 		}
 	}
-	return o, nil
+	return obj, nil
 }
 
 // checkName refuses names that could escape or confuse a tree surface
@@ -556,30 +556,30 @@ func checkName(name string) error {
 
 // Revise mints a local revision of an object (a copy of the rendered head
 // with fn applied) that supersedes every head this device knows.
-func (h *Handle) Revise(o *index.Object, fn func(r *index.Revision)) (*index.Object, error) {
-	o.Revise(h.store.NodeID, time.Now().UnixNano(), fn)
-	return h.Index.PutObject(o)
+func (h *Handle) Revise(obj *index.Object, fn func(r *index.Revision)) (*index.Object, error) {
+	obj.Revise(h.store.NodeID, time.Now().UnixNano(), fn)
+	return h.Index.PutObject(obj)
 }
 
 // Replace publishes complete new content for an existing file object while
 // preserving its object identity and tags. mtime, if non-zero, records the
 // source modification time.
-func (h *Handle) Replace(o *index.Object, r io.Reader) (*index.Object, error) {
-	return h.ReplaceAt(o, r, 0)
+func (h *Handle) Replace(obj *index.Object, src io.Reader) (*index.Object, error) {
+	return h.ReplaceAt(obj, src, 0)
 }
 
-func (h *Handle) ReplaceAt(o *index.Object, r io.Reader, mtime int64) (*index.Object, error) {
-	hash, size, err := h.Holder().Put(r)
+func (h *Handle) ReplaceAt(obj *index.Object, src io.Reader, mtime int64) (*index.Object, error) {
+	hash, size, err := h.Holder().Put(src)
 	if err != nil {
 		return nil, err
 	}
-	return h.ReplaceHeld(o, hash, size, mtime, 0)
+	return h.ReplaceHeld(obj, hash, size, mtime, 0)
 }
 
 // ReplaceHeld publishes content the holder already has (a folder scan) as
 // the object's new revision; mode 0 keeps the previous mode.
-func (h *Handle) ReplaceHeld(o *index.Object, hash string, size, mtime int64, mode uint32) (*index.Object, error) {
-	o, err := h.Revise(o, func(rev *index.Revision) {
+func (h *Handle) ReplaceHeld(obj *index.Object, hash string, size, mtime int64, mode uint32) (*index.Object, error) {
+	obj, err := h.Revise(obj, func(rev *index.Revision) {
 		rev.Blob, rev.Size, rev.Kind, rev.Target, rev.Deleted = hash, size, index.KindFile, "", false
 		if mtime != 0 {
 			rev.MTime = mtime
@@ -594,16 +594,16 @@ func (h *Handle) ReplaceHeld(o *index.Object, hash string, size, mtime int64, mo
 	if err := h.RecordHeld(hash); err != nil {
 		return nil, err
 	}
-	return o, nil
+	return obj, nil
 }
 
 // Rename changes only the display path; object identity and content survive.
-func (h *Handle) Rename(o *index.Object, name string) (*index.Object, error) {
+func (h *Handle) Rename(obj *index.Object, name string) (*index.Object, error) {
 	if err := checkName(name); err != nil {
 		return nil, err
 	}
-	o.Name.Set(name, time.Now().UnixNano(), h.store.NodeID)
-	return h.Index.PutObject(o)
+	obj.Name.Set(name, time.Now().UnixNano(), h.store.NodeID)
+	return h.Index.PutObject(obj)
 }
 
 // GetBlob opens one blob by hash (a specific head's content).
@@ -615,11 +615,11 @@ func (h *Handle) GetBlob(blob string) (io.ReadCloser, error) {
 }
 
 // Get opens the current content of an object.
-func (h *Handle) Get(o *index.Object) (io.ReadCloser, error) {
-	if o.Blob() == "" {
-		return nil, fmt.Errorf("object %s has no content (%s)", o.ID[:8], o.Head().KindOrFile())
+func (h *Handle) Get(obj *index.Object) (io.ReadCloser, error) {
+	if obj.Blob() == "" {
+		return nil, fmt.Errorf("object %s has no content (%s)", obj.ID[:8], obj.Head().KindOrFile())
 	}
-	return h.Holder().Open(o.Blob())
+	return h.Holder().Open(obj.Blob())
 }
 
 // BackfillSize repairs a head written before size metadata existed. Size
@@ -628,8 +628,8 @@ func (h *Handle) Get(o *index.Object) (io.ReadCloser, error) {
 // is intentionally local-only: discovering a legacy remote size must not
 // fetch a whole blob merely to satisfy stat(2). The repaired record syncs
 // normally and collapses with unrepaired copies (index.Revision.same).
-func (h *Handle) BackfillSize(o *index.Object) (bool, error) {
-	head := o.Head()
+func (h *Handle) BackfillSize(obj *index.Object) (bool, error) {
+	head := obj.Head()
 	if head == nil || head.Size != 0 || head.Blob == "" {
 		return false, nil
 	}
@@ -638,7 +638,7 @@ func (h *Handle) BackfillSize(o *index.Object) (bool, error) {
 		return false, nil // not held here; a holder will repair it
 	}
 	head.Size = size
-	if _, err := h.Index.PutObject(o); err != nil {
+	if _, err := h.Index.PutObject(obj); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -652,9 +652,9 @@ func (h *Handle) Stats() (objects, held int, err error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	for _, o := range objs {
+	for _, obj := range objs {
 		objects++
-		if b := o.Blob(); b == "" || h.Holder().Has(b) {
+		if blob := obj.Blob(); blob == "" || h.Holder().Has(blob) {
 			held++
 		}
 	}
@@ -683,9 +683,9 @@ func (h *Handle) ResolveTrashed(ref string) (*index.Object, error) {
 func resolveIn(all []*index.Object, ref string) (*index.Object, error) {
 	if len(ref) >= 8 {
 		var byID []*index.Object
-		for _, o := range all {
-			if strings.HasPrefix(o.ID, ref) {
-				byID = append(byID, o)
+		for _, obj := range all {
+			if strings.HasPrefix(obj.ID, ref) {
+				byID = append(byID, obj)
 			}
 		}
 		if len(byID) == 1 {
@@ -696,9 +696,9 @@ func resolveIn(all []*index.Object, ref string) (*index.Object, error) {
 		}
 	}
 	var named []*index.Object
-	for _, o := range all {
-		if o.Name.V == ref {
-			named = append(named, o)
+	for _, obj := range all {
+		if obj.Name.V == ref {
+			named = append(named, obj)
 		}
 	}
 	switch len(named) {
@@ -712,32 +712,32 @@ func resolveIn(all []*index.Object, ref string) (*index.Object, error) {
 }
 
 // Tag applies +tag / -tag mutations to an object.
-func (h *Handle) Tag(o *index.Object, add, remove []string) (*index.Object, error) {
+func (h *Handle) Tag(obj *index.Object, add, remove []string) (*index.Object, error) {
 	now := time.Now().UnixNano()
-	for _, t := range add {
-		if !o.Tags.Has(t) {
-			o.Tags.Add(t, now)
+	for _, tag := range add {
+		if !obj.Tags.Has(tag) {
+			obj.Tags.Add(tag, now)
 		}
 	}
-	for _, t := range remove {
-		o.Tags.Remove(t, now)
+	for _, tag := range remove {
+		obj.Tags.Remove(tag, now)
 	}
-	return h.Index.PutObject(o)
+	return h.Index.PutObject(obj)
 }
 
 // Delete tombstones an object. The blob stays until retention/drop-safety
 // machinery lands (memo §5 — deletion is intent, dropping is local).
-func (h *Handle) Delete(o *index.Object) error {
-	_, err := h.Revise(o, func(r *index.Revision) { r.Deleted = true })
+func (h *Handle) Delete(obj *index.Object) error {
+	_, err := h.Revise(obj, func(r *index.Revision) { r.Deleted = true })
 	return err
 }
 
 // Restore revives a tombstoned object with its last content (ADR 0001 §4).
-func (h *Handle) Restore(o *index.Object) (*index.Object, error) {
-	if !o.IsDeleted() {
-		return o, nil
+func (h *Handle) Restore(obj *index.Object) (*index.Object, error) {
+	if !obj.IsDeleted() {
+		return obj, nil
 	}
-	return h.Revise(o, func(r *index.Revision) { r.Deleted = false })
+	return h.Revise(obj, func(r *index.Revision) { r.Deleted = false })
 }
 
 // Trash lists tombstoned objects, newest deletion first.
@@ -747,9 +747,9 @@ func (h *Handle) Trash() ([]*index.Object, error) {
 		return nil, err
 	}
 	var out []*index.Object
-	for _, o := range all {
-		if o.IsDeleted() {
-			out = append(out, o)
+	for _, obj := range all {
+		if obj.IsDeleted() {
+			out = append(out, obj)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Modified() > out[j].Modified() })
@@ -770,9 +770,9 @@ func (h *Handle) Conflicts() ([]Conflict, error) {
 		return nil, err
 	}
 	var out []Conflict
-	for _, o := range objs {
-		for _, r := range o.Conflicts() {
-			out = append(out, Conflict{Object: o, Revision: r, Name: index.ConflictName(o.Name.V, r)})
+	for _, obj := range objs {
+		for _, rev := range obj.Conflicts() {
+			out = append(out, Conflict{Object: obj, Revision: rev, Name: index.ConflictName(obj.Name.V, rev)})
 		}
 	}
 	return out, nil
@@ -781,11 +781,11 @@ func (h *Handle) Conflicts() ([]Conflict, error) {
 // Resolve settles an object's conflict in favor of its rendered head: a new
 // revision dominating every head. The losing content stays in the blob
 // store like any superseded version.
-func (h *Handle) Resolve(o *index.Object) (*index.Object, error) {
-	if len(o.Conflicts()) == 0 {
-		return o, nil
+func (h *Handle) Resolve(obj *index.Object) (*index.Object, error) {
+	if len(obj.Conflicts()) == 0 {
+		return obj, nil
 	}
-	return h.Revise(o, nil)
+	return h.Revise(obj, nil)
 }
 
 // Project materializes the bucket as a read-only directory — a projection
@@ -800,26 +800,26 @@ func (h *Handle) Project(dir string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	n := 0
-	for _, o := range objs {
-		dst := filepath.Join(dir, filepath.Clean("/"+o.Name.V))
-		head := o.Head()
+	count := 0
+	for _, obj := range objs {
+		dst := filepath.Join(dir, filepath.Clean("/"+obj.Name.V))
+		head := obj.Head()
 		switch head.KindOrFile() {
 		case index.KindDir:
 			if err := os.MkdirAll(dst, 0o755); err != nil {
-				return n, err
+				return count, err
 			}
-			n++
+			count++
 			continue
 		case index.KindSymlink:
 			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-				return n, err
+				return count, err
 			}
 			_ = os.Remove(dst)
 			if err := os.Symlink(head.Target, dst); err != nil {
-				return n, err
+				return count, err
 			}
-			n++
+			count++
 			continue
 		}
 		src, err := h.Holder().Path(head.Blob)
@@ -827,17 +827,17 @@ func (h *Handle) Project(dir string) (int, error) {
 			continue // blob not held here; sync will fill it later
 		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return n, err
+			return count, err
 		}
 		_ = os.Remove(dst)
 		if err := os.Link(src, dst); err != nil {
 			if err := copyFile(src, dst); err != nil {
-				return n, err
+				return count, err
 			}
 		}
-		n++
+		count++
 	}
-	return n, nil
+	return count, nil
 }
 
 func copyFile(src, dst string) error {

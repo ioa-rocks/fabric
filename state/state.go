@@ -86,9 +86,9 @@ func (d Dir) KeystorePath() string { return filepath.Join(d.Path, "namespace.key
 // back to a deterministic short path in the temp dir, derived from the
 // state dir so daemon and CLI agree without coordination.
 func (d Dir) ControlSocketPath() string {
-	p := filepath.Join(d.Path, "control.sock")
-	if len(p) < 100 {
-		return p
+	sockPath := filepath.Join(d.Path, "control.sock")
+	if len(sockPath) < 100 {
+		return sockPath
 	}
 	abs, err := filepath.Abs(d.Path)
 	if err != nil {
@@ -104,8 +104,8 @@ func (d Dir) IsMaster() bool {
 	return err == nil
 }
 
-func (d Dir) SaveConfig(c Config) error {
-	data, err := json.MarshalIndent(c, "", "  ")
+func (d Dir) SaveConfig(cfg Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -117,11 +117,11 @@ func (d Dir) LoadConfig() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	var c Config
-	if err := json.Unmarshal(data, &c); err != nil {
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parsing %s: %w", d.configPath(), err)
 	}
-	return c, nil
+	return cfg, nil
 }
 
 // EnsureDeviceKey returns this node's libp2p identity, generating and
@@ -159,8 +159,8 @@ func (d Dir) LoadDeviceKey() (crypto.PrivKey, error) {
 	return crypto.UnmarshalPrivateKey(data)
 }
 
-func (d Dir) SaveCert(c *cert.Cert) error {
-	data, err := c.Marshal()
+func (d Dir) SaveCert(memberCert *cert.Cert) error {
+	data, err := memberCert.Marshal()
 	if err != nil {
 		return err
 	}
@@ -200,14 +200,14 @@ func (d Dir) LoadRecords() ([][]byte, error) {
 // (events.cbor, retired 2026-11-07) to events.cbor.retired, so nothing reads
 // it again. Reports whether there was one.
 func (d Dir) RetireEventLog() (bool, error) {
-	p := filepath.Join(d.Path, "events.cbor")
-	if _, err := os.Stat(p); err != nil {
+	logPath := filepath.Join(d.Path, "events.cbor")
+	if _, err := os.Stat(logPath); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil
 		}
 		return false, err
 	}
-	return true, os.Rename(p, p+".retired")
+	return true, os.Rename(logPath, logPath+".retired")
 }
 
 // LoadCert returns (nil, nil) when no certificate exists yet.

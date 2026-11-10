@@ -30,11 +30,11 @@ import (
 // override it. NAT-observed endpoints are added separately by holePunchAddrs:
 // Host.Addrs alone can omit them when this node is private or observations
 // have not reached the normal advertisement threshold.
-var punchAddrsOf = func(h host.Host) []ma.Multiaddr {
+var punchAddrsOf = func(libp2pHost host.Host) []ma.Multiaddr {
 	var out []ma.Multiaddr
-	for _, a := range h.Addrs() {
-		if _, relayed := transportOf(a); !relayed && manet.IsPublicAddr(a) {
-			out = append(out, a)
+	for _, addr := range libp2pHost.Addrs() {
+		if _, relayed := transportOf(addr); !relayed && manet.IsPublicAddr(addr) {
+			out = append(out, addr)
 		}
 	}
 	return out
@@ -60,23 +60,23 @@ var punchTrace = logPunchEvent
 
 type punchTracer struct{}
 
-func (punchTracer) Trace(e *holepunch.Event) { punchTrace(e) }
+func (punchTracer) Trace(evt *holepunch.Event) { punchTrace(evt) }
 
-func logPunchEvent(e *holepunch.Event) {
-	switch v := e.Evt.(type) {
+func logPunchEvent(evt *holepunch.Event) {
+	switch inner := evt.Evt.(type) {
 	case *holepunch.StartHolePunchEvt:
-		log.Printf("holepunch: peer=%s rtt=%s addrs=%v", e.Remote, v.RTT.Round(time.Millisecond), v.RemoteAddrs)
+		log.Printf("holepunch: peer=%s rtt=%s addrs=%v", evt.Remote, inner.RTT.Round(time.Millisecond), inner.RemoteAddrs)
 	case *holepunch.EndHolePunchEvt:
-		if v.Success {
-			log.Printf("holepunch: peer=%s elapsed=%s direct", e.Remote, v.EllapsedTime.Round(time.Millisecond))
+		if inner.Success {
+			log.Printf("holepunch: peer=%s elapsed=%s direct", evt.Remote, inner.EllapsedTime.Round(time.Millisecond))
 		} else {
-			log.Printf("holepunch: peer=%s elapsed=%s error=%q", e.Remote, v.EllapsedTime.Round(time.Millisecond), v.Error)
+			log.Printf("holepunch: peer=%s elapsed=%s error=%q", evt.Remote, inner.EllapsedTime.Round(time.Millisecond), inner.Error)
 		}
 	case *holepunch.ProtocolErrorEvt:
-		log.Printf("holepunch: peer=%s protocol error=%q", e.Remote, v.Error)
+		log.Printf("holepunch: peer=%s protocol error=%q", evt.Remote, inner.Error)
 	case *holepunch.DirectDialEvt:
-		if v.Success {
-			log.Printf("holepunch: peer=%s elapsed=%s direct dial succeeded, no punch needed", e.Remote, v.EllapsedTime.Round(time.Millisecond))
+		if inner.Success {
+			log.Printf("holepunch: peer=%s elapsed=%s direct dial succeeded, no punch needed", evt.Remote, inner.EllapsedTime.Round(time.Millisecond))
 		}
 	}
 }
@@ -96,19 +96,19 @@ func (d *Daemon) startHolePunch() error {
 	return nil
 }
 
-// canPunch reports whether this node may initiate a punch with p: the
+// canPunch reports whether this node may initiate a punch with peerID: the
 // service must be active (a public address found, the DCUtR handler
 // registered — until then DirectConnect would block) and we must hold the
-// relayed connection p dialed. DCUtR is one-directional: the responder
+// relayed connection peerID dialed. DCUtR is one-directional: the responder
 // resets a request arriving over a connection it dialed itself, so only the
 // side that accepted the relayed connection can initiate. Both daemons run
 // this loop, so every relayed pair has exactly one initiator.
-func (d *Daemon) canPunch(p peer.ID) bool {
+func (d *Daemon) canPunch(peerID peer.ID) bool {
 	if !d.punchActive() {
 		return false
 	}
-	for _, c := range d.Host.Network().ConnsToPeer(p) {
-		if _, relayed := transportOf(c.RemoteMultiaddr()); relayed && !c.IsClosed() && c.Stat().Direction == network.DirInbound {
+	for _, conn := range d.Host.Network().ConnsToPeer(peerID) {
+		if _, relayed := transportOf(conn.RemoteMultiaddr()); relayed && !conn.IsClosed() && conn.Stat().Direction == network.DirInbound {
 			return true
 		}
 	}
@@ -121,8 +121,8 @@ func (d *Daemon) punchActive() bool {
 	if d.punch == nil {
 		return false
 	}
-	for _, p := range d.Host.Mux().Protocols() {
-		if p == holepunch.Protocol {
+	for _, proto := range d.Host.Mux().Protocols() {
+		if proto == holepunch.Protocol {
 			return true
 		}
 	}
@@ -134,8 +134,8 @@ func (d *Daemon) punchActive() bool {
 // reports false when this side cannot initiate (see canPunch) so the caller
 // falls back to a plain direct dial, which still helps when the peer has a
 // real pinhole.
-func (d *Daemon) startPunch(p peer.ID) bool {
-	if !d.canPunch(p) {
+func (d *Daemon) startPunch(peerID peer.ID) bool {
+	if !d.canPunch(peerID) {
 		return false
 	}
 	now := time.Now()
@@ -144,31 +144,31 @@ func (d *Daemon) startPunch(p peer.ID) bool {
 		d.dials.active = make(map[peer.ID]context.CancelFunc)
 		d.dials.failures = make(map[peer.ID]time.Time)
 	}
-	if _, busy := d.dials.active[p]; busy || len(d.dials.active) >= 8 || d.ctx.Err() != nil {
+	if _, busy := d.dials.active[peerID]; busy || len(d.dials.active) >= 8 || d.ctx.Err() != nil {
 		d.dials.Unlock()
 		return true
 	}
 	d.teleMu.Lock()
-	if now.Sub(d.lastDial[p]) < meshFillBackoff {
+	if now.Sub(d.lastDial[peerID]) < meshFillBackoff {
 		d.teleMu.Unlock()
 		d.dials.Unlock()
 		return true
 	}
-	d.lastDial[p] = now
+	d.lastDial[peerID] = now
 	d.teleMu.Unlock()
-	d.dials.active[p] = func() {}
+	d.dials.active[peerID] = func() {}
 	d.dials.Unlock()
 	go func() {
-		defer func() { d.dials.Lock(); delete(d.dials.active, p); d.dials.Unlock() }()
-		err := d.punch.DirectConnect(p)
+		defer func() { d.dials.Lock(); delete(d.dials.active, peerID); d.dials.Unlock() }()
+		err := d.punch.DirectConnect(peerID)
 		d.dials.Lock()
 		defer d.dials.Unlock()
 		if err == nil {
-			delete(d.dials.failures, p)
-			log.Printf("reconnect: source=punch peer=%s elapsed=%s connected", p, time.Since(now).Round(time.Millisecond))
-		} else if time.Since(d.dials.failures[p]) >= time.Minute {
-			d.dials.failures[p] = time.Now()
-			log.Printf("reconnect: source=punch peer=%s elapsed=%s error=%q", p, time.Since(now).Round(time.Millisecond), err)
+			delete(d.dials.failures, peerID)
+			log.Printf("reconnect: source=punch peer=%s elapsed=%s connected", peerID, time.Since(now).Round(time.Millisecond))
+		} else if time.Since(d.dials.failures[peerID]) >= time.Minute {
+			d.dials.failures[peerID] = time.Now()
+			log.Printf("reconnect: source=punch peer=%s elapsed=%s error=%q", peerID, time.Since(now).Round(time.Millisecond), err)
 		}
 	}()
 	return true

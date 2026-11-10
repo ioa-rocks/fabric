@@ -39,13 +39,13 @@ func NewDIDRoot(circleDID string) *DIDRoot { return &DIDRoot{did: circleDID} }
 // the circle's handovers file); a history that does not verify is an
 // error.
 func NewDIDRootWith(circleDID string, handovers ...*Statement) (*DIDRoot, error) {
-	r := NewDIDRoot(circleDID)
-	for _, h := range handovers {
-		if _, err := r.Learn(h); err != nil {
+	root := NewDIDRoot(circleDID)
+	for _, handover := range handovers {
+		if _, err := root.Learn(handover); err != nil {
 			return nil, err
 		}
 	}
-	return r, nil
+	return root, nil
 }
 
 // DID is the circle's DID.
@@ -61,11 +61,11 @@ func (r *DIDRoot) RootKeys(circleDID string) []ed25519.PublicKey {
 	if !r.Honours(circleDID) {
 		return nil
 	}
-	k, err := did.KeyFor(circleDID)
+	key, err := did.KeyFor(circleDID)
 	if err != nil {
 		return nil
 	}
-	return []ed25519.PublicKey{k}
+	return []ed25519.PublicKey{key}
 }
 
 // Handovers implements RootHistory: the circle's key handovers known
@@ -82,19 +82,19 @@ func (r *DIDRoot) Handovers(circleDID string) []*Statement {
 // Current is the circle's signing key as far as this node knows: the last
 // handover's recipient, else the DID key.
 func (r *DIDRoot) Current() ed25519.PublicKey {
-	k, err := did.KeyFor(r.CurrentDID())
+	key, err := did.KeyFor(r.CurrentDID())
 	if err != nil {
 		return nil
 	}
-	return k
+	return key
 }
 
 // CurrentDID is Current as a did:key.
 func (r *DIDRoot) CurrentDID() string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if n := len(r.handovers); n > 0 {
-		return r.handovers[n-1].Payload.Aud
+	if count := len(r.handovers); count > 0 {
+		return r.handovers[count-1].Payload.Aud
 	}
 	return r.did
 }
@@ -104,8 +104,8 @@ func (r *DIDRoot) CurrentDID() string {
 func (r *DIDRoot) RootProof() *Statement {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if n := len(r.handovers); n > 0 {
-		return r.handovers[n-1]
+	if count := len(r.handovers); count > 0 {
+		return r.handovers[count-1]
 	}
 	return nil
 }
@@ -116,13 +116,13 @@ func (r *DIDRoot) RootProof() *Statement {
 // other is refused, loudly.
 var ErrConflictingHandover = errors.New("conflicting key handover: the same key already handed over to a different key")
 
-// Extends is Learn without learning: whether h — with the lineage it
+// Extends is Learn without learning: whether handover — with the lineage it
 // carries — verifies and would grow the history known here, or why not. A
 // relay asks this before it forwards a handover (fabricnet: a handover is
 // pushed before it applies, so the push must not be the check — Codex
 // review, 2026-11-07).
-func (r *DIDRoot) Extends(h *Statement) (bool, error) {
-	lineage, err := r.lineage(h)
+func (r *DIDRoot) Extends(handover *Statement) (bool, error) {
+	lineage, err := r.lineage(handover)
 	if err != nil {
 		return false, err
 	}
@@ -135,8 +135,8 @@ func (r *DIDRoot) Extends(h *Statement) (bool, error) {
 // every handover must be signed by the key it retires, chain from the DID
 // key, and extend what is known; a lineage that is a prefix of the known
 // history is nothing new. Reports whether the history grew.
-func (r *DIDRoot) Learn(h *Statement) (bool, error) {
-	lineage, err := r.lineage(h)
+func (r *DIDRoot) Learn(handover *Statement) (bool, error) {
+	lineage, err := r.lineage(handover)
 	if err != nil {
 		return false, err
 	}
@@ -150,15 +150,15 @@ func (r *DIDRoot) Learn(h *Statement) (bool, error) {
 	return true, nil
 }
 
-// lineage is h's verified handover chain from the DID key, ending with h.
-func (r *DIDRoot) lineage(h *Statement) ([]*Statement, error) {
-	if h == nil || h.Payload.Typ != TypeHandover {
+// lineage is handover's verified handover chain from the DID key, ending with handover.
+func (r *DIDRoot) lineage(handover *Statement) ([]*Statement, error) {
+	if handover == nil || handover.Payload.Typ != TypeHandover {
 		return nil, errors.New("not a handover")
 	}
-	if !r.Honours(h.Payload.Sub) {
-		return nil, fmt.Errorf("handover is for circle %s, not %s", short(h.Payload.Sub), short(r.did))
+	if !r.Honours(handover.Payload.Sub) {
+		return nil, fmt.Errorf("handover is for circle %s, not %s", short(handover.Payload.Sub), short(r.did))
 	}
-	lineage := h.Handovers() // ends with h
+	lineage := handover.Handovers() // ends with handover
 	if _, err := walkHandovers(lineage, r.RootKeys(r.did), r.did, true); err != nil {
 		return nil, err
 	}

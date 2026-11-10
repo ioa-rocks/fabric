@@ -176,12 +176,12 @@ func NewRoster(roots *statement.DIDRoot) *Roster {
 // OpenRoster loads a circle directory's roster: its key history, its
 // devices.cbor and the circle's revocation file. Save writes back to
 // devices.cbor (and handovers.cbor when the history grew).
-func OpenRoster(c *Circle, now time.Time) (*Roster, error) {
-	roots, err := c.DIDRoot()
+func OpenRoster(held *Circle, now time.Time) (*Roster, error) {
+	roots, err := held.DIDRoot()
 	if err != nil {
-		return nil, fmt.Errorf("circle %q: %w", c.Config.Name, err)
+		return nil, fmt.Errorf("circle %q: %w", held.Config.Name, err)
 	}
-	return NewRoster(roots).Attach(c, now)
+	return NewRoster(roots).Attach(held, now)
 }
 
 // Attach returns the roster with a circle directory folded in — its
@@ -191,17 +191,17 @@ func OpenRoster(c *Circle, now time.Time) (*Roster, error) {
 // directory, so the devices the file names are judged by the circle's
 // revocations and a device revoked before a restart stays revoked after
 // it (Codex review, 2026-11-05).
-func (r *Roster) Attach(c *Circle, now time.Time) (*Roster, error) {
-	hs, err := c.Handovers()
+func (r *Roster) Attach(held *Circle, now time.Time) (*Roster, error) {
+	handovers, err := held.Handovers()
 	if err != nil {
-		return nil, fmt.Errorf("circle %q: %w", c.Config.Name, err)
+		return nil, fmt.Errorf("circle %q: %w", held.Config.Name, err)
 	}
-	if n := len(hs); n > 0 {
-		if _, err := r.roots.Learn(hs[n-1]); err != nil {
-			return nil, fmt.Errorf("circle %q key history: %w", c.Config.Name, err)
+	if count := len(handovers); count > 0 {
+		if _, err := r.roots.Learn(handovers[count-1]); err != nil {
+			return nil, fmt.Errorf("circle %q key history: %w", held.Config.Name, err)
 		}
 	}
-	revs, err := c.Revocations(now)
+	revs, err := held.Revocations(now)
 	if err != nil {
 		return nil, err
 	}
@@ -209,20 +209,20 @@ func (r *Roster) Attach(c *Circle, now time.Time) (*Roster, error) {
 	set := nr.revs.Clone()
 	for _, rv := range revs {
 		if _, err := set.Add(rv.Stmt); err != nil {
-			return nil, fmt.Errorf("circle %q revocation: %w", c.Config.Name, err)
+			return nil, fmt.Errorf("circle %q revocation: %w", held.Config.Name, err)
 		}
 	}
 	nr.revs = set
 	nr.reslotAll()
-	nr, err = nr.WithPath(DevicesPath(c), now)
+	nr, err = nr.WithPath(DevicesPath(held), now)
 	if err != nil {
-		return nil, fmt.Errorf("circle %q: %w", c.Config.Name, err)
+		return nil, fmt.Errorf("circle %q: %w", held.Config.Name, err)
 	}
 	return nr, nil
 }
 
 // DevicesPath is the circle directory's devices.cbor.
-func DevicesPath(c *Circle) string { return filepath.Join(c.Path, devicesFile) }
+func DevicesPath(held *Circle) string { return filepath.Join(held.Path, devicesFile) }
 
 // WithPath returns the roster with the admissions already in path merged in
 // and path as the place Save writes to. Stale or unverifiable entries in
@@ -284,8 +284,8 @@ func (r *Roster) Revocations() *statement.RevocationSet { return r.revs }
 func (r *Roster) clone() *Roster {
 	nr := &Roster{roots: r.roots, path: r.path, revs: r.revs, learned: r.learned,
 		slots: make(map[string]*slot, len(r.slots))}
-	for k, v := range r.slots {
-		nr.slots[k] = v
+	for deviceDID, devSlot := range r.slots {
+		nr.slots[deviceDID] = devSlot
 	}
 	return nr
 }
@@ -362,8 +362,8 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, err
 		return r0, false, err
 	}
 	cur := r.slots[dev.DID]
-	for _, d := range cur.all() {
-		if d.Stmt.ID() == st.ID() {
+	for _, existing := range cur.all() {
+		if existing.Stmt.ID() == st.ID() {
 			return r, false, nil
 		}
 	}
@@ -384,23 +384,23 @@ func (r *Roster) Add(st *statement.Statement, now time.Time) (*Roster, bool, err
 // no longer honours is left out, verdicts are re-derived, and the rest is
 // split by eligibility and ordered by Later. Entries whose verdict did not
 // change are shared, never copied.
-func (r *Roster) build(ps []*Device) *slot {
+func (r *Roster) build(devices []*Device) *slot {
 	var elig, retired []*Device
 	seen := map[[32]byte]bool{}
-	for _, p := range ps {
-		id := p.Stmt.ID()
+	for _, dev := range devices {
+		id := dev.Stmt.ID()
 		if seen[id] {
 			continue
 		}
 		seen[id] = true
-		if p.Chain.RootsHonoured(r.roots) != nil {
+		if dev.Chain.RootsHonoured(r.roots) != nil {
 			continue // signed by a retired key after its handover (or a compromised one): no fact, for good
 		}
-		p = r.judged(p)
-		if r.eligible(p) {
-			elig = append(elig, p)
+		dev = r.judged(dev)
+		if r.eligible(dev) {
+			elig = append(elig, dev)
 		} else {
-			retired = append(retired, p)
+			retired = append(retired, dev)
 		}
 	}
 	if len(elig) == 0 && len(retired) == 0 {
@@ -412,13 +412,13 @@ func (r *Roster) build(ps []*Device) *slot {
 }
 
 // byLater orders admissions later-issued first.
-func byLater(ps []*Device) {
-	sort.Slice(ps, func(i, j int) bool { return Later(ps[i], ps[j]) })
+func byLater(devices []*Device) {
+	sort.Slice(devices, func(i, j int) bool { return Later(devices[i], devices[j]) })
 }
 
 // epoch is the key epoch of an admission: how many handovers its root
 // link rides — which of the circle's keys signed it.
-func epoch(d *Device) int { return len(d.Chain.Handovers) }
+func epoch(dev *Device) int { return len(dev.Chain.Handovers) }
 
 // judged returns dev with its verdict re-derived: the same pointer when
 // nothing changed, a copy otherwise.
@@ -434,8 +434,8 @@ func (r *Roster) judged(dev *Device) *Device {
 
 // sameSlot reports whether two slots keep the same entries with the same
 // verdicts.
-func sameSlot(a, b *slot) bool {
-	as, bs := a.all(), b.all()
+func sameSlot(first, second *slot) bool {
+	as, bs := first.all(), second.all()
 	if len(as) != len(bs) {
 		return false
 	}
@@ -495,8 +495,8 @@ func (r *Roster) Acks(deviceDID string) ([][]byte, error) {
 		id := rv.ID()
 		ids = append(ids, id[:])
 	}
-	for _, d := range r.slots[deviceDID].all() {
-		ids = append(ids, d.Stmt.Payload.Acks...)
+	for _, dev := range r.slots[deviceDID].all() {
+		ids = append(ids, dev.Stmt.Payload.Acks...)
 	}
 	out, err := statement.CanonicalIDs(ids)
 	if err != nil {
@@ -593,11 +593,11 @@ func (r *Roster) judge(st *statement.Statement, now time.Time) (*Device, error) 
 // before or after the newer one was revoked (Codex review, 2026-11-05).
 // Re-admission after a revocation is a later-issued admission, whatever
 // its window.
-// Later reports whether a is the later word by the roster's order (issue
+// Later reports whether first is the later word by the roster's order (issue
 // time, expiry, statement ID) — the one order used wherever two admissions
 // must be ranked, for one device or across devices (an overlay address
 // claimed twice, fabricnet).
-func Later(a, b *Device) bool { return prefer(b, a) }
+func Later(first, second *Device) bool { return prefer(second, first) }
 
 func prefer(cur, next *Device) bool {
 	if ni, ci := next.Stmt.Payload.Iat, cur.Stmt.Payload.Iat; ni != ci {
@@ -640,9 +640,9 @@ func (r *Roster) verdict(dev *Device) error {
 // through the entry itself stands as the entry does (agy review and Codex
 // review, 2026-11-06). An empty want.Verb asks about standing alone —
 // whether the chain is live — and skips the verb cap.
-func (r *Roster) Cap(c *statement.Compiled, want statement.Want) error {
-	for _, links := range [][]statement.Link{c.Auth, c.Ident} {
-		for _, l := range links {
+func (r *Roster) Cap(compiled *statement.Compiled, want statement.Want) error {
+	for _, links := range [][]statement.Link{compiled.Auth, compiled.Ident} {
+		for _, link := range links {
 			// The entry comparison is this circle's judgement of its own
 			// admissions. An identity chain anchored in another circle (a
 			// grant to that circle, presented by one of its members) has
@@ -650,29 +650,29 @@ func (r *Roster) Cap(c *statement.Compiled, want statement.Want) error {
 			// (capByRoster asks it), not this one's — a device that is a
 			// member of both would be judged against the wrong entry (agy,
 			// 2026-11-06).
-			if l.Sub != r.CircleDID() {
+			if link.Sub != r.CircleDID() {
 				continue
 			}
-			for _, rv := range r.Removals(l.Aud) {
-				if !l.Stmt.Acknowledges(rv.ID()) {
-					return fmt.Errorf("%s removed from the circle", shortDID(l.Aud))
+			for _, rv := range r.Removals(link.Aud) {
+				if !link.Stmt.Acknowledges(rv.ID()) {
+					return fmt.Errorf("%s removed from the circle", shortDID(link.Aud))
 				}
 			}
-			dev := r.slots[l.Aud].entry()
+			dev := r.slots[link.Aud].entry()
 			if dev == nil {
 				continue
 			}
-			if dev.Stmt.ID() == l.ID {
+			if dev.Stmt.ID() == link.ID {
 				if dev.dead != nil {
-					return fmt.Errorf("admission of %s: %w", shortDID(l.Aud), dev.dead)
+					return fmt.Errorf("admission of %s: %w", shortDID(link.Aud), dev.dead)
 				}
 				continue
 			}
 			if !dev.Admits(want.Now) {
-				return fmt.Errorf("admission of %s is superseded by one that does not admit it now", shortDID(l.Aud))
+				return fmt.Errorf("admission of %s is superseded by one that does not admit it now", shortDID(link.Aud))
 			}
 			if want.Verb != "" && !dev.Chain.Allows(want.Sub, want.Res, want.Verb) {
-				return fmt.Errorf("admission of %s is superseded by one without %s", shortDID(l.Aud), want.Verb)
+				return fmt.Errorf("admission of %s is superseded by one without %s", shortDID(link.Aud), want.Verb)
 			}
 		}
 	}
@@ -684,12 +684,12 @@ func (r *Roster) Cap(c *statement.Compiled, want statement.Want) error {
 // a removal that just arrived retires to memory. Shared slots are replaced,
 // never touched.
 func (r *Roster) reslotAll() {
-	for did, s := range r.slots {
-		if ns := r.build(s.all()); !sameSlot(s, ns) {
+	for deviceDID, devSlot := range r.slots {
+		if ns := r.build(devSlot.all()); !sameSlot(devSlot, ns) {
 			if ns == nil {
-				delete(r.slots, did)
+				delete(r.slots, deviceDID)
 			} else {
-				r.slots[did] = ns
+				r.slots[deviceDID] = ns
 			}
 		}
 	}
@@ -787,8 +787,8 @@ func (r *Roster) Held(deviceDID string) []*Device {
 // Devices lists every entry by device DID.
 func (r *Roster) Devices() []*Device {
 	out := make([]*Device, 0, len(r.slots))
-	for _, s := range r.slots {
-		out = append(out, s.entry())
+	for _, devSlot := range r.slots {
+		out = append(out, devSlot.entry())
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].DID < out[j].DID })
 	return out
@@ -822,13 +822,13 @@ func (r *Roster) LapsedDevices(now time.Time) []*Device {
 func (r *Roster) UsedIPs() []string {
 	seen := map[string]bool{}
 	var out []string
-	for _, s := range r.slots {
+	for _, devSlot := range r.slots {
 		// The entry's address alone: an earlier admission the slot keeps
 		// as a fact may have granted one the renewal took away.
-		if dev := s.entry(); dev != nil {
-			if m := dev.Stmt.Payload.Meta; m != nil && m.IP != "" && !seen[m.IP] {
-				seen[m.IP] = true
-				out = append(out, m.IP)
+		if dev := devSlot.entry(); dev != nil {
+			if meta := dev.Stmt.Payload.Meta; meta != nil && meta.IP != "" && !seen[meta.IP] {
+				seen[meta.IP] = true
+				out = append(out, meta.IP)
 			}
 		}
 	}
@@ -854,10 +854,10 @@ func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
 			changed = true
 		}
 	}
-	for did, s := range nr.slots {
+	for deviceDID, devSlot := range nr.slots {
 		var kept []*Device
 		moved := false
-		for _, dev := range s.all() {
+		for _, dev := range devSlot.all() {
 			if !now.Before(dev.Exp.Add(LapsedRetention)) {
 				moved, dropped = true, true
 				continue
@@ -874,9 +874,9 @@ func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
 		}
 		changed = true
 		if ns := nr.build(kept); ns == nil {
-			delete(nr.slots, did)
+			delete(nr.slots, deviceDID)
 		} else {
-			nr.slots[did] = ns
+			nr.slots[deviceDID] = ns
 		}
 	}
 	if !changed {
@@ -892,18 +892,18 @@ func (r *Roster) GC(now time.Time) (nr *Roster, changed, dropped bool) {
 // merely lapsed (the oracle caught this, 2026-11-06). Zero when unknown,
 // which keeps the revocation (statement.Spent).
 func (r *Roster) targetExpiry(rv *statement.Statement) time.Time {
-	t := rv.Payload.Target
-	if t == nil || len(t.ID) != 32 {
+	target := rv.Payload.Target
+	if target == nil || len(target.ID) != 32 {
 		return time.Time{}
 	}
 	var id [32]byte
-	copy(id[:], t.ID)
-	for _, s := range r.slots {
-		for _, dev := range s.all() {
+	copy(id[:], target.ID)
+	for _, devSlot := range r.slots {
+		for _, dev := range devSlot.all() {
 			for _, links := range [][]statement.Link{dev.Chain.Auth, dev.Chain.Ident} {
-				for _, l := range links {
-					if l.ID == id {
-						return l.Stmt.Expiry().Add(LapsedRetention)
+				for _, link := range links {
+					if link.ID == id {
+						return link.Stmt.Expiry().Add(LapsedRetention)
 					}
 				}
 			}
@@ -918,8 +918,8 @@ func (r *Roster) targetExpiry(rv *statement.Statement) time.Time {
 func (r *Roster) Encode() ([]byte, error) {
 	list := make([][]byte, 0, len(r.slots))
 	for _, dev := range r.Devices() {
-		for _, d := range r.slots[dev.DID].all() {
-			if raw, err := d.Stmt.Bytes(); err == nil {
+		for _, held := range r.slots[dev.DID].all() {
+			if raw, err := held.Stmt.Bytes(); err == nil {
 				list = append(list, raw)
 			}
 		}
@@ -959,9 +959,9 @@ func (r *Roster) Save() error {
 	return nil
 }
 
-func shortDID(d string) string {
-	if len(d) > 16 {
-		return d[:16] + "…"
+func shortDID(didStr string) string {
+	if len(didStr) > 16 {
+		return didStr[:16] + "…"
 	}
-	return d
+	return didStr
 }

@@ -155,12 +155,12 @@ type denyBody struct {
 func (d *Daemon) serveControl() (func(), error) {
 	sock := d.Dir.ControlSocketPath()
 	_ = os.Remove(sock) // stale socket from an unclean shutdown
-	l, err := net.Listen("unix", sock)
+	listener, err := net.Listen("unix", sock)
 	if err != nil {
 		return nil, fmt.Errorf("control socket: %w", err)
 	}
 	if err := os.Chmod(sock, 0o600); err != nil {
-		l.Close()
+		listener.Close()
 		return nil, err
 	}
 
@@ -180,7 +180,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/keys/revoke", d.handleKeyRevoke)
 
 	srv := &http.Server{Handler: mux}
-	go srv.Serve(l)
+	go srv.Serve(listener)
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -189,7 +189,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	}, nil
 }
 
-func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
+func (d *Daemon) handleStatus(resp http.ResponseWriter, _ *http.Request) {
 	now := time.Now()
 	reply := StatusReply{
 		Name:         d.Config.Name,
@@ -211,47 +211,47 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	if d.Circle != nil {
 		reply.Circles = d.Circle.Info(time.Now())
 	}
-	for _, a := range d.Host.Addrs() {
-		reply.Addrs = append(reply.Addrs, fmt.Sprintf("%s/p2p/%s", a, d.Host.ID()))
+	for _, addr := range d.Host.Addrs() {
+		reply.Addrs = append(reply.Addrs, fmt.Sprintf("%s/p2p/%s", addr, d.Host.ID()))
 	}
 	members, revoked := d.Store.Snapshot()
 	seen := map[string]bool{}
-	for _, p := range d.Host.Network().Peers() {
-		sp := StatusPeer{ID: p.String(), Connected: true, Member: d.Store.IsMember(p, now), Revoked: d.Store.IsRevoked(p, now)}
-		c, ok := d.Store.Cert(p)
+	for _, peerID := range d.Host.Network().Peers() {
+		sp := StatusPeer{ID: peerID.String(), Connected: true, Member: d.Store.IsMember(peerID, now), Revoked: d.Store.IsRevoked(peerID, now)}
+		memberCert, ok := d.Store.Cert(peerID)
 		if !ok {
 			// A lapsed member connecting is a stranger with a name: say
 			// who it is and that its cert ran out.
-			c, ok = d.Store.LapsedCert(p)
+			memberCert, ok = d.Store.LapsedCert(peerID)
 			sp.Expired = ok
 		}
 		if ok {
-			sp.Name = c.Payload.Meta.Name
-			sp.IP = c.Payload.Meta.IP
-			sp.AddrConflict = d.addrConflict(p)
-			sp.Scope = c.Payload.Meta.Scope
-			exp := c.Expiry()
+			sp.Name = memberCert.Payload.Meta.Name
+			sp.IP = memberCert.Payload.Meta.IP
+			sp.AddrConflict = d.addrConflict(peerID)
+			sp.Scope = memberCert.Payload.Meta.Scope
+			exp := memberCert.Expiry()
 			sp.CertExpiry = &exp
 		}
-		if c := bestConn(d.Host.Network().ConnsToPeer(p)); c != nil {
-			sp.Direction = dirString(c.Stat().Direction)
-			sp.Addr = c.RemoteMultiaddr().String()
-			sp.Transport, sp.Relayed = transportOf(c.RemoteMultiaddr())
+		if conn := bestConn(d.Host.Network().ConnsToPeer(peerID)); conn != nil {
+			sp.Direction = dirString(conn.Stat().Direction)
+			sp.Addr = conn.RemoteMultiaddr().String()
+			sp.Transport, sp.Relayed = transportOf(conn.RemoteMultiaddr())
 		}
-		if rtt, ok := d.RTT(p); ok {
+		if rtt, ok := d.RTT(peerID); ok {
 			sp.RTTMillis = float64(rtt.Microseconds()) / 1000
 		}
-		sp.KnownAddrs = d.knownAddrs(p)
-		sp.Agent = d.agentOf(p.String())
+		sp.KnownAddrs = d.knownAddrs(peerID)
+		sp.Agent = d.agentOf(peerID.String())
 		switch {
 		case sp.Member:
 			// The circles the peer table verified the peer in (handshake,
 			// gossip).
-			sp.Circles = d.Store.Circles(p, now)
-		case !sp.Revoked && d.Auth.IsKept(p):
+			sp.Circles = d.Store.Circles(peerID, now)
+		case !sp.Revoked && d.Auth.IsKept(peerID):
 			sp.Grantee = true
 			if d.Circle != nil {
-				sp.Circles = d.Circle.PresentedCircles(p)
+				sp.Circles = d.Circle.PresentedCircles(peerID)
 			}
 		}
 		reply.Peers = append(reply.Peers, sp)
@@ -261,27 +261,27 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	// is in them as well (its own admissions travel the same way) and is
 	// never an offline peer of itself.
 	seen[d.Host.ID().String()] = true
-	for p, c := range members {
-		if !seen[p.String()] {
-			exp := c.Expiry()
-			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Member: true, IP: c.Payload.Meta.IP, AddrConflict: d.addrConflict(p), Scope: c.Payload.Meta.Scope, CertExpiry: &exp, KnownAddrs: d.knownAddrs(p)})
-			seen[p.String()] = true
+	for peerID, memberCert := range members {
+		if !seen[peerID.String()] {
+			exp := memberCert.Expiry()
+			reply.Peers = append(reply.Peers, StatusPeer{ID: peerID.String(), Name: memberCert.Payload.Meta.Name, Member: true, IP: memberCert.Payload.Meta.IP, AddrConflict: d.addrConflict(peerID), Scope: memberCert.Payload.Meta.Scope, CertExpiry: &exp, KnownAddrs: d.knownAddrs(peerID)})
+			seen[peerID.String()] = true
 		}
 	}
 	// Lapsed members stay visible until their retention runs out: an
 	// expired device that is off is still "carbon — expired", not nothing.
-	for p, c := range d.Store.Lapsed() {
-		if !seen[p.String()] {
-			exp := c.Expiry()
-			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Name: c.Payload.Meta.Name, Expired: true, IP: c.Payload.Meta.IP, Scope: c.Payload.Meta.Scope, CertExpiry: &exp, KnownAddrs: d.knownAddrs(p)})
-			seen[p.String()] = true
+	for peerID, memberCert := range d.Store.Lapsed() {
+		if !seen[peerID.String()] {
+			exp := memberCert.Expiry()
+			reply.Peers = append(reply.Peers, StatusPeer{ID: peerID.String(), Name: memberCert.Payload.Meta.Name, Expired: true, IP: memberCert.Payload.Meta.IP, Scope: memberCert.Payload.Meta.Scope, CertExpiry: &exp, KnownAddrs: d.knownAddrs(peerID)})
+			seen[peerID.String()] = true
 		}
 	}
-	for p, exp := range revoked {
-		if !seen[p.String()] {
+	for peerID, exp := range revoked {
+		if !seen[peerID.String()] {
 			until := exp
-			reply.Peers = append(reply.Peers, StatusPeer{ID: p.String(), Revoked: true, RevokedUntil: &until})
-			seen[p.String()] = true
+			reply.Peers = append(reply.Peers, StatusPeer{ID: peerID.String(), Revoked: true, RevokedUntil: &until})
+			seen[peerID.String()] = true
 		}
 	}
 	// Bootstrap peers we have not yet authenticated with.
@@ -294,65 +294,65 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			})
 		}
 	}
-	writeJSON(w, reply)
+	writeJSON(resp, reply)
 }
 
 // handleGraph returns the aggregated mesh link state — every live link any
 // reachable member reports, not just this node's own.
-func (d *Daemon) handleGraph(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, map[string][]LinkInfo{"links": d.graphLinks()})
+func (d *Daemon) handleGraph(resp http.ResponseWriter, _ *http.Request) {
+	writeJSON(resp, map[string][]LinkInfo{"links": d.graphLinks()})
 }
 
-func (d *Daemon) handleMembers(w http.ResponseWriter, _ *http.Request) {
+func (d *Daemon) handleMembers(resp http.ResponseWriter, _ *http.Request) {
 	members, _ := d.Store.Snapshot()
 	out := make([]MemberInfo, 0, len(members)+1)
-	add := func(p peer.ID, c *cert.Cert, self, expired bool) {
-		devKey, err := c.DeviceKey()
+	add := func(peerID peer.ID, memberCert *cert.Cert, self, expired bool) {
+		devKey, err := memberCert.DeviceKey()
 		if err != nil {
 			return
 		}
-		raw, err := c.Marshal()
+		raw, err := memberCert.Marshal()
 		if err != nil {
 			return
 		}
 		info := MemberInfo{
-			ID:           p.String(),
-			Name:         c.Payload.Meta.Name,
+			ID:           peerID.String(),
+			Name:         memberCert.Payload.Meta.Name,
 			Fingerprint:  admission.Fingerprint(devKey),
 			DevicePub:    devKey,
 			Cert:         raw,
-			IP:           c.Payload.Meta.IP,
-			Scope:        c.Payload.Meta.Scope,
-			Expiry:       c.Expiry(),
-			Connected:    self || d.Host.Network().Connectedness(p) == network.Connected,
+			IP:           memberCert.Payload.Meta.IP,
+			Scope:        memberCert.Payload.Meta.Scope,
+			Expiry:       memberCert.Expiry(),
+			Connected:    self || d.Host.Network().Connectedness(peerID) == network.Connected,
 			Self:         self,
 			Expired:      expired,
-			AddrConflict: d.addrConflict(p),
+			AddrConflict: d.addrConflict(peerID),
 		}
 		out = append(out, info)
 	}
 	// This node is listed once, by the cert it holds (cert.cbor): the
 	// roster's own entry for it may be a bare admission without a name.
 	add(d.Host.ID(), d.OwnCert(), true, false)
-	for p, c := range members {
-		if p != d.Host.ID() {
-			add(p, c, false, false)
+	for peerID, memberCert := range members {
+		if peerID != d.Host.ID() {
+			add(peerID, memberCert, false, false)
 		}
 	}
 	// Lapsed members ride along flagged: the signing side must not renew
 	// them (nothing could deliver it) but must keep their address reserved
 	// and hand it back when the same device re-joins.
-	for p, c := range d.Store.Lapsed() {
-		add(p, c, false, true)
+	for peerID, memberCert := range d.Store.Lapsed() {
+		add(peerID, memberCert, false, true)
 	}
-	writeJSON(w, out)
+	writeJSON(resp, out)
 }
 
 // addrConflict is the address the peer claims but does not hold, as a
 // string for the replies; "" when it holds its address or has none.
-func (d *Daemon) addrConflict(p peer.ID) string {
-	if a, ok := d.Store.AddrConflict(p); ok {
-		return a.String()
+func (d *Daemon) addrConflict(peerID peer.ID) string {
+	if addr, ok := d.Store.AddrConflict(peerID); ok {
+		return addr.String()
 	}
 	return ""
 }
@@ -360,39 +360,39 @@ func (d *Daemon) addrConflict(p peer.ID) string {
 // handleEvents returns the membership feed of the home circle, newest
 // first — the admission-transparency surface of spec §5, read from the
 // roster: every admission it holds (renewals included) and every removal.
-func (d *Daemon) handleEvents(w http.ResponseWriter, _ *http.Request) {
+func (d *Daemon) handleEvents(resp http.ResponseWriter, _ *http.Request) {
 	out := []EventInfo{}
-	r, ok := d.Store.RosterFor(d.CircleDID())
+	roster, ok := d.Store.RosterFor(d.CircleDID())
 	if !ok {
-		writeJSON(w, out)
+		writeJSON(resp, out)
 		return
 	}
 	names, peers := map[string]string{}, map[string]string{}
-	for _, dev := range r.Devices() {
-		for _, h := range r.Held(dev.DID) {
-			c, err := cert.FromStatement(h.Stmt)
+	for _, dev := range roster.Devices() {
+		for _, held := range roster.Held(dev.DID) {
+			memberCert, err := cert.FromStatement(held.Stmt)
 			if err != nil {
 				continue
 			}
-			info := EventInfo{Kind: "member-added", Name: c.Payload.Meta.Name, At: h.Issued()}
-			if k, err := c.DeviceKey(); err == nil {
-				if p, err := fabricnet.PeerIDForKey(k); err == nil {
-					info.PeerID = p.String()
+			info := EventInfo{Kind: "member-added", Name: memberCert.Payload.Meta.Name, At: held.Issued()}
+			if devKey, err := memberCert.DeviceKey(); err == nil {
+				if peerID, err := fabricnet.PeerIDForKey(devKey); err == nil {
+					info.PeerID = peerID.String()
 				}
 			}
 			names[dev.DID], peers[dev.DID] = info.Name, info.PeerID
 			out = append(out, info)
 		}
 	}
-	for _, st := range r.Revocations().All() {
+	for _, st := range roster.Revocations().All() {
 		rv, err := circle.RevocationFromStatement(st)
-		if err != nil || rv.Device == "" || rv.Circle != r.CircleDID() {
+		if err != nil || rv.Device == "" || rv.Circle != roster.CircleDID() {
 			continue
 		}
 		out = append(out, EventInfo{Kind: "member-revoked", Name: names[rv.Device], PeerID: peers[rv.Device], At: time.Unix(rv.At, 0)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].At.After(out[j].At) })
-	writeJSON(w, out)
+	writeJSON(resp, out)
 }
 
 // bestConn prefers a direct connection over a relayed one — during a
@@ -402,9 +402,9 @@ func bestConn(conns []network.Conn) network.Conn {
 	if len(conns) == 0 {
 		return nil
 	}
-	for _, c := range conns {
-		if _, relayed := transportOf(c.RemoteMultiaddr()); !relayed {
-			return c
+	for _, conn := range conns {
+		if _, relayed := transportOf(conn.RemoteMultiaddr()); !relayed {
+			return conn
 		}
 	}
 	return conns[0]
@@ -425,11 +425,11 @@ func dirString(dir network.Direction) string {
 // stable display. Gossiped signed records keep these alive even while the
 // peer is unreachable — for an offline member this is the dial plan, not a
 // connection.
-func (d *Daemon) knownAddrs(p peer.ID) []string {
-	addrs := d.Host.Peerstore().Addrs(p)
+func (d *Daemon) knownAddrs(peerID peer.ID) []string {
+	addrs := d.Host.Peerstore().Addrs(peerID)
 	out := make([]string, 0, len(addrs))
-	for _, a := range addrs {
-		out = append(out, a.String())
+	for _, addr := range addrs {
+		out = append(out, addr.String())
 	}
 	sort.Strings(out)
 	return out
@@ -439,8 +439,8 @@ func (d *Daemon) knownAddrs(p peer.ID) []string {
 // the connection, and whether it goes through a circuit relay rather than
 // directly.
 func transportOf(addr ma.Multiaddr) (transport string, relayed bool) {
-	for _, p := range addr.Protocols() {
-		switch p.Code {
+	for _, proto := range addr.Protocols() {
+		switch proto.Code {
 		case ma.P_CIRCUIT:
 			relayed = true
 		case ma.P_QUIC_V1:
@@ -461,13 +461,13 @@ func transportOf(addr ma.Multiaddr) (transport string, relayed bool) {
 // handlePending aggregates the local queue (if this node runs one) with
 // every reachable remote queue host — so `fabric pending` and the UI on
 // the master see the whole picture regardless of where joiners knock.
-func (d *Daemon) handlePending(w http.ResponseWriter, _ *http.Request) {
+func (d *Daemon) handlePending(resp http.ResponseWriter, _ *http.Request) {
 	pending, sources := d.allPending()
 	if sources == 0 {
-		http.Error(w, "no admission queue here and no queue host reachable", http.StatusNotFound)
+		http.Error(resp, "no admission queue here and no queue host reachable", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, pending)
+	writeJSON(resp, pending)
 }
 
 // allPending merges local and remote queues, deduplicated by fingerprint
@@ -479,22 +479,22 @@ func (d *Daemon) allPending() ([]admission.PendingInfo, int) {
 	seen := map[string]bool{}
 	add := func(entries []admission.PendingInfo) {
 		sources++
-		for _, e := range entries {
-			if !seen[e.Fingerprint] {
-				seen[e.Fingerprint] = true
-				out = append(out, e)
+		for _, entry := range entries {
+			if !seen[entry.Fingerprint] {
+				seen[entry.Fingerprint] = true
+				out = append(out, entry)
 			}
 		}
 	}
 	if d.Queue != nil {
 		add(d.Queue.List())
 	}
-	for _, p := range d.queueHosts() {
+	for _, peerID := range d.queueHosts() {
 		ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
-		entries, err := admission.RemoteList(ctx, d.Host, p)
+		entries, err := admission.RemoteList(ctx, d.Host, peerID)
 		cancel()
 		if err != nil {
-			log.Printf("queue host %s: list failed: %v", p, err)
+			log.Printf("queue host %s: list failed: %v", peerID, err)
 			continue
 		}
 		add(entries)
@@ -506,47 +506,47 @@ func (d *Daemon) allPending() ([]admission.PendingInfo, int) {
 // (target "") or a remote queue host.
 func (d *Daemon) routeToQueue(fingerprint string) (peer.ID, bool) {
 	if d.Queue != nil {
-		for _, e := range d.Queue.List() {
-			if e.Fingerprint == fingerprint {
+		for _, entry := range d.Queue.List() {
+			if entry.Fingerprint == fingerprint {
 				return "", true
 			}
 		}
 	}
-	for _, p := range d.queueHosts() {
+	for _, peerID := range d.queueHosts() {
 		ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
-		entries, err := admission.RemoteList(ctx, d.Host, p)
+		entries, err := admission.RemoteList(ctx, d.Host, peerID)
 		cancel()
 		if err != nil {
 			continue
 		}
-		for _, e := range entries {
-			if e.Fingerprint == fingerprint {
-				return p, true
+		for _, entry := range entries {
+			if entry.Fingerprint == fingerprint {
+				return peerID, true
 			}
 		}
 	}
 	return "", false
 }
 
-func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleApprove(resp http.ResponseWriter, req *http.Request) {
 	var body approveBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(resp, err.Error(), http.StatusBadRequest)
 		return
 	}
 	certBytes, err := base64.StdEncoding.DecodeString(body.CertB64)
 	if err != nil {
-		http.Error(w, "cert_b64: "+err.Error(), http.StatusBadRequest)
+		http.Error(resp, "cert_b64: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	target, found := d.routeToQueue(body.Fingerprint)
 	if !found {
-		http.Error(w, fmt.Sprintf("no pending request %q on any reachable queue", body.Fingerprint), http.StatusNotFound)
+		http.Error(resp, fmt.Sprintf("no pending request %q on any reachable queue", body.Fingerprint), http.StatusNotFound)
 		return
 	}
 	if target == "" {
 		if err := d.Queue.Approve(body.Fingerprint, certBytes); err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+			http.Error(resp, err.Error(), http.StatusNotFound)
 			return
 		}
 	} else {
@@ -554,7 +554,7 @@ func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
 		err = admission.RemoteApprove(ctx, d.Host, target, body.Fingerprint, certBytes)
 		cancel()
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			http.Error(resp, err.Error(), http.StatusBadGateway)
 			return
 		}
 	}
@@ -564,27 +564,27 @@ func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
 	// records it too — the roster deduplicates.
 	if d.Circle != nil {
 		if _, err := d.Circle.Admit(certBytes); err != nil {
-			http.Error(w, "cert delivered, but recording the admission failed: "+err.Error(), http.StatusInternalServerError)
+			http.Error(resp, "cert delivered, but recording the admission failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
-	writeJSON(w, map[string]string{"result": "approved"})
+	writeJSON(resp, map[string]string{"result": "approved"})
 }
 
-func (d *Daemon) handleDeny(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleDeny(resp http.ResponseWriter, req *http.Request) {
 	var body denyBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(resp, err.Error(), http.StatusBadRequest)
 		return
 	}
 	target, found := d.routeToQueue(body.Fingerprint)
 	if !found {
-		http.Error(w, fmt.Sprintf("no pending request %q on any reachable queue", body.Fingerprint), http.StatusNotFound)
+		http.Error(resp, fmt.Sprintf("no pending request %q on any reachable queue", body.Fingerprint), http.StatusNotFound)
 		return
 	}
 	if target == "" {
 		if err := d.Queue.Deny(body.Fingerprint); err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+			http.Error(resp, err.Error(), http.StatusNotFound)
 			return
 		}
 	} else {
@@ -592,16 +592,16 @@ func (d *Daemon) handleDeny(w http.ResponseWriter, r *http.Request) {
 		err := admission.RemoteDeny(ctx, d.Host, target, body.Fingerprint)
 		cancel()
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			http.Error(resp, err.Error(), http.StatusBadGateway)
 			return
 		}
 	}
-	writeJSON(w, map[string]string{"result": "denied"})
+	writeJSON(resp, map[string]string{"result": "denied"})
 }
 
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+func writeJSON(resp http.ResponseWriter, val any) {
+	resp.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(resp).Encode(val)
 }
 
 // --- client side (used by the CLI) ---
@@ -615,8 +615,8 @@ func NewClient(dir state.Dir) *Client {
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "unix", sock)
+				var dialer net.Dialer
+				return dialer.DialContext(ctx, "unix", sock)
 			},
 		},
 	}}
@@ -656,45 +656,45 @@ func (c *Client) post(path string, body any, out any) error {
 }
 
 func (c *Client) Status() (*StatusReply, error) {
-	var s StatusReply
-	if err := c.get("/v0/status", &s); err != nil {
+	var status StatusReply
+	if err := c.get("/v0/status", &status); err != nil {
 		return nil, err
 	}
-	return &s, nil
+	return &status, nil
 }
 
 func (c *Client) Pending() ([]admission.PendingInfo, error) {
-	var p []admission.PendingInfo
-	if err := c.get("/v0/pending", &p); err != nil {
+	var pending []admission.PendingInfo
+	if err := c.get("/v0/pending", &pending); err != nil {
 		return nil, err
 	}
-	return p, nil
+	return pending, nil
 }
 
 func (c *Client) Events() ([]EventInfo, error) {
-	var e []EventInfo
-	if err := c.get("/v0/events", &e); err != nil {
+	var events []EventInfo
+	if err := c.get("/v0/events", &events); err != nil {
 		return nil, err
 	}
-	return e, nil
+	return events, nil
 }
 
 func (c *Client) Graph() ([]LinkInfo, error) {
-	var g struct {
+	var graph struct {
 		Links []LinkInfo `json:"links"`
 	}
-	if err := c.get("/v0/graph", &g); err != nil {
+	if err := c.get("/v0/graph", &graph); err != nil {
 		return nil, err
 	}
-	return g.Links, nil
+	return graph.Links, nil
 }
 
 func (c *Client) Members() ([]MemberInfo, error) {
-	var m []MemberInfo
-	if err := c.get("/v0/members", &m); err != nil {
+	var members []MemberInfo
+	if err := c.get("/v0/members", &members); err != nil {
 		return nil, err
 	}
-	return m, nil
+	return members, nil
 }
 
 // Approve delivers a cert the owner signed for a pending join request; the
@@ -715,15 +715,15 @@ func (c *Client) Deny(fingerprint string) error {
 // admission) into the circle directory, so the change reaches the devices
 // online now. The daemon reads the circle directory itself — nothing on the
 // socket can add or remove a revocation.
-func (d *Daemon) handleCircleRefresh(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleCircleRefresh(resp http.ResponseWriter, req *http.Request) {
 	if d.Circle == nil {
-		http.Error(w, "this node serves no circle", http.StatusNotFound)
+		http.Error(resp, "this node serves no circle", http.StatusNotFound)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(req.Context(), 20*time.Second)
 	defer cancel()
-	n := d.Circle.Refresh(ctx)
-	writeJSON(w, circleRefreshReply{Reached: n})
+	reached := d.Circle.Refresh(ctx)
+	writeJSON(resp, circleRefreshReply{Reached: reached})
 }
 
 type circleRefreshReply struct {
@@ -741,27 +741,27 @@ type circleAdmitReply struct {
 // handleCircleAdmit records an admission the owner CLI just signed in
 // the circle's roster (CircleService.Admit): verified against the
 // circle's root, never trusted because it came over the socket.
-func (d *Daemon) handleCircleAdmit(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleCircleAdmit(resp http.ResponseWriter, req *http.Request) {
 	if d.Circle == nil {
-		http.Error(w, "this node serves no circle", http.StatusNotFound)
+		http.Error(resp, "this node serves no circle", http.StatusNotFound)
 		return
 	}
 	var body circleAdmitBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(resp, err.Error(), http.StatusBadRequest)
 		return
 	}
 	raw, err := base64.StdEncoding.DecodeString(body.AdmissionB64)
 	if err != nil {
-		http.Error(w, "admission_b64: "+err.Error(), http.StatusBadRequest)
+		http.Error(resp, "admission_b64: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	fresh, err := d.Circle.Admit(raw)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(resp, err.Error(), http.StatusBadRequest)
 		return
 	}
-	writeJSON(w, circleAdmitReply{Fresh: fresh})
+	writeJSON(resp, circleAdmitReply{Fresh: fresh})
 }
 
 type circleHandoverBody struct {
@@ -772,27 +772,27 @@ type circleHandoverReply struct {
 	Grew bool `json:"grew"` // the circle's key history did not hold this handover yet
 }
 
-func (d *Daemon) handleCircleHandover(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleCircleHandover(resp http.ResponseWriter, req *http.Request) {
 	if d.Circle == nil {
-		http.Error(w, "this node serves no circle", http.StatusNotFound)
+		http.Error(resp, "this node serves no circle", http.StatusNotFound)
 		return
 	}
 	var body circleHandoverBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(resp, err.Error(), http.StatusBadRequest)
 		return
 	}
 	raw, err := base64.StdEncoding.DecodeString(body.HandoverB64)
 	if err != nil {
-		http.Error(w, "handover_b64: "+err.Error(), http.StatusBadRequest)
+		http.Error(resp, "handover_b64: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	grew, err := d.Circle.Handover(raw)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(resp, err.Error(), http.StatusBadRequest)
 		return
 	}
-	writeJSON(w, circleHandoverReply{Grew: grew})
+	writeJSON(resp, circleHandoverReply{Grew: grew})
 }
 
 // CircleHandover hands the daemon a key handover signed here (`circle
@@ -840,43 +840,43 @@ type revokeKeyBody struct {
 	ID string `json:"id"`
 }
 
-func (d *Daemon) handleKeys(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleKeys(resp http.ResponseWriter, req *http.Request) {
 	ks, err := d.Keys()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(resp, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if ks == nil {
 		ks = []KeyRecord{}
 	}
-	writeJSON(w, ks)
+	writeJSON(resp, ks)
 }
 
-func (d *Daemon) handleKeyIssue(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleKeyIssue(resp http.ResponseWriter, req *http.Request) {
 	var body IssueKeyBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(resp, err.Error(), http.StatusBadRequest)
 		return
 	}
-	k, err := d.IssueKey(body.Circle, body.Res, body.Verbs, time.Duration(body.ValidityS)*time.Second, body.Label)
+	issued, err := d.IssueKey(body.Circle, body.Res, body.Verbs, time.Duration(body.ValidityS)*time.Second, body.Label)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(resp, err.Error(), http.StatusBadRequest)
 		return
 	}
-	writeJSON(w, k)
+	writeJSON(resp, issued)
 }
 
-func (d *Daemon) handleKeyRevoke(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleKeyRevoke(resp http.ResponseWriter, req *http.Request) {
 	var body revokeKeyBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(resp, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err := d.RevokeKey(body.ID); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(resp, err.Error(), http.StatusBadRequest)
 		return
 	}
-	writeJSON(w, map[string]string{"result": "revoked"})
+	writeJSON(resp, map[string]string{"result": "revoked"})
 }
 
 // Keys lists the sub-keys this device issued.

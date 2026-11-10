@@ -37,17 +37,17 @@ func (s *Store) ListObjectsPage(ctx context.Context, after string, tags ...strin
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
 		}
-		o, err := UnmarshalObject(it.Value())
+		obj, err := UnmarshalObject(it.Value())
 		if err != nil {
 			return nil, "", err
 		}
 		last = strings.TrimPrefix(string(it.Key()), "o/")
-		match := !o.IsDeleted()
+		match := !obj.IsDeleted()
 		for _, tag := range tags {
-			match = match && o.Tags.Has(tag)
+			match = match && obj.Tags.Has(tag)
 		}
 		if match {
-			out = append(out, o)
+			out = append(out, obj)
 		}
 		it.Next()
 	}

@@ -17,43 +17,43 @@ var Version = "0.0.1"
 func Agent() string {
 	rev, dirty := "", false
 	if info, ok := debug.ReadBuildInfo(); ok {
-		for _, s := range info.Settings {
-			switch s.Key {
+		for _, setting := range info.Settings {
+			switch setting.Key {
 			case "vcs.revision":
-				rev = s.Value
+				rev = setting.Value
 			case "vcs.modified":
-				dirty = s.Value == "true"
+				dirty = setting.Value == "true"
 			}
 		}
 	}
-	b := strings.Builder{}
-	b.WriteString("fabric/")
-	b.WriteString(Version)
+	buf := strings.Builder{}
+	buf.WriteString("fabric/")
+	buf.WriteString(Version)
 	if rev != "" {
-		b.WriteString(" ")
+		buf.WriteString(" ")
 		if len(rev) > 9 {
 			rev = rev[:9]
 		}
-		b.WriteString(rev)
+		buf.WriteString(rev)
 		if dirty {
-			b.WriteString("+")
+			buf.WriteString("+")
 		}
 	}
-	return b.String()
+	return buf.String()
 }
 
 // agentOf is the software label a connected peer announced on identify;
 // empty when unknown. A node from before this label announces libp2p's
 // default agent string, reported as is.
-func (d *Daemon) agentOf(p string) string {
-	id, err := peer.Decode(p)
+func (d *Daemon) agentOf(peerID string) string {
+	id, err := peer.Decode(peerID)
 	if err != nil {
 		return ""
 	}
-	v, err := d.Host.Peerstore().Get(id, "AgentVersion")
+	val, err := d.Host.Peerstore().Get(id, "AgentVersion")
 	if err != nil {
 		return ""
 	}
-	s, _ := v.(string)
-	return s
+	agent, _ := val.(string)
+	return agent
 }

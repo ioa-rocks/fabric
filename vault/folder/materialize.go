@@ -31,8 +31,8 @@ func (r *Replica) Materialize() (Report, error) {
 		return rep, err
 	}
 	byObject := map[string][]string{} // object ID -> paths the folder holds for it
-	for rel, e := range entries {
-		byObject[e.ObjectID] = append(byObject[e.ObjectID], rel)
+	for rel, entry := range entries {
+		byObject[entry.ObjectID] = append(byObject[entry.ObjectID], rel)
 	}
 	// Objects whose deletion is parked stay as the operator left them until
 	// accept or reject decides (ADR 0001 §4).
@@ -47,14 +47,14 @@ func (r *Replica) Materialize() (Report, error) {
 		conflictOf string
 	}
 	var wants []want
-	for _, o := range objs {
-		if _, parked := held[o.ID]; parked {
+	for _, obj := range objs {
+		if _, parked := held[obj.ID]; parked {
 			continue
 		}
-		if o.IsDeleted() {
+		if obj.IsDeleted() {
 			// Everything the folder holds for a tombstoned object goes to the
 			// shadow store.
-			for _, rel := range byObject[o.ID] {
+			for _, rel := range byObject[obj.ID] {
 				if err := r.retire(rel, entries[rel]); err != nil {
 					rep.Errors = append(rep.Errors, err.Error())
 					continue
@@ -63,33 +63,33 @@ func (r *Replica) Materialize() (Report, error) {
 			}
 			continue
 		}
-		wants = append(wants, want{rel: o.Name.V, objectID: o.ID, rev: *o.Head()})
-		for _, c := range o.Conflicts() {
-			wants = append(wants, want{rel: index.ConflictName(o.Name.V, c), objectID: o.ID, rev: c, conflictOf: o.ID})
+		wants = append(wants, want{rel: obj.Name.V, objectID: obj.ID, rev: *obj.Head()})
+		for _, conflict := range obj.Conflicts() {
+			wants = append(wants, want{rel: index.ConflictName(obj.Name.V, conflict), objectID: obj.ID, rev: conflict, conflictOf: obj.ID})
 		}
 		// Paths this folder holds for the object that are no longer wanted
 		// (renames, resolved conflicts) are retired below.
-		wanted := map[string]bool{o.Name.V: true}
-		for _, c := range o.Conflicts() {
-			wanted[index.ConflictName(o.Name.V, c)] = true
+		wanted := map[string]bool{obj.Name.V: true}
+		for _, conflict := range obj.Conflicts() {
+			wanted[index.ConflictName(obj.Name.V, conflict)] = true
 		}
-		for _, rel := range byObject[o.ID] {
+		for _, rel := range byObject[obj.ID] {
 			if wanted[rel] {
 				continue
 			}
-			e := entries[rel]
+			entry := entries[rel]
 			// A plain rename: move the file if it is unchanged locally.
-			if e.ConflictOf == "" && e.Blob == o.Head().Blob && e.Kind == o.Head().KindOrFile() {
-				if _, taken := entries[o.Name.V]; !taken {
-					if err := r.move(rel, o.Name.V, e); err == nil {
-						entries[o.Name.V] = e
+			if entry.ConflictOf == "" && entry.Blob == obj.Head().Blob && entry.Kind == obj.Head().KindOrFile() {
+				if _, taken := entries[obj.Name.V]; !taken {
+					if err := r.move(rel, obj.Name.V, entry); err == nil {
+						entries[obj.Name.V] = entry
 						delete(entries, rel)
 						rep.Changed++
 						continue
 					}
 				}
 			}
-			if err := r.retire(rel, e); err != nil {
+			if err := r.retire(rel, entry); err != nil {
 				rep.Errors = append(rep.Errors, err.Error())
 				continue
 			}
@@ -97,11 +97,11 @@ func (r *Replica) Materialize() (Report, error) {
 			rep.Removed++
 		}
 	}
-	for _, w := range wants {
-		e, have := entries[w.rel]
-		changed, err := r.place(w.rel, w.objectID, w.rev, w.conflictOf, e, have)
+	for _, wanted := range wants {
+		entry, have := entries[wanted.rel]
+		changed, err := r.place(wanted.rel, wanted.objectID, wanted.rev, wanted.conflictOf, entry, have)
 		if err != nil {
-			rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v", w.rel, err))
+			rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v", wanted.rel, err))
 			continue
 		}
 		if changed {
@@ -121,12 +121,12 @@ func (r *Replica) Materialize() (Report, error) {
 }
 
 // place makes rel match rev. Returns whether anything was written.
-func (r *Replica) place(rel, objectID string, rev index.Revision, conflictOf string, e Entry, have bool) (bool, error) {
-	e.ObjectID = objectID
-	p := filepath.Join(r.Dir, filepath.FromSlash(rel))
-	si, statErr := lstat(p)
+func (r *Replica) place(rel, objectID string, rev index.Revision, conflictOf string, entry Entry, have bool) (bool, error) {
+	entry.ObjectID = objectID
+	targetPath := filepath.Join(r.Dir, filepath.FromSlash(rel))
+	si, statErr := lstat(targetPath)
 	exists := statErr == nil
-	if have && exists && !e.unchanged(si) && !si.isDir {
+	if have && exists && !entry.unchanged(si) && !si.isDir {
 		return false, nil // local change pending; Scan owns it
 	}
 	if have && !exists {
@@ -139,61 +139,61 @@ func (r *Replica) place(rel, objectID string, rev index.Revision, conflictOf str
 	case index.KindDir:
 		if exists && si.isDir {
 			if !have {
-				_ = r.putEntry(rel, Entry{ObjectID: objectIDFor(e, conflictOf), Kind: index.KindDir, MTime: si.mtime, Inode: si.inode})
+				_ = r.putEntry(rel, Entry{ObjectID: objectIDFor(entry, conflictOf), Kind: index.KindDir, MTime: si.mtime, Inode: si.inode})
 			}
 			return false, nil
 		}
 		if exists {
 			return false, fmt.Errorf("directory record but a file is at %s", rel)
 		}
-		if err := os.MkdirAll(p, 0o755); err != nil {
+		if err := os.MkdirAll(targetPath, 0o755); err != nil {
 			return false, err
 		}
-		si, _ = lstat(p)
-		return true, r.putEntry(rel, Entry{ObjectID: objectIDFor(e, conflictOf), Kind: index.KindDir, MTime: si.mtime, Inode: si.inode})
+		si, _ = lstat(targetPath)
+		return true, r.putEntry(rel, Entry{ObjectID: objectIDFor(entry, conflictOf), Kind: index.KindDir, MTime: si.mtime, Inode: si.inode})
 	case index.KindSymlink:
-		if have && e.Kind == index.KindSymlink && e.Target == rev.Target && exists && si.isLnk {
+		if have && entry.Kind == index.KindSymlink && entry.Target == rev.Target && exists && si.isLnk {
 			return false, nil
 		}
 		if exists && si.isDir {
 			return false, fmt.Errorf("symlink record but a directory is at %s", rel)
 		}
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 			return false, err
 		}
-		tmp := p + ".vault-tmp"
+		tmp := targetPath + ".vault-tmp"
 		_ = os.Remove(tmp)
 		if err := os.Symlink(rev.Target, tmp); err != nil {
 			return false, err
 		}
-		if err := os.Rename(tmp, p); err != nil {
+		if err := os.Rename(tmp, targetPath); err != nil {
 			_ = os.Remove(tmp)
 			return false, err
 		}
-		si, _ = lstat(p)
-		return true, r.putEntry(rel, Entry{ObjectID: objectIDFor(e, conflictOf), Kind: index.KindSymlink, Target: rev.Target, MTime: si.mtime, Inode: si.inode, ConflictOf: conflictOf})
+		si, _ = lstat(targetPath)
+		return true, r.putEntry(rel, Entry{ObjectID: objectIDFor(entry, conflictOf), Kind: index.KindSymlink, Target: rev.Target, MTime: si.mtime, Inode: si.inode, ConflictOf: conflictOf})
 	}
 	// File.
-	if have && e.Blob == rev.Blob && e.Kind == index.KindFile && exists && !si.isDir && !si.isLnk {
+	if have && entry.Blob == rev.Blob && entry.Kind == index.KindFile && exists && !si.isDir && !si.isLnk {
 		// Content in place; align mode and mtime if the record says otherwise.
 		changed := false
 		if rev.Mode != 0 && rev.Mode&0o111 != si.mode&0o111 {
-			if err := os.Chmod(p, os.FileMode(rev.Mode)); err != nil {
+			if err := os.Chmod(targetPath, os.FileMode(rev.Mode)); err != nil {
 				return false, err
 			}
 			changed = true
 		}
 		if rev.MTime != 0 && rev.MTime != si.mtime {
-			t := time.Unix(0, rev.MTime)
-			if err := os.Chtimes(p, t, t); err != nil {
+			mtime := time.Unix(0, rev.MTime)
+			if err := os.Chtimes(targetPath, mtime, mtime); err != nil {
 				return false, err
 			}
 			changed = true
 		}
 		if changed {
-			si, _ = lstat(p)
-			e.MTime, e.Inode, e.Mode = si.mtime, si.inode, si.mode
-			return true, r.putEntry(rel, e)
+			si, _ = lstat(targetPath)
+			entry.MTime, entry.Inode, entry.Mode = si.mtime, si.inode, si.mode
+			return true, r.putEntry(rel, entry)
 		}
 		return false, nil
 	}
@@ -206,8 +206,8 @@ func (r *Replica) place(rel, objectID string, rev index.Revision, conflictOf str
 	// The working file is the only copy of its bytes; before replacing it,
 	// keep them in the shadow store — a conflict copy or a restore may need
 	// them, and the trash window applies.
-	if have && exists && !si.isLnk && e.Blob != "" && e.Blob != rev.Blob {
-		if _, _, err := r.shadow.PutFile(p); err != nil {
+	if have && exists && !si.isLnk && entry.Blob != "" && entry.Blob != rev.Blob {
+		if _, _, err := r.shadow.PutFile(targetPath); err != nil {
 			return false, err
 		}
 	}
@@ -223,7 +223,7 @@ func (r *Replica) place(rel, objectID string, rev index.Revision, conflictOf str
 			return false, err
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 		return false, err
 	}
 	tmp, err := os.CreateTemp(filepath.Join(r.state, "staging"), "place-*")
@@ -258,34 +258,34 @@ func (r *Replica) place(rel, objectID string, rev index.Revision, conflictOf str
 		return false, err
 	}
 	if rev.MTime != 0 {
-		t := time.Unix(0, rev.MTime)
-		_ = os.Chtimes(tmp.Name(), t, t)
+		mtime := time.Unix(0, rev.MTime)
+		_ = os.Chtimes(tmp.Name(), mtime, mtime)
 	}
-	if err := os.Rename(tmp.Name(), p); err != nil {
+	if err := os.Rename(tmp.Name(), targetPath); err != nil {
 		// Staging may be on another filesystem than the folder.
-		if err := copyInto(tmp.Name(), p, mode); err != nil {
+		if err := copyInto(tmp.Name(), targetPath, mode); err != nil {
 			return false, err
 		}
 		if rev.MTime != 0 {
-			t := time.Unix(0, rev.MTime)
-			_ = os.Chtimes(p, t, t)
+			mtime := time.Unix(0, rev.MTime)
+			_ = os.Chtimes(targetPath, mtime, mtime)
 		}
 	}
-	si, err = lstat(p)
+	si, err = lstat(targetPath)
 	if err != nil {
 		return false, err
 	}
-	return true, r.putEntry(rel, Entry{ObjectID: objectIDFor(e, conflictOf), Blob: rev.Blob, Size: si.size, MTime: si.mtime, Inode: si.inode, Kind: index.KindFile, Mode: si.mode, ConflictOf: conflictOf})
+	return true, r.putEntry(rel, Entry{ObjectID: objectIDFor(entry, conflictOf), Blob: rev.Blob, Size: si.size, MTime: si.mtime, Inode: si.inode, Kind: index.KindFile, Mode: si.mode, ConflictOf: conflictOf})
 }
 
-func objectIDFor(e Entry, _ string) string { return e.ObjectID }
+func objectIDFor(entry Entry, _ string) string { return entry.ObjectID }
 
 // retire moves a file that the index no longer wants at rel into the
 // shadow store (its bytes stay for the trash window) and drops the entry.
 // A locally changed file is left alone: Scan will publish it.
-func (r *Replica) retire(rel string, e Entry) error {
-	p := filepath.Join(r.Dir, filepath.FromSlash(rel))
-	si, err := lstat(p)
+func (r *Replica) retire(rel string, entry Entry) error {
+	targetPath := filepath.Join(r.Dir, filepath.FromSlash(rel))
+	si, err := lstat(targetPath)
 	if os.IsNotExist(err) {
 		return r.deleteEntry(rel)
 	}
@@ -294,23 +294,23 @@ func (r *Replica) retire(rel string, e Entry) error {
 	}
 	switch {
 	case si.isDir:
-		if empty, _ := isEmptyDir(p); empty {
-			if err := os.Remove(p); err != nil {
+		if empty, _ := isEmptyDir(targetPath); empty {
+			if err := os.Remove(targetPath); err != nil {
 				return err
 			}
 		}
 	case si.isLnk:
-		if err := os.Remove(p); err != nil {
+		if err := os.Remove(targetPath); err != nil {
 			return err
 		}
 	default:
-		if !e.unchanged(si) {
+		if !entry.unchanged(si) {
 			return nil
 		}
-		if _, _, err := r.shadow.PutFile(p); err != nil {
+		if _, _, err := r.shadow.PutFile(targetPath); err != nil {
 			return err
 		}
-		if err := os.Remove(p); err != nil {
+		if err := os.Remove(targetPath); err != nil {
 			return err
 		}
 	}
@@ -318,11 +318,11 @@ func (r *Replica) retire(rel string, e Entry) error {
 }
 
 // move renames an unchanged file to its new name.
-func (r *Replica) move(from, to string, e Entry) error {
+func (r *Replica) move(from, to string, entry Entry) error {
 	src := filepath.Join(r.Dir, filepath.FromSlash(from))
 	dst := filepath.Join(r.Dir, filepath.FromSlash(to))
 	si, err := lstat(src)
-	if err != nil || !e.unchanged(si) {
+	if err != nil || !entry.unchanged(si) {
 		return fmt.Errorf("%s changed locally", from)
 	}
 	if _, err := os.Lstat(dst); err == nil {
@@ -338,8 +338,8 @@ func (r *Replica) move(from, to string, e Entry) error {
 		return err
 	}
 	si, _ = lstat(dst)
-	e.Inode, e.MTime = si.inode, si.mtime
-	return r.putEntry(to, e)
+	entry.Inode, entry.MTime = si.inode, si.mtime
+	return r.putEntry(to, entry)
 }
 
 func copyInto(src, dst string, mode os.FileMode) error {

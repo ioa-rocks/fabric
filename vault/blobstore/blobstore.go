@@ -33,7 +33,7 @@ func (s *Store) path(hash string) string {
 // Put streams a blob in and returns its hash. Content-addressing makes Put
 // idempotent: re-adding existing content is a no-op. Writes are atomic
 // (tmp file + rename), so a crash never leaves a half blob under its hash.
-func (s *Store) Put(r io.Reader) (hash string, size int64, err error) {
+func (s *Store) Put(src io.Reader) (hash string, size int64, err error) {
 	tmp, err := os.CreateTemp(s.root, "put-*")
 	if err != nil {
 		return "", 0, err
@@ -43,15 +43,15 @@ func (s *Store) Put(r io.Reader) (hash string, size int64, err error) {
 		os.Remove(tmp.Name()) // no-op after successful rename
 	}()
 
-	h := blake3.New()
-	size, err = io.Copy(io.MultiWriter(tmp, h), r)
+	hasher := blake3.New()
+	size, err = io.Copy(io.MultiWriter(tmp, hasher), src)
 	if err != nil {
 		return "", 0, err
 	}
 	if err := tmp.Sync(); err != nil {
 		return "", 0, err
 	}
-	hash = hex.EncodeToString(h.Sum(nil))
+	hash = hex.EncodeToString(hasher.Sum(nil))
 
 	dst := s.path(hash)
 	if _, err := os.Stat(dst); err == nil {
@@ -68,31 +68,31 @@ func (s *Store) Put(r io.Reader) (hash string, size int64, err error) {
 
 // PutFile is Put from a file path.
 func (s *Store) PutFile(path string) (string, int64, error) {
-	f, err := os.Open(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return "", 0, err
 	}
-	defer f.Close()
-	return s.Put(f)
+	defer file.Close()
+	return s.Put(file)
 }
 
 // Open returns a reader for a blob.
 func (s *Store) Open(hash string) (io.ReadCloser, error) {
-	f, err := os.Open(s.path(hash))
+	file, err := os.Open(s.path(hash))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("blob %s: not held here", hash)
 	}
-	return f, err
+	return file, err
 }
 
 // Path exposes the on-disk location of a blob — for hardlink/copy
 // projections. Callers must treat the file as immutable.
 func (s *Store) Path(hash string) (string, error) {
-	p := s.path(hash)
-	if _, err := os.Stat(p); err != nil {
+	blobPath := s.path(hash)
+	if _, err := os.Stat(blobPath); err != nil {
 		return "", fmt.Errorf("blob %s: %w", hash, err)
 	}
-	return p, nil
+	return blobPath, nil
 }
 
 // Has reports whether the blob is held here.
@@ -114,16 +114,16 @@ func (s *Store) Size(hash string) (int64, error) {
 // (memo §8): bit-rot shows up as a hash mismatch and the blob can be
 // re-fetched from another complete copy.
 func (s *Store) Verify(hash string) error {
-	f, err := s.Open(hash)
+	file, err := s.Open(hash)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	h := blake3.New()
-	if _, err := io.Copy(h, f); err != nil {
+	defer file.Close()
+	hasher := blake3.New()
+	if _, err := io.Copy(hasher, file); err != nil {
 		return err
 	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != hash {
+	if got := hex.EncodeToString(hasher.Sum(nil)); got != hash {
 		return fmt.Errorf("blob %s corrupt: content hashes to %s", hash, got)
 	}
 	return nil

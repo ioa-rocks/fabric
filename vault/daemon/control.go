@@ -29,9 +29,9 @@ import (
 // paths are capped at ~108 bytes; deep state dirs fall back to a
 // deterministic short path in the temp dir (same scheme as fabric's).
 func SocketPath(statePath string) string {
-	p := filepath.Join(statePath, "control.sock")
-	if len(p) < 100 {
-		return p
+	sockPath := filepath.Join(statePath, "control.sock")
+	if len(sockPath) < 100 {
+		return sockPath
 	}
 	sum := sha256.Sum256([]byte(statePath))
 	return filepath.Join(os.TempDir(), fmt.Sprintf("vault-%s.sock", hex.EncodeToString(sum[:8])))
@@ -90,13 +90,13 @@ type ConflictInfo struct {
 	By    string `json:"by"`
 }
 
-func Info(o *index.Object) ObjectInfo {
-	info := ObjectInfo{ID: o.ID, Name: o.Name.V, Created: o.CreatedAt, Modified: o.Modified(), Tags: o.Tags.List(), Deleted: o.IsDeleted()}
-	if h := o.Head(); h != nil {
-		info.Blob, info.Size, info.Kind, info.Mode, info.MTime, info.Target = h.Blob, h.Size, h.KindOrFile(), h.Mode, h.MTime, h.Target
+func Info(obj *index.Object) ObjectInfo {
+	info := ObjectInfo{ID: obj.ID, Name: obj.Name.V, Created: obj.CreatedAt, Modified: obj.Modified(), Tags: obj.Tags.List(), Deleted: obj.IsDeleted()}
+	if head := obj.Head(); head != nil {
+		info.Blob, info.Size, info.Kind, info.Mode, info.MTime, info.Target = head.Blob, head.Size, head.KindOrFile(), head.Mode, head.MTime, head.Target
 	}
-	for _, r := range o.Conflicts() {
-		info.Conflicts = append(info.Conflicts, ConflictInfo{Name: index.ConflictName(o.Name.V, r), Blob: r.Blob, Size: r.Size, Kind: r.KindOrFile(), MTime: r.MTime, TS: r.TS, By: r.By})
+	for _, rev := range obj.Conflicts() {
+		info.Conflicts = append(info.Conflicts, ConflictInfo{Name: index.ConflictName(obj.Name.V, rev), Blob: rev.Blob, Size: rev.Size, Kind: rev.KindOrFile(), MTime: rev.MTime, TS: rev.TS, By: rev.By})
 	}
 	return info
 }
@@ -182,12 +182,12 @@ type mountDirBody struct {
 func (d *Daemon) serveControl() (func(), error) {
 	sock := SocketPath(d.Store.Path)
 	_ = os.Remove(sock) // stale socket from an unclean shutdown
-	l, err := net.Listen("unix", sock)
+	listener, err := net.Listen("unix", sock)
 	if err != nil {
 		return nil, fmt.Errorf("control socket: %w", err)
 	}
 	if err := os.Chmod(sock, 0o600); err != nil {
-		l.Close()
+		listener.Close()
 		return nil, err
 	}
 
@@ -221,7 +221,7 @@ func (d *Daemon) serveControl() (func(), error) {
 		defer d.end()
 		mux.ServeHTTP(w, r)
 	})}
-	go srv.Serve(l)
+	go srv.Serve(listener)
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -230,12 +230,12 @@ func (d *Daemon) serveControl() (func(), error) {
 	}, nil
 }
 
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+func writeJSON(resp http.ResponseWriter, val any) {
+	resp.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(resp).Encode(val)
 }
 
-func httpErr(w http.ResponseWriter, err error) {
+func httpErr(resp http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	msg := err.Error()
 	switch {
@@ -249,190 +249,190 @@ func httpErr(w http.ResponseWriter, err error) {
 		strings.Contains(msg, "names "):
 		code = http.StatusConflict
 	}
-	http.Error(w, msg, code)
+	http.Error(resp, msg, code)
 }
 
-func (d *Daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleStatus(resp http.ResponseWriter, req *http.Request) {
 	buckets, err := d.Store.Buckets()
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	s := StatusReply{
+	status := StatusReply{
 		Version: Version,
 		Buckets: len(buckets),
 		Mesh:    d.Fabric != nil,
 	}
-	for _, c := range d.Store.Circles() {
-		ci := CircleInfo{DID: c.Config.DID, Name: c.Config.Name}
-		if _, err := c.LoadAdmission(); err == nil {
+	for _, heldCircle := range d.Store.Circles() {
+		ci := CircleInfo{DID: heldCircle.Config.DID, Name: heldCircle.Config.Name}
+		if _, err := heldCircle.LoadAdmission(); err == nil {
 			ci.Admitted = true
 		}
-		for _, b := range buckets {
-			if b.Genesis.Owner == c.Config.DID {
+		for _, bkt := range buckets {
+			if bkt.Genesis.Owner == heldCircle.Config.DID {
 				ci.Buckets++
 			}
 		}
-		s.Circles = append(s.Circles, ci)
+		status.Circles = append(status.Circles, ci)
 	}
 	if d.Fabric != nil {
-		s.MeshName = d.Fabric.Config.Name
-		s.PeerID = d.Fabric.Host.ID().String()
+		status.MeshName = d.Fabric.Config.Name
+		status.PeerID = d.Fabric.Host.ID().String()
 		now := time.Now()
-		for _, p := range d.Fabric.Host.Network().Peers() {
-			if !d.Fabric.Store.IsMember(p, now) {
+		for _, peerID := range d.Fabric.Host.Network().Peers() {
+			if !d.Fabric.Store.IsMember(peerID, now) {
 				continue
 			}
-			pi := PeerInfo{PeerID: p.String()}
-			if c, ok := d.Fabric.Store.Cert(p); ok {
-				pi.Name = c.Payload.Meta.Name
+			pi := PeerInfo{PeerID: peerID.String()}
+			if memberCert, ok := d.Fabric.Store.Cert(peerID); ok {
+				pi.Name = memberCert.Payload.Meta.Name
 			}
-			cctx, ccancel := context.WithTimeout(r.Context(), 3*time.Second)
-			for _, did := range d.Fabric.Circle.Shared(cctx, p) {
-				if c, ok := d.Store.Owns(did); ok {
-					pi.Shared = append(pi.Shared, c.Config.Name)
+			cctx, ccancel := context.WithTimeout(req.Context(), 3*time.Second)
+			for _, circleDID := range d.Fabric.Circle.Shared(cctx, peerID) {
+				if heldCircle, ok := d.Store.Owns(circleDID); ok {
+					pi.Shared = append(pi.Shared, heldCircle.Config.Name)
 				}
 			}
 			ccancel()
-			if protos, err := d.Fabric.Host.Peerstore().SupportsProtocols(p, HelloProtocol); err == nil && len(protos) > 0 && d.Fabric.Auth.Allows(p, HelloProtocol) {
+			if protos, err := d.Fabric.Host.Peerstore().SupportsProtocols(peerID, HelloProtocol); err == nil && len(protos) > 0 && d.Fabric.Auth.Allows(peerID, HelloProtocol) {
 				pi.Vault = true
-				ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-				if h, err := d.hello(ctx, p); err == nil {
-					pi.Circles, pi.Version = h.Circles, h.Version
+				ctx, cancel := context.WithTimeout(req.Context(), 3*time.Second)
+				if card, err := d.hello(ctx, peerID); err == nil {
+					pi.Circles, pi.Version = card.Circles, card.Version
 				}
 				cancel()
 			}
-			s.Peers = append(s.Peers, pi)
+			status.Peers = append(status.Peers, pi)
 		}
 	}
 	if folders, err := d.folderInfos(); err == nil {
-		s.Folders = folders
+		status.Folders = folders
 	}
 	if mounts, err := d.mountInfos(); err == nil {
-		s.Mounts = mounts
+		status.Mounts = mounts
 	}
-	writeJSON(w, s)
+	writeJSON(resp, status)
 }
 
-func (d *Daemon) handleMounts(w http.ResponseWriter, _ *http.Request) {
+func (d *Daemon) handleMounts(resp http.ResponseWriter, _ *http.Request) {
 	mounts, err := d.mountInfos()
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	writeJSON(w, mounts)
+	writeJSON(resp, mounts)
 }
 
-func (d *Daemon) handleAddMount(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleAddMount(resp http.ResponseWriter, req *http.Request) {
 	var body mountBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	if !filepath.IsAbs(body.Dir) {
-		httpErr(w, fmt.Errorf("mount: dir must be an absolute path (the daemon's cwd is not yours)"))
+		httpErr(resp, fmt.Errorf("mount: dir must be an absolute path (the daemon's cwd is not yours)"))
 		return
 	}
 	if d.Mounter == nil {
-		httpErr(w, fmt.Errorf("mount: this daemon has no mounter wired"))
+		httpErr(resp, fmt.Errorf("mount: this daemon has no mounter wired"))
 		return
 	}
 	id, err := d.Store.ResolveBucketID(body.Bucket)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	decl := store.MountDecl{Bucket: id, Write: body.Write}
 	// Redeclaring a directory replaces its mount; release the old one first.
 	if err := d.releaseMount(body.Dir); err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	if err := d.Store.SetMount(body.Dir, decl); err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	if err := d.establishMount(body.Dir, decl); err != nil {
 		// The first attempt fails loudly and withdraws the declaration —
 		// the retry loop must not keep hammering a mistyped directory.
 		_ = d.Store.RemoveMount(body.Dir)
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	writeJSON(w, MountInfo{Dir: body.Dir, Bucket: id, Write: body.Write, Mounted: true})
+	writeJSON(resp, MountInfo{Dir: body.Dir, Bucket: id, Write: body.Write, Mounted: true})
 }
 
-func (d *Daemon) handleRemoveMount(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleRemoveMount(resp http.ResponseWriter, req *http.Request) {
 	var body mountDirBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	if err := d.Store.RemoveMount(body.Dir); err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	if err := d.releaseMount(body.Dir); err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	writeJSON(w, map[string]string{"dir": body.Dir})
+	writeJSON(resp, map[string]string{"dir": body.Dir})
 }
 
-func (d *Daemon) handleBuckets(w http.ResponseWriter, _ *http.Request) {
+func (d *Daemon) handleBuckets(resp http.ResponseWriter, _ *http.Request) {
 	buckets, err := d.Store.Buckets()
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	folders, _ := d.Store.Folders()
 	mounts, _ := d.Store.Mounts()
 	out := []BucketInfo{}
-	for _, b := range buckets {
-		id, err := b.ID()
+	for _, bkt := range buckets {
+		id, err := bkt.ID()
 		if err != nil {
 			continue
 		}
 		pl := d.Store.Placement(id)
-		info := BucketInfo{ID: id, Owner: b.Genesis.Owner, Name: b.Genesis.Name, Sub: pl.Mode, Root: pl.Root}
-		for dir, f := range folders {
-			if f.Bucket == id {
+		info := BucketInfo{ID: id, Owner: bkt.Genesis.Owner, Name: bkt.Genesis.Name, Sub: pl.Mode, Root: pl.Root}
+		for dir, folderDecl := range folders {
+			if folderDecl.Bucket == id {
 				info.Folder = dir
 			}
 		}
-		for dir, m := range mounts {
-			if m.Bucket == id {
+		for dir, mountDecl := range mounts {
+			if mountDecl.Bucket == id {
 				info.Mounts = append(info.Mounts, dir)
 			}
 		}
 		sort.Strings(info.Mounts)
-		if h, err := d.handle(id); err == nil {
-			info.Objects, info.Held, _ = h.Stats()
-			if cs, err := h.Conflicts(); err == nil {
+		if handle, err := d.handle(id); err == nil {
+			info.Objects, info.Held, _ = handle.Stats()
+			if cs, err := handle.Conflicts(); err == nil {
 				info.Conflicts = len(cs)
 			}
-			if set, err := h.Held(); err == nil {
+			if set, err := handle.Held(); err == nil {
 				info.HeldDeletions = len(set)
 			}
 		}
 		out = append(out, info)
 	}
-	writeJSON(w, out)
+	writeJSON(resp, out)
 }
 
-func (d *Daemon) handleSub(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleSub(resp http.ResponseWriter, req *http.Request) {
 	var body subBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	mode := body.Mode
 	if mode == "none" {
 		mode = store.SubNone
 	}
-	id, err := d.Store.ResolveBucketID(r.PathValue("bucket"))
+	id, err := d.Store.ResolveBucketID(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	pl := d.Store.Placement(id)
@@ -444,86 +444,86 @@ func (d *Daemon) handleSub(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := d.Store.SetPlacement(id, pl); err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	pl = d.Store.Placement(id)
 	if mode == store.SubFull {
-		if h, err := d.handle(id); err == nil {
-			go d.fetchMissing(h) // start honoring the commitment now
+		if handle, err := d.handle(id); err == nil {
+			go d.fetchMissing(handle) // start honoring the commitment now
 		}
 	}
-	writeJSON(w, map[string]string{"id": id, "sub": mode, "root": pl.Root})
+	writeJSON(resp, map[string]string{"id": id, "sub": mode, "root": pl.Root})
 }
 
-func (d *Daemon) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleCreateBucket(resp http.ResponseWriter, req *http.Request) {
 	var body createBucketBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	genesis, err := base64.StdEncoding.DecodeString(body.GenesisB64)
 	if err != nil {
-		httpErr(w, fmt.Errorf("genesis_b64: %w", err))
+		httpErr(resp, fmt.Errorf("genesis_b64: %w", err))
 		return
 	}
 	policy, err := base64.StdEncoding.DecodeString(body.PolicyB64)
 	if err != nil {
-		httpErr(w, fmt.Errorf("policy_b64: %w", err))
+		httpErr(resp, fmt.Errorf("policy_b64: %w", err))
 		return
 	}
-	h, err := d.adopt(genesis, policy)
+	handle, err := d.adopt(genesis, policy)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	// The creating device subscribes full by default — it is about to hold
 	// the data it puts (memo §6's "offer the circle's defaults" UX, reduced
 	// to the one sane default we have).
-	_ = d.Store.SetSubscription(h.ID(), store.SubFull)
+	_ = d.Store.SetSubscription(handle.ID(), store.SubFull)
 	d.kickSync()
-	writeJSON(w, BucketInfo{ID: h.ID(), Owner: h.Bucket.Genesis.Owner, Name: h.Bucket.Genesis.Name, Sub: store.SubFull})
+	writeJSON(resp, BucketInfo{ID: handle.ID(), Owner: handle.Bucket.Genesis.Owner, Name: handle.Bucket.Genesis.Name, Sub: store.SubFull})
 }
 
-func splitTags(s string) []string {
-	if s == "" {
+func splitTags(raw string) []string {
+	if raw == "" {
 		return nil
 	}
 	var out []string
-	for _, p := range strings.Split(s, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
+	for _, part := range strings.Split(raw, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
 		}
 	}
 	return out
 }
 
-func (d *Daemon) handleList(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleList(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	objs, err := h.Index.ListObjects(splitTags(r.URL.Query().Get("tags"))...)
+	objs, err := handle.Index.ListObjects(splitTags(req.URL.Query().Get("tags"))...)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	out := []ObjectInfo{}
 	repaired := false
-	for _, o := range objs {
-		if changed, err := h.BackfillSize(o); err != nil {
-			httpErr(w, err)
+	for _, obj := range objs {
+		if changed, err := handle.BackfillSize(obj); err != nil {
+			httpErr(resp, err)
 			return
 		} else if changed {
 			repaired = true
 		}
-		out = append(out, Info(o))
+		out = append(out, Info(obj))
 	}
 	if repaired {
 		d.kickSync()
 	}
-	writeJSON(w, out)
+	writeJSON(resp, out)
 }
 
 // ObjectPage is a bounded browse response. Next may be set on an empty page
@@ -533,67 +533,67 @@ type ObjectPage struct {
 	Next    string       `json:"next,omitempty"`
 }
 
-func (d *Daemon) handleListPage(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleListPage(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	objects, next, err := h.Index.ListObjectsPage(r.Context(), r.URL.Query().Get("after"), splitTags(r.URL.Query().Get("tags"))...)
+	objects, next, err := handle.Index.ListObjectsPage(req.Context(), req.URL.Query().Get("after"), splitTags(req.URL.Query().Get("tags"))...)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	out := ObjectPage{Objects: make([]ObjectInfo, 0, len(objects)), Next: next}
-	for _, o := range objects {
-		out.Objects = append(out.Objects, Info(o))
+	for _, obj := range objects {
+		out.Objects = append(out.Objects, Info(obj))
 	}
-	writeJSON(w, out)
+	writeJSON(resp, out)
 }
 
-func (d *Daemon) handlePut(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handlePut(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	name := r.URL.Query().Get("name")
+	name := req.URL.Query().Get("name")
 	if name == "" {
-		httpErr(w, fmt.Errorf("put: name query parameter is required"))
+		httpErr(resp, fmt.Errorf("put: name query parameter is required"))
 		return
 	}
-	o, err := h.Put(name, r.Body, splitTags(r.URL.Query().Get("tags"))...)
+	obj, err := handle.Put(name, req.Body, splitTags(req.URL.Query().Get("tags"))...)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	d.kickSync()
-	writeJSON(w, Info(o))
+	writeJSON(resp, Info(obj))
 }
 
-func (d *Daemon) handleGet(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleGet(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	o, err := h.ResolveObject(r.URL.Query().Get("ref"))
+	obj, err := handle.ResolveObject(req.URL.Query().Get("ref"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	// blob= selects one of the object's heads — a conflict copy — instead
 	// of the rendered winner (ADR 0001 §3).
-	blob := o.Blob()
-	if want := r.URL.Query().Get("blob"); want != "" {
+	blob := obj.Blob()
+	if want := req.URL.Query().Get("blob"); want != "" {
 		found := false
-		for _, rev := range o.Heads {
+		for _, rev := range obj.Heads {
 			if rev.Blob == want {
 				found = true
 			}
 		}
 		if !found {
-			httpErr(w, fmt.Errorf("blob %.12s is not a head of %s", want, o.ID[:8]))
+			httpErr(resp, fmt.Errorf("blob %.12s is not a head of %s", want, obj.ID[:8]))
 			return
 		}
 		blob = want
@@ -601,140 +601,140 @@ func (d *Daemon) handleGet(w http.ResponseWriter, r *http.Request) {
 	// On-demand fetch: a missing blob is a mesh lookup, not an error —
 	// vault get works on any node that can reach a holder (API-first; the
 	// cache axis without the bookkeeping).
-	if blob != "" && !h.Holder().Has(blob) && d.Fabric != nil {
-		if err := d.fetchAnywhere(h, blob); err != nil {
-			httpErr(w, fmt.Errorf("blob not held here and no peer served it: %w", err))
+	if blob != "" && !handle.Holder().Has(blob) && d.Fabric != nil {
+		if err := d.fetchAnywhere(handle, blob); err != nil {
+			httpErr(resp, fmt.Errorf("blob not held here and no peer served it: %w", err))
 			return
 		}
 	}
-	rc, err := h.GetBlob(blob)
+	rc, err := handle.GetBlob(blob)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	defer rc.Close()
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-Vault-Object", o.ID)
-	w.Header().Set("X-Vault-Name", o.Name.V)
-	_, _ = io.Copy(w, rc)
+	resp.Header().Set("Content-Type", "application/octet-stream")
+	resp.Header().Set("X-Vault-Object", obj.ID)
+	resp.Header().Set("X-Vault-Name", obj.Name.V)
+	_, _ = io.Copy(resp, rc)
 }
 
-func (d *Daemon) handleReplace(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleReplace(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	o, err := h.ResolveObject(r.URL.Query().Get("ref"))
+	obj, err := handle.ResolveObject(req.URL.Query().Get("ref"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	o, err = h.Replace(o, r.Body)
+	obj, err = handle.Replace(obj, req.Body)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	d.kickSync()
-	writeJSON(w, Info(o))
+	writeJSON(resp, Info(obj))
 }
 
-func (d *Daemon) handleRename(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleRename(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	var body renameBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	if body.Name == "" {
-		httpErr(w, fmt.Errorf("rename: name is required"))
+		httpErr(resp, fmt.Errorf("rename: name is required"))
 		return
 	}
-	o, err := h.ResolveObject(body.Ref)
+	obj, err := handle.ResolveObject(body.Ref)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	o, err = h.Rename(o, body.Name)
+	obj, err = handle.Rename(obj, body.Name)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	d.kickSync()
-	writeJSON(w, Info(o))
+	writeJSON(resp, Info(obj))
 }
 
-func (d *Daemon) handleTag(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleTag(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	var body tagBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
-	o, err := h.ResolveObject(body.Ref)
+	obj, err := handle.ResolveObject(body.Ref)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	if o, err = h.Tag(o, body.Add, body.Remove); err != nil {
-		httpErr(w, err)
+	if obj, err = handle.Tag(obj, body.Add, body.Remove); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	d.kickSync()
-	writeJSON(w, Info(o))
+	writeJSON(resp, Info(obj))
 }
 
-func (d *Daemon) handleRm(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleRm(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	var body refBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
-	o, err := h.ResolveObject(body.Ref)
+	obj, err := handle.ResolveObject(body.Ref)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	if err := h.Delete(o); err != nil {
-		httpErr(w, err)
+	if err := handle.Delete(obj); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	d.kickSync()
-	writeJSON(w, Info(o))
+	writeJSON(resp, Info(obj))
 }
 
-func (d *Daemon) handleProject(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleProject(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	var body projectBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	if !filepath.IsAbs(body.Dir) {
-		httpErr(w, fmt.Errorf("project: dir must be an absolute path (the daemon's cwd is not yours)"))
+		httpErr(resp, fmt.Errorf("project: dir must be an absolute path (the daemon's cwd is not yours)"))
 		return
 	}
-	n, err := h.Project(body.Dir)
+	count, err := handle.Project(body.Dir)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	writeJSON(w, map[string]int{"count": n})
+	writeJSON(resp, map[string]int{"count": count})
 }

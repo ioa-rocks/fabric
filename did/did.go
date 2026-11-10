@@ -41,8 +41,8 @@ func KeyFor(did string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(data[2:]), nil
 }
 
-// IsKey reports whether s has the did:key shape this package produces.
-func IsKey(s string) bool {
-	_, err := KeyFor(s)
+// IsKey reports whether candidate has the did:key shape this package produces.
+func IsKey(candidate string) bool {
+	_, err := KeyFor(candidate)
 	return err == nil
 }

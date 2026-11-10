@@ -24,18 +24,18 @@ func HomeSigner(dir state.Dir, rootPriv ed25519.PrivateKey) (circleDID string, p
 	if err != nil || cfg.CircleDID == "" {
 		return keyDID, nil, nil
 	}
-	c, err := circle.ByDID(circle.Root(dir.Path), cfg.CircleDID)
+	held, err := circle.ByDID(circle.Root(dir.Path), cfg.CircleDID)
 	if err != nil {
 		return cfg.CircleDID, nil, nil // no circle directory: the key is the circle
 	}
-	roots, err := c.DIDRoot()
+	roots, err := held.DIDRoot()
 	if err != nil {
-		return "", nil, fmt.Errorf("circle %q key history: %w", c.Config.Name, err)
+		return "", nil, fmt.Errorf("circle %q key history: %w", held.Config.Name, err)
 	}
 	if cur := roots.Current(); cur != nil && !cur.Equal(rootPriv.Public()) {
-		return "", nil, fmt.Errorf("the root key container holds a key circle %q has handed over from — rotate rewrote it; restore the container from a device holding the current key", c.Config.Name)
+		return "", nil, fmt.Errorf("the root key container holds a key circle %q has handed over from — rotate rewrote it; restore the container from a device holding the current key", held.Config.Name)
 	}
-	return c.Config.DID, roots.RootProof(), nil
+	return held.Config.DID, roots.RootProof(), nil
 }
 
 // RevokeDevice signs the home circle's removal of a device with the root
@@ -47,16 +47,16 @@ func RevokeDevice(dir state.Dir, rootPriv ed25519.PrivateKey, deviceDID string, 
 	if err != nil {
 		return nil, err
 	}
-	c, err := circle.ByDID(circle.Root(dir.Path), circleDID)
+	held, err := circle.ByDID(circle.Root(dir.Path), circleDID)
 	if err != nil {
 		return nil, fmt.Errorf("this node holds no directory for circle %s (start the daemon once): %w", circleDID, err)
 	}
-	r, err := circle.RevokeIn(rootPriv, proof, circleDID, deviceDID, now)
+	revocation, err := circle.RevokeIn(rootPriv, proof, circleDID, deviceDID, now)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := c.AddRevocations(now, r); err != nil {
+	if _, err := held.AddRevocations(now, revocation); err != nil {
 		return nil, err
 	}
-	return r, nil
+	return revocation, nil
 }

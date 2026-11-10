@@ -26,12 +26,12 @@ func cmdPolicy(args []string) error {
 		return err
 	}
 	defer st.Close()
-	p, err := st.Policy(pos[0])
+	policy, err := st.Policy(pos[0])
 	if err != nil {
 		return err
 	}
 	if len(pos) == 1 {
-		printPolicy(p)
+		printPolicy(policy)
 		return nil
 	}
 	if pos[1] != "set" || len(pos) < 3 {
@@ -43,7 +43,7 @@ func cmdPolicy(args []string) error {
 	if err != nil {
 		return err
 	}
-	c, err := pth.openOwner(owner)
+	ownerCircle, err := pth.openOwner(owner)
 	if err != nil {
 		return err
 	}
@@ -51,19 +51,19 @@ func cmdPolicy(args []string) error {
 	if err != nil {
 		return err
 	}
-	priv, err := c.Unlock(pass)
+	priv, err := ownerCircle.Unlock(pass)
 	if err != nil {
 		return err
 	}
 	var applyErr error
-	raw, err := store.SignPolicyRevision(priv, p, func(np *bucket.Policy) {
+	raw, err := store.SignPolicyRevision(priv, policy, func(next *bucket.Policy) {
 		for _, kv := range pos[2:] {
-			k, v, ok := strings.Cut(kv, "=")
+			key, val, ok := strings.Cut(kv, "=")
 			if !ok {
 				applyErr = fmt.Errorf("expected key=value, got %q", kv)
 				return
 			}
-			if err := setPolicyField(np, k, v); err != nil {
+			if err := setPolicyField(next, key, val); err != nil {
 				applyErr = err
 				return
 			}
@@ -75,59 +75,59 @@ func cmdPolicy(args []string) error {
 	if err != nil {
 		return err
 	}
-	p, err = st.SetPolicy(pos[0], raw)
+	policy, err = st.SetPolicy(pos[0], raw)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("policy v%d installed\n", p.Version)
-	printPolicy(p)
+	fmt.Printf("policy v%d installed\n", policy.Version)
+	printPolicy(policy)
 	return nil
 }
 
-func setPolicyField(p *bucket.Policy, k, v string) error {
+func setPolicyField(policy *bucket.Policy, key, val string) error {
 	num := func() (int, error) {
-		n, err := strconv.Atoi(v)
+		parsed, err := strconv.Atoi(val)
 		if err != nil {
-			return 0, fmt.Errorf("%s: %q is not a number", k, v)
+			return 0, fmt.Errorf("%s: %q is not a number", key, val)
 		}
-		return n, nil
+		return parsed, nil
 	}
 	var err error
-	switch k {
+	switch key {
 	case "copies":
-		p.Copies, err = num()
+		policy.Copies, err = num()
 	case "trash_days":
-		p.TrashDays, err = num()
+		policy.TrashDays, err = num()
 	case "hold_min_count":
-		p.HoldMinCount, err = num()
+		policy.HoldMinCount, err = num()
 	case "hold_min_percent":
-		p.HoldMinPercent, err = num()
+		policy.HoldMinPercent, err = num()
 	case "symlinks":
-		p.Symlinks = v
+		policy.Symlinks = val
 	case "nested_repos":
-		p.NestedRepos = v
+		policy.NestedRepos = val
 	case "ignore":
 		// Comma-separated patterns replace the list; "" clears it.
-		p.Ignore = nil
-		for _, pat := range strings.Split(v, ",") {
+		policy.Ignore = nil
+		for _, pat := range strings.Split(val, ",") {
 			if pat = strings.TrimSpace(pat); pat != "" {
-				p.Ignore = append(p.Ignore, pat)
+				policy.Ignore = append(policy.Ignore, pat)
 			}
 		}
 	default:
-		return fmt.Errorf("unknown policy key %q", k)
+		return fmt.Errorf("unknown policy key %q", key)
 	}
 	return err
 }
 
-func printPolicy(p bucket.Policy) {
-	minCount, minPercent, enabled := p.Hold()
+func printPolicy(policy bucket.Policy) {
+	minCount, minPercent, enabled := policy.Hold()
 	hold := "off"
 	if enabled {
 		hold = fmt.Sprintf(">= %d objects and >= %d%% of the bucket", minCount, minPercent)
 	}
 	fmt.Printf("version       %d\ncopies        %d\ntrash_days    %d\nsymlinks      %s\nnested_repos  %s\nhold          %s\nignore        %s\n",
-		p.Version, p.Copies, p.TrashDays, p.SymlinkMode(), p.NestedRepoMode(), hold, strings.Join(p.Ignore, ", "))
+		policy.Version, policy.Copies, policy.TrashDays, policy.SymlinkMode(), policy.NestedRepoMode(), hold, strings.Join(policy.Ignore, ", "))
 }
 
 func cmdTrash(args []string) error {
@@ -150,8 +150,8 @@ func cmdTrash(args []string) error {
 		fmt.Println("trash is empty")
 		return nil
 	}
-	for _, o := range objs {
-		fmt.Printf("%s  %s  deleted %s\n", o.ID[:12], o.Name, time.Unix(0, o.Modified).Format(time.RFC3339))
+	for _, obj := range objs {
+		fmt.Printf("%s  %s  deleted %s\n", obj.ID[:12], obj.Name, time.Unix(0, obj.Modified).Format(time.RFC3339))
 	}
 	return nil
 }
@@ -168,11 +168,11 @@ func cmdRestore(args []string) error {
 		return err
 	}
 	defer st.Close()
-	o, err := st.Restore(pos[0], pos[1])
+	obj, err := st.Restore(pos[0], pos[1])
 	if err != nil {
 		return err
 	}
-	fmt.Printf("restored %s (%s)\n", o.ID[:12], o.Name)
+	fmt.Printf("restored %s (%s)\n", obj.ID[:12], obj.Name)
 	return nil
 }
 
@@ -196,10 +196,10 @@ func cmdConflicts(args []string) error {
 		fmt.Println("no conflicts")
 		return nil
 	}
-	for _, c := range cs {
+	for _, conflict := range cs {
 		fmt.Printf("%s  %s\n    kept:  %.12s  %d bytes  %s\n    copy:  %s  %.12s  %d bytes  by %s\n",
-			c.Object.ID[:12], c.Object.Name, c.Object.Blob, c.Object.Size, time.Unix(0, c.Object.Modified).Format(time.RFC3339),
-			c.Copy.Name, c.Copy.Blob, c.Copy.Size, c.Copy.By)
+			conflict.Object.ID[:12], conflict.Object.Name, conflict.Object.Blob, conflict.Object.Size, time.Unix(0, conflict.Object.Modified).Format(time.RFC3339),
+			conflict.Copy.Name, conflict.Copy.Blob, conflict.Copy.Size, conflict.Copy.By)
 	}
 	fmt.Println("resolve in favor of the kept version: fabric bucket resolve <bucket> <object-ref>")
 	return nil
@@ -217,11 +217,11 @@ func cmdResolve(args []string) error {
 		return err
 	}
 	defer st.Close()
-	o, err := st.Resolve(pos[0], pos[1])
+	obj, err := st.Resolve(pos[0], pos[1])
 	if err != nil {
 		return err
 	}
-	fmt.Printf("resolved %s (%s) in favor of %.12s\n", o.ID[:12], o.Name, o.Blob)
+	fmt.Printf("resolved %s (%s) in favor of %.12s\n", obj.ID[:12], obj.Name, obj.Blob)
 	return nil
 }
 
@@ -238,17 +238,17 @@ func cmdHeld(args []string) error {
 	}
 	defer st.Close()
 	if len(pos) == 2 {
-		var n int
+		var count int
 		switch pos[1] {
 		case "accept":
-			n, err = st.AcceptHeld(pos[0])
+			count, err = st.AcceptHeld(pos[0])
 			if err == nil {
-				fmt.Printf("accepted: %d object(s) deleted (recoverable from trash)\n", n)
+				fmt.Printf("accepted: %d object(s) deleted (recoverable from trash)\n", count)
 			}
 		case "reject":
-			n, err = st.RejectHeld(pos[0])
+			count, err = st.RejectHeld(pos[0])
 			if err == nil {
-				fmt.Printf("rejected: %d object(s) kept; the deleting device converges on the restore\n", n)
+				fmt.Printf("rejected: %d object(s) kept; the deleting device converges on the restore\n", count)
 			}
 		default:
 			err = fmt.Errorf("usage: fabric bucket held <bucket> [accept|reject]")
@@ -263,8 +263,8 @@ func cmdHeld(args []string) error {
 		fmt.Println("no held deletions")
 		return nil
 	}
-	for _, e := range list {
-		fmt.Printf("%s  %s  from %s  since %s\n", e.ID[:12], e.Name, e.From, time.Unix(0, e.FirstSeen).Format(time.RFC3339))
+	for _, entry := range list {
+		fmt.Printf("%s  %s  from %s  since %s\n", entry.ID[:12], entry.Name, entry.From, time.Unix(0, entry.FirstSeen).Format(time.RFC3339))
 	}
 	fmt.Printf("%d deletion(s) held — fabric bucket held <bucket> accept|reject\n", len(list))
 	return nil
@@ -276,9 +276,9 @@ func bucketOwner(st store_, ref string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, b := range infos {
-		if b.Name == ref || (len(ref) >= 6 && strings.HasPrefix(b.ID, ref)) {
-			return b.Owner, nil
+	for _, bkt := range infos {
+		if bkt.Name == ref || (len(ref) >= 6 && strings.HasPrefix(bkt.ID, ref)) {
+			return bkt.Owner, nil
 		}
 	}
 	return "", fmt.Errorf("no bucket %q", ref)

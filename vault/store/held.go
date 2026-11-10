@@ -114,8 +114,8 @@ func (h *Handle) ApplyRecords(records []*index.Object, from string) (held int, e
 			}
 			// Already-held tombstones count too: the rest of the same
 			// rm -rf must not trickle past a set that is already parked.
-			n := len(deleting) + len(h.recentDeletes) + len(set)
-			hold = n >= minCount && n*100 >= minPercent*live
+			total := len(deleting) + len(h.recentDeletes) + len(set)
+			hold = total >= minCount && total*100 >= minPercent*live
 		}
 	}
 	heldIDs := map[string]bool{}
@@ -196,25 +196,25 @@ func (h *Handle) AcceptHeld() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	n := 0
+	count := 0
 	for id, rec := range set {
 		in, err := index.UnmarshalObject(rec.Record)
 		if err != nil {
-			return n, err
+			return count, err
 		}
 		merged, err := h.Index.PutObject(in)
 		if err != nil {
-			return n, err
+			return count, err
 		}
 		if merged.IsDeleted() {
 			if _, err := h.Revise(merged, func(r *index.Revision) { r.Deleted, r.Confirmed = true, true }); err != nil {
-				return n, err
+				return count, err
 			}
 		}
 		delete(set, id)
-		n++
+		count++
 	}
-	return n, h.writeHeld(set)
+	return count, h.writeHeld(set)
 }
 
 // RejectHeld keeps the objects: a peer's parked tombstone is merged and then
@@ -229,31 +229,31 @@ func (h *Handle) RejectHeld() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	n := 0
+	count := 0
 	for id, rec := range set {
 		if rec.From == "local" {
 			if cur, err := h.Index.GetObject(id); err == nil && cur.IsDeleted() {
 				if _, err := h.Restore(cur); err != nil {
-					return n, err
+					return count, err
 				}
 			}
 			delete(set, id)
-			n++
+			count++
 			continue
 		}
 		in, err := index.UnmarshalObject(rec.Record)
 		if err != nil {
-			return n, err
+			return count, err
 		}
 		merged, err := h.Index.PutObject(in)
 		if err != nil {
-			return n, err
+			return count, err
 		}
 		if _, err := h.Restore(merged); err != nil {
-			return n, err
+			return count, err
 		}
 		delete(set, id)
-		n++
+		count++
 	}
-	return n, h.writeHeld(set)
+	return count, h.writeHeld(set)
 }

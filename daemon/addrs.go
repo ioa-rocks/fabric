@@ -20,31 +20,31 @@ func advertiseAddrs(addrs, announce []ma.Multiaddr) []ma.Multiaddr {
 func advertiseAddrsWithExcludedIPs(addrs, announce []ma.Multiaddr, excluded map[netip.Addr]struct{}) []ma.Multiaddr {
 	out := make([]ma.Multiaddr, 0, len(addrs))
 	var loopback []ma.Multiaddr
-	for _, a := range addrs {
-		if ip, ok := multiaddrIP(a); ok {
+	for _, addr := range addrs {
+		if ip, ok := multiaddrIP(addr); ok {
 			if _, ex := excluded[ip]; ex {
 				continue
 			}
 			if ip.IsLoopback() {
-				loopback = append(loopback, a)
+				loopback = append(loopback, addr)
 				continue
 			}
 		}
-		out = append(out, a)
+		out = append(out, addr)
 	}
 	if len(out) == 0 {
 		out = loopback
 	}
-	for _, a := range announce {
+	for _, addr := range announce {
 		dup := false
 		for _, have := range out {
-			if have.Equal(a) {
+			if have.Equal(addr) {
 				dup = true
 				break
 			}
 		}
 		if !dup {
-			out = append(out, a)
+			out = append(out, addr)
 		}
 	}
 	return out
@@ -67,13 +67,13 @@ func excludedInterfaceIPs() map[netip.Addr]struct{} {
 		if err != nil {
 			continue
 		}
-		for _, a := range addrs {
-			prefix, err := netip.ParsePrefix(a.String())
+		for _, netAddr := range addrs {
+			prefix, err := netip.ParsePrefix(netAddr.String())
 			if err == nil {
 				ips[prefix.Addr()] = struct{}{}
 				continue
 			}
-			addr, err := netip.ParseAddr(a.String())
+			addr, err := netip.ParseAddr(netAddr.String())
 			if err == nil {
 				ips[addr] = struct{}{}
 			}
@@ -95,21 +95,21 @@ func isDockerBridgeName(name string) bool {
 	if !strings.HasPrefix(name, "br-") || len(name) == len("br-") {
 		return false
 	}
-	for _, r := range name[len("br-"):] {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+	for _, ch := range name[len("br-"):] {
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
 			return false
 		}
 	}
 	return true
 }
 
-func multiaddrIP(a ma.Multiaddr) (netip.Addr, bool) {
-	if s, err := a.ValueForProtocol(ma.P_IP4); err == nil {
-		ip, err := netip.ParseAddr(s)
+func multiaddrIP(addr ma.Multiaddr) (netip.Addr, bool) {
+	if raw, err := addr.ValueForProtocol(ma.P_IP4); err == nil {
+		ip, err := netip.ParseAddr(raw)
 		return ip, err == nil
 	}
-	if s, err := a.ValueForProtocol(ma.P_IP6); err == nil {
-		ip, err := netip.ParseAddr(s)
+	if raw, err := addr.ValueForProtocol(ma.P_IP6); err == nil {
+		ip, err := netip.ParseAddr(raw)
 		return ip, err == nil
 	}
 	return netip.Addr{}, false

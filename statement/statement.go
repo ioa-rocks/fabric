@@ -225,77 +225,77 @@ func init() {
 	}
 }
 
-// Sign fills the format fields of p (version, issuer, proof, nonce) and
+// Sign fills the format fields of payload (version, issuer, proof, nonce) and
 // signs it with priv. parent is the statement this one chains from (nil
 // when issued by a root); for asserts the issuer must be the parent's
 // recipient. Typ defaults to assert.
-func Sign(priv ed25519.PrivateKey, p Payload, parent *Statement) (*Statement, error) {
-	p.V = Version
-	if p.Typ == "" {
-		p.Typ = TypeAssert
+func Sign(priv ed25519.PrivateKey, payload Payload, parent *Statement) (*Statement, error) {
+	payload.V = Version
+	if payload.Typ == "" {
+		payload.Typ = TypeAssert
 	}
-	if p.Typ != TypeAssert && p.Typ != TypeRevoke && p.Typ != TypeHandover {
-		return nil, fmt.Errorf("unknown statement type %q", p.Typ)
+	if payload.Typ != TypeAssert && payload.Typ != TypeRevoke && payload.Typ != TypeHandover {
+		return nil, fmt.Errorf("unknown statement type %q", payload.Typ)
 	}
 	issuer := did.ForKey(priv.Public().(ed25519.PublicKey))
-	if p.Iss == "" {
-		p.Iss = issuer
-	} else if p.Iss != issuer {
+	if payload.Iss == "" {
+		payload.Iss = issuer
+	} else if payload.Iss != issuer {
 		return nil, errors.New("payload issuer does not match the signing key")
 	}
-	if p.Sub == "" {
+	if payload.Sub == "" {
 		return nil, errors.New("statement needs a sub (circle DID)")
 	}
-	if p.Iat == 0 {
+	if payload.Iat == 0 {
 		return nil, errors.New("statement needs iat")
 	}
-	switch p.Typ {
+	switch payload.Typ {
 	case TypeAssert:
-		if p.Aud == "" {
+		if payload.Aud == "" {
 			return nil, errors.New("assert needs an aud")
 		}
-		if p.Nbf == 0 || p.Exp <= p.Nbf {
+		if payload.Nbf == 0 || payload.Exp <= payload.Nbf {
 			return nil, errors.New("assert needs nbf < exp")
 		}
-		if time.Duration(p.Exp-p.Nbf)*time.Second > MaxValidity {
+		if time.Duration(payload.Exp-payload.Nbf)*time.Second > MaxValidity {
 			return nil, fmt.Errorf("assert window exceeds MaxValidity (%s)", MaxValidity)
 		}
 		// Retention reasons from the issue time (an admission has expired
 		// by iat + MaxValidity), so the bound holds from iat as well as
 		// from nbf (agy review, 2026-11-06).
-		if time.Duration(p.Exp-p.Iat)*time.Second > MaxValidity {
+		if time.Duration(payload.Exp-payload.Iat)*time.Second > MaxValidity {
 			return nil, fmt.Errorf("assert expires more than MaxValidity (%s) after it was issued", MaxValidity)
 		}
-		if p.Target != nil {
+		if payload.Target != nil {
 			return nil, errors.New("assert carries a revocation target")
 		}
-		acks, err := CanonicalIDs(p.Acks)
+		acks, err := CanonicalIDs(payload.Acks)
 		if err != nil {
 			return nil, fmt.Errorf("acks: %w", err)
 		}
-		p.Acks = acks
+		payload.Acks = acks
 	case TypeRevoke:
-		if p.Target == nil || (len(p.Target.ID) == 0 && p.Target.Aud == "") {
+		if payload.Target == nil || (len(payload.Target.ID) == 0 && payload.Target.Aud == "") {
 			return nil, errors.New("revoke needs a target (id or aud)")
 		}
-		if len(p.Target.ID) != 0 && p.Target.Aud != "" {
+		if len(payload.Target.ID) != 0 && payload.Target.Aud != "" {
 			return nil, errors.New("revoke target is either id or aud, not both")
 		}
-		if p.Target.Before != 0 {
+		if payload.Target.Before != 0 {
 			return nil, errors.New("a removal has no before: the sweep is a version-1 form and is no longer signed")
 		}
-		if len(p.Acks) != 0 {
+		if len(payload.Acks) != 0 {
 			return nil, errors.New("a revoke carries no acks")
 		}
 	case TypeHandover:
-		if err := handoverShape(p); err != nil {
+		if err := handoverShape(payload); err != nil {
 			return nil, err
 		}
 		if parent != nil && parent.Payload.Typ != TypeHandover {
 			return nil, errors.New("a handover chains only on the previous handover")
 		}
 	}
-	if p.Typ != TypeHandover && p.Compromised {
+	if payload.Typ != TypeHandover && payload.Compromised {
 		return nil, errors.New("compromised is a handover's field")
 	}
 	if parent != nil {
@@ -305,13 +305,13 @@ func Sign(priv ed25519.PrivateKey, p Payload, parent *Statement) (*Statement, er
 			// A root-issued statement of the circle's current key rides the
 			// latest handover; the chaining rule below makes the new key
 			// the issuer.
-			if parent.Payload.Sub != p.Sub {
+			if parent.Payload.Sub != payload.Sub {
 				return nil, errors.New("handover is for a different circle")
 			}
 		default:
 			return nil, errors.New("parent must be an assert or a handover")
 		}
-		if parent.Payload.Aud != p.Iss {
+		if parent.Payload.Aud != payload.Iss {
 			return nil, errors.New("issuer is not the parent's recipient")
 		}
 		if parent.Depth() >= MaxDepth {
@@ -320,25 +320,25 @@ func Sign(priv ed25519.PrivateKey, p Payload, parent *Statement) (*Statement, er
 		if len(parent.Handovers())+boolInt(parent.Payload.Typ == TypeHandover) > MaxHandovers {
 			return nil, fmt.Errorf("lineage would exceed MaxHandovers %d", MaxHandovers)
 		}
-		pb, err := parent.Bytes()
+		parentBytes, err := parent.Bytes()
 		if err != nil {
 			return nil, err
 		}
-		p.Prf = [][]byte{pb}
+		payload.Prf = [][]byte{parentBytes}
 	} else {
-		p.Prf = [][]byte{}
+		payload.Prf = [][]byte{}
 	}
-	if p.Nonce == nil {
-		p.Nonce = make([]byte, nonceSize)
-		if _, err := rand.Read(p.Nonce); err != nil {
+	if payload.Nonce == nil {
+		payload.Nonce = make([]byte, nonceSize)
+		if _, err := rand.Read(payload.Nonce); err != nil {
 			return nil, fmt.Errorf("generating nonce: %w", err)
 		}
 	}
-	msg, err := encMode.Marshal(p)
+	msg, err := encMode.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("encoding payload: %w", err)
 	}
-	return &Statement{Payload: p, Sig: ed25519.Sign(priv, msg), raw: msg, parent: parent}, nil
+	return &Statement{Payload: payload, Sig: ed25519.Sign(priv, msg), raw: msg, parent: parent}, nil
 }
 
 // Decode parses a statement and, recursively, the parents embedded in prf.
@@ -355,91 +355,91 @@ func decode(data []byte, depth, handovers int) (*Statement, error) {
 	if handovers > MaxHandovers {
 		return nil, fmt.Errorf("lineage carries more than MaxHandovers %d", MaxHandovers)
 	}
-	var w wire
-	if err := cbor.Unmarshal(data, &w); err != nil {
+	var env wire
+	if err := cbor.Unmarshal(data, &env); err != nil {
 		return nil, fmt.Errorf("decoding statement: %w", err)
 	}
-	s := &Statement{Sig: w.Sig, raw: bytes.Clone(w.Payload)}
-	if err := cbor.Unmarshal(w.Payload, &s.Payload); err != nil {
+	stmt := &Statement{Sig: env.Sig, raw: bytes.Clone(env.Payload)}
+	if err := cbor.Unmarshal(env.Payload, &stmt.Payload); err != nil {
 		return nil, fmt.Errorf("decoding statement payload: %w", err)
 	}
-	if v := s.Payload.V; v < MinVersion || v > Version {
-		return nil, fmt.Errorf("statement version %d, this node reads %d through %d", v, MinVersion, Version)
+	if version := stmt.Payload.V; version < MinVersion || version > Version {
+		return nil, fmt.Errorf("statement version %d, this node reads %d through %d", version, MinVersion, Version)
 	}
-	if err := shape(s.Payload); err != nil {
+	if err := shape(stmt.Payload); err != nil {
 		return nil, err
 	}
-	if s.Payload.Typ == TypeHandover {
+	if stmt.Payload.Typ == TypeHandover {
 		handovers++
 	} else {
 		depth++
 	}
-	switch len(s.Payload.Prf) {
+	switch len(stmt.Payload.Prf) {
 	case 0:
 	case 1:
-		parent, err := decode(s.Payload.Prf[0], depth, handovers)
+		parent, err := decode(stmt.Payload.Prf[0], depth, handovers)
 		if err != nil {
 			return nil, fmt.Errorf("prf: %w", err)
 		}
-		if parent.Payload.Typ == TypeAssert && s.Payload.Typ == TypeHandover {
+		if parent.Payload.Typ == TypeAssert && stmt.Payload.Typ == TypeHandover {
 			return nil, errors.New("a handover chains only on a handover")
 		}
-		s.parent = parent
+		stmt.parent = parent
 	default:
 		return nil, errors.New("a statement has at most one parent")
 	}
-	return s, nil
+	return stmt, nil
 }
 
 // shape is the version-dependent structural check Decode applies before
 // anything is trusted: what acks and aud targets may look like at each
 // version. Decode refuses, never repairs.
-func shape(p Payload) error {
-	if len(p.Acks) != 0 {
-		if p.V < 2 {
+func shape(payload Payload) error {
+	if len(payload.Acks) != 0 {
+		if payload.V < 2 {
 			return errors.New("acks on a version-1 statement")
 		}
-		if p.Typ != TypeAssert {
+		if payload.Typ != TypeAssert {
 			return errors.New("acks on a revoke")
 		}
-		if err := checkCanonicalIDs(p.Acks); err != nil {
+		if err := checkCanonicalIDs(payload.Acks); err != nil {
 			return fmt.Errorf("acks: %w", err)
 		}
 	}
-	if t := p.Target; t != nil && t.Aud != "" && p.V >= 2 && t.Before != 0 {
+	if target := payload.Target; target != nil && target.Aud != "" && payload.V >= 2 && target.Before != 0 {
 		return errors.New("a version-2 revoke with an aud target is a removal and carries no before")
 	}
-	if p.Typ == TypeHandover {
-		if p.V < 2 {
+	if payload.Typ == TypeHandover {
+		if payload.V < 2 {
 			return errors.New("a handover is a version-2 statement")
 		}
-		return handoverShape(p)
+		return handoverShape(payload)
 	}
-	if p.Compromised {
+	if payload.Compromised {
 		return errors.New("compromised on a statement that is not a handover")
 	}
 	return nil
 }
 
 // handoverShape is what a handover may say: a new key and nothing else.
-func handoverShape(p Payload) error {
-	if p.Aud == "" {
+func handoverShape(payload Payload) error {
+	if payload.Aud == "" {
 		return errors.New("handover needs an aud (the new key)")
 	}
-	if _, err := did.KeyFor(p.Aud); err != nil {
+	if _, err := did.KeyFor(payload.Aud); err != nil {
 		return fmt.Errorf("handover aud: %w", err)
 	}
-	if p.Aud == p.Iss {
+	if payload.Aud == payload.Iss {
 		return errors.New("handover to the same key")
 	}
-	if len(p.Res) != 0 || len(p.Verbs) != 0 || p.Meta != nil || p.Del != 0 || p.Nbf != 0 || p.Exp != 0 || p.Target != nil || len(p.Acks) != 0 {
+	if len(payload.Res) != 0 || len(payload.Verbs) != 0 || payload.Meta != nil || payload.Del != 0 || payload.Nbf != 0 || payload.Exp != 0 || payload.Target != nil || len(payload.Acks) != 0 {
 		return errors.New("a handover carries only the new key")
 	}
 	return nil
 }
 
-func boolInt(b bool) int {
-	if b {
+func boolInt(cond bool) int {
+	if cond {
 		return 1
 	}
 	return 0
@@ -497,16 +497,16 @@ func (s *Statement) Acknowledges(id [32]byte) bool {
 // IsRemoval reports whether the statement is a device-wide removal (a
 // version-2 revoke with an aud target): the kind an assert acknowledges.
 func (s *Statement) IsRemoval() bool {
-	t := s.Payload.Target
-	return s.Payload.Typ == TypeRevoke && s.Payload.V >= 2 && t != nil && t.Aud != ""
+	target := s.Payload.Target
+	return s.Payload.Typ == TypeRevoke && s.Payload.V >= 2 && target != nil && target.Aud != ""
 }
 
 // IsSweep reports whether the statement is a legacy sweep (a version-1
 // revoke with an aud target): it kills by the cut, and nothing
 // acknowledges it.
 func (s *Statement) IsSweep() bool {
-	t := s.Payload.Target
-	return s.Payload.Typ == TypeRevoke && s.Payload.V < 2 && t != nil && t.Aud != ""
+	target := s.Payload.Target
+	return s.Payload.Typ == TypeRevoke && s.Payload.V < 2 && target != nil && target.Aud != ""
 }
 
 // Bytes encodes the statement for the wire or disk, payload verbatim.
@@ -543,8 +543,8 @@ func (s *Statement) Depth() int { return len(s.Chain()) }
 // with s.
 func (s *Statement) lineage() []*Statement {
 	var out []*Statement
-	for p := s; p != nil; p = p.parent {
-		out = append(out, p)
+	for cur := s; cur != nil; cur = cur.parent {
+		out = append(out, cur)
 	}
 	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 		out[i], out[j] = out[j], out[i]
@@ -557,9 +557,9 @@ func (s *Statement) lineage() []*Statement {
 // Handovers lists them; a handover's own Chain is empty.
 func (s *Statement) Chain() []*Statement {
 	var out []*Statement
-	for _, p := range s.lineage() {
-		if p.Payload.Typ != TypeHandover {
-			out = append(out, p)
+	for _, link := range s.lineage() {
+		if link.Payload.Typ != TypeHandover {
+			out = append(out, link)
 		}
 	}
 	return out
@@ -570,9 +570,9 @@ func (s *Statement) Chain() []*Statement {
 // handover statement, the list ends with it.
 func (s *Statement) Handovers() []*Statement {
 	var out []*Statement
-	for _, p := range s.lineage() {
-		if p.Payload.Typ == TypeHandover {
-			out = append(out, p)
+	for _, link := range s.lineage() {
+		if link.Payload.Typ == TypeHandover {
+			out = append(out, link)
 		}
 	}
 	return out
@@ -582,11 +582,11 @@ func (s *Statement) Handovers() []*Statement {
 // root-issued statement of the circle's current key rides — or nil when
 // the circle's key is its DID key.
 func (s *Statement) RootProof() *Statement {
-	hs := s.Handovers()
-	if len(hs) == 0 {
+	handovers := s.Handovers()
+	if len(handovers) == 0 {
 		return nil
 	}
-	return hs[len(hs)-1]
+	return handovers[len(handovers)-1]
 }
 
 // Handover signs "from now on the key of circle sub is newPub": the
@@ -649,31 +649,31 @@ func (s *Statement) Label() string {
 // root signs). Rule 3 then lets the revocation kill only statements that
 // chain through own.
 func Revoke(priv ed25519.PrivateKey, sub string, own *Statement, target Target, now time.Time) (*Statement, error) {
-	p := Payload{Typ: TypeRevoke, Sub: sub, Iat: now.Unix(), At: now.Unix(), Target: &target}
+	payload := Payload{Typ: TypeRevoke, Sub: sub, Iat: now.Unix(), At: now.Unix(), Target: &target}
 	if own != nil && own.Payload.Sub != sub {
 		return nil, errors.New("revoker's statement is in a different circle")
 	}
-	return Sign(priv, p, own)
+	return Sign(priv, payload, own)
 }
 
 // Covers reports whether r, read as a pattern in a statement whose sub is
-// ownSub, covers the concrete or pattern resource o in circle oSub.
-func (r Resource) Covers(ownSub string, o Resource, oSub string) bool {
-	if r.Kind != Any && r.Kind != o.Kind {
+// ownSub, covers the concrete or pattern resource other in circle otherSub.
+func (r Resource) Covers(ownSub string, other Resource, otherSub string) bool {
+	if r.Kind != Any && r.Kind != other.Kind {
 		return false
 	}
-	rs := r.Sub
-	if rs == "" {
-		rs = ownSub
+	ownCircle := r.Sub
+	if ownCircle == "" {
+		ownCircle = ownSub
 	}
-	os := o.Sub
-	if os == "" {
-		os = oSub
+	otherCircle := other.Sub
+	if otherCircle == "" {
+		otherCircle = otherSub
 	}
-	if rs != Any && rs != os {
+	if ownCircle != Any && ownCircle != otherCircle {
 		return false
 	}
-	return patternCovers(r.Name, o.Name)
+	return patternCovers(r.Name, other.Name)
 }
 
 // patternCovers: "*" covers everything; "p*" covers names and patterns
@@ -682,15 +682,15 @@ func patternCovers(pat, name string) bool {
 	if pat == Any {
 		return true
 	}
-	if n := len(pat); n > 0 && pat[n-1] == '*' {
-		return len(name) >= n-1 && name[:n-1] == pat[:n-1]
+	if patLen := len(pat); patLen > 0 && pat[patLen-1] == '*' {
+		return len(name) >= patLen-1 && name[:patLen-1] == pat[:patLen-1]
 	}
 	return pat == name
 }
 
-func hasVerb(verbs []string, v string) bool {
-	for _, h := range verbs {
-		if h == v {
+func hasVerb(verbs []string, want string) bool {
+	for _, verb := range verbs {
+		if verb == want {
 			return true
 		}
 	}

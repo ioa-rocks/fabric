@@ -47,10 +47,10 @@ func (r *Replica) Scan() (Report, error) {
 	}
 	byName := make(map[string]*index.Object, len(objs))
 	conflictNames := map[string]conflictRef{}
-	for _, o := range objs {
-		byName[o.Name.V] = o
-		for _, rev := range o.Conflicts() {
-			conflictNames[index.ConflictName(o.Name.V, rev)] = conflictRef{o, rev}
+	for _, obj := range objs {
+		byName[obj.Name.V] = obj
+		for _, rev := range obj.Conflicts() {
+			conflictNames[index.ConflictName(obj.Name.V, rev)] = conflictRef{obj, rev}
 		}
 	}
 	entries, err := r.entries()
@@ -59,16 +59,16 @@ func (r *Replica) Scan() (Report, error) {
 	}
 	seen := map[string]bool{}
 	root := r.Dir
-	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(root, func(entryPath string, _ fs.DirEntry, err error) error {
 		if err != nil {
 			rep.Errors = append(rep.Errors, err.Error())
 			return nil
 		}
-		if p == root {
+		if entryPath == root {
 			return nil
 		}
-		rel := filepath.ToSlash(strings.TrimPrefix(p, root+string(filepath.Separator)))
-		si, err := lstat(p)
+		rel := filepath.ToSlash(strings.TrimPrefix(entryPath, root+string(filepath.Separator)))
+		si, err := lstat(entryPath)
 		if err != nil {
 			rep.Errors = append(rep.Errors, err.Error())
 			return nil
@@ -81,7 +81,7 @@ func (r *Replica) Scan() (Report, error) {
 			return nil
 		}
 		if si.isDir && pol.NestedRepoMode() == bucket.NestedReposExclude {
-			if _, err := os.Lstat(filepath.Join(p, ".git")); err == nil {
+			if _, err := os.Lstat(filepath.Join(entryPath, ".git")); err == nil {
 				rep.Excluded++
 				return filepath.SkipDir
 			}
@@ -93,21 +93,21 @@ func (r *Replica) Scan() (Report, error) {
 		seen[rel] = true
 		if si.isDir {
 			// A directory record only when empty (ADR 0001 §6).
-			empty, _ := isEmptyDir(p)
+			empty, _ := isEmptyDir(entryPath)
 			if empty && byName[rel] == nil {
 				if _, ok := entries[rel]; !ok {
-					o, err := r.Handle.PutEntry(rel, index.Revision{Kind: index.KindDir, MTime: si.mtime}, nil)
+					obj, err := r.Handle.PutEntry(rel, index.Revision{Kind: index.KindDir, MTime: si.mtime}, nil)
 					if err != nil {
 						rep.Errors = append(rep.Errors, err.Error())
 						return nil
 					}
-					_ = r.putEntry(rel, Entry{ObjectID: o.ID, Kind: index.KindDir, MTime: si.mtime, Inode: si.inode})
+					_ = r.putEntry(rel, Entry{ObjectID: obj.ID, Kind: index.KindDir, MTime: si.mtime, Inode: si.inode})
 					rep.Added++
 				}
 			}
 			return nil
 		}
-		if err := r.scanEntry(rel, p, si, byName, conflictNames, entries, &rep); err != nil {
+		if err := r.scanEntry(rel, entryPath, si, byName, conflictNames, entries, &rep); err != nil {
 			rep.Errors = append(rep.Errors, err.Error())
 		}
 		return nil
@@ -119,34 +119,34 @@ func (r *Replica) Scan() (Report, error) {
 	// bucket's bulk hold, so an rm -rf is parked, not propagated.
 	var tombstones []*index.Object
 	var gone []string
-	for rel, e := range entries {
+	for rel, entry := range entries {
 		if seen[rel] {
 			continue
 		}
-		if e.ConflictOf != "" {
+		if entry.ConflictOf != "" {
 			// A deleted conflict copy resolves its object — only while the kept
 			// file itself is still in the folder. Removing both at once (rm -rf)
 			// deletes the object rather than choosing a winner; resolving here
 			// raced the tombstone in map order and let the live resolve beat
 			// the delete past the bulk hold.
-			if o, err := r.Handle.Index.GetObject(e.ConflictOf); err == nil && len(o.Conflicts()) > 0 && seen[o.Name.V] {
-				if _, err := r.Handle.Resolve(o); err != nil {
+			if obj, err := r.Handle.Index.GetObject(entry.ConflictOf); err == nil && len(obj.Conflicts()) > 0 && seen[obj.Name.V] {
+				if _, err := r.Handle.Resolve(obj); err != nil {
 					rep.Errors = append(rep.Errors, err.Error())
 				}
 			}
 			_ = r.deleteEntry(rel)
 			continue
 		}
-		o, err := r.Handle.Index.GetObject(e.ObjectID)
-		if err != nil || o.IsDeleted() {
+		obj, err := r.Handle.Index.GetObject(entry.ObjectID)
+		if err != nil || obj.IsDeleted() {
 			_ = r.deleteEntry(rel)
 			continue
 		}
-		if o.Name.V != rel {
+		if obj.Name.V != rel {
 			// Renamed by a peer and not yet materialized here; not a deletion.
 			continue
 		}
-		cp := cloneObject(o)
+		cp := cloneObject(obj)
 		cp.Revise(r.Handle.NodeID(), time.Now().UnixNano(), func(rev *index.Revision) { rev.Deleted = true })
 		tombstones = append(tombstones, cp)
 		gone = append(gone, rel)
@@ -182,76 +182,76 @@ type conflictRef struct {
 }
 
 // scanEntry reconciles one file or symlink with the index.
-func (r *Replica) scanEntry(rel, p string, si statInfo, byName map[string]*index.Object, conflicts map[string]conflictRef, entries map[string]Entry, rep *Report) error {
-	e, known := entries[rel]
-	if known && e.unchanged(si) && e.Kind != index.KindDir {
-		if e.Kind == index.KindFile && e.ConflictOf == "" && e.Mode&0o111 != si.mode&0o111 {
-			return r.attrRevision(rel, e, si, rep)
+func (r *Replica) scanEntry(rel, entryPath string, si statInfo, byName map[string]*index.Object, conflicts map[string]conflictRef, entries map[string]Entry, rep *Report) error {
+	entry, known := entries[rel]
+	if known && entry.unchanged(si) && entry.Kind != index.KindDir {
+		if entry.Kind == index.KindFile && entry.ConflictOf == "" && entry.Mode&0o111 != si.mode&0o111 {
+			return r.attrRevision(rel, entry, si, rep)
 		}
 		return nil
 	}
 	if si.isLnk {
-		target, err := os.Readlink(p)
+		target, err := os.Readlink(entryPath)
 		if err != nil {
 			return err
 		}
-		if known && e.Kind == index.KindSymlink && e.Target == target {
-			return r.putEntry(rel, Entry{ObjectID: e.ObjectID, Kind: index.KindSymlink, Target: target, MTime: si.mtime, Inode: si.inode})
+		if known && entry.Kind == index.KindSymlink && entry.Target == target {
+			return r.putEntry(rel, Entry{ObjectID: entry.ObjectID, Kind: index.KindSymlink, Target: target, MTime: si.mtime, Inode: si.inode})
 		}
-		if o := byName[rel]; o != nil {
-			o, err = r.Handle.Revise(o, func(rev *index.Revision) {
+		if obj := byName[rel]; obj != nil {
+			obj, err = r.Handle.Revise(obj, func(rev *index.Revision) {
 				rev.Kind, rev.Target, rev.Blob, rev.Size, rev.Deleted, rev.MTime = index.KindSymlink, target, "", 0, false, si.mtime
 			})
 			if err != nil {
 				return err
 			}
 			rep.Changed++
-			return r.putEntry(rel, Entry{ObjectID: o.ID, Kind: index.KindSymlink, Target: target, MTime: si.mtime, Inode: si.inode})
+			return r.putEntry(rel, Entry{ObjectID: obj.ID, Kind: index.KindSymlink, Target: target, MTime: si.mtime, Inode: si.inode})
 		}
-		o, err := r.Handle.PutEntry(rel, index.Revision{Kind: index.KindSymlink, Target: target, MTime: si.mtime}, nil)
+		obj, err := r.Handle.PutEntry(rel, index.Revision{Kind: index.KindSymlink, Target: target, MTime: si.mtime}, nil)
 		if err != nil {
 			return err
 		}
 		rep.Added++
-		return r.putEntry(rel, Entry{ObjectID: o.ID, Kind: index.KindSymlink, Target: target, MTime: si.mtime, Inode: si.inode})
+		return r.putEntry(rel, Entry{ObjectID: obj.ID, Kind: index.KindSymlink, Target: target, MTime: si.mtime, Inode: si.inode})
 	}
-	hash, err := hashFile(p)
+	hash, err := hashFile(entryPath)
 	if err != nil {
 		return err
 	}
 	// A rendered conflict copy, untouched: it is that losing head.
-	if c, ok := conflicts[rel]; ok && c.rev.Blob == hash {
-		return r.putEntry(rel, Entry{ObjectID: c.object.ID, Blob: hash, Size: si.size, MTime: si.mtime, Inode: si.inode, Kind: index.KindFile, Mode: si.mode, ConflictOf: c.object.ID})
+	if conflict, ok := conflicts[rel]; ok && conflict.rev.Blob == hash {
+		return r.putEntry(rel, Entry{ObjectID: conflict.object.ID, Blob: hash, Size: si.size, MTime: si.mtime, Inode: si.inode, Kind: index.KindFile, Mode: si.mode, ConflictOf: conflict.object.ID})
 	}
-	if known && e.ConflictOf != "" {
+	if known && entry.ConflictOf != "" {
 		// An edited conflict copy becomes an object of its own; the original
 		// resolves for its kept version.
-		if o, err := r.Handle.Index.GetObject(e.ConflictOf); err == nil {
-			_, _ = r.Handle.Resolve(o)
+		if obj, err := r.Handle.Index.GetObject(entry.ConflictOf); err == nil {
+			_, _ = r.Handle.Resolve(obj)
 		}
 		known = false
 	}
 	newEntry := Entry{Blob: hash, Size: si.size, MTime: si.mtime, Inode: si.inode, Kind: index.KindFile, Mode: si.mode}
-	if o := byName[rel]; o != nil {
-		head := o.Head()
+	if obj := byName[rel]; obj != nil {
+		head := obj.Head()
 		if head.Blob == hash && head.KindOrFile() == index.KindFile {
 			// Same content; only stat or mode moved.
 			if head.Mode&0o111 != si.mode&0o111 || head.MTime != si.mtime {
-				o, err = r.Handle.Revise(o, func(rev *index.Revision) { rev.Mode, rev.MTime = si.mode, si.mtime })
+				obj, err = r.Handle.Revise(obj, func(rev *index.Revision) { rev.Mode, rev.MTime = si.mode, si.mtime })
 				if err != nil {
 					return err
 				}
 			}
-			newEntry.ObjectID = o.ID
+			newEntry.ObjectID = obj.ID
 			return r.putEntry(rel, newEntry)
 		}
 		// The working file is the content: register it in the scan database
 		// first so the holder resolves the hash to it, then publish.
-		newEntry.ObjectID = o.ID
+		newEntry.ObjectID = obj.ID
 		if err := r.putEntry(rel, newEntry); err != nil {
 			return err
 		}
-		if _, err := r.Handle.ReplaceHeld(o, hash, si.size, si.mtime, si.mode); err != nil {
+		if _, err := r.Handle.ReplaceHeld(obj, hash, si.size, si.mtime, si.mode); err != nil {
 			return err
 		}
 		rep.Changed++
@@ -262,63 +262,63 @@ func (r *Replica) scanEntry(rel, p string, si statInfo, byName map[string]*index
 	if err := r.putEntry(rel, newEntry); err != nil {
 		return err
 	}
-	o, err := r.Handle.PutEntry(rel, index.Revision{Kind: index.KindFile, Mode: si.mode, MTime: si.mtime, Blob: hash, Size: si.size}, nil)
+	obj, err := r.Handle.PutEntry(rel, index.Revision{Kind: index.KindFile, Mode: si.mode, MTime: si.mtime, Blob: hash, Size: si.size}, nil)
 	if err != nil {
 		_ = r.deleteEntry(rel)
 		return err
 	}
 	rep.Added++
-	newEntry.ObjectID = o.ID
+	newEntry.ObjectID = obj.ID
 	return r.putEntry(rel, newEntry)
 }
 
 // attrRevision records an exec-bit change on an otherwise unchanged file.
-func (r *Replica) attrRevision(rel string, e Entry, si statInfo, rep *Report) error {
-	o, err := r.Handle.Index.GetObject(e.ObjectID)
+func (r *Replica) attrRevision(rel string, entry Entry, si statInfo, rep *Report) error {
+	obj, err := r.Handle.Index.GetObject(entry.ObjectID)
 	if err != nil {
 		return err
 	}
-	if _, err := r.Handle.Revise(o, func(rev *index.Revision) { rev.Mode = si.mode }); err != nil {
+	if _, err := r.Handle.Revise(obj, func(rev *index.Revision) { rev.Mode = si.mode }); err != nil {
 		return err
 	}
-	e.Mode = si.mode
+	entry.Mode = si.mode
 	rep.Changed++
-	return r.putEntry(rel, e)
+	return r.putEntry(rel, entry)
 }
 
-func hashFile(p string) (string, error) {
-	f, err := os.Open(p)
+func hashFile(filePath string) (string, error) {
+	file, err := os.Open(filePath)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-	h := blake3.New()
-	if _, err := io.Copy(h, f); err != nil {
+	defer file.Close()
+	hasher := blake3.New()
+	if _, err := io.Copy(hasher, file); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-func isEmptyDir(p string) (bool, error) {
-	f, err := os.Open(p)
+func isEmptyDir(dirPath string) (bool, error) {
+	dir, err := os.Open(dirPath)
 	if err != nil {
 		return false, err
 	}
-	defer f.Close()
-	names, err := f.Readdirnames(0)
+	defer dir.Close()
+	names, err := dir.Readdirnames(0)
 	if err != nil {
 		return false, err
 	}
-	for _, n := range names {
-		if n != Marker {
+	for _, name := range names {
+		if name != Marker {
 			return false, nil
 		}
 	}
 	return true, nil
 }
 
-func cloneObject(o *index.Object) *index.Object {
-	raw, _ := o.Marshal()
+func cloneObject(obj *index.Object) *index.Object {
+	raw, _ := obj.Marshal()
 	cp, _ := index.UnmarshalObject(raw)
 	return cp
 }

@@ -108,24 +108,24 @@ func (d *Daemon) devicePriv() (ed25519.PrivateKey, error) {
 // can parent a sub-key.
 func (d *Daemon) ownAdmission(circleDID string) (*statement.Statement, error) {
 	if circleDID == d.CircleDID() {
-		c := d.OwnCert()
-		if c == nil {
+		memberCert := d.OwnCert()
+		if memberCert == nil {
 			return nil, errors.New("this device holds no membership cert")
 		}
-		return c.Stmt, nil
+		return memberCert.Stmt, nil
 	}
 	if d.Circle == nil {
 		return nil, errors.New("no circle service")
 	}
-	c := d.Circle.circleByDID(circleDID)
-	if c == nil {
+	held := d.Circle.circleByDID(circleDID)
+	if held == nil {
 		return nil, fmt.Errorf("this node holds no circle %s", shortDID(circleDID))
 	}
-	a := d.Circle.liveAdmission(c, time.Now())
-	if a == nil {
-		return nil, fmt.Errorf("this device has no live admission in circle %q", c.Config.Name)
+	admission := d.Circle.liveAdmission(held, time.Now())
+	if admission == nil {
+		return nil, fmt.Errorf("this device has no live admission in circle %q", held.Config.Name)
 	}
-	return a.Stmt, nil
+	return admission.Stmt, nil
 }
 
 // rootsFor is the Roots view a chain in circleDID compiles against.
@@ -174,10 +174,10 @@ func (d *Daemon) IssueKey(circleDID string, res []string, verbs []string, validi
 	}
 	now := time.Now()
 	var rs []statement.Resource
-	for _, n := range res {
-		rs = append(rs, statement.Resource{Kind: statement.KindSubject, Name: n, Sub: circleDID})
+	for _, name := range res {
+		rs = append(rs, statement.Resource{Kind: statement.KindSubject, Name: name, Sub: circleDID})
 	}
-	s, err := statement.Sign(devPriv, statement.Payload{
+	stmt, err := statement.Sign(devPriv, statement.Payload{
 		Aud: did.ForKey(pub), Sub: circleDID, Res: rs, Verbs: verbs,
 		Nbf: now.Unix(), Exp: now.Add(validity).Unix(), Iat: now.Unix(), Del: 0,
 	}, parent)
@@ -186,23 +186,23 @@ func (d *Daemon) IssueKey(circleDID string, res []string, verbs []string, validi
 	}
 	// Fail here, not at the first use: attenuation (verbs and subjects
 	// within the device's own), windows, depth.
-	comp, err := statement.Compile(s, nil, circleDID, d.rootsFor(circleDID))
+	comp, err := statement.Compile(stmt, nil, circleDID, d.rootsFor(circleDID))
 	if err != nil {
 		return nil, fmt.Errorf("sub-key would not verify: %w", err)
 	}
-	for _, v := range verbs {
-		for _, r := range res {
-			if !comp.Allows(circleDID, statement.Resource{Kind: statement.KindSubject, Name: r}, v) {
-				return nil, fmt.Errorf("sub-key would not verify: this device does not hold %s on %s in that circle", v, r)
+	for _, verb := range verbs {
+		for _, resName := range res {
+			if !comp.Allows(circleDID, statement.Resource{Kind: statement.KindSubject, Name: resName}, verb) {
+				return nil, fmt.Errorf("sub-key would not verify: this device does not hold %s on %s in that circle", verb, resName)
 			}
 		}
 	}
-	wire, err := s.Bytes()
+	wire, err := stmt.Bytes()
 	if err != nil {
 		return nil, err
 	}
 	rec := KeyRecord{
-		ID: s.IDHex(), DID: did.ForKey(pub), Circle: circleDID, Res: res, Verbs: verbs,
+		ID: stmt.IDHex(), DID: did.ForKey(pub), Circle: circleDID, Res: res, Verbs: verbs,
 		Nbf: now.Unix(), Exp: now.Add(validity).Unix(), Issued: now.Unix(), Label: label,
 	}
 	keysMu.Lock()
@@ -229,8 +229,8 @@ func (d *Daemon) RevokeKey(idHex string) error {
 		return err
 	}
 	i := -1
-	for j, k := range ks {
-		if k.ID == idHex || (len(idHex) >= 8 && len(k.ID) >= len(idHex) && k.ID[:len(idHex)] == idHex) {
+	for j, keyRec := range ks {
+		if keyRec.ID == idHex || (len(idHex) >= 8 && len(keyRec.ID) >= len(idHex) && keyRec.ID[:len(idHex)] == idHex) {
 			if i >= 0 {
 				return fmt.Errorf("%q matches several keys", idHex)
 			}
@@ -255,8 +255,8 @@ func (d *Daemon) RevokeKey(idHex string) error {
 	if d.Circle == nil {
 		return errors.New("no circle service")
 	}
-	c := d.Circle.circleByDID(rec.Circle)
-	if c == nil {
+	held := d.Circle.circleByDID(rec.Circle)
+	if held == nil {
 		return fmt.Errorf("revoking needs circle %s's directory on this node (fabric circle status)", shortDID(rec.Circle))
 	}
 	devPriv, err := d.devicePriv()
@@ -264,11 +264,11 @@ func (d *Daemon) RevokeKey(idHex string) error {
 		return err
 	}
 	now := time.Now()
-	r, err := circle.RevokeAs(devPriv, parent, rec.Circle, statement.Target{ID: id}, now)
+	revocation, err := circle.RevokeAs(devPriv, parent, rec.Circle, statement.Target{ID: id}, now)
 	if err != nil {
 		return err
 	}
-	if _, err := c.AddRevocations(now, r); err != nil {
+	if _, err := held.AddRevocations(now, revocation); err != nil {
 		return err
 	}
 	d.Circle.forgetAll()
@@ -284,8 +284,8 @@ func (d *Daemon) RevokeKey(idHex string) error {
 	return nil
 }
 
-func contextWithTimeout(d time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), d)
+func contextWithTimeout(timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), timeout)
 }
 
 // DeviceSign signs msg with the hot device key and names the signer.
@@ -311,15 +311,15 @@ func (d *Daemon) DeviceDID() (string, error) {
 // fails every check).
 func cleanSubjects(res []string) ([]string, error) {
 	out := make([]string, 0, len(res))
-	for _, r := range res {
-		r = strings.TrimSpace(r)
-		if r == "" {
+	for _, item := range res {
+		item = strings.TrimSpace(item)
+		if item == "" {
 			continue
 		}
-		if r != "*" && !strings.HasPrefix(r, "subject:") {
-			return nil, fmt.Errorf("resource %q: use subject:<name> or *", r)
+		if item != "*" && !strings.HasPrefix(item, "subject:") {
+			return nil, fmt.Errorf("resource %q: use subject:<name> or *", item)
 		}
-		out = append(out, r)
+		out = append(out, item)
 	}
 	if len(out) == 0 {
 		return nil, errors.New("at least one subject (or *) is required")
@@ -330,9 +330,9 @@ func cleanSubjects(res []string) ([]string, error) {
 // cleanList trims a comma-split list.
 func cleanList(in []string) []string {
 	out := make([]string, 0, len(in))
-	for _, v := range in {
-		if v = strings.TrimSpace(v); v != "" {
-			out = append(out, v)
+	for _, item := range in {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
 		}
 	}
 	return out

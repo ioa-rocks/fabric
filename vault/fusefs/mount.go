@@ -68,15 +68,15 @@ func Mount(mountpoint, bucket string, src source, opts Options) (*fuse.Server, e
 	if err != nil {
 		return nil, err
 	}
-	m, err := newMountState(bucket, src, objects, opts)
+	state, err := newMountState(bucket, src, objects, opts)
 	if err != nil {
 		return nil, err
 	}
-	root, err := newTree(m, objects)
+	root, err := newTree(state, objects)
 	if err != nil {
 		return nil, err
 	}
-	m.root = root
+	state.root = root
 	var mountOptions []string
 	if !opts.Writable {
 		mountOptions = []string{"ro"}
@@ -113,7 +113,7 @@ func newMountState(bucket string, src source, seed []daemon.ObjectInfo, opts Opt
 	if ttl <= 0 {
 		ttl = DefaultMetadataTTL
 	}
-	m := &mountState{
+	state := &mountState{
 		bucket:           bucket,
 		src:              src,
 		cat:              newCatalog(src, bucket, ttl, seed),
@@ -122,21 +122,21 @@ func newMountState(bucket string, src source, seed []daemon.ObjectInfo, opts Opt
 		namespaceKey:     namespaceKey(seed),
 	}
 	if opts.StageDir != "" {
-		m.cacheDir = filepath.Join(opts.StageDir, "cache")
-		m.unpublishedDir = filepath.Join(opts.StageDir, "unpublished")
-		if err := os.MkdirAll(m.cacheDir, 0o700); err != nil {
+		state.cacheDir = filepath.Join(opts.StageDir, "cache")
+		state.unpublishedDir = filepath.Join(opts.StageDir, "unpublished")
+		if err := os.MkdirAll(state.cacheDir, 0o700); err != nil {
 			return nil, err
 		}
 	}
-	return m, nil
+	return state, nil
 }
 
 func namespaceKey(objects []daemon.ObjectInfo) string {
 	parts := make([]string, 0, len(objects))
-	for _, o := range objects {
-		key := o.ID + "\x00" + o.Name + "\x00" + o.Kind + "\x00" + o.Target
-		for _, c := range o.Conflicts {
-			key += "\x00" + c.Name
+	for _, obj := range objects {
+		key := obj.ID + "\x00" + obj.Name + "\x00" + obj.Kind + "\x00" + obj.Target
+		for _, conflict := range obj.Conflicts {
+			key += "\x00" + conflict.Name
 		}
 		parts = append(parts, key)
 	}
@@ -199,10 +199,10 @@ func (m *mountState) refreshNamespace(ctx context.Context) error {
 }
 
 func (d *dirNode) hasLocalContent() bool {
-	for _, f := range d.files {
-		f.mu.Lock()
-		local := f.object.ID == "" || f.writing || f.failed
-		f.mu.Unlock()
+	for _, file := range d.files {
+		file.mu.Lock()
+		local := file.object.ID == "" || file.writing || file.failed
+		file.mu.Unlock()
 		if local {
 			return true
 		}
@@ -262,12 +262,12 @@ type catalog struct {
 }
 
 func newCatalog(src source, bucket string, ttl time.Duration, seed []daemon.ObjectInfo) *catalog {
-	c := &catalog{src: src, bucket: bucket, ttl: ttl, byID: make(map[string]daemon.ObjectInfo, len(seed))}
-	for _, o := range seed {
-		c.byID[o.ID] = o
+	cat := &catalog{src: src, bucket: bucket, ttl: ttl, byID: make(map[string]daemon.ObjectInfo, len(seed))}
+	for _, obj := range seed {
+		cat.byID[obj.ID] = obj
 	}
-	c.fetched = time.Now()
-	return c
+	cat.fetched = time.Now()
+	return cat
 }
 
 func (c *catalog) lookup(id string) (daemon.ObjectInfo, bool, error) {
@@ -276,8 +276,8 @@ func (c *catalog) lookup(id string) (daemon.ObjectInfo, bool, error) {
 	if err := c.refreshLocked(); err != nil {
 		return daemon.ObjectInfo{}, false, err
 	}
-	o, ok := c.byID[id]
-	return o, ok, nil
+	obj, ok := c.byID[id]
+	return obj, ok, nil
 }
 
 func (c *catalog) refreshLocked() error {
@@ -289,8 +289,8 @@ func (c *catalog) refreshLocked() error {
 		return err
 	}
 	byID := make(map[string]daemon.ObjectInfo, len(objects))
-	for _, o := range objects {
-		byID[o.ID] = o
+	for _, obj := range objects {
+		byID[obj.ID] = obj
 	}
 	c.byID, c.fetched = byID, time.Now()
 	return nil
@@ -299,12 +299,12 @@ func (c *catalog) refreshLocked() error {
 // update and forget keep the cache coherent with writes this mount just
 // made, so a second operation inside the same window does not act on the
 // pre-write name.
-func (c *catalog) update(o daemon.ObjectInfo) {
-	if o.ID == "" {
+func (c *catalog) update(obj daemon.ObjectInfo) {
+	if obj.ID == "" {
 		return
 	}
 	c.mu.Lock()
-	c.byID[o.ID] = o
+	c.byID[obj.ID] = obj
 	c.mu.Unlock()
 }
 
@@ -316,8 +316,8 @@ func (c *catalog) forget(id string) {
 
 func (c *catalog) replace(objects []daemon.ObjectInfo) {
 	byID := make(map[string]daemon.ObjectInfo, len(objects))
-	for _, o := range objects {
-		byID[o.ID] = o
+	for _, obj := range objects {
+		byID[obj.ID] = obj
 	}
 	c.mu.Lock()
 	c.byID, c.fetched = byID, time.Now()
@@ -361,68 +361,68 @@ type fileNode struct {
 	handle *fileHandle
 }
 
-func newTree(m *mountState, objects []daemon.ObjectInfo) (*dirNode, error) {
-	root := newDir(m, "")
+func newTree(state *mountState, objects []daemon.ObjectInfo) (*dirNode, error) {
+	root := newDir(state, "")
 	sort.Slice(objects, func(i, j int) bool { return objects[i].ID < objects[j].ID })
 	for _, object := range objects {
 		parts, err := objectPath(object.Name)
 		if err != nil {
 			return nil, fmt.Errorf("object %s name %q: %w", shortID(object.ID), object.Name, err)
 		}
-		d := root
+		dir := root
 		for i, part := range parts[:len(parts)-1] {
-			if d.files[part] != nil || d.links[part] != nil {
+			if dir.files[part] != nil || dir.links[part] != nil {
 				return nil, fmt.Errorf("object path conflict: %q is both a file and directory", strings.Join(parts, "/"))
 			}
-			if d.dirs[part] == nil {
-				d.dirs[part] = newDir(m, path.Join(parts[:i+1]...))
+			if dir.dirs[part] == nil {
+				dir.dirs[part] = newDir(state, path.Join(parts[:i+1]...))
 			}
-			d = d.dirs[part]
+			dir = dir.dirs[part]
 		}
 		name := parts[len(parts)-1]
 		switch object.Kind {
 		case "dir":
-			if d.files[name] != nil || d.links[name] != nil {
+			if dir.files[name] != nil || dir.links[name] != nil {
 				return nil, fmt.Errorf("object path conflict: %q is both a file and directory", strings.Join(parts, "/"))
 			}
-			if d.dirs[name] == nil {
-				d.dirs[name] = newDir(m, path.Join(parts...))
+			if dir.dirs[name] == nil {
+				dir.dirs[name] = newDir(state, path.Join(parts...))
 			}
-			if d.dirs[name].object.ID == "" || object.ID < d.dirs[name].object.ID {
-				d.dirs[name].object = object
+			if dir.dirs[name].object.ID == "" || object.ID < dir.dirs[name].object.ID {
+				dir.dirs[name].object = object
 			}
 			continue
 		case "symlink":
-			if d.dirs[name] != nil || d.files[name] != nil {
+			if dir.dirs[name] != nil || dir.files[name] != nil {
 				return nil, fmt.Errorf("object path conflict: %q is both a symlink and a file or directory", strings.Join(parts, "/"))
 			}
-			if _, exists := d.links[name]; exists {
+			if _, exists := dir.links[name]; exists {
 				name = disambiguate(name, object.ID)
 			}
-			d.links[name] = &symlinkNode{m: m, object: object}
+			dir.links[name] = &symlinkNode{m: state, object: object}
 			continue
 		}
-		if _, isDir := d.dirs[name]; isDir {
+		if _, isDir := dir.dirs[name]; isDir {
 			return nil, fmt.Errorf("object path conflict: %q is both a file and directory", strings.Join(parts, "/"))
 		}
-		if d.files[name] != nil || d.links[name] != nil {
+		if dir.files[name] != nil || dir.links[name] != nil {
 			name = disambiguate(name, object.ID)
 		}
-		d.files[name] = &fileNode{m: m, object: object}
+		dir.files[name] = &fileNode{m: state, object: object}
 		for i := range object.Conflicts {
-			c := object.Conflicts[i]
-			cname := path.Base(c.Name)
-			if d.files[cname] != nil || d.dirs[cname] != nil || d.links[cname] != nil {
+			conflict := object.Conflicts[i]
+			cname := path.Base(conflict.Name)
+			if dir.files[cname] != nil || dir.dirs[cname] != nil || dir.links[cname] != nil {
 				cname = disambiguate(cname, object.ID)
 			}
-			d.files[cname] = &fileNode{m: m, object: object, conflict: &c}
+			dir.files[cname] = &fileNode{m: state, object: object, conflict: &conflict}
 		}
 	}
 	return root, nil
 }
 
-func newDir(m *mountState, prefix string) *dirNode {
-	return &dirNode{m: m, prefix: prefix, dirs: map[string]*dirNode{}, files: map[string]*fileNode{}, links: map[string]*symlinkNode{}}
+func newDir(state *mountState, prefix string) *dirNode {
+	return &dirNode{m: state, prefix: prefix, dirs: map[string]*dirNode{}, files: map[string]*fileNode{}, links: map[string]*symlinkNode{}}
 }
 
 func objectPath(name string) ([]string, error) {
@@ -570,7 +570,7 @@ func (f *fileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32,
 		return nil, 0, syscall.EROFS
 	}
 	f.mu.Lock()
-	if c := f.conflict; c != nil {
+	if conflict := f.conflict; conflict != nil {
 		object := f.object
 		f.mu.Unlock()
 		if write {
@@ -580,10 +580,10 @@ func (f *fileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32,
 		if err != nil {
 			return nil, 0, syscall.EIO
 		}
-		r, err := f.m.src.GetBlob(f.m.bucket, object.ID, c.Blob)
+		rc, err := f.m.src.GetBlob(f.m.bucket, object.ID, conflict.Blob)
 		if err == nil {
-			_, err = io.Copy(tmp, r)
-			r.Close()
+			_, err = io.Copy(tmp, rc)
+			rc.Close()
 		}
 		if err != nil {
 			tmp.Close()
@@ -611,15 +611,15 @@ func (f *fileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32,
 		return nil, 0, syscall.EIO
 	}
 	if flags&syscall.O_TRUNC == 0 && object.ID != "" {
-		r, err := f.m.src.Get(f.m.bucket, object.ID)
+		rc, err := f.m.src.Get(f.m.bucket, object.ID)
 		if err != nil {
 			tmp.Close()
 			os.Remove(tmp.Name())
 			f.cancelWriter(write)
 			return nil, 0, syscall.EIO
 		}
-		_, err = io.Copy(tmp, r)
-		r.Close()
+		_, err = io.Copy(tmp, rc)
+		rc.Close()
 		if err != nil {
 			tmp.Close()
 			os.Remove(tmp.Name())
@@ -627,13 +627,13 @@ func (f *fileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32,
 			return nil, 0, syscall.EIO
 		}
 	}
-	h := &fileHandle{file: tmp, path: tmp.Name(), node: f, writable: write, dirty: write && flags&syscall.O_TRUNC != 0}
+	handle := &fileHandle{file: tmp, path: tmp.Name(), node: f, writable: write, dirty: write && flags&syscall.O_TRUNC != 0}
 	if write {
 		f.mu.Lock()
-		f.handle = h
+		f.handle = handle
 		f.mu.Unlock()
 	}
-	return h, fuse.FOPEN_DIRECT_IO, 0
+	return handle, fuse.FOPEN_DIRECT_IO, 0
 }
 
 func (f *fileNode) cancelWriter(write bool) {
@@ -715,21 +715,21 @@ func reserveUnpublished(dir, name string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
 		return "", err
 	}
-	f, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	file, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err == nil {
-		f.Close()
+		file.Close()
 		return dest, nil
 	}
 	if !errors.Is(err, os.ErrExist) {
 		return "", err
 	}
 	ext := filepath.Ext(dest)
-	f, err = os.CreateTemp(filepath.Dir(dest), strings.TrimSuffix(filepath.Base(dest), ext)+".*"+ext)
+	file, err = os.CreateTemp(filepath.Dir(dest), strings.TrimSuffix(filepath.Base(dest), ext)+".*"+ext)
 	if err != nil {
 		return "", err
 	}
-	taken := f.Name()
-	f.Close()
+	taken := file.Name()
+	file.Close()
 	return taken, nil
 }
 

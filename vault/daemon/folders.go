@@ -62,11 +62,11 @@ type liveFolder struct {
 
 func (d *Daemon) folderLoop() {
 	d.reconcileFolders()
-	t := time.NewTicker(FolderReconcileInterval)
-	defer t.Stop()
+	ticker := time.NewTicker(FolderReconcileInterval)
+	defer ticker.Stop()
 	for {
 		select {
-		case <-t.C:
+		case <-ticker.C:
 			d.reconcileFolders()
 		case <-d.ctx.Done():
 			return
@@ -110,22 +110,22 @@ func (d *Daemon) reconcileFolders() {
 }
 
 func (d *Daemon) openFolder(dir string, decl store.FolderDecl) error {
-	h, err := d.handle(decl.Bucket)
+	handle, err := d.handle(decl.Bucket)
 	if err != nil {
 		return err
 	}
-	rep, err := folder.Open(dir, d.Store.FolderStateDir(decl.Bucket), h)
+	rep, err := folder.Open(dir, d.Store.FolderStateDir(decl.Bucket), handle)
 	if err != nil {
 		return err
 	}
 	rep.Log = log.Printf
-	rep.Fetch = func(hash string) error { return d.fetchAnywhere(h, hash) }
-	h.SetHolder(rep, "path")
+	rep.Fetch = func(hash string) error { return d.fetchAnywhere(handle, hash) }
+	handle.SetHolder(rep, "path")
 	lf := &liveFolder{rep: rep, decl: decl, watched: map[string]bool{}, scan: make(chan struct{}, 1), mat: make(chan struct{}, 1), done: make(chan struct{})}
 	stopCh := make(chan struct{})
 	lf.stop = func() { close(stopCh) }
-	if w, err := fsnotify.NewWatcher(); err == nil {
-		lf.watcher = w
+	if watcher, err := fsnotify.NewWatcher(); err == nil {
+		lf.watcher = watcher
 	} else {
 		log.Printf("vault folders: %s: no file watcher (%v); periodic scans only", dir, err)
 	}
@@ -235,12 +235,12 @@ func (d *Daemon) watchDirs(lf *liveFolder, root string) {
 	if lf.watcher == nil || lf.degraded {
 		return
 	}
-	_ = filepath.WalkDir(root, func(p string, de os.DirEntry, err error) error {
+	_ = filepath.WalkDir(root, func(dirPath string, de os.DirEntry, err error) error {
 		if err != nil || !de.IsDir() || lf.degraded {
 			return nil
 		}
-		if p != root {
-			if _, err := os.Lstat(filepath.Join(p, ".git")); err == nil {
+		if dirPath != root {
+			if _, err := os.Lstat(filepath.Join(dirPath, ".git")); err == nil {
 				return filepath.SkipDir
 			}
 			switch de.Name() {
@@ -248,18 +248,18 @@ func (d *Daemon) watchDirs(lf *liveFolder, root string) {
 				return filepath.SkipDir
 			}
 		}
-		if lf.watched[p] {
+		if lf.watched[dirPath] {
 			return nil
 		}
-		if err := lf.watcher.Add(p); err != nil {
+		if err := lf.watcher.Add(dirPath); err != nil {
 			lf.degraded = true
 			if !lf.warned {
 				lf.warned = true
-				log.Printf("vault folders: %s: cannot watch %s (%v); scanning every %s instead — raise fs.inotify.max_user_watches to restore live change detection", root, p, err, FolderDegradedScanInterval)
+				log.Printf("vault folders: %s: cannot watch %s (%v); scanning every %s instead — raise fs.inotify.max_user_watches to restore live change detection", root, dirPath, err, FolderDegradedScanInterval)
 			}
 			return filepath.SkipAll
 		}
-		lf.watched[p] = true
+		lf.watched[dirPath] = true
 		return nil
 	})
 }
@@ -309,8 +309,8 @@ func (d *Daemon) closeFolder(dir string) {
 	if lf.watcher != nil {
 		_ = lf.watcher.Close()
 	}
-	if h, err := d.handle(lf.decl.Bucket); err == nil {
-		h.SetHolder(nil, "")
+	if handle, err := d.handle(lf.decl.Bucket); err == nil {
+		handle.SetHolder(nil, "")
 	}
 	_ = lf.rep.Close()
 }
@@ -335,9 +335,9 @@ func (d *Daemon) folderInfos() ([]FolderInfo, error) {
 	}
 	names := map[string]string{}
 	if buckets, err := d.Store.Buckets(); err == nil {
-		for _, b := range buckets {
-			if id, err := b.ID(); err == nil {
-				names[id] = b.Genesis.Name
+		for _, bkt := range buckets {
+			if id, err := bkt.ID(); err == nil {
+				names[id] = bkt.Genesis.Name
 			}
 		}
 	}

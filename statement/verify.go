@@ -94,28 +94,28 @@ func Compile(authority, identity *Statement, sub string, roots Roots) (*Compiled
 	auth := authority.Chain()
 	// Rule 1 and 4: every authority link is in sub; the root link's issuer is
 	// an honoured root for sub.
-	for _, l := range auth {
-		if l.Payload.Sub != sub {
-			return nil, fmt.Errorf("authority link %s is in circle %q, want %q", l.IDHex()[:8], l.Payload.Sub, sub)
+	for _, link := range auth {
+		if link.Payload.Sub != sub {
+			return nil, fmt.Errorf("authority link %s is in circle %q, want %q", link.IDHex()[:8], link.Payload.Sub, sub)
 		}
 	}
-	c := &Compiled{Sub: sub, Handovers: auth[0].Handovers()}
+	compiled := &Compiled{Sub: sub, Handovers: auth[0].Handovers()}
 	var err error
-	if c.Auth, c.Nbf, c.Exp, err = compileChain(auth, roots.RootKeys(sub), sub, c.Handovers, "authority"); err != nil {
+	if compiled.Auth, compiled.Nbf, compiled.Exp, err = compileChain(auth, roots.RootKeys(sub), sub, compiled.Handovers, "authority"); err != nil {
 		return nil, err
 	}
-	if err := historyAllows(roots, sub, c.Handovers, auth[0]); err != nil {
+	if err := historyAllows(roots, sub, compiled.Handovers, auth[0]); err != nil {
 		return nil, fmt.Errorf("authority root link: %w", err)
 	}
 	leaf := auth[len(auth)-1]
-	for _, v := range leaf.Payload.Verbs {
-		if !KnownVerbs[v] {
-			c.UnknownVerbs = append(c.UnknownVerbs, v)
+	for _, verb := range leaf.Payload.Verbs {
+		if !KnownVerbs[verb] {
+			compiled.UnknownVerbs = append(compiled.UnknownVerbs, verb)
 		}
 	}
-	c.PresentingKey = leaf.Payload.Aud
+	compiled.PresentingKey = leaf.Payload.Aud
 	if identity == nil {
-		return c, nil
+		return compiled, nil
 	}
 
 	// Identity chain: anchored at the authority leaf's aud (rule 1 note). A
@@ -130,25 +130,25 @@ func Compile(authority, identity *Statement, sub string, roots Roots) (*Compiled
 	// 2026-11-02).
 	anchor := leaf.Payload.Aud
 	ident := identity.Chain()
-	isub := ident[0].Payload.Sub
-	for _, l := range ident {
-		if l.Payload.Sub != isub {
+	identSub := ident[0].Payload.Sub
+	for _, link := range ident {
+		if link.Payload.Sub != identSub {
 			return nil, errors.New("identity links span several circles")
 		}
 	}
 	anchorKeys := roots.RootKeys(anchor)
 	identHandovers := ident[0].Handovers()
 	if len(anchorKeys) > 0 {
-		c.IdentAnchor = anchor
-		c.IdentHandovers = identHandovers
+		compiled.IdentAnchor = anchor
+		compiled.IdentHandovers = identHandovers
 	} else {
-		k, err := did.KeyFor(anchor)
+		key, err := did.KeyFor(anchor)
 		if err != nil {
 			return nil, fmt.Errorf("identity anchor %q is neither a held circle nor a did:key", anchor)
 		}
-		anchorKeys = []ed25519.PublicKey{k}
-		for i, l := range ident {
-			if l.Payload.Aud == anchor {
+		anchorKeys = []ed25519.PublicKey{key}
+		for i, link := range ident {
+			if link.Payload.Aud == anchor {
 				ident = ident[i+1:]
 				identHandovers = nil // the suffix starts at a device key, not a circle's
 				break
@@ -157,27 +157,27 @@ func Compile(authority, identity *Statement, sub string, roots Roots) (*Compiled
 		if len(ident) == 0 {
 			// The anchor is the last link's recipient: the presenter is the
 			// anchor itself and the chain adds nothing.
-			return c, nil
+			return compiled, nil
 		}
 	}
-	links, inbf, iexp, err := compileChain(ident, anchorKeys, isub, identHandovers, "identity")
+	links, identNbf, identExp, err := compileChain(ident, anchorKeys, identSub, identHandovers, "identity")
 	if err != nil {
 		return nil, err
 	}
-	if c.IdentAnchor != "" {
+	if compiled.IdentAnchor != "" {
 		if err := historyAllows(roots, anchor, identHandovers, ident[0]); err != nil {
 			return nil, fmt.Errorf("identity root link: %w", err)
 		}
 	}
-	c.Ident = links
-	if inbf.After(c.Nbf) {
-		c.Nbf = inbf
+	compiled.Ident = links
+	if identNbf.After(compiled.Nbf) {
+		compiled.Nbf = identNbf
 	}
-	if iexp.Before(c.Exp) {
-		c.Exp = iexp
+	if identExp.Before(compiled.Exp) {
+		compiled.Exp = identExp
 	}
-	c.PresentingKey = ident[len(ident)-1].Payload.Aud
-	return c, nil
+	compiled.PresentingKey = ident[len(ident)-1].Payload.Aud
+	return compiled, nil
 }
 
 // compileChain checks one chain root-first. anchorKeys are the keys whose
@@ -194,34 +194,34 @@ func compileChain(chain []*Statement, anchorKeys []ed25519.PublicKey, sub string
 	}
 	var links []Link
 	var nbf, exp time.Time
-	for i, l := range chain {
-		p := l.Payload
-		id := l.IDHex()[:8]
-		if p.Typ != TypeAssert {
+	for i, link := range chain {
+		payload := link.Payload
+		id := link.IDHex()[:8]
+		if payload.Typ != TypeAssert {
 			return nil, nbf, exp, fmt.Errorf("%s link %s is not an assert", what, id)
 		}
-		if p.Aud == "" {
+		if payload.Aud == "" {
 			return nil, nbf, exp, fmt.Errorf("%s link %s has no recipient", what, id)
 		}
-		if err := l.VerifySignature(); err != nil {
+		if err := link.VerifySignature(); err != nil {
 			return nil, nbf, exp, fmt.Errorf("%s link %s: %w", what, id, err)
 		}
 		// Rule 2 (shape): nbf < exp, window within MaxValidity.
-		if p.Nbf == 0 || p.Exp <= p.Nbf {
+		if payload.Nbf == 0 || payload.Exp <= payload.Nbf {
 			return nil, nbf, exp, fmt.Errorf("%s link %s has no valid window", what, id)
 		}
-		if time.Duration(p.Exp-p.Nbf)*time.Second > MaxValidity || time.Duration(p.Exp-p.Iat)*time.Second > MaxValidity {
+		if time.Duration(payload.Exp-payload.Nbf)*time.Second > MaxValidity || time.Duration(payload.Exp-payload.Iat)*time.Second > MaxValidity {
 			return nil, nbf, exp, fmt.Errorf("%s link %s window exceeds MaxValidity", what, id)
 		}
 		if i == 0 {
 			// Root-issued: the issuer must be one of the keys allowed on top.
-			issKey, err := l.IssuerKey()
+			issKey, err := link.IssuerKey()
 			if err != nil {
 				return nil, nbf, exp, fmt.Errorf("%s root link: %w", what, err)
 			}
 			honoured := false
-			for _, k := range rootKeys {
-				if bytes.Equal(k, issKey) {
+			for _, key := range rootKeys {
+				if bytes.Equal(key, issKey) {
 					honoured = true
 					break
 				}
@@ -229,72 +229,72 @@ func compileChain(chain []*Statement, anchorKeys []ed25519.PublicKey, sub string
 			if !honoured {
 				return nil, nbf, exp, fmt.Errorf("%s root link %s is issued by a key this node does not honour for the circle", what, id)
 			}
-			nbf, exp = l.NotBefore(), l.Expiry()
+			nbf, exp = link.NotBefore(), link.Expiry()
 		} else {
 			parent := chain[i-1].Payload
 			// Chaining.
-			if p.Iss != parent.Aud {
+			if payload.Iss != parent.Aud {
 				return nil, nbf, exp, fmt.Errorf("%s link %s is not issued by its parent's recipient", what, id)
 			}
 			// Delegation depth: parent must allow a child, child strictly shallower.
 			if parent.Del < 1 {
 				return nil, nbf, exp, fmt.Errorf("%s link %s: parent is not delegable (del 0)", what, id)
 			}
-			if p.Del >= parent.Del {
-				return nil, nbf, exp, fmt.Errorf("%s link %s: del %d must be below the parent's %d", what, id, p.Del, parent.Del)
+			if payload.Del >= parent.Del {
+				return nil, nbf, exp, fmt.Errorf("%s link %s: del %d must be below the parent's %d", what, id, payload.Del, parent.Del)
 			}
 			// Attenuation: child verbs ⊆ parent verbs, child res ⊆ parent res.
-			for _, v := range p.Verbs {
-				if !verbAllows(parent.Verbs, v) {
-					return nil, nbf, exp, fmt.Errorf("%s link %s grants verb %q its parent does not hold", what, id, v)
+			for _, verb := range payload.Verbs {
+				if !verbAllows(parent.Verbs, verb) {
+					return nil, nbf, exp, fmt.Errorf("%s link %s grants verb %q its parent does not hold", what, id, verb)
 				}
 			}
-			for _, r := range p.Res {
-				if !resCovered(parent, p.Sub, r) {
-					return nil, nbf, exp, fmt.Errorf("%s link %s names resource %s/%s its parent does not cover", what, id, r.Kind, r.Name)
+			for _, res := range payload.Res {
+				if !resCovered(parent, payload.Sub, res) {
+					return nil, nbf, exp, fmt.Errorf("%s link %s names resource %s/%s its parent does not cover", what, id, res.Kind, res.Name)
 				}
 			}
 			// Rule 8: admission verbs and overlay metadata need an admission issuer.
-			if needsAdmission(p) && !hasVerb(parent.Verbs, VerbAdmin) {
+			if needsAdmission(payload) && !hasVerb(parent.Verbs, VerbAdmin) {
 				return nil, nbf, exp, fmt.Errorf("%s link %s carries admission verbs or overlay metadata but its issuer is not an admin", what, id)
 			}
 			// Rule 7: overlay fields against the immediate parent only.
-			if err := checkOverlay(p.Meta, parent.Meta, false); err != nil {
+			if err := checkOverlay(payload.Meta, parent.Meta, false); err != nil {
 				return nil, nbf, exp, fmt.Errorf("%s link %s: %w", what, id, err)
 			}
-			if l.NotBefore().After(nbf) {
-				nbf = l.NotBefore()
+			if link.NotBefore().After(nbf) {
+				nbf = link.NotBefore()
 			}
-			if l.Expiry().Before(exp) {
-				exp = l.Expiry()
+			if link.Expiry().Before(exp) {
+				exp = link.Expiry()
 			}
 		}
 		if i == 0 {
-			if err := checkOverlay(p.Meta, nil, true); err != nil {
+			if err := checkOverlay(payload.Meta, nil, true); err != nil {
 				return nil, nbf, exp, fmt.Errorf("%s link %s: %w", what, id, err)
 			}
 		}
-		links = append(links, Link{ID: l.ID(), Iss: p.Iss, Aud: p.Aud, Sub: p.Sub, Iat: p.Iat, Stmt: l})
+		links = append(links, Link{ID: link.ID(), Iss: payload.Iss, Aud: payload.Aud, Sub: payload.Sub, Iat: payload.Iat, Stmt: link})
 	}
 	return links, nbf, exp, nil
 }
 
 // needsAdmission reports whether a link carries anything only the root or an
 // admin may issue.
-func needsAdmission(p Payload) bool {
-	for _, v := range p.Verbs {
-		if admissionVerbs[v] {
+func needsAdmission(payload Payload) bool {
+	for _, verb := range payload.Verbs {
+		if admissionVerbs[verb] {
 			return true
 		}
 	}
-	return p.Meta != nil && (p.Meta.IP != "" || p.Meta.Prefix != "")
+	return payload.Meta != nil && (payload.Meta.IP != "" || payload.Meta.Prefix != "")
 }
 
-// resCovered reports whether some resource of parent covers r as named in
+// resCovered reports whether some resource of parent covers res as named in
 // a child whose sub is childSub.
-func resCovered(parent Payload, childSub string, r Resource) bool {
-	for _, pr := range parent.Res {
-		if pr.Covers(parent.Sub, r, childSub) {
+func resCovered(parent Payload, childSub string, res Resource) bool {
+	for _, parentRes := range parent.Res {
+		if parentRes.Covers(parent.Sub, res, childSub) {
 			return true
 		}
 	}
@@ -304,46 +304,46 @@ func resCovered(parent Payload, childSub string, r Resource) bool {
 // checkOverlay is rule 7. A root-issued link may carry anything well-formed.
 // Otherwise ip must lie in the parent's prefix or equal the parent's ip,
 // and prefix must lie in the parent's prefix.
-func checkOverlay(m, parent *Meta, rootIssued bool) error {
-	if m == nil {
+func checkOverlay(meta, parent *Meta, rootIssued bool) error {
+	if meta == nil {
 		return nil
 	}
 	var ip netip.Prefix
 	var prefix netip.Prefix
 	var err error
-	if m.IP != "" {
-		if ip, err = netip.ParsePrefix(m.IP); err != nil {
+	if meta.IP != "" {
+		if ip, err = netip.ParsePrefix(meta.IP); err != nil {
 			return fmt.Errorf("meta.ip: %w", err)
 		}
 	}
-	if m.Prefix != "" {
-		if prefix, err = netip.ParsePrefix(m.Prefix); err != nil {
+	if meta.Prefix != "" {
+		if prefix, err = netip.ParsePrefix(meta.Prefix); err != nil {
 			return fmt.Errorf("meta.prefix: %w", err)
 		}
 	}
 	if rootIssued {
 		return nil
 	}
-	if m.IP != "" {
+	if meta.IP != "" {
 		ok := false
 		if parent != nil && parent.Prefix != "" {
-			if pp, err := netip.ParsePrefix(parent.Prefix); err == nil && pp.Contains(ip.Addr()) {
+			if parentPrefix, err := netip.ParsePrefix(parent.Prefix); err == nil && parentPrefix.Contains(ip.Addr()) {
 				ok = true
 			}
 		}
-		if !ok && parent != nil && parent.IP != "" && parent.IP == m.IP {
+		if !ok && parent != nil && parent.IP != "" && parent.IP == meta.IP {
 			ok = true // a sub-key inheriting its device's address
 		}
 		if !ok {
 			return errors.New("meta.ip is outside the parent's prefix and not the parent's own ip")
 		}
 	}
-	if m.Prefix != "" {
+	if meta.Prefix != "" {
 		if parent == nil || parent.Prefix == "" {
 			return errors.New("meta.prefix on a link whose parent has no prefix")
 		}
-		pp, err := netip.ParsePrefix(parent.Prefix)
-		if err != nil || !pp.Contains(prefix.Addr()) || prefix.Bits() < pp.Bits() {
+		parentPrefix, err := netip.ParsePrefix(parent.Prefix)
+		if err != nil || !parentPrefix.Contains(prefix.Addr()) || prefix.Bits() < parentPrefix.Bits() {
 			return errors.New("meta.prefix is not inside the parent's prefix")
 		}
 	}
@@ -358,25 +358,25 @@ func (c *Compiled) Allows(sub string, res Resource, verb string) bool {
 	if sub != c.Sub || !KnownVerbs[verb] {
 		return false
 	}
-	for _, l := range c.Auth {
-		if !linkAllows(l.Stmt.Payload, sub, res, verb) {
+	for _, link := range c.Auth {
+		if !linkAllows(link.Stmt.Payload, sub, res, verb) {
 			return false
 		}
 	}
-	for _, l := range c.Ident {
-		if !linkAllows(l.Stmt.Payload, sub, res, verb) {
+	for _, link := range c.Ident {
+		if !linkAllows(link.Stmt.Payload, sub, res, verb) {
 			return false
 		}
 	}
 	return true
 }
 
-func linkAllows(p Payload, sub string, res Resource, verb string) bool {
-	if !verbAllows(p.Verbs, verb) {
+func linkAllows(payload Payload, sub string, res Resource, verb string) bool {
+	if !verbAllows(payload.Verbs, verb) {
 		return false
 	}
-	for _, r := range p.Res {
-		if r.Covers(p.Sub, res, sub) {
+	for _, linkRes := range payload.Res {
+		if linkRes.Covers(payload.Sub, res, sub) {
 			return true
 		}
 	}
@@ -424,8 +424,8 @@ func (c *Compiled) RootsHonoured(roots Roots) error {
 		if len(keys) == 0 {
 			// The circle is no longer held here; as in Compile, a did:key
 			// anchor still resolves on its own.
-			if k, err := did.KeyFor(c.IdentAnchor); err == nil {
-				keys = []ed25519.PublicKey{k}
+			if key, err := did.KeyFor(c.IdentAnchor); err == nil {
+				keys = []ed25519.PublicKey{key}
 			}
 		}
 		if err := honourRoot(roots, c.IdentAnchor, keys, c.IdentHandovers, c.Ident[0].Stmt, false); err != nil {
@@ -459,28 +459,28 @@ func (c *Compiled) RevokedBy(roots Roots, revs Revocations) error {
 // sub-key under an admission that never saw its device's removal stays
 // dead after the device is restored.
 func revoked(links []Link, roots Roots, revs Revocations) error {
-	for i, l := range links {
-		for _, r := range revs.Candidates(l.ID, l.Aud) {
-			if !targets(r, l) || r.Payload.Sub != l.Sub {
+	for i, link := range links {
+		for _, rev := range revs.Candidates(link.ID, link.Aud) {
+			if !targets(rev, link) || rev.Payload.Sub != link.Sub {
 				continue
 			}
-			if r.IsRootIssued() {
+			if rev.IsRootIssued() {
 				// The revocation's own lineage signatures were checked at
 				// RevocationSet.Add; here its handovers are walked and the
 				// node's history applied, as for any root-issued statement.
-				if honourRoot(roots, l.Sub, rootKeysOrDID(roots, l.Sub), r.Handovers(), r, false) == nil {
-					return fmt.Errorf("link %s revoked by the root", short(l.Aud))
+				if honourRoot(roots, link.Sub, rootKeysOrDID(roots, link.Sub), rev.Handovers(), rev, false) == nil {
+					return fmt.Errorf("link %s revoked by the root", short(link.Aud))
 				}
 				continue
 			}
-			leaf := r.Parent()
-			if leaf.Payload.Aud != r.Payload.Iss {
+			leaf := rev.Parent()
+			if leaf.Payload.Aud != rev.Payload.Iss {
 				continue
 			}
 			leafID := leaf.ID()
 			for j := 0; j < i; j++ {
 				if links[j].ID == leafID {
-					return fmt.Errorf("link %s revoked by %s", short(l.Aud), short(r.Payload.Iss))
+					return fmt.Errorf("link %s revoked by %s", short(link.Aud), short(rev.Payload.Iss))
 				}
 			}
 		}
@@ -488,21 +488,21 @@ func revoked(links []Link, roots Roots, revs Revocations) error {
 	return nil
 }
 
-func targets(r *Statement, l Link) bool {
-	t := r.Payload.Target
-	if t == nil || r.Payload.Typ != TypeRevoke {
+func targets(rev *Statement, link Link) bool {
+	target := rev.Payload.Target
+	if target == nil || rev.Payload.Typ != TypeRevoke {
 		return false
 	}
-	if len(t.ID) != 0 {
-		return bytes.Equal(t.ID, l.ID[:])
+	if len(target.ID) != 0 {
+		return bytes.Equal(target.ID, link.ID[:])
 	}
-	if t.Aud != l.Aud {
+	if target.Aud != link.Aud {
 		return false
 	}
-	if r.Payload.V < 2 {
-		return l.Iat <= t.Before // legacy sweep: the cut rule, never an acknowledgment
+	if rev.Payload.V < 2 {
+		return link.Iat <= target.Before // legacy sweep: the cut rule, never an acknowledgment
 	}
-	return !l.Stmt.Acknowledges(r.ID())
+	return !link.Stmt.Acknowledges(rev.ID())
 }
 
 // rootKeysOrDID resolves a circle's root keys through roots, falling back
@@ -513,19 +513,19 @@ func rootKeysOrDID(roots Roots, circleDID string) []ed25519.PublicKey {
 	if keys := roots.RootKeys(circleDID); len(keys) > 0 {
 		return keys
 	}
-	if k, err := did.KeyFor(circleDID); err == nil {
-		return []ed25519.PublicKey{k}
+	if key, err := did.KeyFor(circleDID); err == nil {
+		return []ed25519.PublicKey{key}
 	}
 	return nil
 }
 
-func rootSigned(r *Statement, rootKeys []ed25519.PublicKey) bool {
-	k, err := r.IssuerKey()
+func rootSigned(stmt *Statement, rootKeys []ed25519.PublicKey) bool {
+	issKey, err := stmt.IssuerKey()
 	if err != nil {
 		return false
 	}
-	for _, rk := range rootKeys {
-		if bytes.Equal(rk, k) {
+	for _, rootKey := range rootKeys {
+		if bytes.Equal(rootKey, issKey) {
 			return true
 		}
 	}
@@ -537,68 +537,68 @@ func rootSigned(r *Statement, rootKeys []ed25519.PublicKey) bool {
 // sigs), each for circle sub, and returns the keys a root-issued statement
 // of that lineage may be signed with: the last handover's recipient, or
 // anchorKeys when there is none.
-func walkHandovers(hs []*Statement, anchorKeys []ed25519.PublicKey, sub string, sigs bool) ([]ed25519.PublicKey, error) {
-	if len(hs) > MaxHandovers {
+func walkHandovers(handovers []*Statement, anchorKeys []ed25519.PublicKey, sub string, sigs bool) ([]ed25519.PublicKey, error) {
+	if len(handovers) > MaxHandovers {
 		return nil, fmt.Errorf("more than MaxHandovers %d", MaxHandovers)
 	}
 	keys := anchorKeys
-	for i, h := range hs {
-		if h.Payload.Typ != TypeHandover {
+	for i, handover := range handovers {
+		if handover.Payload.Typ != TypeHandover {
 			return nil, errors.New("not a handover")
 		}
-		if h.Payload.Sub != sub {
-			return nil, fmt.Errorf("handover %d is for circle %s, not %s", i, short(h.Payload.Sub), short(sub))
+		if handover.Payload.Sub != sub {
+			return nil, fmt.Errorf("handover %d is for circle %s, not %s", i, short(handover.Payload.Sub), short(sub))
 		}
-		if err := handoverShape(h.Payload); err != nil {
+		if err := handoverShape(handover.Payload); err != nil {
 			return nil, fmt.Errorf("handover %d: %w", i, err)
 		}
-		if !rootSigned(h, keys) {
+		if !rootSigned(handover, keys) {
 			if i == 0 {
 				return nil, errors.New("the first handover is not signed by the circle's key")
 			}
 			return nil, fmt.Errorf("handover %d is not signed by the key the previous one handed over to", i)
 		}
 		if sigs {
-			if err := h.VerifySignature(); err != nil {
+			if err := handover.VerifySignature(); err != nil {
 				return nil, fmt.Errorf("handover %d: %w", i, err)
 			}
 		}
-		k, err := did.KeyFor(h.Payload.Aud)
+		key, err := did.KeyFor(handover.Payload.Aud)
 		if err != nil {
 			return nil, fmt.Errorf("handover %d: %w", i, err)
 		}
-		keys = []ed25519.PublicKey{k}
+		keys = []ed25519.PublicKey{key}
 	}
 	return keys, nil
 }
 
 // historyAllows applies the node's known key history (RootHistory, when
-// roots has one) to a root-issued statement st whose lineage carries the
-// handovers hs: the two histories must agree where they overlap, and when
-// the node knows a handover the lineage does not — one that retired st's
-// signer — st must have been issued no later than that handover, and the
+// roots has one) to a root-issued statement stmt whose lineage carries the
+// handovers: the two histories must agree where they overlap, and when
+// the node knows a handover the lineage does not — one that retired stmt's
+// signer — stmt must have been issued no later than that handover, and the
 // handover must not have declared the key compromised. A lineage that
 // knows more than the node is honoured on its own proof; the holder learns
 // it from the statement (DIDRoot.Learn) outside the verifier.
-func historyAllows(roots Roots, sub string, hs []*Statement, st *Statement) error {
-	h, ok := roots.(RootHistory)
+func historyAllows(roots Roots, sub string, handovers []*Statement, stmt *Statement) error {
+	history, ok := roots.(RootHistory)
 	if !ok {
 		return nil
 	}
-	known := h.Handovers(sub)
-	for i := 0; i < len(known) && i < len(hs); i++ {
-		if known[i].ID() != hs[i].ID() {
+	known := history.Handovers(sub)
+	for i := 0; i < len(known) && i < len(handovers); i++ {
+		if known[i].ID() != handovers[i].ID() {
 			return ErrConflictingHandover
 		}
 	}
-	if len(known) <= len(hs) {
+	if len(known) <= len(handovers) {
 		return nil
 	}
-	retiring := known[len(hs)]
+	retiring := known[len(handovers)]
 	if retiring.Payload.Compromised {
 		return errors.New("signed by a key the circle declared compromised")
 	}
-	if st.Payload.Iat > retiring.Payload.Iat {
+	if stmt.Payload.Iat > retiring.Payload.Iat {
 		return errors.New("signed by a retired key after its handover")
 	}
 	return nil
@@ -613,29 +613,29 @@ func historyAllows(roots Roots, sub string, hs []*Statement, st *Statement) erro
 // signer).
 func SigningKeys(roots Roots, sub string, at int64) []ed25519.PublicKey {
 	anchor := roots.RootKeys(sub)
-	h, ok := roots.(RootHistory)
+	history, ok := roots.(RootHistory)
 	if !ok {
 		return anchor
 	}
-	hs := h.Handovers(sub)
-	if len(hs) == 0 {
+	handovers := history.Handovers(sub)
+	if len(handovers) == 0 {
 		return anchor
 	}
 	var out []ed25519.PublicKey
 	epochKeys := [][]ed25519.PublicKey{anchor}
-	for _, ho := range hs {
-		if k, err := did.KeyFor(ho.Payload.Aud); err == nil {
-			epochKeys = append(epochKeys, []ed25519.PublicKey{k})
+	for _, handover := range handovers {
+		if key, err := did.KeyFor(handover.Payload.Aud); err == nil {
+			epochKeys = append(epochKeys, []ed25519.PublicKey{key})
 		}
 	}
-	for i, ks := range epochKeys {
-		if i < len(hs) {
-			retiring := hs[i]
+	for i, keys := range epochKeys {
+		if i < len(handovers) {
+			retiring := handovers[i]
 			if retiring.Payload.Compromised || at > retiring.Payload.Iat {
 				continue
 			}
 		}
-		out = append(out, ks...)
+		out = append(out, keys...)
 	}
 	return out
 }
@@ -643,64 +643,64 @@ func SigningKeys(roots Roots, sub string, at int64) []ed25519.PublicKey {
 // KeyHonouredAt reports whether the key keyDID (a did:key) is one of
 // SigningKeys for circle sub at the instant at.
 func KeyHonouredAt(roots Roots, sub, keyDID string, at int64) bool {
-	k, err := did.KeyFor(keyDID)
+	key, err := did.KeyFor(keyDID)
 	if err != nil {
 		return false
 	}
-	for _, c := range SigningKeys(roots, sub, at) {
-		if c.Equal(k) {
+	for _, candidate := range SigningKeys(roots, sub, at) {
+		if candidate.Equal(key) {
 			return true
 		}
 	}
 	return false
 }
 
-// honourRoot is the whole root check for a root-issued statement st of
-// circle sub: its lineage's handovers hs run from anchorKeys to its
+// honourRoot is the whole root check for a root-issued statement stmt of
+// circle sub: its lineage's handovers run from anchorKeys to its
 // signer, and the node's history allows it. sigs re-verifies the
 // handovers' signatures (Compile does; Check and the revocation pass rely
 // on what was verified at compile or ingest).
-func honourRoot(roots Roots, sub string, anchorKeys []ed25519.PublicKey, hs []*Statement, st *Statement, sigs bool) error {
-	keys, err := walkHandovers(hs, anchorKeys, sub, sigs)
+func honourRoot(roots Roots, sub string, anchorKeys []ed25519.PublicKey, handovers []*Statement, stmt *Statement, sigs bool) error {
+	keys, err := walkHandovers(handovers, anchorKeys, sub, sigs)
 	if err != nil {
 		return err
 	}
-	if !rootSigned(st, keys) {
+	if !rootSigned(stmt, keys) {
 		return errors.New("not signed by the circle's key")
 	}
-	return historyAllows(roots, sub, hs, st)
+	return historyAllows(roots, sub, handovers, stmt)
 }
 
 // RootSigned reports whether a parentless statement of circle sub is
 // signed by the circle's root as roots knows it: by the anchor key, or by
 // the current key through the handovers the statement carries, within the
 // node's history. Signatures are verified.
-func RootSigned(roots Roots, sub string, st *Statement) bool {
-	if st == nil || !st.IsRootIssued() {
+func RootSigned(roots Roots, sub string, stmt *Statement) bool {
+	if stmt == nil || !stmt.IsRootIssued() {
 		return false
 	}
-	if err := st.VerifySignature(); err != nil {
+	if err := stmt.VerifySignature(); err != nil {
 		return false
 	}
-	return honourRoot(roots, sub, rootKeysOrDID(roots, sub), st.Handovers(), st, true) == nil
+	return honourRoot(roots, sub, rootKeysOrDID(roots, sub), stmt.Handovers(), stmt, true) == nil
 }
 
 // Verify is Compile followed by Check: the whole §6 checklist in one call,
 // for callers that do not cache.
 func Verify(authority, identity *Statement, roots Roots, revs Revocations, want Want) (*Compiled, error) {
-	c, err := Compile(authority, identity, want.Sub, roots)
+	compiled, err := Compile(authority, identity, want.Sub, roots)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.Check(roots, revs, want); err != nil {
+	if err := compiled.Check(roots, revs, want); err != nil {
 		return nil, err
 	}
-	return c, nil
+	return compiled, nil
 }
 
-func short(s string) string {
-	if len(s) > 16 {
-		return s[:16] + "…"
+func short(text string) string {
+	if len(text) > 16 {
+		return text[:16] + "…"
 	}
-	return s
+	return text
 }

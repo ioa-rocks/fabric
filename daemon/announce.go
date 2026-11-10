@@ -43,12 +43,12 @@ func announceKind(entry string) string {
 func listenSuffixes(listen []string) []ma.Multiaddr {
 	var out []ma.Multiaddr
 	seen := map[string]bool{}
-	for _, s := range listen {
-		m, err := ma.NewMultiaddr(s)
+	for _, raw := range listen {
+		addr, err := ma.NewMultiaddr(raw)
 		if err != nil {
 			continue
 		}
-		first, rest := ma.SplitFirst(m)
+		first, rest := ma.SplitFirst(addr)
 		if first.Protocol().Code != ma.P_IP4 && first.Protocol().Code != ma.P_IP6 {
 			continue
 		}
@@ -81,13 +81,13 @@ func systemLookup(host string) []net.IP {
 func expandAnnounce(entries, listen []string, lookup lookupFunc) []ma.Multiaddr {
 	suffixes := listenSuffixes(listen)
 	var out []ma.Multiaddr
-	add := func(m ma.Multiaddr) {
+	add := func(addr ma.Multiaddr) {
 		for _, have := range out {
-			if have.Equal(m) {
+			if have.Equal(addr) {
 				return
 			}
 		}
-		out = append(out, m)
+		out = append(out, addr)
 	}
 	addIP := func(ip net.IP) {
 		var base ma.Multiaddr
@@ -107,14 +107,14 @@ func expandAnnounce(entries, listen []string, lookup lookupFunc) []ma.Multiaddr 
 	for _, entry := range entries {
 		switch announceKind(entry) {
 		case "multiaddr":
-			m, err := ma.NewMultiaddr(entry)
+			addr, err := ma.NewMultiaddr(entry)
 			if err != nil {
 				continue
 			}
-			add(m)
+			add(addr)
 			// A DNS multiaddr (pre-expansion configs) still gets its
 			// resolved IP literals, with the entry's own transport tail.
-			first, rest := ma.SplitFirst(m)
+			first, rest := ma.SplitFirst(addr)
 			code := first.Protocol().Code
 			if code == ma.P_DNS4 || code == ma.P_DNS6 || code == ma.P_DNS {
 				for _, ip := range lookup(first.Value()) {
@@ -174,13 +174,13 @@ func ExpandAnnounce(entries, listen []string) []ma.Multiaddr {
 // then is the re-resolve ticker worth running. Bare hostnames and DNS
 // multiaddrs both qualify.
 func hasHostEntries(entries []string) bool {
-	for _, e := range entries {
-		switch announceKind(e) {
+	for _, entry := range entries {
+		switch announceKind(entry) {
 		case "host":
 			return true
 		case "multiaddr":
-			if m, err := ma.NewMultiaddr(e); err == nil {
-				first, _ := ma.SplitFirst(m)
+			if addr, err := ma.NewMultiaddr(entry); err == nil {
+				first, _ := ma.SplitFirst(addr)
 				code := first.Protocol().Code
 				if code == ma.P_DNS4 || code == ma.P_DNS6 || code == ma.P_DNS {
 					return true
@@ -196,13 +196,13 @@ func hasHostEntries(entries []string) bool {
 // into the AddrsFactory atomically and the host is nudged so the updated
 // record gossips out.
 func (d *Daemon) watchAnnounce() {
-	t := time.NewTicker(reResolveInterval)
-	defer t.Stop()
+	ticker := time.NewTicker(reResolveInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-d.ctx.Done():
 			return
-		case <-t.C:
+		case <-ticker.C:
 			next := expandAnnounce(d.Config.AnnounceAddrs, d.Config.ListenAddrs, systemLookup)
 			if equalAddrSets(next, *d.announced.Load()) {
 				continue
@@ -216,26 +216,26 @@ func (d *Daemon) watchAnnounce() {
 	}
 }
 
-func equalAddrSets(a, b []ma.Multiaddr) bool {
-	if len(a) != len(b) {
+func equalAddrSets(first, second []ma.Multiaddr) bool {
+	if len(first) != len(second) {
 		return false
 	}
-	as, bs := make([]string, len(a)), make([]string, len(b))
-	for i := range a {
-		as[i] = a[i].String()
+	firstStrs, secondStrs := make([]string, len(first)), make([]string, len(second))
+	for i := range first {
+		firstStrs[i] = first[i].String()
 	}
-	for i := range b {
-		bs[i] = b[i].String()
+	for i := range second {
+		secondStrs[i] = second[i].String()
 	}
-	sort.Strings(as)
-	sort.Strings(bs)
-	return slices.Equal(as, bs)
+	sort.Strings(firstStrs)
+	sort.Strings(secondStrs)
+	return slices.Equal(firstStrs, secondStrs)
 }
 
 func joinAddrs(addrs []ma.Multiaddr) string {
-	s := make([]string, len(addrs))
-	for i, a := range addrs {
-		s[i] = a.String()
+	strs := make([]string, len(addrs))
+	for i, addr := range addrs {
+		strs[i] = addr.String()
 	}
-	return strings.Join(s, " ")
+	return strings.Join(strs, " ")
 }

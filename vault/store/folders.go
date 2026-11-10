@@ -41,7 +41,7 @@ func (c *Store) Folders() (map[string]FolderDecl, error) {
 }
 
 // SetFolder declares a folder replica at dir.
-func (c *Store) SetFolder(dir string, f FolderDecl) error {
+func (c *Store) SetFolder(dir string, decl FolderDecl) error {
 	if !filepath.IsAbs(dir) {
 		return fmt.Errorf("folder must be an absolute path")
 	}
@@ -49,12 +49,12 @@ func (c *Store) SetFolder(dir string, f FolderDecl) error {
 	if err != nil {
 		return err
 	}
-	for d, cur := range folders {
-		if cur.Bucket == f.Bucket && d != dir {
-			return fmt.Errorf("bucket %.12s is already a folder at %s", f.Bucket, d)
+	for otherDir, cur := range folders {
+		if cur.Bucket == decl.Bucket && otherDir != dir {
+			return fmt.Errorf("bucket %.12s is already a folder at %s", decl.Bucket, otherDir)
 		}
 	}
-	folders[dir] = f
+	folders[dir] = decl
 	return c.writeFolders(folders)
 }
 

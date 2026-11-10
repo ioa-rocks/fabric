@@ -13,31 +13,31 @@ import (
 	"ioa.rocks/fabric/statement"
 )
 
-// SignV1 signs p as a version-1 statement — the form the fleet issued
+// SignV1 signs payload as a version-1 statement — the form the fleet issued
 // between 2026-11-02 and 2026-11-06 — so a test can hold a legacy sweep
 // ({aud, before}, the cut rule) against the version-2 reading. It fills
 // the format fields as statement.Sign does and returns the statement
 // through statement.Decode, so it is exactly what a peer would read off
 // the wire.
-func SignV1(priv ed25519.PrivateKey, p statement.Payload, parent *statement.Statement) (*statement.Statement, error) {
-	p.V = 1
-	if p.Typ == "" {
-		p.Typ = statement.TypeAssert
+func SignV1(priv ed25519.PrivateKey, payload statement.Payload, parent *statement.Statement) (*statement.Statement, error) {
+	payload.V = 1
+	if payload.Typ == "" {
+		payload.Typ = statement.TypeAssert
 	}
-	p.Iss = did.ForKey(priv.Public().(ed25519.PublicKey))
-	p.Acks = nil
+	payload.Iss = did.ForKey(priv.Public().(ed25519.PublicKey))
+	payload.Acks = nil
 	if parent != nil {
-		pb, err := parent.Bytes()
+		parentBytes, err := parent.Bytes()
 		if err != nil {
 			return nil, err
 		}
-		p.Prf = [][]byte{pb}
+		payload.Prf = [][]byte{parentBytes}
 	} else {
-		p.Prf = [][]byte{}
+		payload.Prf = [][]byte{}
 	}
-	if p.Nonce == nil {
-		p.Nonce = make([]byte, 16)
-		if _, err := rand.Read(p.Nonce); err != nil {
+	if payload.Nonce == nil {
+		payload.Nonce = make([]byte, 16)
+		if _, err := rand.Read(payload.Nonce); err != nil {
 			return nil, err
 		}
 	}
@@ -45,7 +45,7 @@ func SignV1(priv ed25519.PrivateKey, p statement.Payload, parent *statement.Stat
 	if err != nil {
 		return nil, err
 	}
-	msg, err := enc.Marshal(p)
+	msg, err := enc.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("encoding payload: %w", err)
 	}

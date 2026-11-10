@@ -43,15 +43,15 @@ type graphCache struct {
 
 // attachLinks wires the link-state responder onto the host.
 func (d *Daemon) attachLinks() {
-	d.Host.SetStreamHandler(LinksProtocolID, d.Auth.RequireMember(func(s network.Stream) {
-		defer s.Close()
-		_ = s.SetDeadline(time.Now().Add(linkQueryTimeout))
-		data, err := cbor.Marshal(d.ownLinksFor(s.Conn().RemotePeer()))
+	d.Host.SetStreamHandler(LinksProtocolID, d.Auth.RequireMember(func(stream network.Stream) {
+		defer stream.Close()
+		_ = stream.SetDeadline(time.Now().Add(linkQueryTimeout))
+		data, err := cbor.Marshal(d.ownLinksFor(stream.Conn().RemotePeer()))
 		if err != nil {
-			s.Reset()
+			stream.Reset()
 			return
 		}
-		_ = wire.WriteFrame(s, data)
+		_ = wire.WriteFrame(stream, data)
 	}))
 }
 
@@ -66,8 +66,8 @@ func (d *Daemon) ownLinks() []LinkInfo { return d.linksWhere(func(peer.ID) bool 
 func (d *Daemon) ownLinksFor(asker peer.ID) []LinkInfo {
 	now := time.Now()
 	theirs := d.Store.Circles(asker, now)
-	return d.linksWhere(func(p peer.ID) bool {
-		for _, did := range d.Store.Circles(p, now) {
+	return d.linksWhere(func(peerID peer.ID) bool {
+		for _, did := range d.Store.Circles(peerID, now) {
 			if slices.Contains(theirs, did) {
 				return true
 			}
@@ -79,18 +79,18 @@ func (d *Daemon) ownLinksFor(asker peer.ID) []LinkInfo {
 func (d *Daemon) linksWhere(keep func(peer.ID) bool) []LinkInfo {
 	now := time.Now()
 	var out []LinkInfo
-	for _, p := range d.Host.Network().Peers() {
-		if !d.Store.IsMember(p, now) || !keep(p) {
+	for _, peerID := range d.Host.Network().Peers() {
+		if !d.Store.IsMember(peerID, now) || !keep(peerID) {
 			continue
 		}
-		l := LinkInfo{A: d.Host.ID().String(), B: p.String()}
-		if c := bestConn(d.Host.Network().ConnsToPeer(p)); c != nil {
-			l.Transport, l.Relayed = transportOf(c.RemoteMultiaddr())
+		link := LinkInfo{A: d.Host.ID().String(), B: peerID.String()}
+		if conn := bestConn(d.Host.Network().ConnsToPeer(peerID)); conn != nil {
+			link.Transport, link.Relayed = transportOf(conn.RemoteMultiaddr())
 		}
-		if rtt, ok := d.RTT(p); ok {
-			l.RTTMillis = float64(rtt.Microseconds()) / 1000
+		if rtt, ok := d.RTT(peerID); ok {
+			link.RTTMillis = float64(rtt.Microseconds()) / 1000
 		}
-		out = append(out, l)
+		out = append(out, link)
 	}
 	return out
 }
@@ -111,39 +111,39 @@ func (d *Daemon) graphLinks() []LinkInfo {
 		wg sync.WaitGroup
 	)
 	now := time.Now()
-	for _, p := range d.Host.Network().Peers() {
-		if !d.Store.IsMember(p, now) {
+	for _, peerID := range d.Host.Network().Peers() {
+		if !d.Store.IsMember(peerID, now) {
 			continue
 		}
 		wg.Add(1)
-		go func(p peer.ID) {
+		go func(peerID peer.ID) {
 			defer wg.Done()
-			remote, err := d.queryLinks(p)
+			remote, err := d.queryLinks(peerID)
 			if err != nil {
 				return
 			}
 			mu.Lock()
 			links = append(links, remote...)
 			mu.Unlock()
-		}(p)
+		}(peerID)
 	}
 	wg.Wait()
 
 	// Dedupe by unordered pair; prefer the report that carries an RTT.
 	byPair := map[string]LinkInfo{}
-	for _, l := range links {
-		a, b := l.A, l.B
-		if a > b {
-			a, b = b, a
+	for _, link := range links {
+		first, second := link.A, link.B
+		if first > second {
+			first, second = second, first
 		}
-		key := a + "|" + b
-		if prev, ok := byPair[key]; !ok || (prev.RTTMillis == 0 && l.RTTMillis > 0) {
-			byPair[key] = l
+		key := first + "|" + second
+		if prev, ok := byPair[key]; !ok || (prev.RTTMillis == 0 && link.RTTMillis > 0) {
+			byPair[key] = link
 		}
 	}
 	out := make([]LinkInfo, 0, len(byPair))
-	for _, l := range byPair {
-		out = append(out, l)
+	for _, link := range byPair {
+		out = append(out, link)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].A+out[i].B < out[j].A+out[j].B })
 
@@ -152,16 +152,16 @@ func (d *Daemon) graphLinks() []LinkInfo {
 	return out
 }
 
-func (d *Daemon) queryLinks(p peer.ID) ([]LinkInfo, error) {
+func (d *Daemon) queryLinks(peerID peer.ID) ([]LinkInfo, error) {
 	ctx, cancel := context.WithTimeout(d.ctx, linkQueryTimeout)
 	defer cancel()
-	s, err := d.Host.NewStream(ctx, p, LinksProtocolID)
+	stream, err := d.Host.NewStream(ctx, peerID, LinksProtocolID)
 	if err != nil {
 		return nil, err
 	}
-	defer s.Close()
-	_ = s.SetDeadline(time.Now().Add(linkQueryTimeout))
-	data, err := wire.ReadFrame(s, maxLinksWireSize)
+	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(linkQueryTimeout))
+	data, err := wire.ReadFrame(stream, maxLinksWireSize)
 	if err != nil {
 		return nil, err
 	}
@@ -170,11 +170,11 @@ func (d *Daemon) queryLinks(p peer.ID) ([]LinkInfo, error) {
 		return nil, err
 	}
 	// Trust but bound: a member may only report links where it is one end.
-	own := p.String()
+	own := peerID.String()
 	var out []LinkInfo
-	for _, l := range links {
-		if l.A == own || l.B == own {
-			out = append(out, l)
+	for _, link := range links {
+		if link.A == own || link.B == own {
+			out = append(out, link)
 		}
 	}
 	return out, nil

@@ -11,18 +11,18 @@ import (
 // first root key, and the key history (DIDRoot, handovers.cbor) leads
 // from there to the current one.
 func (c *Circle) RootKeys() []ed25519.PublicKey {
-	k, err := did.KeyFor(c.Config.DID)
+	key, err := did.KeyFor(c.Config.DID)
 	if err != nil {
 		return nil
 	}
-	return []ed25519.PublicKey{k}
+	return []ed25519.PublicKey{key}
 }
 
 // Roots is this circle alone as a statement.Roots, with its key history;
 // an unreadable history leaves the bare DID.
 func (c *Circle) Roots() statement.Roots {
-	if r, err := c.DIDRoot(); err == nil {
-		return r
+	if root, err := c.DIDRoot(); err == nil {
+		return root
 	}
 	return statement.NewDIDRoot(c.Config.DID)
 }
@@ -36,29 +36,29 @@ func Held(root string) HeldRoots { return HeldRoots{root: root} }
 
 // RootKeys implements statement.Roots.
 func (h HeldRoots) RootKeys(circleDID string) []ed25519.PublicKey {
-	if c := h.circle(circleDID); c != nil {
-		return c.RootKeys()
+	if held := h.circle(circleDID); held != nil {
+		return held.RootKeys()
 	}
 	return nil
 }
 
 // Handovers implements statement.RootHistory from the circle's file.
 func (h HeldRoots) Handovers(circleDID string) []*statement.Statement {
-	if c := h.circle(circleDID); c != nil {
-		hs, _ := c.Handovers()
-		return hs
+	if held := h.circle(circleDID); held != nil {
+		handovers, _ := held.Handovers()
+		return handovers
 	}
 	return nil
 }
 
 func (h HeldRoots) circle(circleDID string) *Circle {
-	cs, err := List(h.root)
+	circles, err := List(h.root)
 	if err != nil {
 		return nil
 	}
-	for _, c := range cs {
-		if c.Config.DID == circleDID {
-			return c
+	for _, held := range circles {
+		if held.Config.DID == circleDID {
+			return held
 		}
 	}
 	return nil
@@ -70,9 +70,9 @@ func (h HeldRoots) circle(circleDID string) *Circle {
 type didKeyRoots struct{}
 
 func (didKeyRoots) RootKeys(circleDID string) []ed25519.PublicKey {
-	k, err := did.KeyFor(circleDID)
+	key, err := did.KeyFor(circleDID)
 	if err != nil {
 		return nil
 	}
-	return []ed25519.PublicKey{k}
+	return []ed25519.PublicKey{key}
 }

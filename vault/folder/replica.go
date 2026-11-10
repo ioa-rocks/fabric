@@ -71,7 +71,7 @@ type Replica struct {
 // directory is created if absent and the marker written if the directory
 // is empty; a directory that has content but no marker is adopted (that is
 // how a Syncthing folder migrates) and the marker is added.
-func Open(dir, stateDir string, h *store.Handle) (*Replica, error) {
+func Open(dir, stateDir string, handle *store.Handle) (*Replica, error) {
 	if !filepath.IsAbs(dir) {
 		return nil, fmt.Errorf("folder must be an absolute path")
 	}
@@ -80,10 +80,10 @@ func Open(dir, stateDir string, h *store.Handle) (*Replica, error) {
 	}
 	marker := filepath.Join(dir, Marker)
 	if raw, err := os.ReadFile(marker); err == nil {
-		if strings.TrimSpace(string(raw)) != h.ID() {
-			return nil, fmt.Errorf("%s belongs to bucket %.12s, not %.12s", dir, strings.TrimSpace(string(raw)), h.ID())
+		if strings.TrimSpace(string(raw)) != handle.ID() {
+			return nil, fmt.Errorf("%s belongs to bucket %.12s, not %.12s", dir, strings.TrimSpace(string(raw)), handle.ID())
 		}
-	} else if err := os.WriteFile(marker, []byte(h.ID()+"\n"), 0o644); err != nil {
+	} else if err := os.WriteFile(marker, []byte(handle.ID()+"\n"), 0o644); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Join(stateDir, "staging"), 0o700); err != nil {
@@ -97,7 +97,7 @@ func Open(dir, stateDir string, h *store.Handle) (*Replica, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening scan database: %w", err)
 	}
-	return &Replica{Dir: dir, Handle: h, state: stateDir, db: db, shadow: shadow}, nil
+	return &Replica{Dir: dir, Handle: handle, state: stateDir, db: db, shadow: shadow}, nil
 }
 
 func (r *Replica) Close() error { return r.db.Close() }
@@ -134,28 +134,28 @@ func (r *Replica) getEntry(rel string) (Entry, bool) {
 		return Entry{}, false
 	}
 	defer closer.Close()
-	var e Entry
-	if err := cbor.Unmarshal(raw, &e); err != nil {
+	var entry Entry
+	if err := cbor.Unmarshal(raw, &entry); err != nil {
 		return Entry{}, false
 	}
-	return e, true
+	return entry, true
 }
 
-func (r *Replica) putEntry(rel string, e Entry) error {
+func (r *Replica) putEntry(rel string, entry Entry) error {
 	old, had := r.getEntry(rel)
-	b := r.db.NewBatch()
-	if had && old.Blob != "" && old.Blob != e.Blob {
-		_ = b.Delete([]byte("b/"+old.Blob+"/"+rel), nil)
+	batch := r.db.NewBatch()
+	if had && old.Blob != "" && old.Blob != entry.Blob {
+		_ = batch.Delete([]byte("b/"+old.Blob+"/"+rel), nil)
 	}
-	raw, err := cbor.Marshal(e)
+	raw, err := cbor.Marshal(entry)
 	if err != nil {
 		return err
 	}
-	_ = b.Set([]byte("p/"+rel), raw, nil)
-	if e.Blob != "" {
-		_ = b.Set([]byte("b/"+e.Blob+"/"+rel), nil, nil)
+	_ = batch.Set([]byte("p/"+rel), raw, nil)
+	if entry.Blob != "" {
+		_ = batch.Set([]byte("b/"+entry.Blob+"/"+rel), nil, nil)
 	}
-	return b.Commit(pebble.Sync)
+	return batch.Commit(pebble.Sync)
 }
 
 func (r *Replica) deleteEntry(rel string) error {
@@ -163,12 +163,12 @@ func (r *Replica) deleteEntry(rel string) error {
 	if !had {
 		return nil
 	}
-	b := r.db.NewBatch()
-	_ = b.Delete([]byte("p/"+rel), nil)
+	batch := r.db.NewBatch()
+	_ = batch.Delete([]byte("p/"+rel), nil)
 	if old.Blob != "" {
-		_ = b.Delete([]byte("b/"+old.Blob+"/"+rel), nil)
+		_ = batch.Delete([]byte("b/"+old.Blob+"/"+rel), nil)
 	}
-	return b.Commit(pebble.Sync)
+	return batch.Commit(pebble.Sync)
 }
 
 // entries returns the whole scan database, path → entry.
@@ -180,11 +180,11 @@ func (r *Replica) entries() (map[string]Entry, error) {
 	}
 	defer it.Close()
 	for it.First(); it.Valid(); it.Next() {
-		var e Entry
-		if err := cbor.Unmarshal(it.Value(), &e); err != nil {
+		var entry Entry
+		if err := cbor.Unmarshal(it.Value(), &entry); err != nil {
 			return nil, err
 		}
-		out[strings.TrimPrefix(string(it.Key()), "p/")] = e
+		out[strings.TrimPrefix(string(it.Key()), "p/")] = entry
 	}
 	return out, nil
 }
@@ -203,10 +203,10 @@ func (r *Replica) pathsForBlob(blob string) []string {
 	return out
 }
 
-func prefixBounds(p string) *pebble.IterOptions {
-	upper := []byte(p)
+func prefixBounds(prefix string) *pebble.IterOptions {
+	upper := []byte(prefix)
 	upper = append(upper[:len(upper):len(upper)], 0xff)
-	return &pebble.IterOptions{LowerBound: []byte(p), UpperBound: upper}
+	return &pebble.IterOptions{LowerBound: []byte(prefix), UpperBound: upper}
 }
 
 // --- stat helpers ---------------------------------------------------------
@@ -220,8 +220,8 @@ type statInfo struct {
 	isLnk bool
 }
 
-func lstat(p string) (statInfo, error) {
-	fi, err := os.Lstat(p)
+func lstat(targetPath string) (statInfo, error) {
+	fi, err := os.Lstat(targetPath)
 	if err != nil {
 		return statInfo{}, err
 	}
@@ -253,13 +253,13 @@ func (r *Replica) Has(hash string) bool {
 // unchanged since the last scan, else the shadow copy.
 func (r *Replica) Path(hash string) (string, error) {
 	for _, rel := range r.pathsForBlob(hash) {
-		e, ok := r.getEntry(rel)
+		entry, ok := r.getEntry(rel)
 		if !ok {
 			continue
 		}
-		p := filepath.Join(r.Dir, filepath.FromSlash(rel))
-		if si, err := lstat(p); err == nil && !si.isDir && !si.isLnk && e.unchanged(si) {
-			return p, nil
+		targetPath := filepath.Join(r.Dir, filepath.FromSlash(rel))
+		if si, err := lstat(targetPath); err == nil && !si.isDir && !si.isLnk && entry.unchanged(si) {
+			return targetPath, nil
 		}
 	}
 	return r.shadow.Path(hash)
@@ -267,20 +267,20 @@ func (r *Replica) Path(hash string) (string, error) {
 
 // Open reads a blob.
 func (r *Replica) Open(hash string) (io.ReadCloser, error) {
-	p, err := r.Path(hash)
+	targetPath, err := r.Path(hash)
 	if err != nil {
 		return nil, err
 	}
-	return os.Open(p)
+	return os.Open(targetPath)
 }
 
 // Size of a held blob.
 func (r *Replica) Size(hash string) (int64, error) {
-	p, err := r.Path(hash)
+	targetPath, err := r.Path(hash)
 	if err != nil {
 		return 0, err
 	}
-	fi, err := os.Stat(p)
+	fi, err := os.Stat(targetPath)
 	if err != nil {
 		return 0, err
 	}

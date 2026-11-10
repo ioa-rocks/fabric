@@ -101,14 +101,14 @@ func (g *Gater) Listed() bool { return g.listed.Load() }
 // SetConnSource gives the gater a view of the live connections (normally
 // host.Network().Conns) for the member-host exemption; without it, no
 // exemption applies.
-func (g *Gater) SetConnSource(f func() []network.Conn) { g.conns.Store(&f) }
+func (g *Gater) SetConnSource(fn func() []network.Conn) { g.conns.Store(&fn) }
 
 // SetOracle names which connected members count as dial-back hosts for the
 // member-host exemption: the NAT oracles (lighthouses serving AutoNAT v2),
 // not every member. Without an oracle predicate no inbound unknown peer is
 // exempted — a member on a carrier or café NAT must not open the dark gater
 // to everyone sharing its IP (agy review, 2026-11-02).
-func (g *Gater) SetOracle(f func(peer.ID) bool) { g.oracle.Store(&f) }
+func (g *Gater) SetOracle(fn func(peer.ID) bool) { g.oracle.Store(&fn) }
 
 // Posture names the posture for status output.
 func (g *Gater) Posture() string {
@@ -122,20 +122,20 @@ func (g *Gater) Posture() string {
 // peer was unknown (dark posture only).
 func (g *Gater) RefusedInbound() uint64 { return g.refused.Load() }
 
-func (g *Gater) InterceptPeerDial(p peer.ID) bool {
-	return !g.store.IsRevoked(p, time.Now())
+func (g *Gater) InterceptPeerDial(peerID peer.ID) bool {
+	return !g.store.IsRevoked(peerID, time.Now())
 }
 
 func (g *Gater) InterceptAddrDial(peer.ID, ma.Multiaddr) bool { return true }
 
 func (g *Gater) InterceptAccept(network.ConnMultiaddrs) bool { return true }
 
-func (g *Gater) InterceptSecured(dir network.Direction, p peer.ID, addrs network.ConnMultiaddrs) bool {
+func (g *Gater) InterceptSecured(dir network.Direction, peerID peer.ID, addrs network.ConnMultiaddrs) bool {
 	now := time.Now()
-	if g.store.IsRevoked(p, now) {
+	if g.store.IsRevoked(peerID, now) {
 		return false
 	}
-	if dir == network.DirOutbound || g.listed.Load() || g.store.IsMember(p, now) {
+	if dir == network.DirOutbound || g.listed.Load() || g.store.IsMember(peerID, now) {
 		return true
 	}
 	if g.fromMemberHost(addrs, now) {
@@ -143,7 +143,7 @@ func (g *Gater) InterceptSecured(dir network.Direction, p peer.ID, addrs network
 		return true
 	}
 	g.refused.Add(1)
-	g.noteRefused(p, addrs, now)
+	g.noteRefused(peerID, addrs, now)
 	return false
 }
 
@@ -163,18 +163,18 @@ func (g *Gater) fromMemberHost(addrs network.ConnMultiaddrs, now time.Time) bool
 	if err != nil {
 		return false
 	}
-	for _, c := range (*src)() {
-		if !g.store.IsMember(c.RemotePeer(), now) || !(*oracle)(c.RemotePeer()) {
+	for _, conn := range (*src)() {
+		if !g.store.IsMember(conn.RemotePeer(), now) || !(*oracle)(conn.RemotePeer()) {
 			continue
 		}
-		if other, err := manet.ToIP(c.RemoteMultiaddr()); err == nil && other.Equal(ip) {
+		if other, err := manet.ToIP(conn.RemoteMultiaddr()); err == nil && other.Equal(ip) {
 			return true
 		}
 	}
 	return false
 }
 
-func (g *Gater) noteRefused(p peer.ID, addrs network.ConnMultiaddrs, now time.Time) {
+func (g *Gater) noteRefused(peerID peer.ID, addrs network.ConnMultiaddrs, now time.Time) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if now.Sub(g.windowStart) >= refusedLogWindow {
@@ -183,7 +183,7 @@ func (g *Gater) noteRefused(p peer.ID, addrs network.ConnMultiaddrs, now time.Ti
 		}
 		g.windowStart, g.windowLines, g.suppressed = now, 0, 0
 	}
-	if last, ok := g.lastLog[p]; ok && now.Sub(last) < refusedLogEvery {
+	if last, ok := g.lastLog[peerID]; ok && now.Sub(last) < refusedLogEvery {
 		return
 	}
 	if g.windowLines >= refusedLogBudget {
@@ -192,9 +192,9 @@ func (g *Gater) noteRefused(p peer.ID, addrs network.ConnMultiaddrs, now time.Ti
 	}
 	g.windowLines++
 	if now.Sub(g.lastSweep) >= refusedLogEvery { // amortised expiry, not per refusal
-		for q, t := range g.lastLog {
-			if now.Sub(t) >= refusedLogEvery {
-				delete(g.lastLog, q)
+		for loggedPeer, loggedAt := range g.lastLog {
+			if now.Sub(loggedAt) >= refusedLogEvery {
+				delete(g.lastLog, loggedPeer)
 			}
 		}
 		g.lastSweep = now
@@ -202,10 +202,10 @@ func (g *Gater) noteRefused(p peer.ID, addrs network.ConnMultiaddrs, now time.Ti
 	if len(g.lastLog) >= refusedLogCap {
 		g.lastLog = make(map[peer.ID]time.Time)
 	}
-	g.lastLog[p] = now
+	g.lastLog[peerID] = now
 	from := ""
 	if addrs != nil {
 		from = " from " + addrs.RemoteMultiaddr().String()
 	}
-	log.Printf("dark: refused inbound connection%s by unknown peer %s (not in this node's member store; a new member is admitted once its MemberAdded event arrives by gossip)", from, p)
+	log.Printf("dark: refused inbound connection%s by unknown peer %s (not in this node's member store; a new member is admitted once its MemberAdded event arrives by gossip)", from, peerID)
 }

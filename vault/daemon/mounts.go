@@ -54,11 +54,11 @@ type liveMount struct {
 // until ctx ends. Runs only when a Mounter is wired.
 func (d *Daemon) mountLoop() {
 	d.reconcileMounts()
-	t := time.NewTicker(MountReconcileInterval)
-	defer t.Stop()
+	ticker := time.NewTicker(MountReconcileInterval)
+	defer ticker.Stop()
 	for {
 		select {
-		case <-t.C:
+		case <-ticker.C:
 			d.reconcileMounts()
 		case <-d.ctx.Done():
 			return
@@ -106,18 +106,18 @@ func (d *Daemon) establishMount(dir string, decl store.MountDecl) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	h, err := d.Mounter.Mount(decl.Bucket, dir, decl.Write)
+	handle, err := d.Mounter.Mount(decl.Bucket, dir, decl.Write)
 	if err != nil {
 		return err
 	}
 	d.mountMu.Lock()
 	d.mountGen++
 	gen := d.mountGen
-	d.liveMounts[dir] = &liveMount{handle: h, decl: decl, gen: gen}
+	d.liveMounts[dir] = &liveMount{handle: handle, decl: decl, gen: gen}
 	delete(d.mountErrs, dir)
 	d.mountMu.Unlock()
 	go func() {
-		h.Wait()
+		handle.Wait()
 		d.mountMu.Lock()
 		if cur, ok := d.liveMounts[dir]; ok && cur.gen == gen {
 			delete(d.liveMounts, dir)
@@ -131,14 +131,14 @@ func (d *Daemon) establishMount(dir string, decl store.MountDecl) error {
 // releaseMount unmounts dir if live. Declarations are the caller's business.
 func (d *Daemon) releaseMount(dir string) error {
 	d.mountMu.Lock()
-	m, ok := d.liveMounts[dir]
+	mount, ok := d.liveMounts[dir]
 	delete(d.liveMounts, dir)
 	delete(d.mountErrs, dir)
 	d.mountMu.Unlock()
 	if !ok {
 		return nil
 	}
-	if err := m.handle.Unmount(); err != nil {
+	if err := mount.handle.Unmount(); err != nil {
 		// EBUSY — most commonly a shell sitting inside the mount. Detach
 		// lazily: the kernel finishes when the last user leaves.
 		if lazyErr := LazyUnmount(dir); lazyErr != nil {
@@ -179,9 +179,9 @@ func (d *Daemon) mountInfos() ([]MountInfo, error) {
 	}
 	names := map[string]string{}
 	if buckets, err := d.Store.Buckets(); err == nil {
-		for _, b := range buckets {
-			if id, err := b.ID(); err == nil {
-				names[id] = b.Genesis.Name
+		for _, bkt := range buckets {
+			if id, err := bkt.ID(); err == nil {
+				names[id] = bkt.Genesis.Name
 			}
 		}
 	}

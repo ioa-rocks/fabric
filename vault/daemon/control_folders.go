@@ -19,29 +19,29 @@ func (d *Daemon) folderRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/folders/rescan", d.handleRescanFolder)
 }
 
-func (d *Daemon) handleFolders(w http.ResponseWriter, _ *http.Request) {
+func (d *Daemon) handleFolders(resp http.ResponseWriter, _ *http.Request) {
 	infos, err := d.folderInfos()
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	writeJSON(w, infos)
+	writeJSON(resp, infos)
 }
 
-func (d *Daemon) handleAddFolder(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleAddFolder(resp http.ResponseWriter, req *http.Request) {
 	var body folderBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	id, err := d.Store.ResolveBucketID(body.Bucket)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	decl := store.FolderDecl{Bucket: id}
 	if err := d.Store.SetFolder(body.Dir, decl); err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	// A folder replica holds everything: it is a full placement.
@@ -52,44 +52,44 @@ func (d *Daemon) handleAddFolder(w http.ResponseWriter, r *http.Request) {
 		// The declaration stands; the loop retries. A first open that fails
 		// is reported loudly here and withdrawn, like a failed first mount.
 		_ = d.Store.RemoveFolder(body.Dir)
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	infos, _ := d.folderInfos()
 	for _, info := range infos {
 		if info.Dir == body.Dir {
-			writeJSON(w, info)
+			writeJSON(resp, info)
 			return
 		}
 	}
-	writeJSON(w, FolderInfo{Dir: body.Dir, Bucket: id})
+	writeJSON(resp, FolderInfo{Dir: body.Dir, Bucket: id})
 }
 
-func (d *Daemon) handleRemoveFolder(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleRemoveFolder(resp http.ResponseWriter, req *http.Request) {
 	var body folderBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	if err := d.Store.RemoveFolder(body.Dir); err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	d.closeFolder(body.Dir)
-	writeJSON(w, map[string]string{"dir": body.Dir})
+	writeJSON(resp, map[string]string{"dir": body.Dir})
 }
 
-func (d *Daemon) handleRescanFolder(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) handleRescanFolder(resp http.ResponseWriter, req *http.Request) {
 	var body folderBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	if err := d.rescanFolder(body.Dir); err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	writeJSON(w, map[string]string{"dir": body.Dir})
+	writeJSON(resp, map[string]string{"dir": body.Dir})
 }
 
 // Client side.

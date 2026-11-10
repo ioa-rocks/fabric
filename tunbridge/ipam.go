@@ -26,17 +26,17 @@ func NextFreeIP(subnet string, taken []string) (string, error) {
 	}
 	prefix = prefix.Masked()
 	used := map[netip.Addr]bool{}
-	for _, t := range taken {
-		if p, err := netip.ParsePrefix(t); err == nil {
-			used[p.Addr()] = true
-		} else if a, err := netip.ParseAddr(t); err == nil {
-			used[a] = true
+	for _, takenAddr := range taken {
+		if parsedPrefix, err := netip.ParsePrefix(takenAddr); err == nil {
+			used[parsedPrefix.Addr()] = true
+		} else if addr, err := netip.ParseAddr(takenAddr); err == nil {
+			used[addr] = true
 		}
 	}
 	broadcast := lastAddr(prefix)
-	for a := prefix.Addr().Next(); prefix.Contains(a) && a != broadcast; a = a.Next() {
-		if !used[a] {
-			return netip.PrefixFrom(a, prefix.Bits()).String(), nil
+	for addr := prefix.Addr().Next(); prefix.Contains(addr) && addr != broadcast; addr = addr.Next() {
+		if !used[addr] {
+			return netip.PrefixFrom(addr, prefix.Bits()).String(), nil
 		}
 	}
 	return "", fmt.Errorf("overlay subnet %s is exhausted", subnet)
@@ -44,12 +44,12 @@ func NextFreeIP(subnet string, taken []string) (string, error) {
 
 // lastAddr returns the highest address in a v4 prefix (the broadcast).
 // LastAddr is the subnet's last (broadcast) address — never allocated.
-func LastAddr(p netip.Prefix) netip.Addr { return lastAddr(p) }
+func LastAddr(prefix netip.Prefix) netip.Addr { return lastAddr(prefix) }
 
-func lastAddr(p netip.Prefix) netip.Addr {
-	a4 := p.Addr().As4()
-	hostBits := 32 - p.Bits()
-	v := uint32(a4[0])<<24 | uint32(a4[1])<<16 | uint32(a4[2])<<8 | uint32(a4[3])
-	v |= (1 << hostBits) - 1
-	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
+func lastAddr(prefix netip.Prefix) netip.Addr {
+	a4 := prefix.Addr().As4()
+	hostBits := 32 - prefix.Bits()
+	ipBits := uint32(a4[0])<<24 | uint32(a4[1])<<16 | uint32(a4[2])<<8 | uint32(a4[3])
+	ipBits |= (1 << hostBits) - 1
+	return netip.AddrFrom4([4]byte{byte(ipBits >> 24), byte(ipBits >> 16), byte(ipBits >> 8), byte(ipBits)})
 }

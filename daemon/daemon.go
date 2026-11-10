@@ -141,16 +141,16 @@ func New(dir state.Dir) (*Daemon, error) {
 	// device joined through the queue, or a gate hosting the circle, gets a
 	// key-less one here (the membership-event log was that persistence
 	// until 2026-11-07).
-	held := false
-	for _, c := range circles {
-		held = held || c.Config.DID == first
+	hasFirst := false
+	for _, held := range circles {
+		hasFirst = hasFirst || held.Config.DID == first
 	}
-	if !held {
-		c, err := circle.Hold(circle.Root(dir.Path), first)
+	if !hasFirst {
+		held, err := circle.Hold(circle.Root(dir.Path), first)
 		if err != nil {
 			return nil, fmt.Errorf("holding the first circle: %w", err)
 		}
-		circles = append(circles, c)
+		circles = append(circles, held)
 	}
 	roots := statement.NewDIDRoot(first)
 	store := fabricnet.NewMemberStore(roots)
@@ -158,24 +158,24 @@ func New(dir state.Dir) (*Daemon, error) {
 	// union (memo §17: transport is the union of circles): a device
 	// admitted only into `family` is admitted here because `family` is.
 	// Dirs whose DID the log-fed roster already honours are that roster.
-	for _, c := range circles {
-		if roots.Honours(c.Config.DID) {
+	for _, held := range circles {
+		if roots.Honours(held.Config.DID) {
 			// The first circle's directory: its roster persists there.
-			if err := store.Attach(c, time.Now()); err != nil {
-				log.Printf("circle %q: devices.cbor unreadable: %v", c.Config.Name, err)
+			if err := store.Attach(held, time.Now()); err != nil {
+				log.Printf("circle %q: devices.cbor unreadable: %v", held.Config.Name, err)
 			}
 			continue
 		}
-		roster, err := circle.OpenRoster(c, time.Now())
+		roster, err := circle.OpenRoster(held, time.Now())
 		if err != nil {
-			log.Printf("circle %q: roster unreadable, starting empty: %v", c.Config.Name, err)
-			roster = circle.NewRoster(statement.NewDIDRoot(c.Config.DID))
+			log.Printf("circle %q: roster unreadable, starting empty: %v", held.Config.Name, err)
+			roster = circle.NewRoster(statement.NewDIDRoot(held.Config.DID))
 		}
 		store.AddRoster(roster)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &Daemon{
+	node := &Daemon{
 		Dir: dir, Config: cfg, Store: store, Gater: fabricnet.NewGater(store), Roots: roots,
 		ownCert: own, ctx: ctx, cancel: cancel,
 		rtt: make(map[peer.ID]time.Duration), reachability: "unknown",
@@ -192,7 +192,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		if _, err := peerInfo(addr); err != nil {
 			log.Printf("bad bootstrap addr %q: %v", addr, err)
 		}
-		d.pinnedBootstrap[addr] = true
+		node.pinnedBootstrap[addr] = true
 	}
 
 	// Announce addresses (config) join the advertised set: a node behind
@@ -202,15 +202,15 @@ func New(dir state.Dir) (*Daemon, error) {
 	// see announce.go); hostnames also resolve into IP literals and are
 	// re-resolved for the daemon's lifetime.
 	announce := expandAnnounce(cfg.AnnounceAddrs, cfg.ListenAddrs, systemLookup)
-	d.announced.Store(&announce)
+	node.announced.Store(&announce)
 
 	opts := []libp2p.Option{
 		libp2p.Identity(priv),
 		libp2p.UserAgent(Agent()),
 		// Share libp2p's observation tracker, including disconnect cleanup.
-		libp2p.WithFxOption(fx.Populate(&d.observedAddrs)),
+		libp2p.WithFxOption(fx.Populate(&node.observedAddrs)),
 		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
-		libp2p.ConnectionGater(d.Gater),
+		libp2p.ConnectionGater(node.Gater),
 		recoveryTransportOption(),
 		// NAT traversal (connectivity-model memo): every node can
 		// hole-punch (DCUtR upgrades relayed connections to direct; the
@@ -218,7 +218,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		// we're private, autorelay reserves a slot on a lighthouse — the
 		// /p2p-circuit address then rides our signed address record like
 		// any other.
-		libp2p.EnableAutoRelayWithPeerSource(d.relayCandidates, recoveryRelayOptions()...),
+		libp2p.EnableAutoRelayWithPeerSource(node.relayCandidates, recoveryRelayOptions()...),
 		// AutoNAT v2: per-address reachability. v1 above gives the single
 		// node verdict that drives autorelay; v2 answers the question v1
 		// can't — WHICH addresses work. On a CGNAT-v4 + firewalled-v6 home
@@ -227,7 +227,7 @@ func New(dir state.Dir) (*Daemon, error) {
 		// Every node is also a v2 dial-back server for its peers.
 		libp2p.EnableAutoNATv2(),
 		libp2p.AddrsFactory(func(addrs []ma.Multiaddr) []ma.Multiaddr {
-			return advertiseAddrs(addrs, *d.announced.Load())
+			return advertiseAddrs(addrs, *node.announced.Load())
 		}),
 	}
 	// Members-dark by default (memo l0-overlapping-circles §12.6): only a
@@ -235,7 +235,7 @@ func New(dir state.Dir) (*Daemon, error) {
 	// one the operator lists explicitly — accepts inbound connections from
 	// peers outside its member store. Everyone else learns new members by
 	// gossip first and refuses the unknown before multistream runs.
-	d.Gater.SetListed(cfg.QueueHost || cfg.Listed)
+	node.Gater.SetListed(cfg.QueueHost || cfg.Listed)
 	if cfg.QueueHost {
 		// The lighthouse is also the mesh's relay and NAT oracle: a
 		// members-only circuit-relay-v2 service (unlimited — it may carry
@@ -256,7 +256,7 @@ func New(dir state.Dir) (*Daemon, error) {
 			opts = append(opts, libp2p.ForceReachabilityPublic())
 		}
 	}
-	h, err := libp2p.New(opts...)
+	libp2pHost, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("starting libp2p host: %w", err)
 	}
@@ -267,38 +267,38 @@ func New(dir state.Dir) (*Daemon, error) {
 		// address as reachable that the internet cannot reach. Only
 		// off-site queue hosts get to hand out verdicts; every node keeps
 		// the v2 *client* (dial-back handler) so it can be verified.
-		h.RemoveStreamHandler(autonatv2.DialProtocol)
+		libp2pHost.RemoveStreamHandler(autonatv2.DialProtocol)
 	}
-	d.Host = h
+	node.Host = libp2pHost
 	// Member-host exemption for AutoNAT dial-backs: only from the IP of a
 	// connected member that is a NAT oracle (serves the v2 dial protocol —
 	// the lighthouses), not of any member: a phone on carrier NAT would
 	// otherwise open the dark gater to everyone behind that NAT.
-	d.Gater.SetConnSource(h.Network().Conns)
+	node.Gater.SetConnSource(libp2pHost.Network().Conns)
 	// Which members count as oracles is decided locally: the lighthouses
 	// the operator configured (join target, `fabric peer add`), not
 	// whoever advertises the dial protocol — a member could advertise it
 	// itself and open the gater to its NAT neighbours (Codex review,
 	// 2026-11-02). Pinned-by-discovery lighthouses do not qualify.
-	d.Gater.SetOracle(d.isConfiguredBootstrap)
-	if err := d.startHolePunch(); err != nil {
-		h.Close()
+	node.Gater.SetOracle(node.isConfiguredBootstrap)
+	if err := node.startHolePunch(); err != nil {
+		libp2pHost.Close()
 		return nil, fmt.Errorf("starting hole punching: %w", err)
 	}
 	// A renewal of this device's cert that reached the roster while
 	// cert.cbor lagged behind (a crash between learning and adoption).
-	if c, ok := store.Cert(h.ID()); ok {
-		d.adoptOwnCert(c)
+	if memberCert, ok := store.Cert(libp2pHost.ID()); ok {
+		node.adoptOwnCert(memberCert)
 	}
 
 	// Hard-coded admission transparency (spec §5): every join is announced.
 	// OwnCert, not the loaded `own`: the roster may hold a newer (renewed)
 	// cert.
-	d.Auth = fabricnet.NewAuthService(h, store, d.OwnCert(), AuthGrace, func(p peer.ID, c *cert.Cert) {
-		log.Printf("member joined: %q (%s)", c.Payload.Meta.Name, p)
+	node.Auth = fabricnet.NewAuthService(libp2pHost, store, node.OwnCert(), AuthGrace, func(peerID peer.ID, memberCert *cert.Cert) {
+		log.Printf("member joined: %q (%s)", memberCert.Payload.Meta.Name, peerID)
 	})
-	d.Sync = fabricnet.NewEventSync(h, store)
-	d.Auth.SetOnAuthenticated(d.Sync.ExchangeAsync)
+	node.Sync = fabricnet.NewEventSync(libp2pHost, store)
+	node.Auth.SetOnAuthenticated(node.Sync.ExchangeAsync)
 
 	// The dialer proves itself on every outbound connection. This is the
 	// self-heal for one-way-known pairs (the gate-hetz incident: A knew B,
@@ -311,17 +311,17 @@ func New(dir state.Dir) (*Daemon, error) {
 	// peer it chose (a member, or its bootstrap), and the accepting side
 	// never speaks before it has read a valid cert. Inbound strangers on a
 	// listed node just time out; a dark node refused them already.
-	h.Network().Notify(&network.NotifyBundle{ConnectedF: func(_ network.Network, c network.Conn) {
-		if c.Stat().Direction != network.DirOutbound || d.OwnCert() == nil {
+	libp2pHost.Network().Notify(&network.NotifyBundle{ConnectedF: func(_ network.Network, conn network.Conn) {
+		if conn.Stat().Direction != network.DirOutbound || node.OwnCert() == nil {
 			return
 		}
-		p := c.RemotePeer()
-		known := d.Store.IsMember(p, time.Now())
+		peerID := conn.RemotePeer()
+		known := node.Store.IsMember(peerID, time.Now())
 		go func() {
-			ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
+			ctx, cancel := context.WithTimeout(node.ctx, 10*time.Second)
 			defer cancel()
-			if err := d.Auth.Authenticate(ctx, p); err == nil && !known {
-				log.Printf("mesh: authenticated %s on connect (was not in the member store)", p)
+			if err := node.Auth.Authenticate(ctx, peerID); err == nil && !known {
+				log.Printf("mesh: authenticated %s on connect (was not in the member store)", peerID)
 			}
 		}()
 	}})
@@ -332,14 +332,14 @@ func New(dir state.Dir) (*Daemon, error) {
 	if recs, err := dir.LoadRecords(); err != nil {
 		log.Printf("record cache unreadable, starting cold: %v", err)
 	} else if len(recs) > 0 {
-		d.Sync.SeedRecords(recs)
+		node.Sync.SeedRecords(recs)
 	}
 
 	// RTT telemetry. The default ping handler answers anyone; re-wrap it so
 	// only members get an answer (spec §4: nothing reachable pre-auth).
-	pingSvc := ping.NewPingService(h)
-	h.SetStreamHandler(ping.ID, d.Auth.RequireMember(pingSvc.PingHandler))
-	d.attachLinks()
+	pingSvc := ping.NewPingService(libp2pHost)
+	libp2pHost.SetStreamHandler(ping.ID, node.Auth.RequireMember(pingSvc.PingHandler))
+	node.attachLinks()
 
 	// The admission queue runs on the master (bootstrap wrinkle, spec §6)
 	// and on any member designated a queue host (`fabric queue on` — the
@@ -347,19 +347,19 @@ func New(dir state.Dir) (*Daemon, error) {
 	// approval happens wherever the root key is, locally via the control
 	// API or remotely over /fabric/queue/1.
 	if dir.IsMaster() || cfg.QueueHost {
-		d.Queue = admission.NewQueue(func(p admission.PendingInfo) {
-			log.Printf("join request pending: %q fingerprint=%s (fabric approve %s)", p.Name, p.Fingerprint, p.Fingerprint)
+		node.Queue = admission.NewQueue(func(pending admission.PendingInfo) {
+			log.Printf("join request pending: %q fingerprint=%s (fabric approve %s)", pending.Name, pending.Fingerprint, pending.Fingerprint)
 		})
-		admission.Attach(h, d.Queue, d.CircleDID)
-		admission.AttachQueue(h, d.Queue, d.Auth.RequireMember, d.isMasterDevice, func(certBytes []byte) error {
-			if d.Circle == nil {
+		admission.Attach(libp2pHost, node.Queue, node.CircleDID)
+		admission.AttachQueue(libp2pHost, node.Queue, node.Auth.RequireMember, node.isMasterDevice, func(certBytes []byte) error {
+			if node.Circle == nil {
 				return errors.New("no circle service attached")
 			}
-			_, err := d.Circle.Admit(certBytes)
+			_, err := node.Circle.Admit(certBytes)
 			return err
 		})
 	}
-	return d, nil
+	return node, nil
 }
 
 // firstCircle settles which circle is the device's first and what it
@@ -370,12 +370,12 @@ func New(dir state.Dir) (*Daemon, error) {
 // this device (its cert view stands in for the membership cert). A node
 // with neither is not set up.
 func firstCircle(cfg state.Config, own *cert.Cert, circles []*circle.Circle, now time.Time) (string, *cert.Cert, error) {
-	fromDir := func(c *circle.Circle) *cert.Cert {
-		a, err := c.LoadAdmission()
-		if err != nil || a.Valid(now) != nil {
+	fromDir := func(held *circle.Circle) *cert.Cert {
+		admission, err := held.LoadAdmission()
+		if err != nil || admission.Valid(now) != nil {
 			return nil
 		}
-		view, err := cert.FromStatement(a.Stmt)
+		view, err := cert.FromStatement(admission.Stmt)
 		if err != nil {
 			return nil
 		}
@@ -386,9 +386,9 @@ func firstCircle(cfg state.Config, own *cert.Cert, circles []*circle.Circle, now
 			return "", nil, fmt.Errorf("config namespace_did %q is not a did:key", cfg.CircleDID)
 		}
 		if own == nil {
-			for _, c := range circles {
-				if c.Config.DID == cfg.CircleDID {
-					own = fromDir(c)
+			for _, held := range circles {
+				if held.Config.DID == cfg.CircleDID {
+					own = fromDir(held)
 				}
 			}
 		}
@@ -400,9 +400,9 @@ func firstCircle(cfg state.Config, own *cert.Cert, circles []*circle.Circle, now
 	if own != nil {
 		return own.Payload.Sub, own, nil
 	}
-	for _, c := range circles {
-		if view := fromDir(c); view != nil {
-			return c.Config.DID, view, nil
+	for _, held := range circles {
+		if view := fromDir(held); view != nil {
+			return held.Config.DID, view, nil
 		}
 	}
 	return "", nil, errors.New("this node is in no circle yet — 'fabric init' mints one, 'fabric join <gate>' or 'fabric join <bundle>' joins one")
@@ -416,46 +416,46 @@ func firstCircle(cfg state.Config, own *cert.Cert, circles []*circle.Circle, now
 // differed from a member's, and it stopped the master from signing sub-keys
 // (step 4 decision 1). Approvals are root-signed events verified at ingest
 // regardless; this guards the pending list and denials.
-func (d *Daemon) isMasterDevice(p peer.ID) bool {
-	m, ok := d.masterDevice()
-	return ok && m == p
+func (d *Daemon) isMasterDevice(peerID peer.ID) bool {
+	masterID, ok := d.masterDevice()
+	return ok && masterID == peerID
 }
 
 // masterDevice derives the master's peer ID from the home roster: the
 // device of the earliest-issued admission it holds (issue time, then ID).
 func (d *Daemon) masterDevice() (peer.ID, bool) {
-	r, ok := d.Store.RosterFor(d.CircleDID())
+	roster, ok := d.Store.RosterFor(d.CircleDID())
 	if !ok {
 		return "", false
 	}
 	var first *circle.Device
-	for _, dev := range r.Devices() {
-		for _, h := range r.Held(dev.DID) {
-			if first == nil || h.Issued().Before(first.Issued()) {
-				first = h
+	for _, dev := range roster.Devices() {
+		for _, held := range roster.Held(dev.DID) {
+			if first == nil || held.Issued().Before(first.Issued()) {
+				first = held
 				continue
 			}
-			if hid, fid := h.Stmt.ID(), first.Stmt.ID(); h.Issued().Equal(first.Issued()) && bytes.Compare(hid[:], fid[:]) < 0 {
-				first = h
+			if hid, fid := held.Stmt.ID(), first.Stmt.ID(); held.Issued().Equal(first.Issued()) && bytes.Compare(hid[:], fid[:]) < 0 {
+				first = held
 			}
 		}
 	}
 	if first == nil {
 		return "", false
 	}
-	c, err := cert.FromStatement(first.Stmt)
+	memberCert, err := cert.FromStatement(first.Stmt)
 	if err != nil {
 		return "", false
 	}
-	devKey, err := c.DeviceKey()
+	devKey, err := memberCert.DeviceKey()
 	if err != nil {
 		return "", false
 	}
-	p, err := fabricnet.PeerIDForKey(devKey)
+	peerID, err := fabricnet.PeerIDForKey(devKey)
 	if err != nil {
 		return "", false
 	}
-	return p, true
+	return peerID, true
 }
 
 // Admitted is the roster's word that an admission is new here — recorded
@@ -463,51 +463,51 @@ func (d *Daemon) masterDevice() (peer.ID, bool) {
 // adopts its own renewed cert from it, and the spec-§5 notifications are
 // logged for the home circle's devices.
 func (d *Daemon) Admitted(from peer.ID, st *statement.Statement) {
-	c, err := cert.FromStatement(st)
+	memberCert, err := cert.FromStatement(st)
 	if err != nil {
 		return
 	}
-	devKey, err := c.DeviceKey()
+	devKey, err := memberCert.DeviceKey()
 	if err != nil {
 		return
 	}
-	p, err := fabricnet.PeerIDForKey(devKey)
+	peerID, err := fabricnet.PeerIDForKey(devKey)
 	if err != nil {
 		return
 	}
-	if p == d.Host.ID() {
-		d.adoptOwnCert(c)
+	if peerID == d.Host.ID() {
+		d.adoptOwnCert(memberCert)
 		return
 	}
-	if c.Payload.Sub != d.CircleDID() {
+	if memberCert.Payload.Sub != d.CircleDID() {
 		return
 	}
 	now := time.Now()
-	name := c.Payload.Meta.Name
-	if !now.Before(c.Expiry()) {
-		log.Printf("roster: %q (%s) lapsed — its cert expired %s; it needs a fresh 'fabric join'", name, p, c.Expiry().Format(time.RFC3339))
+	name := memberCert.Payload.Meta.Name
+	if !now.Before(memberCert.Expiry()) {
+		log.Printf("roster: %q (%s) lapsed — its cert expired %s; it needs a fresh 'fabric join'", name, peerID, memberCert.Expiry().Format(time.RFC3339))
 		return
 	}
 	// Renewals and restorations are admissions too (spec §5) but must not
 	// fire the "new member" notification: what else the roster holds for
 	// the device tells them apart.
 	earlier, liveBefore := false, false
-	if r, ok := d.Store.RosterFor(c.Payload.Sub); ok {
-		for _, h := range r.Held(cert.DIDForKey(devKey)) {
-			if h.Stmt.ID() == st.ID() {
+	if roster, ok := d.Store.RosterFor(memberCert.Payload.Sub); ok {
+		for _, held := range roster.Held(cert.DIDForKey(devKey)) {
+			if held.Stmt.ID() == st.ID() {
 				continue
 			}
 			earlier = true
-			liveBefore = liveBefore || now.Before(h.Exp)
+			liveBefore = liveBefore || now.Before(held.Exp)
 		}
 	}
 	switch {
 	case !earlier:
-		log.Printf("member added: %q (%s), approved by master", name, p)
+		log.Printf("member added: %q (%s), approved by master", name, peerID)
 	case !liveBefore:
-		log.Printf("member re-admitted: %q (%s), approved by master", name, p)
+		log.Printf("member re-admitted: %q (%s), approved by master", name, peerID)
 	default:
-		log.Printf("member cert renewed: %q (%s), now expires %s", name, p, c.Expiry().Format(time.RFC3339))
+		log.Printf("member cert renewed: %q (%s), now expires %s", name, peerID, memberCert.Expiry().Format(time.RFC3339))
 	}
 }
 
@@ -516,13 +516,13 @@ func (d *Daemon) Admitted(from peer.ID, st *statement.Statement) {
 func (d *Daemon) queueHosts() []peer.ID {
 	var hosts []peer.ID
 	now := time.Now()
-	for _, p := range d.Host.Network().Peers() {
-		if !d.Store.IsMember(p, now) {
+	for _, peerID := range d.Host.Network().Peers() {
+		if !d.Store.IsMember(peerID, now) {
 			continue
 		}
-		protos, err := d.Host.Peerstore().SupportsProtocols(p, admission.QueueProtocolID)
+		protos, err := d.Host.Peerstore().SupportsProtocols(peerID, admission.QueueProtocolID)
 		if err == nil && len(protos) > 0 {
-			hosts = append(hosts, p)
+			hosts = append(hosts, peerID)
 		}
 	}
 	return hosts
@@ -531,8 +531,8 @@ func (d *Daemon) queueHosts() []peer.ID {
 // Run serves until the context given to Stop/cancel fires.
 func (d *Daemon) Run() error {
 	log.Printf("fabric node %q up, peer ID %s", d.Config.Name, d.Host.ID())
-	for _, a := range d.Host.Addrs() {
-		log.Printf("listening on %s/p2p/%s", a, d.Host.ID())
+	for _, addr := range d.Host.Addrs() {
+		log.Printf("listening on %s/p2p/%s", addr, d.Host.ID())
 	}
 	if d.Queue != nil {
 		log.Printf("admission queue active (master)")
@@ -637,11 +637,11 @@ func (d *Daemon) startDNS() {
 // dnsLookup resolves a member name to its overlay address; the node's own
 // name resolves to itself.
 func (d *Daemon) dnsLookup(host string) (netip.Addr, bool) {
-	match := func(c *cert.Cert) (netip.Addr, bool) {
-		if !strings.EqualFold(c.Payload.Meta.Name, host) || c.Payload.Meta.IP == "" {
+	match := func(memberCert *cert.Cert) (netip.Addr, bool) {
+		if !strings.EqualFold(memberCert.Payload.Meta.Name, host) || memberCert.Payload.Meta.IP == "" {
 			return netip.Addr{}, false
 		}
-		pfx, err := netip.ParsePrefix(c.Payload.Meta.IP)
+		pfx, err := netip.ParsePrefix(memberCert.Payload.Meta.IP)
 		if err != nil {
 			return netip.Addr{}, false
 		}
@@ -716,20 +716,20 @@ func (d *Daemon) watchReachability() {
 		select {
 		case <-d.ctx.Done():
 			return
-		case ev, ok := <-sub.Out():
+		case rawEvt, ok := <-sub.Out():
 			if !ok {
 				return
 			}
-			switch e := ev.(type) {
+			switch evt := rawEvt.(type) {
 			case libp2pevent.EvtLocalReachabilityChanged:
 				d.teleMu.Lock()
-				d.reachability = e.Reachability.String()
+				d.reachability = evt.Reachability.String()
 				d.teleMu.Unlock()
 			case libp2pevent.EvtHostReachableAddrsChanged:
 				d.teleMu.Lock()
-				d.reachableAddrs = addrStrings(e.Reachable)
-				d.unreachableAddrs = addrStrings(e.Unreachable)
-				d.unknownAddrs = addrStrings(e.Unknown)
+				d.reachableAddrs = addrStrings(evt.Reachable)
+				d.unreachableAddrs = addrStrings(evt.Unreachable)
+				d.unknownAddrs = addrStrings(evt.Unknown)
 				d.teleMu.Unlock()
 			}
 		}
@@ -741,8 +741,8 @@ func addrStrings(addrs []ma.Multiaddr) []string {
 		return nil
 	}
 	out := make([]string, len(addrs))
-	for i, a := range addrs {
-		out[i] = a.String()
+	for i, addr := range addrs {
+		out[i] = addr.String()
 	}
 	sort.Strings(out)
 	return out
@@ -751,29 +751,29 @@ func addrStrings(addrs []ma.Multiaddr) []string {
 // measureRTT pings every connected member once, in the background.
 func (d *Daemon) measureRTT() {
 	now := time.Now()
-	for _, p := range d.Host.Network().Peers() {
-		if !d.Store.IsMember(p, now) {
+	for _, peerID := range d.Host.Network().Peers() {
+		if !d.Store.IsMember(peerID, now) {
 			continue
 		}
-		go func(p peer.ID) {
+		go func(peerID peer.ID) {
 			ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
 			defer cancel()
-			res := <-ping.Ping(ctx, d.Host, p)
+			res := <-ping.Ping(ctx, d.Host, peerID)
 			if res.Error != nil {
 				return
 			}
 			d.teleMu.Lock()
-			d.rtt[p] = res.RTT
+			d.rtt[peerID] = res.RTT
 			d.teleMu.Unlock()
-		}(p)
+		}(peerID)
 	}
 }
 
 // RTT returns the last measured round-trip time to a peer, if any.
-func (d *Daemon) RTT(p peer.ID) (time.Duration, bool) {
+func (d *Daemon) RTT(peerID peer.ID) (time.Duration, bool) {
 	d.teleMu.Lock()
 	defer d.teleMu.Unlock()
-	rtt, ok := d.rtt[p]
+	rtt, ok := d.rtt[peerID]
 	return rtt, ok
 }
 
@@ -806,9 +806,9 @@ func AllocateOverlayIP(dir state.Dir, members []MemberInfo) (string, error) {
 		return "", nil
 	}
 	taken := make([]string, 0, len(members)+1)
-	for _, m := range members {
-		if m.IP != "" {
-			taken = append(taken, m.IP)
+	for _, member := range members {
+		if member.IP != "" {
+			taken = append(taken, member.IP)
 		}
 	}
 	// The master's own cert is not in the member store.
@@ -852,13 +852,13 @@ func CheckOverlayIP(dir state.Dir, members []MemberInfo, want, fingerprint strin
 		return "", fmt.Errorf("overlay address %s is the subnet's network/broadcast address", addr)
 	}
 	got := netip.PrefixFrom(addr, subnet.Bits()).String()
-	for _, m := range members {
-		if m.IP == "" || m.Fingerprint == fingerprint {
+	for _, member := range members {
+		if member.IP == "" || member.Fingerprint == fingerprint {
 			continue
 		}
-		if p, err := netip.ParsePrefix(m.IP); err == nil && p.Addr() == addr {
-			who := m.Name
-			if m.Expired {
+		if pfx, err := netip.ParsePrefix(member.IP); err == nil && pfx.Addr() == addr {
+			who := member.Name
+			if member.Expired {
 				who += " (expired; its address is held until it re-joins or is revoked)"
 			}
 			return "", fmt.Errorf("overlay address %s is held by %s", addr, who)
@@ -872,9 +872,9 @@ func CheckOverlayIP(dir state.Dir, members []MemberInfo, want, fingerprint strin
 // a known device coming back after its cert expired keeps its address
 // instead of drawing a new one.
 func ReturningMemberIP(members []MemberInfo, fingerprint string) string {
-	for _, m := range members {
-		if m.Expired && m.Fingerprint == fingerprint {
-			return m.IP
+	for _, member := range members {
+		if member.Expired && member.Fingerprint == fingerprint {
+			return member.IP
 		}
 	}
 	return ""
@@ -898,31 +898,31 @@ func (d *Daemon) OwnCert() *cert.Cert {
 // the expiries — a cert.cbor left from before the 2026-11-02 migration
 // must not keep this device on a root nobody honours (Codex review,
 // 2026-11-02).
-func (d *Daemon) adoptOwnCert(c *cert.Cert) {
+func (d *Daemon) adoptOwnCert(memberCert *cert.Cert) {
 	ns := d.CircleDID()
 	d.certMu.Lock()
 	if cur := d.ownCert; cur != nil {
-		moving := cur.Payload.Sub != c.Payload.Sub && c.Payload.Sub == ns
-		if !moving && (cur.Payload.Sub == ns && c.Payload.Sub != ns || !c.Expiry().After(cur.Expiry())) {
+		moving := cur.Payload.Sub != memberCert.Payload.Sub && memberCert.Payload.Sub == ns
+		if !moving && (cur.Payload.Sub == ns && memberCert.Payload.Sub != ns || !memberCert.Expiry().After(cur.Expiry())) {
 			d.certMu.Unlock()
 			return
 		}
 	}
-	d.ownCert = c
+	d.ownCert = memberCert
 	d.certMu.Unlock()
-	if err := d.Dir.SaveCert(c); err != nil {
+	if err := d.Dir.SaveCert(memberCert); err != nil {
 		log.Printf("persisting renewed cert: %v", err)
 	}
-	if d.Bridge != nil && d.bridgeIP != c.Payload.Meta.IP {
+	if d.Bridge != nil && d.bridgeIP != memberCert.Payload.Meta.IP {
 		// Renumbering (fabric renew -ip). The bridge and resolver were
 		// brought up on the old address; a restart re-addresses fabric0.
-		log.Printf("overlay address changed %s -> %s — restart this daemon to re-address fabric0", d.bridgeIP, c.Payload.Meta.IP)
+		log.Printf("overlay address changed %s -> %s — restart this daemon to re-address fabric0", d.bridgeIP, memberCert.Payload.Meta.IP)
 	}
 	if d.Auth != nil {
-		d.Auth.SetOwn(c)
+		d.Auth.SetOwn(memberCert)
 		go d.representCert()
 	}
-	log.Printf("own certificate renewed — now expires %s", c.Expiry().Format(time.RFC3339))
+	log.Printf("own certificate renewed — now expires %s", memberCert.Expiry().Format(time.RFC3339))
 }
 
 // representCert re-runs the handshake with every connected member after
@@ -932,15 +932,15 @@ func (d *Daemon) representCert() {
 	if d.Host == nil || d.ctx == nil {
 		return
 	}
-	for _, p := range d.Host.Network().Peers() {
-		if p == d.Host.ID() || !d.Store.IsMember(p, time.Now()) {
+	for _, peerID := range d.Host.Network().Peers() {
+		if peerID == d.Host.ID() || !d.Store.IsMember(peerID, time.Now()) {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
-		err := d.Auth.Authenticate(ctx, p)
+		err := d.Auth.Authenticate(ctx, peerID)
 		cancel()
 		if err != nil {
-			log.Printf("re-presenting cert to %s: %v", p, err)
+			log.Printf("re-presenting cert to %s: %v", peerID, err)
 		}
 	}
 }
@@ -957,12 +957,12 @@ func (d *Daemon) CircleDID() string {
 func (d *Daemon) persistRecords() {
 	recs := d.Sync.KnownRecords()
 	sort.Slice(recs, func(i, j int) bool { return bytes.Compare(recs[i], recs[j]) < 0 })
-	h := sha256.New()
-	for _, r := range recs {
-		h.Write(r)
+	hasher := sha256.New()
+	for _, rec := range recs {
+		hasher.Write(rec)
 	}
 	var sum [sha256.Size]byte
-	h.Sum(sum[:0])
+	hasher.Sum(sum[:0])
 	if sum == d.recordsHash {
 		return
 	}
@@ -989,8 +989,8 @@ func (d *Daemon) reconnectLoop() {
 			fingerprint = recovery.network
 		}
 		connected := false
-		for _, p := range d.Host.Network().Peers() {
-			if d.Store.IsMember(p, now) {
+		for _, peerID := range d.Host.Network().Peers() {
+			if d.Store.IsMember(peerID, now) {
 				connected = true
 				break
 			}
@@ -1024,9 +1024,9 @@ func (d *Daemon) pinQueueHosts() {
 	defer d.cfgMu.Unlock()
 	cfg := d.Config
 	var added []string
-	for _, p := range d.queueHosts() {
-		for _, addr := range d.Host.Peerstore().Addrs(p) {
-			bootstrap, ok := durableBootstrapAddr(addr, p)
+	for _, peerID := range d.queueHosts() {
+		for _, addr := range d.Host.Peerstore().Addrs(peerID) {
+			bootstrap, ok := durableBootstrapAddr(addr, peerID)
 			if !ok || d.pinnedBootstrap[bootstrap] {
 				continue
 			}
@@ -1050,7 +1050,7 @@ func (d *Daemon) pinQueueHosts() {
 	log.Printf("lighthouse bootstrap: discovered public queue-host addresses saved")
 }
 
-func durableBootstrapAddr(addr ma.Multiaddr, p peer.ID) (string, bool) {
+func durableBootstrapAddr(addr ma.Multiaddr, peerID peer.ID) (string, bool) {
 	if _, err := addr.ValueForProtocol(ma.P_CIRCUIT); err == nil {
 		return "", false
 	}
@@ -1067,7 +1067,7 @@ func durableBootstrapAddr(addr ma.Multiaddr, p peer.ID) (string, bool) {
 	if !public {
 		return "", false
 	}
-	withPeer := addr.Encapsulate(ma.StringCast("/p2p/" + p.String()))
+	withPeer := addr.Encapsulate(ma.StringCast("/p2p/" + peerID.String()))
 	return withPeer.String(), true
 }
 
@@ -1082,12 +1082,12 @@ func (d *Daemon) bootstrapAddrs() []string {
 // isConfiguredBootstrap reports whether the peer is one of the
 // operator-configured bootstrap lighthouses (Config.Bootstrap, not the
 // discovered list): the local trust anchor for the NAT-oracle exemption.
-func (d *Daemon) isConfiguredBootstrap(p peer.ID) bool {
+func (d *Daemon) isConfiguredBootstrap(peerID peer.ID) bool {
 	d.cfgMu.Lock()
 	addrs := append([]string{}, d.Config.Bootstrap...)
 	d.cfgMu.Unlock()
 	for _, addr := range addrs {
-		if info, err := peerInfo(addr); err == nil && info.ID == p {
+		if info, err := peerInfo(addr); err == nil && info.ID == peerID {
 			return true
 		}
 	}
@@ -1142,15 +1142,15 @@ func (d *Daemon) relayCandidates(ctx context.Context, num int) <-chan peer.AddrI
 			}
 		}
 		now := time.Now()
-		for _, p := range d.Host.Network().Peers() {
-			if !d.Store.IsMember(p, now) {
+		for _, peerID := range d.Host.Network().Peers() {
+			if !d.Store.IsMember(peerID, now) {
 				continue
 			}
-			protos, err := d.Host.Peerstore().SupportsProtocols(p, proto.ProtoIDv2Hop)
+			protos, err := d.Host.Peerstore().SupportsProtocols(peerID, proto.ProtoIDv2Hop)
 			if err != nil || len(protos) == 0 {
 				continue
 			}
-			if !emit(peer.AddrInfo{ID: p, Addrs: d.Host.Peerstore().Addrs(p)}) {
+			if !emit(peer.AddrInfo{ID: peerID, Addrs: d.Host.Peerstore().Addrs(peerID)}) {
 				return
 			}
 		}
@@ -1170,27 +1170,27 @@ const meshFillBackoff = 2 * time.Minute
 // serves both directions.
 func (d *Daemon) meshFill() {
 	members, _ := d.Store.Snapshot()
-	for p := range members {
-		if p == d.Host.ID() || d.hasDirectConnection(p) {
+	for peerID := range members {
+		if peerID == d.Host.ID() || d.hasDirectConnection(peerID) {
 			continue
 		}
-		if usableConnection(d.Host.Network().Connectedness(p)) {
-			if !d.startPunch(p) {
-				d.retryDirect(p)
+		if usableConnection(d.Host.Network().Connectedness(peerID)) {
+			if !d.startPunch(peerID) {
+				d.retryDirect(peerID)
 			}
 			continue
 		}
-		if len(d.Host.Peerstore().Addrs(p)) == 0 {
+		if len(d.Host.Peerstore().Addrs(peerID)) == 0 {
 			continue // no known addresses — nothing to try yet
 		}
-		d.startDial(peer.AddrInfo{ID: p, Addrs: d.Host.Peerstore().Addrs(p)}, "mesh")
+		d.startDial(peer.AddrInfo{ID: peerID, Addrs: d.Host.Peerstore().Addrs(peerID)}, "mesh")
 	}
 }
 
 func peerInfo(addr string) (*peer.AddrInfo, error) {
-	m, err := ma.NewMultiaddr(addr)
+	multiaddr, err := ma.NewMultiaddr(addr)
 	if err != nil {
 		return nil, err
 	}
-	return peer.AddrInfoFromP2pAddr(m)
+	return peer.AddrInfoFromP2pAddr(multiaddr)
 }

@@ -92,9 +92,9 @@ func AllScopes() []string { return []string{ScopeTun, ScopeVault, ScopeAstral} }
 // ScopeWithout is every known family except one — the "-no-overlay" shape.
 func ScopeWithout(family string) []string {
 	var out []string
-	for _, f := range AllScopes() {
-		if f != family {
-			out = append(out, f)
+	for _, known := range AllScopes() {
+		if known != family {
+			out = append(out, known)
 		}
 	}
 	return out
@@ -140,21 +140,21 @@ func (c *Cert) Allows(family string) bool {
 func NormalizeScope(tokens []string) ([]string, error) {
 	var out []string
 	seen := map[string]bool{}
-	for _, t := range tokens {
-		t = strings.TrimSpace(t)
-		switch t {
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		switch token {
 		case "":
 			continue
 		case ScopeMesh:
 			seen[ScopeMesh] = true
 			continue
 		case ScopeTun, ScopeVault, ScopeAstral:
-			if !seen[t] {
-				seen[t] = true
-				out = append(out, t)
+			if !seen[token] {
+				seen[token] = true
+				out = append(out, token)
 			}
 		default:
-			return nil, fmt.Errorf("unknown scope family %q (known: %s, or mesh)", t, strings.Join(AllScopes(), ", "))
+			return nil, fmt.Errorf("unknown scope family %q (known: %s, or mesh)", token, strings.Join(AllScopes(), ", "))
 		}
 	}
 	if out == nil {
@@ -227,9 +227,9 @@ func VerbsForScope(cmd string, scope []string) []string {
 		// onto a gateway grant; it means nothing on a device itself.
 		verbs = append(verbs, statement.VerbAdmin, statement.VerbTerminate)
 	}
-	for _, f := range AllScopes() {
-		if ScopeAllows(scope, f) {
-			verbs = append(verbs, familyVerbs[f]...)
+	for _, family := range AllScopes() {
+		if ScopeAllows(scope, family) {
+			verbs = append(verbs, familyVerbs[family]...)
 		}
 	}
 	return verbs
@@ -240,9 +240,9 @@ func VerbsForScope(cmd string, scope []string) []string {
 // verbs the statement carries (any verb of a family admits the family).
 func scopeOfVerbs(verbs []string) []string {
 	var out []string
-	for _, f := range AllScopes() {
-		if hasAnyVerb(verbs, familyVerbs[f]) {
-			out = append(out, f)
+	for _, family := range AllScopes() {
+		if hasAnyVerb(verbs, familyVerbs[family]) {
+			out = append(out, family)
 		}
 	}
 	if len(out) == len(AllScopes()) {
@@ -255,8 +255,8 @@ func scopeOfVerbs(verbs []string) []string {
 }
 
 func hasAnyVerb(verbs, want []string) bool {
-	for _, w := range want {
-		if slices.Contains(verbs, w) {
+	for _, verb := range want {
+		if slices.Contains(verbs, verb) {
 			return true
 		}
 	}
@@ -299,11 +299,11 @@ func IssueAsDel(priv ed25519.PrivateKey, own *statement.Statement, circleDID str
 	if cmd != CmdMember && cmd != CmdAdmin {
 		return nil, fmt.Errorf("unknown command path %q", cmd)
 	}
-	var m *statement.Meta
+	var stmtMeta *statement.Meta
 	if meta.Name != "" || meta.IP != "" {
-		m = &statement.Meta{Name: meta.Name, IP: meta.IP}
+		stmtMeta = &statement.Meta{Name: meta.Name, IP: meta.IP}
 	}
-	s, err := statement.Sign(priv, statement.Payload{
+	stmt, err := statement.Sign(priv, statement.Payload{
 		Aud: did.ForKey(devicePub),
 		Sub: circleDID,
 		// Any resource in any circle: a member may use whatever grants its
@@ -312,7 +312,7 @@ func IssueAsDel(priv ed25519.PrivateKey, own *statement.Statement, circleDID str
 		// authority anywhere on its own — the foreign authority chain does.
 		Res:   []statement.Resource{{Kind: statement.Any, Name: statement.Any, Sub: statement.Any}},
 		Verbs: VerbsForScope(cmd, meta.Scope),
-		Meta:  m,
+		Meta:  stmtMeta,
 		Del:   del,
 		Iat:   nbf.Unix(),
 		Nbf:   nbf.Unix(),
@@ -321,30 +321,30 @@ func IssueAsDel(priv ed25519.PrivateKey, own *statement.Statement, circleDID str
 	if err != nil {
 		return nil, err
 	}
-	return FromStatement(s)
+	return FromStatement(stmt)
 }
 
 // FromStatement reads a statement as a membership certificate.
-func FromStatement(s *statement.Statement) (*Cert, error) {
-	p := s.Payload
-	if p.Typ != statement.TypeAssert {
+func FromStatement(stmt *statement.Statement) (*Cert, error) {
+	payload := stmt.Payload
+	if payload.Typ != statement.TypeAssert {
 		return nil, errors.New("not a certificate: statement is not an admission")
 	}
-	if !slices.Contains(p.Verbs, statement.VerbMember) {
+	if !slices.Contains(payload.Verbs, statement.VerbMember) {
 		return nil, errors.New("not a certificate: statement does not carry member")
 	}
 	view := Payload{
-		Iss: p.Iss, Aud: p.Aud, Sub: p.Sub, Cmd: CmdMember,
-		Meta: Meta{Scope: scopeOfVerbs(p.Verbs)},
-		Nbf:  p.Nbf, Exp: p.Exp, Nonce: p.Nonce, Prf: p.Prf,
+		Iss: payload.Iss, Aud: payload.Aud, Sub: payload.Sub, Cmd: CmdMember,
+		Meta: Meta{Scope: scopeOfVerbs(payload.Verbs)},
+		Nbf:  payload.Nbf, Exp: payload.Exp, Nonce: payload.Nonce, Prf: payload.Prf,
 	}
-	if slices.Contains(p.Verbs, statement.VerbAdmin) {
+	if slices.Contains(payload.Verbs, statement.VerbAdmin) {
 		view.Cmd = CmdAdmin
 	}
-	if p.Meta != nil {
-		view.Meta.Name, view.Meta.IP = p.Meta.Name, p.Meta.IP
+	if payload.Meta != nil {
+		view.Meta.Name, view.Meta.IP = payload.Meta.Name, payload.Meta.IP
 	}
-	return &Cert{Payload: view, Sig: s.Sig, Stmt: s}, nil
+	return &Cert{Payload: view, Sig: stmt.Sig, Stmt: stmt}, nil
 }
 
 // Renew re-issues an existing certificate with a fresh validity window
@@ -372,25 +372,25 @@ func RenewMeta(rootPriv ed25519.PrivateKey, old *Cert, meta Meta, nbf time.Time,
 // Verify checks a certificate against the expected root key at the given
 // time. It returns nil only if the cert is a currently valid membership
 // proof for the circle that key roots.
-func Verify(c *Cert, rootPub ed25519.PublicKey, now time.Time) error {
-	return VerifyRoots(c, statement.RootMap{did.ForKey(rootPub): {rootPub}}, now)
+func Verify(memberCert *Cert, rootPub ed25519.PublicKey, now time.Time) error {
+	return VerifyRoots(memberCert, statement.RootMap{did.ForKey(rootPub): {rootPub}}, now)
 }
 
 // VerifyRoots checks a certificate against a set of honoured roots: the
 // cert's circle (sub) must be one the roots store answers for, and the
 // chain must verify for member at now (statement rules 1–8).
-func VerifyRoots(c *Cert, roots statement.Roots, now time.Time) error {
-	if c.Stmt == nil {
+func VerifyRoots(memberCert *Cert, roots statement.Roots, now time.Time) error {
+	if memberCert.Stmt == nil {
 		return errors.New("certificate without statement form")
 	}
-	if !bytes.Equal(c.Sig, c.Stmt.Sig) {
+	if !bytes.Equal(memberCert.Sig, memberCert.Stmt.Sig) {
 		return errors.New("signature does not match the statement")
 	}
-	_, err := statement.Verify(c.Stmt, nil, roots, nil, statement.Want{
-		Sub:           c.Payload.Sub,
+	_, err := statement.Verify(memberCert.Stmt, nil, roots, nil, statement.Want{
+		Sub:           memberCert.Payload.Sub,
 		Res:           statement.Resource{Kind: statement.KindRole, Name: statement.VerbMember},
 		Verb:          statement.VerbMember,
-		PresentingKey: c.Payload.Aud,
+		PresentingKey: memberCert.Payload.Aud,
 		Now:           now,
 	})
 	return err
@@ -415,9 +415,9 @@ func (c *Cert) Marshal() ([]byte, error) { return c.Stmt.Bytes() }
 // until Verify passes. A certificate minted before statements (2026-11-02)
 // no longer decodes: re-issue it with `fabric renew` on the master.
 func Unmarshal(data []byte) (*Cert, error) {
-	s, err := statement.Decode(data)
+	stmt, err := statement.Decode(data)
 	if err != nil {
 		return nil, fmt.Errorf("decoding certificate: %w (a pre-statement certificate? re-issue it with 'fabric renew')", err)
 	}
-	return FromStatement(s)
+	return FromStatement(stmt)
 }

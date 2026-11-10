@@ -76,19 +76,19 @@ func List(root string) ([]*Circle, error) {
 		return nil, err
 	}
 	var out []*Circle
-	for _, e := range entries {
-		if !e.IsDir() {
+	for _, entry := range entries {
+		if !entry.IsDir() {
 			continue
 		}
-		p := filepath.Join(root, e.Name())
-		if !Exists(p) {
+		path := filepath.Join(root, entry.Name())
+		if !Exists(path) {
 			continue
 		}
-		c, err := Open(p)
+		held, err := Open(path)
 		if err != nil {
-			return nil, fmt.Errorf("circle %s: %w", e.Name(), err)
+			return nil, fmt.Errorf("circle %s: %w", entry.Name(), err)
 		}
-		out = append(out, c)
+		out = append(out, held)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Config.Name < out[j].Config.Name })
 	return out, nil
@@ -96,49 +96,49 @@ func List(root string) ([]*Circle, error) {
 
 // Any reports whether the node holds at least one circle.
 func Any(root string) bool {
-	cs, err := List(root)
-	return err == nil && len(cs) > 0
+	circles, err := List(root)
+	return err == nil && len(circles) > 0
 }
 
 // ByName opens the circle called name under root.
 func ByName(root, name string) (*Circle, error) {
-	p := filepath.Join(root, name)
-	if !Exists(p) {
+	path := filepath.Join(root, name)
+	if !Exists(path) {
 		return nil, fmt.Errorf("no circle %q on this node (see 'fabric circle status')", name)
 	}
-	return Open(p)
+	return Open(path)
 }
 
 // ByDID finds the circle with the given owner DID under root.
-func ByDID(root, did string) (*Circle, error) {
-	cs, err := List(root)
+func ByDID(root, circleDID string) (*Circle, error) {
+	circles, err := List(root)
 	if err != nil {
 		return nil, err
 	}
-	for _, c := range cs {
-		if c.Config.DID == did {
-			return c, nil
+	for _, held := range circles {
+		if held.Config.DID == circleDID {
+			return held, nil
 		}
 	}
-	return nil, fmt.Errorf("this node holds no circle %s", did)
+	return nil, fmt.Errorf("this node holds no circle %s", circleDID)
 }
 
 // Only resolves "which circle" when a command did not say: the single one
 // a node holds, else an error listing the choices.
 func Only(root string) (*Circle, error) {
-	cs, err := List(root)
+	circles, err := List(root)
 	if err != nil {
 		return nil, err
 	}
-	switch len(cs) {
+	switch len(circles) {
 	case 0:
 		return nil, errors.New("this node holds no circle (did you run 'fabric circle init'?)")
 	case 1:
-		return cs[0], nil
+		return circles[0], nil
 	}
-	names := make([]string, len(cs))
-	for i, c := range cs {
-		names[i] = c.Config.Name
+	names := make([]string, len(circles))
+	for i, held := range circles {
+		names[i] = held.Config.Name
 	}
 	return nil, fmt.Errorf("this node holds several circles (%s) — say which with -circle", strings.Join(names, ", "))
 }
@@ -267,44 +267,44 @@ func (b *Bundle) DeviceAdmission() (*Admission, error) {
 	if len(b.Admission) == 0 {
 		return nil, nil
 	}
-	a, err := UnmarshalAdmission(b.Admission)
+	admission, err := UnmarshalAdmission(b.Admission)
 	if err != nil {
 		return nil, fmt.Errorf("bundle admission: %w", err)
 	}
-	if a.Circle != b.Config.DID {
+	if admission.Circle != b.Config.DID {
 		return nil, errors.New("bundle admission is for a different circle")
 	}
-	return a, nil
+	return admission, nil
 }
 
 // NewDeviceBundle packs what an admitted device needs: the circle's
 // config (name, DID, gate hints, prefix) and its own admission.
-func NewDeviceBundle(c *Circle, a *Admission, gates []string) (*Bundle, error) {
-	if a.Circle != c.Config.DID {
+func NewDeviceBundle(held *Circle, admission *Admission, gates []string) (*Bundle, error) {
+	if admission.Circle != held.Config.DID {
 		return nil, errors.New("admission is for a different circle")
 	}
-	raw, err := a.Marshal()
+	raw, err := admission.Marshal()
 	if err != nil {
 		return nil, err
 	}
-	cfg := c.Config
+	cfg := held.Config
 	cfg.Gates = gates
-	hs, err := c.handoverBytes()
+	handovers, err := held.handoverBytes()
 	if err != nil {
 		return nil, err
 	}
-	return &Bundle{Config: cfg, Admission: raw, Handovers: hs}, nil
+	return &Bundle{Config: cfg, Admission: raw, Handovers: handovers}, nil
 }
 
 // handoverBytes is the circle's key history as wire bytes, for bundles.
 func (c *Circle) handoverBytes() ([][]byte, error) {
-	hs, err := c.Handovers()
+	handovers, err := c.Handovers()
 	if err != nil {
 		return nil, err
 	}
 	var out [][]byte
-	for _, h := range hs {
-		raw, err := h.Bytes()
+	for _, handover := range handovers {
+		raw, err := handover.Bytes()
 		if err != nil {
 			return nil, err
 		}
@@ -370,24 +370,24 @@ func ReadBundle(src string) (*Bundle, error) {
 		return nil, err
 	}
 	if info.IsDir() {
-		c, err := Open(src)
+		held, err := Open(src)
 		if err != nil {
 			return nil, err
 		}
-		return c.Export()
+		return held.Export()
 	}
 	raw, err := os.ReadFile(src)
 	if err != nil {
 		return nil, err
 	}
-	var b Bundle
-	if err := json.Unmarshal(raw, &b); err != nil {
+	var bundle Bundle
+	if err := json.Unmarshal(raw, &bundle); err != nil {
 		return nil, fmt.Errorf("%s is not a circle bundle: %w", src, err)
 	}
-	if b.Config.DID == "" || (len(b.Key) == 0 && len(b.Admission) == 0) {
+	if bundle.Config.DID == "" || (len(bundle.Key) == 0 && len(bundle.Admission) == 0) {
 		return nil, fmt.Errorf("%s is not a circle bundle", src)
 	}
-	return &b, nil
+	return &bundle, nil
 }
 
 // Hold makes sure the node holds a directory for a circle it is in without
@@ -396,19 +396,19 @@ func ReadBundle(src string) (*Bundle, error) {
 // history persist there as they do for every other circle (before
 // 2026-11-07 the membership-event log was that persistence). Returns the
 // existing directory when one honours the DID.
-func Hold(root, did string) (*Circle, error) {
-	if c, err := ByDID(root, did); err == nil {
-		return c, nil
+func Hold(root, circleDID string) (*Circle, error) {
+	if held, err := ByDID(root, circleDID); err == nil {
+		return held, nil
 	}
 	name := "home"
 	if Exists(filepath.Join(root, name)) {
-		name = "home-" + did[len(did)-6:]
+		name = "home-" + circleDID[len(circleDID)-6:]
 	}
 	path := filepath.Join(root, name)
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return nil, err
 	}
-	if err := writeConfig(path, Config{Name: name, DID: did}); err != nil {
+	if err := writeConfig(path, Config{Name: name, DID: circleDID}); err != nil {
 		return nil, err
 	}
 	return Open(path)
@@ -419,60 +419,60 @@ func Hold(root, did string) (*Circle, error) {
 // that (a device without the key), the config with its gate hints either
 // way. Refuses to replace a circle already held — swapping identities
 // under live buckets is not a thing to do by accident.
-func Join(root string, b *Bundle) (*Circle, error) {
-	if err := validName(b.Config.Name); err != nil {
+func Join(root string, bundle *Bundle) (*Circle, error) {
+	if err := validName(bundle.Config.Name); err != nil {
 		return nil, fmt.Errorf("bundle: %w", err)
 	}
-	if !b.HasKey() && len(b.Admission) == 0 {
+	if !bundle.HasKey() && len(bundle.Admission) == 0 {
 		return nil, errors.New("bundle carries neither a key nor an admission")
 	}
-	admission, err := b.DeviceAdmission()
+	admission, err := bundle.DeviceAdmission()
 	if err != nil {
 		return nil, err
 	}
-	if c, err := ByDID(root, b.Config.DID); err == nil {
-		return nil, fmt.Errorf("this node already holds that circle as %q (%s)", c.Config.Name, c.Path)
+	if held, err := ByDID(root, bundle.Config.DID); err == nil {
+		return nil, fmt.Errorf("this node already holds that circle as %q (%s)", held.Config.Name, held.Path)
 	}
-	path := filepath.Join(root, b.Config.Name)
+	path := filepath.Join(root, bundle.Config.Name)
 	if Exists(path) {
-		return nil, fmt.Errorf("this node already holds a different circle named %q (%s)", b.Config.Name, path)
+		return nil, fmt.Errorf("this node already holds a different circle named %q (%s)", bundle.Config.Name, path)
 	}
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return nil, err
 	}
-	if b.HasKey() {
-		if err := os.WriteFile(keyPath(path), b.Key, 0o600); err != nil {
+	if bundle.HasKey() {
+		if err := os.WriteFile(keyPath(path), bundle.Key, 0o600); err != nil {
 			return nil, err
 		}
 	}
-	if err := writeConfig(path, b.Config); err != nil {
+	if err := writeConfig(path, bundle.Config); err != nil {
 		return nil, err
 	}
-	c, err := Open(path)
+	held, err := Open(path)
 	if err != nil {
 		return nil, err
 	}
-	if len(b.Handovers) > 0 {
-		roots := statement.NewDIDRoot(b.Config.DID)
-		for _, raw := range b.Handovers {
-			h, err := statement.Decode(raw)
+	if len(bundle.Handovers) > 0 {
+		roots := statement.NewDIDRoot(bundle.Config.DID)
+		for _, raw := range bundle.Handovers {
+			handover, err := statement.Decode(raw)
 			if err != nil {
 				return nil, fmt.Errorf("bundle key history: %w", err)
 			}
-			if _, err := roots.Learn(h); err != nil {
+			if _, err := roots.Learn(handover); err != nil {
 				return nil, fmt.Errorf("bundle key history: %w", err)
 			}
 		}
-		if err := SaveHandovers(path, roots.Handovers(b.Config.DID)); err != nil {
+		if err := SaveHandovers(path, roots.Handovers(bundle.Config.DID)); err != nil {
 			return nil, err
 		}
 	}
 	if admission != nil {
-		if err := c.SaveAdmission(admission); err != nil {
+		if err := held.SaveAdmission(admission); err != nil {
 			return nil, err
 		}
 	}
-	return c, nil
+	return held, nil
 }
 
 // validName keeps circle names usable as directory names and CLI words.
@@ -488,8 +488,8 @@ func validName(name string) error {
 
 // WriteBundle writes a bundle file (mode 0600 — an owner bundle carries
 // the key container).
-func WriteBundle(file string, b *Bundle) error {
-	raw, err := json.MarshalIndent(b, "", "  ")
+func WriteBundle(file string, bundle *Bundle) error {
+	raw, err := json.MarshalIndent(bundle, "", "  ")
 	if err != nil {
 		return err
 	}

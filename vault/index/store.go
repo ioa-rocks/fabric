@@ -48,21 +48,21 @@ func (s *Store) Close() error { return s.db.Close() }
 // PutObject stores an object record, merging with any existing version of
 // the same object — every write path goes through Merge, so local edits and
 // sync deltas obey identical semantics.
-func (s *Store) PutObject(o *Object) (*Object, error) {
+func (s *Store) PutObject(obj *Object) (*Object, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cur, err := s.GetObject(o.ID)
+	cur, err := s.GetObject(obj.ID)
 	if err == nil {
-		o = Merge(cur, o)
+		obj = Merge(cur, obj)
 	}
-	raw, err := o.Marshal()
+	raw, err := obj.Marshal()
 	if err != nil {
 		return nil, err
 	}
-	if err := s.db.Set([]byte("o/"+o.ID), raw, pebble.Sync); err != nil {
+	if err := s.db.Set([]byte("o/"+obj.ID), raw, pebble.Sync); err != nil {
 		return nil, err
 	}
-	return o, nil
+	return obj, nil
 }
 
 // GetObject loads one object record.
@@ -86,27 +86,27 @@ func (s *Store) ListObjects(tags ...string) ([]*Object, error) {
 	}
 	defer it.Close()
 	for it.First(); it.Valid(); it.Next() {
-		o, err := UnmarshalObject(it.Value())
+		obj, err := UnmarshalObject(it.Value())
 		if err != nil {
 			return nil, err
 		}
-		if o.IsDeleted() {
+		if obj.IsDeleted() {
 			continue
 		}
 		match := true
-		for _, t := range tags {
-			if !o.Tags.Has(t) {
+		for _, tag := range tags {
+			if !obj.Tags.Has(tag) {
 				match = false
 				break
 			}
 		}
 		if match {
-			out = append(out, o)
+			out = append(out, obj)
 		}
 	}
 	slices.SortFunc(out, func(a, b *Object) int {
-		if c := strings.Compare(a.Name.V, b.Name.V); c != 0 {
-			return c
+		if cmp := strings.Compare(a.Name.V, b.Name.V); cmp != 0 {
+			return cmp
 		}
 		return strings.Compare(a.ID, b.ID)
 	})
@@ -120,9 +120,9 @@ func (s *Store) FindByName(name string) ([]*Object, error) {
 		return nil, err
 	}
 	var out []*Object
-	for _, o := range all {
-		if o.Name.V == name {
-			out = append(out, o)
+	for _, obj := range all {
+		if obj.Name.V == name {
+			out = append(out, obj)
 		}
 	}
 	return out, nil
@@ -131,18 +131,18 @@ func (s *Store) FindByName(name string) ([]*Object, error) {
 // PutLocation records that a node holds a form of a blob. Newest timestamp
 // wins per (blob, node) — replicas converge on the latest claim regardless
 // of exchange order.
-func (s *Store) PutLocation(l Location) error {
+func (s *Store) PutLocation(loc Location) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := []byte("l/" + l.Blob + "/" + l.Node)
+	key := []byte("l/" + loc.Blob + "/" + loc.Node)
 	if raw, closer, err := s.db.Get(key); err == nil {
 		cur, err := unmarshalLocation(raw)
 		closer.Close()
-		if err == nil && cur.TS >= l.TS {
+		if err == nil && cur.TS >= loc.TS {
 			return nil
 		}
 	}
-	raw, err := marshalLocation(l)
+	raw, err := marshalLocation(loc)
 	if err != nil {
 		return err
 	}
@@ -158,11 +158,11 @@ func (s *Store) Locations(blob string) ([]Location, error) {
 	}
 	defer it.Close()
 	for it.First(); it.Valid(); it.Next() {
-		l, err := unmarshalLocation(it.Value())
+		loc, err := unmarshalLocation(it.Value())
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, l)
+		out = append(out, loc)
 	}
 	return out, nil
 }
@@ -178,11 +178,11 @@ func (s *Store) DumpObjects() ([]*Object, error) {
 	}
 	defer it.Close()
 	for it.First(); it.Valid(); it.Next() {
-		o, err := UnmarshalObject(it.Value())
+		obj, err := UnmarshalObject(it.Value())
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, o)
+		out = append(out, obj)
 	}
 	return out, nil
 }
@@ -196,17 +196,17 @@ func (s *Store) DumpLocations() ([]Location, error) {
 	}
 	defer it.Close()
 	for it.First(); it.Valid(); it.Next() {
-		l, err := unmarshalLocation(it.Value())
+		loc, err := unmarshalLocation(it.Value())
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, l)
+		out = append(out, loc)
 	}
 	return out, nil
 }
 
-func prefixBounds(p string) *pebble.IterOptions {
-	upper := []byte(p)
+func prefixBounds(prefix string) *pebble.IterOptions {
+	upper := []byte(prefix)
 	upper = append(upper[:len(upper):len(upper)], 0xff)
-	return &pebble.IterOptions{LowerBound: []byte(p), UpperBound: upper}
+	return &pebble.IterOptions{LowerBound: []byte(prefix), UpperBound: upper}
 }

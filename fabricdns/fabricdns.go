@@ -72,31 +72,31 @@ func (s *Server) Close() {
 	}
 }
 
-func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
-	m := new(dns.Msg)
-	m.SetReply(req)
-	m.Authoritative = true
+func (s *Server) handle(writer dns.ResponseWriter, req *dns.Msg) {
+	reply := new(dns.Msg)
+	reply.SetReply(req)
+	reply.Authoritative = true
 
-	for _, q := range req.Question {
-		name := strings.ToLower(strings.TrimSuffix(q.Name, "."))
+	for _, question := range req.Question {
+		name := strings.ToLower(strings.TrimSuffix(question.Name, "."))
 		host, ok := strings.CutSuffix(name, "."+Suffix)
 		if !ok || host == "" || strings.Contains(host, ".") {
-			m.Rcode = dns.RcodeRefused // not our zone (or a subdomain we don't do)
+			reply.Rcode = dns.RcodeRefused // not our zone (or a subdomain we don't do)
 			continue
 		}
 		ip, found := s.lookup(host)
 		if !found {
-			m.Rcode = dns.RcodeNameError
+			reply.Rcode = dns.RcodeNameError
 			continue
 		}
 		// A answered; AAAA (and anything else) gets an empty NOERROR so
 		// dual-stack resolvers settle on the A record without retries.
-		if q.Qtype == dns.TypeA && ip.Is4() {
-			m.Answer = append(m.Answer, &dns.A{
-				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
+		if question.Qtype == dns.TypeA && ip.Is4() {
+			reply.Answer = append(reply.Answer, &dns.A{
+				Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
 				A:   ip.AsSlice(),
 			})
 		}
 	}
-	_ = w.WriteMsg(m)
+	_ = writer.WriteMsg(reply)
 }

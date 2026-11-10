@@ -30,8 +30,8 @@ func (f *fileNode) Setattr(ctx context.Context, handle fs.FileHandle, in *fuse.S
 	if !f.m.writable {
 		return syscall.EROFS
 	}
-	if h, ok := handle.(*fileHandle); ok {
-		return h.Setattr(ctx, in, out)
+	if fh, ok := handle.(*fileHandle); ok {
+		return fh.Setattr(ctx, in, out)
 	}
 	f.mu.Lock()
 	active := f.handle
@@ -57,13 +57,13 @@ func (f *fileNode) Setattr(ctx context.Context, handle fs.FileHandle, in *fuse.S
 	// are synchronized tree metadata (ADR 0001 §6).
 	var mode *uint32
 	var mtime *int64
-	if m, ok := in.GetMode(); ok {
-		v := m & 0o777
-		mode = &v
+	if rawMode, ok := in.GetMode(); ok {
+		perm := rawMode & 0o777
+		mode = &perm
 	}
-	if t, ok := in.GetMTime(); ok {
-		v := t.UnixNano()
-		mtime = &v
+	if modTime, ok := in.GetMTime(); ok {
+		ts := modTime.UnixNano()
+		mtime = &ts
 	}
 	if (mode != nil || mtime != nil) && object.ID != "" {
 		updated, err := f.m.src.SetAttr(f.m.bucket, object.ID, mode, mtime)
@@ -139,8 +139,8 @@ func (d *dirNode) Create(ctx context.Context, name string, _ uint32, _ uint32, _
 		d.m.mu.Unlock()
 		return nil, nil, 0, syscall.EEXIST
 	}
-	f := &fileNode{m: d.m, object: daemon.ObjectInfo{Name: path.Join(d.prefix, name)}, writing: true}
-	d.files[name] = f
+	file := &fileNode{m: d.m, object: daemon.ObjectInfo{Name: path.Join(d.prefix, name)}, writing: true}
+	d.files[name] = file
 	d.m.mu.Unlock()
 	tmp, err := d.m.stage()
 	if err != nil {
@@ -149,12 +149,12 @@ func (d *dirNode) Create(ctx context.Context, name string, _ uint32, _ uint32, _
 		d.m.mu.Unlock()
 		return nil, nil, 0, syscall.EIO
 	}
-	inode := d.NewPersistentInode(ctx, f, fs.StableAttr{Mode: syscall.S_IFREG})
-	h := &fileHandle{file: tmp, path: tmp.Name(), node: f, writable: true, dirty: true}
-	f.mu.Lock()
-	f.handle = h
-	f.mu.Unlock()
-	return inode, h, fuse.FOPEN_DIRECT_IO, 0
+	inode := d.NewPersistentInode(ctx, file, fs.StableAttr{Mode: syscall.S_IFREG})
+	handle := &fileHandle{file: tmp, path: tmp.Name(), node: file, writable: true, dirty: true}
+	file.mu.Lock()
+	file.handle = handle
+	file.mu.Unlock()
+	return inode, handle, fuse.FOPEN_DIRECT_IO, 0
 }
 
 func (d *dirNode) Unlink(_ context.Context, name string) syscall.Errno {
@@ -163,22 +163,22 @@ func (d *dirNode) Unlink(_ context.Context, name string) syscall.Errno {
 	}
 	d.m.mu.Lock()
 	defer d.m.mu.Unlock()
-	if l := d.links[name]; l != nil {
-		if _, err := d.m.src.Rm(d.m.bucket, l.object.ID); err != nil {
+	if link := d.links[name]; link != nil {
+		if _, err := d.m.src.Rm(d.m.bucket, link.object.ID); err != nil {
 			return syscall.EIO
 		}
-		d.m.cat.forget(l.object.ID)
+		d.m.cat.forget(link.object.ID)
 		delete(d.links, name)
 		return d.keepIfEmpty()
 	}
-	f := d.files[name]
-	if f == nil {
+	file := d.files[name]
+	if file == nil {
 		return syscall.ENOENT
 	}
-	f.mu.Lock()
-	f.removed = true
-	object, conflict := f.object, f.conflict
-	f.mu.Unlock()
+	file.mu.Lock()
+	file.removed = true
+	object, conflict := file.object, file.conflict
+	file.mu.Unlock()
 	if conflict != nil {
 		// Deleting a conflict copy settles the object for the kept version
 		// (ADR 0001 §3).
@@ -207,12 +207,12 @@ func (d *dirNode) Unlink(_ context.Context, name string) syscall.Errno {
 
 // fileFor finds the kept (non-conflict) node of an object in this directory.
 func (d *dirNode) fileFor(id string) *fileNode {
-	for _, f := range d.files {
-		f.mu.Lock()
-		match := f.conflict == nil && f.object.ID == id
-		f.mu.Unlock()
+	for _, file := range d.files {
+		file.mu.Lock()
+		match := file.conflict == nil && file.object.ID == id
+		file.mu.Unlock()
 		if match {
-			return f
+			return file
 		}
 	}
 	return nil
@@ -269,27 +269,27 @@ func (d *dirNode) Rename(_ context.Context, name string, target fs.InodeEmbedder
 	}
 	d.m.mu.Lock()
 	defer d.m.mu.Unlock()
-	if f := d.files[name]; f != nil {
-		f.mu.Lock()
-		conflict := f.conflict != nil
-		f.mu.Unlock()
+	if file := d.files[name]; file != nil {
+		file.mu.Lock()
+		conflict := file.conflict != nil
+		file.mu.Unlock()
 		if conflict {
 			return syscall.EPERM // copy it to keep it; unlink resolves
 		}
-		return d.renameFile(name, f, to, newName)
+		return d.renameFile(name, file, to, newName)
 	}
-	if l := d.links[name]; l != nil {
+	if link := d.links[name]; link != nil {
 		if to.files[newName] != nil || to.dirs[newName] != nil || to.links[newName] != nil {
 			return syscall.EEXIST
 		}
-		updated, err := d.m.src.Rename(d.m.bucket, l.object.ID, path.Join(to.prefix, newName))
+		updated, err := d.m.src.Rename(d.m.bucket, link.object.ID, path.Join(to.prefix, newName))
 		if err != nil {
 			return syscall.EIO
 		}
 		d.m.cat.update(updated)
-		l.object = updated
+		link.object = updated
 		delete(d.links, name)
-		to.links[newName] = l
+		to.links[newName] = link
 		return 0
 	}
 	child := d.dirs[name]
@@ -311,26 +311,26 @@ func (d *dirNode) Rename(_ context.Context, name string, target fs.InodeEmbedder
 		d.m.cat.update(updated)
 		dn.object = updated
 	}
-	for _, l := range child.allLinks() {
-		updated, err := d.m.src.Rename(d.m.bucket, l.object.ID, newPrefix+strings.TrimPrefix(l.object.Name, oldPrefix))
+	for _, link := range child.allLinks() {
+		updated, err := d.m.src.Rename(d.m.bucket, link.object.ID, newPrefix+strings.TrimPrefix(link.object.Name, oldPrefix))
 		if err != nil {
 			return syscall.EIO
 		}
 		d.m.cat.update(updated)
-		l.object = updated
+		link.object = updated
 	}
-	for _, f := range child.allFiles() {
-		f.mu.Lock()
-		obj := f.object
-		f.mu.Unlock()
+	for _, file := range child.allFiles() {
+		file.mu.Lock()
+		obj := file.object
+		file.mu.Unlock()
 		updated, err := d.m.src.Rename(d.m.bucket, obj.ID, newPrefix+strings.TrimPrefix(obj.Name, oldPrefix))
 		if err != nil {
 			return syscall.EIO
 		}
 		d.m.cat.update(updated)
-		f.mu.Lock()
-		f.object = updated
-		f.mu.Unlock()
+		file.mu.Lock()
+		file.object = updated
+		file.mu.Unlock()
 	}
 	delete(d.dirs, name)
 	to.dirs[newName] = child
@@ -338,13 +338,13 @@ func (d *dirNode) Rename(_ context.Context, name string, target fs.InodeEmbedder
 	return 0
 }
 
-func (d *dirNode) renameFile(name string, f *fileNode, to *dirNode, newName string) syscall.Errno {
+func (d *dirNode) renameFile(name string, file *fileNode, to *dirNode, newName string) syscall.Errno {
 	if to.dirs[newName] != nil {
 		return syscall.EISDIR
 	}
-	f.mu.Lock()
-	srcObj := f.object
-	f.mu.Unlock()
+	file.mu.Lock()
+	srcObj := file.object
+	file.mu.Unlock()
 	if srcObj.ID == "" {
 		return syscall.EBUSY
 	}
@@ -353,12 +353,12 @@ func (d *dirNode) renameFile(name string, f *fileNode, to *dirNode, newName stri
 		dest.mu.Lock()
 		destObj := dest.object
 		dest.mu.Unlock()
-		r, err := d.m.src.Get(d.m.bucket, srcObj.ID)
+		rc, err := d.m.src.Get(d.m.bucket, srcObj.ID)
 		if err != nil {
 			return syscall.EIO
 		}
-		updated, err := d.m.src.Replace(d.m.bucket, destObj.ID, r)
-		r.Close()
+		updated, err := d.m.src.Replace(d.m.bucket, destObj.ID, rc)
+		rc.Close()
 		if err != nil {
 			return syscall.EIO
 		}
@@ -368,61 +368,61 @@ func (d *dirNode) renameFile(name string, f *fileNode, to *dirNode, newName stri
 		updated.Name = newPath
 		d.m.cat.update(updated)
 		d.m.cat.forget(srcObj.ID)
-		f.mu.Lock()
-		f.object = updated
-		f.mu.Unlock()
+		file.mu.Lock()
+		file.object = updated
+		file.mu.Unlock()
 	} else {
 		updated, err := d.m.src.Rename(d.m.bucket, srcObj.ID, newPath)
 		if err != nil {
 			return syscall.EIO
 		}
 		d.m.cat.update(updated)
-		f.mu.Lock()
-		f.object = updated
-		f.mu.Unlock()
+		file.mu.Lock()
+		file.object = updated
+		file.mu.Unlock()
 	}
 	delete(d.files, name)
-	to.files[newName] = f
+	to.files[newName] = file
 	return 0
 }
 
 func (d *dirNode) allDirs() []*dirNode {
 	out := []*dirNode{d}
-	for _, c := range d.dirs {
-		out = append(out, c.allDirs()...)
+	for _, child := range d.dirs {
+		out = append(out, child.allDirs()...)
 	}
 	return out
 }
 func (d *dirNode) allLinks() []*symlinkNode {
 	var out []*symlinkNode
-	for _, l := range d.links {
-		out = append(out, l)
+	for _, link := range d.links {
+		out = append(out, link)
 	}
-	for _, c := range d.dirs {
-		out = append(out, c.allLinks()...)
+	for _, child := range d.dirs {
+		out = append(out, child.allLinks()...)
 	}
 	return out
 }
 func (d *dirNode) allFiles() []*fileNode {
 	var out []*fileNode
-	for _, f := range d.files {
-		f.mu.Lock()
-		conflict := f.conflict != nil
-		f.mu.Unlock()
+	for _, file := range d.files {
+		file.mu.Lock()
+		conflict := file.conflict != nil
+		file.mu.Unlock()
 		if conflict {
 			continue // renders under the object's name; renamed with it
 		}
-		out = append(out, f)
+		out = append(out, file)
 	}
-	for _, c := range d.dirs {
-		out = append(out, c.allFiles()...)
+	for _, child := range d.dirs {
+		out = append(out, child.allFiles()...)
 	}
 	return out
 }
 func (d *dirNode) reprefix(old, new string) {
 	d.prefix = new + strings.TrimPrefix(d.prefix, old)
-	for _, c := range d.dirs {
-		c.reprefix(old, new)
+	for _, child := range d.dirs {
+		child.reprefix(old, new)
 	}
 }
 

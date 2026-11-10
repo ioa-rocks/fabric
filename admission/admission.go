@@ -107,15 +107,15 @@ func NewQueue(onNew func(PendingInfo)) *Queue {
 func (q *Queue) Submit(req JoinRequest) (Status, []byte) {
 	fp := Fingerprint(req.DevicePub)
 	q.mu.Lock()
-	e, ok := q.entries[fp]
+	item, ok := q.entries[fp]
 	if !ok {
-		e = &entry{req: req, receivedAt: time.Now(), status: StatusPending}
-		q.entries[fp] = e
+		item = &entry{req: req, receivedAt: time.Now(), status: StatusPending}
+		q.entries[fp] = item
 	}
-	status, cert := e.status, e.cert
+	status, cert := item.status, item.cert
 	q.mu.Unlock()
 	if !ok && q.onNew != nil {
-		q.onNew(PendingInfo{Fingerprint: fp, Name: req.Name, DevicePub: req.DevicePub, ReceivedAt: e.receivedAt, Status: StatusPending, Circle: req.Circle})
+		q.onNew(PendingInfo{Fingerprint: fp, Name: req.Name, DevicePub: req.DevicePub, ReceivedAt: item.receivedAt, Status: StatusPending, Circle: req.Circle})
 	}
 	return status, cert
 }
@@ -125,14 +125,14 @@ func (q *Queue) List() []PendingInfo {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	out := make([]PendingInfo, 0, len(q.entries))
-	for fp, e := range q.entries {
+	for fp, item := range q.entries {
 		out = append(out, PendingInfo{
 			Fingerprint: fp,
-			Name:        e.req.Name,
-			DevicePub:   e.req.DevicePub,
-			ReceivedAt:  e.receivedAt,
-			Status:      e.status,
-			Circle:      e.req.Circle,
+			Name:        item.req.Name,
+			DevicePub:   item.req.DevicePub,
+			ReceivedAt:  item.receivedAt,
+			Status:      item.status,
+			Circle:      item.req.Circle,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ReceivedAt.Before(out[j].ReceivedAt) })
@@ -153,8 +153,8 @@ func (q *Queue) Find(prefix string) (PendingInfo, error) {
 	case 0:
 		return PendingInfo{}, fmt.Errorf("no pending request matches %q", prefix)
 	case 1:
-		e := q.entries[found[0]]
-		return PendingInfo{Fingerprint: found[0], Name: e.req.Name, DevicePub: e.req.DevicePub, ReceivedAt: e.receivedAt, Status: e.status, Circle: e.req.Circle}, nil
+		item := q.entries[found[0]]
+		return PendingInfo{Fingerprint: found[0], Name: item.req.Name, DevicePub: item.req.DevicePub, ReceivedAt: item.receivedAt, Status: item.status, Circle: item.req.Circle}, nil
 	default:
 		return PendingInfo{}, fmt.Errorf("fingerprint prefix %q is ambiguous", prefix)
 	}
@@ -165,12 +165,12 @@ func (q *Queue) Find(prefix string) (PendingInfo, error) {
 func (q *Queue) Approve(fingerprint string, signedCert []byte) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	e, ok := q.entries[fingerprint]
+	item, ok := q.entries[fingerprint]
 	if !ok {
 		return fmt.Errorf("no pending request %q", fingerprint)
 	}
-	e.status = StatusApproved
-	e.cert = signedCert
+	item.status = StatusApproved
+	item.cert = signedCert
 	return nil
 }
 
@@ -178,60 +178,60 @@ func (q *Queue) Approve(fingerprint string, signedCert []byte) error {
 func (q *Queue) Deny(fingerprint string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	e, ok := q.entries[fingerprint]
+	item, ok := q.entries[fingerprint]
 	if !ok {
 		return fmt.Errorf("no pending request %q", fingerprint)
 	}
-	e.status = StatusDenied
-	e.cert = nil
+	item.status = StatusDenied
+	item.cert = nil
 	return nil
 }
 
 // Attach wires the queue onto a host as the /fabric/join/1 responder.
 // circleDID is read per request, not captured.
-func Attach(h host.Host, q *Queue, circleDID func() string) {
-	h.SetStreamHandler(ProtocolID, func(s network.Stream) {
-		defer s.Close()
-		_ = s.SetDeadline(time.Now().Add(30 * time.Second))
-		data, err := wire.ReadFrame(s, maxJoinWireSize)
+func Attach(localHost host.Host, queue *Queue, circleDID func() string) {
+	localHost.SetStreamHandler(ProtocolID, func(stream network.Stream) {
+		defer stream.Close()
+		_ = stream.SetDeadline(time.Now().Add(30 * time.Second))
+		data, err := wire.ReadFrame(stream, maxJoinWireSize)
 		if err != nil {
-			s.Reset()
+			stream.Reset()
 			return
 		}
 		var req JoinRequest
 		if err := cbor.Unmarshal(data, &req); err != nil || len(req.DevicePub) != ed25519.PublicKeySize {
-			s.Reset()
+			stream.Reset()
 			return
 		}
-		status, certBytes := q.Submit(req)
+		status, certBytes := queue.Submit(req)
 		resp := JoinResponse{Status: status, CircleDID: circleDID(), Cert: certBytes}
 		out, err := cbor.Marshal(resp)
 		if err != nil {
-			s.Reset()
+			stream.Reset()
 			return
 		}
-		_ = wire.WriteFrame(s, out)
+		_ = wire.WriteFrame(stream, out)
 	})
 }
 
 // Request performs one join round-trip against a queue host as the joiner.
-func Request(ctx context.Context, h host.Host, target peer.ID, req JoinRequest) (*JoinResponse, error) {
-	s, err := h.NewStream(ctx, target, ProtocolID)
+func Request(ctx context.Context, localHost host.Host, target peer.ID, req JoinRequest) (*JoinResponse, error) {
+	stream, err := localHost.NewStream(ctx, target, ProtocolID)
 	if err != nil {
 		return nil, fmt.Errorf("opening join stream: %w", err)
 	}
-	defer s.Close()
+	defer stream.Close()
 	if deadline, ok := ctx.Deadline(); ok {
-		_ = s.SetDeadline(deadline)
+		_ = stream.SetDeadline(deadline)
 	}
 	data, err := cbor.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
-	if err := wire.WriteFrame(s, data); err != nil {
+	if err := wire.WriteFrame(stream, data); err != nil {
 		return nil, fmt.Errorf("sending join request: %w", err)
 	}
-	respData, err := wire.ReadFrame(s, maxJoinWireSize)
+	respData, err := wire.ReadFrame(stream, maxJoinWireSize)
 	if err != nil {
 		return nil, fmt.Errorf("reading join response: %w", err)
 	}

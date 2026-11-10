@@ -19,8 +19,8 @@ type RelayACL struct {
 
 func NewRelayACL(store *MemberStore) *RelayACL { return &RelayACL{store: store} }
 
-func (a *RelayACL) AllowReserve(p peer.ID, _ ma.Multiaddr) bool {
-	return a.store.IsMember(p, time.Now())
+func (a *RelayACL) AllowReserve(peerID peer.ID, _ ma.Multiaddr) bool {
+	return a.store.IsMember(peerID, time.Now())
 }
 
 func (a *RelayACL) AllowConnect(src peer.ID, _ ma.Multiaddr, dest peer.ID) bool {

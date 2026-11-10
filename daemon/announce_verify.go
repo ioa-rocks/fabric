@@ -49,34 +49,34 @@ func verifyAnnounce(ctx context.Context, entry string, listen []string, self pee
 	// A throwaway host with its own identity: the daemon owns the real
 	// device key and the listen ports; this dialer only needs to complete
 	// a handshake that pins the expected remote identity.
-	h, err := libp2p.New(libp2p.NoListenAddrs)
+	verifier, err := libp2p.New(libp2p.NoListenAddrs)
 	if err != nil {
 		return VerifyUnreachable, fmt.Sprintf("verifier host: %v", err)
 	}
-	defer h.Close()
+	defer verifier.Close()
 
 	dialCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	if err := h.Connect(dialCtx, peer.AddrInfo{ID: self, Addrs: addrs}); err == nil {
+	if err := verifier.Connect(dialCtx, peer.AddrInfo{ID: self, Addrs: addrs}); err == nil {
 		return VerifyOK, ""
 	}
 
 	// The identity-pinned dial failed. Distinguish "wrong box" from "no
 	// route": if a plain TCP connect to any derived literal succeeds,
 	// something IS listening there — it just isn't this node.
-	for _, a := range addrs {
-		ip, ok := multiaddrIP(a)
+	for _, addr := range addrs {
+		ip, ok := multiaddrIP(addr)
 		if !ok {
 			continue
 		}
-		port, err := a.ValueForProtocol(ma.P_TCP)
+		port, err := addr.ValueForProtocol(ma.P_TCP)
 		if err != nil {
 			continue
 		}
 		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip.String(), port), 3*time.Second)
 		if err == nil {
 			conn.Close()
-			return VerifyMismatch, fmt.Sprintf("%s answers, but not as this node", a)
+			return VerifyMismatch, fmt.Sprintf("%s answers, but not as this node", addr)
 		}
 	}
 	return VerifyUnreachable, "no answer on any derived address"

@@ -63,18 +63,18 @@ type state struct {
 
 // NewPeerTable returns an empty table; AddRoster gives it circles.
 func NewPeerTable() *PeerTable {
-	t := &PeerTable{ops: make(chan func()), stop: make(chan struct{})}
-	t.view.Store(t.st.snapshot())
-	go t.run()
-	return t
+	table := &PeerTable{ops: make(chan func()), stop: make(chan struct{})}
+	table.view.Store(table.st.snapshot())
+	go table.run()
+	return table
 }
 
 // NewMemberStore is a table over one memory-only roster of the circle
 // roots names — the first circle, fed by the membership-event log.
 func NewMemberStore(roots *statement.DIDRoot) *PeerTable {
-	t := NewPeerTable()
-	t.AddRoster(circle.NewRoster(roots))
-	return t
+	table := NewPeerTable()
+	table.AddRoster(circle.NewRoster(roots))
+	return table
 }
 
 // Close stops the owner; later changes fail, reads keep the last view.
@@ -91,8 +91,8 @@ func (t *PeerTable) run() {
 		select {
 		case <-t.stop:
 			return
-		case f := <-t.ops:
-			f()
+		case fn := <-t.ops:
+			fn()
 		}
 	}
 }
@@ -126,8 +126,8 @@ func (t *PeerTable) apply(fn func(s *state) error) error {
 // replace commits a mutated roster: saved first, swapped in only when the
 // save succeeded, so memory and disk change together or neither. persist
 // is false for verdict-only changes (the saved form holds admissions alone).
-func (s *state) replace(i int, nr *circle.Roster, persist bool) error {
-	if nr == s.rosters[i] {
+func (s *state) replace(idx int, nr *circle.Roster, persist bool) error {
+	if nr == s.rosters[idx] {
 		return nil
 	}
 	if persist || nr.Learned() {
@@ -143,13 +143,13 @@ func (s *state) replace(i int, nr *circle.Roster, persist bool) error {
 			// 2026-11-07). Adopted in memory, reported; the roster stays
 			// marked unsaved (Learned) so the next change, or a retry of
 			// the handover, writes the history.
-			s.rosters[i] = nr
+			s.rosters[idx] = nr
 			s.dirty = true
 			return err
 		}
 		nr.MarkSaved()
 	}
-	s.rosters[i] = nr
+	s.rosters[idx] = nr
 	s.dirty = true
 	return nil
 }
@@ -157,21 +157,21 @@ func (s *state) replace(i int, nr *circle.Roster, persist bool) error {
 // flush writes a roster whose key history is still unsaved after a failed
 // save, when a retry finds nothing new to apply (Codex review,
 // 2026-11-07: a restart in between would have lost the compromise).
-func (s *state) flush(i int) error {
-	r := s.rosters[i]
-	if !r.Learned() {
+func (s *state) flush(idx int) error {
+	roster := s.rosters[idx]
+	if !roster.Learned() {
 		return nil
 	}
-	if err := r.Save(); err != nil {
-		return fmt.Errorf("roster: %s not written: %w", r.Path(), err)
+	if err := roster.Save(); err != nil {
+		return fmt.Errorf("roster: %s not written: %w", roster.Path(), err)
 	}
-	r.MarkSaved()
+	roster.MarkSaved()
 	return nil
 }
 
 func (s *state) index(circleDID string) int {
-	for i, r := range s.rosters {
-		if r.Honours(circleDID) {
+	for i, roster := range s.rosters {
+		if roster.Honours(circleDID) {
 			return i
 		}
 	}
@@ -182,9 +182,9 @@ func (t *PeerTable) signal() {
 	t.watchMu.Lock()
 	ws := append([]chan struct{}(nil), t.watchers...)
 	t.watchMu.Unlock()
-	for _, w := range ws {
+	for _, watcher := range ws {
 		select {
-		case w <- struct{}{}:
+		case watcher <- struct{}{}:
 		default: // a signal is already pending; the watcher reads the newest view
 		}
 	}
@@ -237,46 +237,46 @@ type deviceIn struct {
 }
 
 func (s *state) snapshot() *View {
-	v := &View{rosters: append([]*circle.Roster(nil), s.rosters...), byPeer: map[peer.ID][]deviceIn{},
+	snap := &View{rosters: append([]*circle.Roster(nil), s.rosters...), byPeer: map[peer.ID][]deviceIn{},
 		addrs: map[peer.ID]deviceIn{}, holders: map[netip.Addr][]peer.ID{}, names: map[string][]peer.ID{}, version: s.version}
-	for _, r := range s.rosters {
-		for _, dev := range r.Devices() {
-			p, err := PeerOfDID(dev.DID)
+	for _, roster := range s.rosters {
+		for _, dev := range roster.Devices() {
+			peerID, err := PeerOfDID(dev.DID)
 			if err != nil {
 				continue
 			}
-			v.byPeer[p] = append(v.byPeer[p], deviceIn{roster: r, dev: dev})
+			snap.byPeer[peerID] = append(snap.byPeer[peerID], deviceIn{roster: roster, dev: dev})
 		}
 	}
 	if s.overlay && len(s.rosters) > 0 {
-		r := s.rosters[0]
+		roster := s.rosters[0]
 		// A standing entry carrying an address in the prefix is a
 		// candidate; whether it routes right now is settled per query
 		// (addrEntry). A dead or lapsed entry is no candidate.
-		for _, dev := range r.Devices() {
-			c := view(dev)
-			if c == nil || !dev.Standing() || c.Payload.Meta.IP == "" || !c.Allows(cert.ScopeTun) {
+		for _, dev := range roster.Devices() {
+			memberCert := view(dev)
+			if memberCert == nil || !dev.Standing() || memberCert.Payload.Meta.IP == "" || !memberCert.Allows(cert.ScopeTun) {
 				continue
 			}
-			pfx, err := netip.ParsePrefix(c.Payload.Meta.IP)
+			pfx, err := netip.ParsePrefix(memberCert.Payload.Meta.IP)
 			if err != nil || (s.overlayPrefix.IsValid() && !s.overlayPrefix.Masked().Contains(pfx.Addr())) {
 				continue
 			}
-			p, err := PeerOfDID(dev.DID)
+			peerID, err := PeerOfDID(dev.DID)
 			if err != nil {
 				continue
 			}
-			if name := strings.ToLower(c.Payload.Meta.Name); name != "" {
-				v.names[name] = append(v.names[name], p)
+			if name := strings.ToLower(memberCert.Payload.Meta.Name); name != "" {
+				snap.names[name] = append(snap.names[name], peerID)
 			}
-			v.addrs[p] = deviceIn{roster: r, dev: dev, addr: pfx.Addr()}
-			v.holders[pfx.Addr()] = append(v.holders[pfx.Addr()], p)
+			snap.addrs[peerID] = deviceIn{roster: roster, dev: dev, addr: pfx.Addr()}
+			snap.holders[pfx.Addr()] = append(snap.holders[pfx.Addr()], peerID)
 		}
-		for _, ps := range v.holders {
-			sort.Slice(ps, func(i, j int) bool { return circle.Later(v.addrs[ps[i]].dev, v.addrs[ps[j]].dev) })
+		for _, peers := range snap.holders {
+			sort.Slice(peers, func(i, j int) bool { return circle.Later(snap.addrs[peers[i]].dev, snap.addrs[peers[j]].dev) })
 		}
 	}
-	return v
+	return snap
 }
 
 // View returns the current snapshot.
@@ -288,9 +288,9 @@ func (v *View) Version() uint64 { return v.version }
 // ---- owner-side changes -------------------------------------------------
 
 // AddRoster adds a circle's roster to the union.
-func (t *PeerTable) AddRoster(r *circle.Roster) {
+func (t *PeerTable) AddRoster(roster *circle.Roster) {
 	_ = t.apply(func(s *state) error {
-		s.rosters = append(s.rosters, r)
+		s.rosters = append(s.rosters, roster)
 		s.dirty = true
 		return nil
 	})
@@ -303,12 +303,12 @@ func (t *PeerTable) AddRoster(r *circle.Roster) {
 // restart (Codex review, 2026-11-04), read with its revocations, so a
 // device revoked before the restart stays revoked (Codex review,
 // 2026-11-05).
-func (t *PeerTable) Attach(c *circle.Circle, now time.Time) error {
+func (t *PeerTable) Attach(cir *circle.Circle, now time.Time) error {
 	return t.apply(func(s *state) error {
 		if len(s.rosters) == 0 {
 			return errors.New("no roster to attach")
 		}
-		nr, err := s.rosters[0].Attach(c, now)
+		nr, err := s.rosters[0].Attach(cir, now)
 		if err != nil {
 			return err
 		}
@@ -342,7 +342,7 @@ func (t *PeerTable) AddAdmission(st *statement.Statement, now time.Time) (fresh 
 		if i < 0 {
 			return fmt.Errorf("roster: circle %s is not honoured here", shortDID(st.Payload.Sub))
 		}
-		nr, f, err := s.rosters[i].Add(st, now)
+		nr, wasFresh, err := s.rosters[i].Add(st, now)
 		// The roster is adopted whatever the verdict on the statement: a
 		// refused admission may still have taught the roster the circle's
 		// key history, which its roots now hold and its slots must reflect
@@ -355,7 +355,7 @@ func (t *PeerTable) AddAdmission(st *statement.Statement, now time.Time) (fresh 
 		if err != nil {
 			return err
 		}
-		fresh = f
+		fresh = wasFresh
 		return nil
 	})
 	return fresh, err
@@ -369,14 +369,14 @@ func (t *PeerTable) AddRevocation(circleDID string, st *statement.Statement) (fr
 		if i < 0 {
 			return fmt.Errorf("roster: circle %s is not honoured here", shortDID(circleDID))
 		}
-		nr, f, err := s.rosters[i].AddRevocation(st)
+		nr, wasFresh, err := s.rosters[i].AddRevocation(st)
 		if nr != s.rosters[i] {
 			_ = s.replace(i, nr, false) // adopted whatever the verdict, as in AddAdmission
 		}
 		if err != nil {
 			return err
 		}
-		fresh = f
+		fresh = wasFresh
 		return nil
 	})
 	return fresh, err
@@ -396,11 +396,11 @@ func (t *PeerTable) AddHandover(circleDID string, st *statement.Statement) (grew
 		if i < 0 {
 			return fmt.Errorf("roster: circle %s is not honoured here", shortDID(circleDID))
 		}
-		nr, g, err := s.rosters[i].AddHandover(st)
+		nr, didGrow, err := s.rosters[i].AddHandover(st)
 		if err != nil {
 			return err
 		}
-		if g {
+		if didGrow {
 			grew = true
 			return s.replace(i, nr, true)
 		}
@@ -413,29 +413,29 @@ func (t *PeerTable) AddHandover(circleDID string, st *statement.Statement) (grew
 // connected peer, be in a circle this node holds, and
 // leave the device live there — a revoked or expired chain is refused and
 // the handshake fails. Lapsed memory is the event log's business (AddMember).
-func (t *PeerTable) Admit(p peer.ID, c *cert.Cert) error {
-	deviceDID, err := DeviceDID(p)
+func (t *PeerTable) Admit(peerID peer.ID, memberCert *cert.Cert) error {
+	deviceDID, err := DeviceDID(peerID)
 	if err != nil {
 		return err
 	}
-	if c.Payload.Aud != deviceDID {
-		return fmt.Errorf("cert is issued to %s, not to connected peer %s", c.Payload.Aud, p)
+	if memberCert.Payload.Aud != deviceDID {
+		return fmt.Errorf("cert is issued to %s, not to connected peer %s", memberCert.Payload.Aud, peerID)
 	}
 	now := time.Now()
-	if _, err := t.AddAdmission(c.Stmt, now); err != nil {
+	if _, err := t.AddAdmission(memberCert.Stmt, now); err != nil {
 		if strings.Contains(err.Error(), "not honoured") {
-			return fmt.Errorf("certificate circle %s is not honoured here", c.Payload.Sub)
+			return fmt.Errorf("certificate circle %s is not honoured here", memberCert.Payload.Sub)
 		}
 		return err
 	}
-	r, ok := t.View().RosterFor(c.Payload.Sub)
+	roster, ok := t.View().RosterFor(memberCert.Payload.Sub)
 	if !ok {
-		return fmt.Errorf("certificate circle %s is not honoured here", c.Payload.Sub)
+		return fmt.Errorf("certificate circle %s is not honoured here", memberCert.Payload.Sub)
 	}
 	// The presented cert is judged on its own — not the device's entry (a
 	// newer, live admission) — so a revoked cert is refused whatever else the
 	// device holds.
-	if err := r.Judge(c.Stmt, now); err != nil {
+	if err := roster.Judge(memberCert.Stmt, now); err != nil {
 		return fmt.Errorf("device is not admitted: %w", err)
 	}
 	return nil
@@ -447,45 +447,45 @@ func (t *PeerTable) Admit(p peer.ID, c *cert.Cert) error {
 // it enters that circle's roster and live says whether the device is
 // admitted there now (a revoked or expired admission is recorded with its
 // verdict and skipped). circleDID is the circle's DID.
-func (t *PeerTable) Verify(p peer.ID, st *statement.Statement) (circleDID string, held, live bool, err error) {
-	c, err := cert.FromStatement(st)
+func (t *PeerTable) Verify(peerID peer.ID, st *statement.Statement) (circleDID string, held, live bool, err error) {
+	memberCert, err := cert.FromStatement(st)
 	if err != nil {
 		return "", false, false, err
 	}
-	deviceDID, err := DeviceDID(p)
+	deviceDID, err := DeviceDID(peerID)
 	if err != nil {
 		return "", false, false, err
 	}
-	if c.Payload.Aud != deviceDID {
-		return "", false, false, fmt.Errorf("admission is issued to %s, not to connected peer %s", c.Payload.Aud, p)
+	if memberCert.Payload.Aud != deviceDID {
+		return "", false, false, fmt.Errorf("admission is issued to %s, not to connected peer %s", memberCert.Payload.Aud, peerID)
 	}
-	if _, ok := t.View().RosterFor(c.Payload.Sub); !ok {
+	if _, ok := t.View().RosterFor(memberCert.Payload.Sub); !ok {
 		return "", false, false, nil
 	}
 	now := time.Now()
 	if _, err := t.AddAdmission(st, now); err != nil {
 		return "", true, false, err
 	}
-	r, ok := t.View().RosterFor(c.Payload.Sub)
+	roster, ok := t.View().RosterFor(memberCert.Payload.Sub)
 	if !ok {
 		return "", false, false, nil
 	}
-	return r.CircleDID(), true, r.Judge(st, now) == nil, nil // the presented admission itself, see Admit
+	return roster.CircleDID(), true, roster.Judge(st, now) == nil, nil // the presented admission itself, see Admit
 }
 
 // AddMember records a verified certificate for a peer: AddAdmission over
 // the cert's statement, whatever the verdict (the caller validated it as
 // far as it could).
-func (t *PeerTable) AddMember(p peer.ID, c *cert.Cert) {
-	_, _ = t.AddAdmission(c.Stmt, time.Now())
+func (t *PeerTable) AddMember(peerID peer.ID, memberCert *cert.Cert) {
+	_, _ = t.AddAdmission(memberCert.Stmt, time.Now())
 }
 
 // GC moves expired devices to lapsed memory, drops lapsed entries past
 // their retention and sweeps that can no longer kill anything.
 func (t *PeerTable) GC(now time.Time) {
 	_ = t.apply(func(s *state) error {
-		for i, r := range s.rosters {
-			nr, changed, dropped := r.GC(now)
+		for i, roster := range s.rosters {
+			nr, changed, dropped := roster.GC(now)
 			if changed {
 				_ = s.replace(i, nr, dropped)
 				continue
@@ -503,38 +503,42 @@ func (t *PeerTable) GC(now time.Time) {
 
 // ---- readers: thin wrappers over the current view ---------------------------
 
-func (t *PeerTable) Rosters() []*circle.Roster                 { return t.View().Rosters() }
-func (t *PeerTable) RosterFor(d string) (*circle.Roster, bool) { return t.View().RosterFor(d) }
-func (t *PeerTable) Roots() statement.Roots                    { return tableRoots{t} }
-func (t *PeerTable) IsMember(p peer.ID, now time.Time) bool    { return t.View().IsMember(p, now) }
-func (t *PeerTable) Circles(p peer.ID, now time.Time) []string {
-	return t.View().Circles(p, now)
+func (t *PeerTable) Rosters() []*circle.Roster                         { return t.View().Rosters() }
+func (t *PeerTable) RosterFor(circleDID string) (*circle.Roster, bool) { return t.View().RosterFor(circleDID) }
+func (t *PeerTable) Roots() statement.Roots                            { return tableRoots{t} }
+func (t *PeerTable) IsMember(peerID peer.ID, now time.Time) bool {
+	return t.View().IsMember(peerID, now)
 }
-func (t *PeerTable) In(p peer.ID, circleDID string, now time.Time) bool {
-	return t.View().In(p, circleDID, now)
+func (t *PeerTable) Circles(peerID peer.ID, now time.Time) []string {
+	return t.View().Circles(peerID, now)
 }
-func (t *PeerTable) Chain(p peer.ID, circleDID string, now time.Time) (*statement.Compiled, bool) {
-	return t.View().Chain(p, circleDID, now)
+func (t *PeerTable) In(peerID peer.ID, circleDID string, now time.Time) bool {
+	return t.View().In(peerID, circleDID, now)
 }
-func (t *PeerTable) Allows(p peer.ID, protocolID string, now time.Time) bool {
-	return t.View().Allows(p, protocolID, now)
+func (t *PeerTable) Chain(peerID peer.ID, circleDID string, now time.Time) (*statement.Compiled, bool) {
+	return t.View().Chain(peerID, circleDID, now)
 }
-func (t *PeerTable) Cert(p peer.ID) (*cert.Cert, bool) { return t.View().Cert(p) }
-func (t *PeerTable) CertIn(p peer.ID, circleDID string) (*cert.Cert, bool) {
-	return t.View().CertIn(p, circleDID)
+func (t *PeerTable) Allows(peerID peer.ID, protocolID string, now time.Time) bool {
+	return t.View().Allows(peerID, protocolID, now)
 }
-func (t *PeerTable) LapsedCert(p peer.ID) (*cert.Cert, bool) { return t.View().LapsedCert(p) }
+func (t *PeerTable) Cert(peerID peer.ID) (*cert.Cert, bool) { return t.View().Cert(peerID) }
+func (t *PeerTable) CertIn(peerID peer.ID, circleDID string) (*cert.Cert, bool) {
+	return t.View().CertIn(peerID, circleDID)
+}
+func (t *PeerTable) LapsedCert(peerID peer.ID) (*cert.Cert, bool) { return t.View().LapsedCert(peerID) }
 func (t *PeerTable) Snapshot() (map[peer.ID]*cert.Cert, map[peer.ID]time.Time) {
 	return t.View().Snapshot()
 }
-func (t *PeerTable) Lapsed() map[peer.ID]*cert.Cert          { return t.View().Lapsed() }
-func (t *PeerTable) IsRevoked(p peer.ID, now time.Time) bool { return t.View().IsRevoked(p, now) }
-func (t *PeerTable) LiveIn(circleDID string) []peer.ID       { return t.View().LiveIn(circleDID) }
-func (t *PeerTable) Route(dst netip.Addr) (peer.ID, bool)    { return t.View().Route(dst, time.Now()) }
-func (t *PeerTable) AddrConflict(p peer.ID) (netip.Addr, bool) {
-	return t.View().AddrConflict(p, time.Now())
+func (t *PeerTable) Lapsed() map[peer.ID]*cert.Cert { return t.View().Lapsed() }
+func (t *PeerTable) IsRevoked(peerID peer.ID, now time.Time) bool {
+	return t.View().IsRevoked(peerID, now)
 }
-func (t *PeerTable) AddrOf(p peer.ID) (netip.Addr, bool) { return t.View().AddrOf(p, time.Now()) }
+func (t *PeerTable) LiveIn(circleDID string) []peer.ID    { return t.View().LiveIn(circleDID) }
+func (t *PeerTable) Route(dst netip.Addr) (peer.ID, bool) { return t.View().Route(dst, time.Now()) }
+func (t *PeerTable) AddrConflict(peerID peer.ID) (netip.Addr, bool) {
+	return t.View().AddrConflict(peerID, time.Now())
+}
+func (t *PeerTable) AddrOf(peerID peer.ID) (netip.Addr, bool) { return t.View().AddrOf(peerID, time.Now()) }
 func (t *PeerTable) Resolve(name string) (netip.Addr, bool) {
 	return t.View().Resolve(name, time.Now())
 }
@@ -565,19 +569,19 @@ func (v *View) Rosters() []*circle.Roster { return v.rosters }
 
 // RosterFor returns the roster of the circle circleDID. Read only.
 func (v *View) RosterFor(circleDID string) (*circle.Roster, bool) {
-	for _, r := range v.rosters {
-		if r.Honours(circleDID) {
-			return r, true
+	for _, roster := range v.rosters {
+		if roster.Honours(circleDID) {
+			return roster, true
 		}
 	}
 	return nil, false
 }
 
-func (v *View) live(p peer.ID, now time.Time) []deviceIn {
+func (v *View) live(peerID peer.ID, now time.Time) []deviceIn {
 	var out []deviceIn
-	for _, d := range v.byPeer[p] {
-		if d.dev.Admits(now) {
-			out = append(out, d)
+	for _, entry := range v.byPeer[peerID] {
+		if entry.dev.Admits(now) {
+			out = append(out, entry)
 		}
 	}
 	return out
@@ -585,21 +589,21 @@ func (v *View) live(p peer.ID, now time.Time) []deviceIn {
 
 // IsMember reports whether the peer is a live device of any circle held
 // here.
-func (v *View) IsMember(p peer.ID, now time.Time) bool { return len(v.live(p, now)) > 0 }
+func (v *View) IsMember(peerID peer.ID, now time.Time) bool { return len(v.live(peerID, now)) > 0 }
 
 // Circles lists the circles (by DID) the peer is a live device of.
-func (v *View) Circles(p peer.ID, now time.Time) []string {
+func (v *View) Circles(peerID peer.ID, now time.Time) []string {
 	var out []string
-	for _, d := range v.live(p, now) {
-		out = append(out, d.roster.CircleDID())
+	for _, entry := range v.live(peerID, now) {
+		out = append(out, entry.roster.CircleDID())
 	}
 	return out
 }
 
 // In reports whether the peer is a live device of the circle.
-func (v *View) In(p peer.ID, circleDID string, now time.Time) bool {
-	for _, d := range v.live(p, now) {
-		if d.roster.Honours(circleDID) {
+func (v *View) In(peerID peer.ID, circleDID string, now time.Time) bool {
+	for _, entry := range v.live(peerID, now) {
+		if entry.roster.Honours(circleDID) {
 			return true
 		}
 	}
@@ -607,10 +611,10 @@ func (v *View) In(p peer.ID, circleDID string, now time.Time) bool {
 }
 
 // Chain returns the peer's compiled admission in a circle, when live.
-func (v *View) Chain(p peer.ID, circleDID string, now time.Time) (*statement.Compiled, bool) {
-	for _, d := range v.live(p, now) {
-		if d.roster.Honours(circleDID) {
-			return d.dev.Chain, true
+func (v *View) Chain(peerID peer.ID, circleDID string, now time.Time) (*statement.Compiled, bool) {
+	for _, entry := range v.live(peerID, now) {
+		if entry.roster.Honours(circleDID) {
+			return entry.dev.Chain, true
 		}
 	}
 	return nil, false
@@ -620,10 +624,10 @@ func (v *View) Chain(p peer.ID, circleDID string, now time.Time) (*statement.Com
 // shared circle admits the protocol (fabric ADR 0005): control-plane
 // protocols for every member, data-plane families only when an admission
 // carries a verb of that family.
-func (v *View) Allows(p peer.ID, protocolID string, now time.Time) bool {
+func (v *View) Allows(peerID peer.ID, protocolID string, now time.Time) bool {
 	family := cert.ScopeFamily(protocolID)
-	for _, d := range v.live(p, now) {
-		if c := view(d.dev); c != nil && c.Allows(family) {
+	for _, entry := range v.live(peerID, now) {
+		if memberCert := view(entry.dev); memberCert != nil && memberCert.Allows(family) {
 			return true
 		}
 	}
@@ -633,19 +637,19 @@ func (v *View) Allows(p peer.ID, protocolID string, now time.Time) bool {
 // Cert returns the peer's membership cert view, if it is a member: the
 // admission carrying an overlay address when it has one, else the first
 // roster's. A summary for display; an access question goes by CertIn.
-func (v *View) Cert(p peer.ID) (*cert.Cert, bool) {
-	c := pick(v.live(p, time.Now()))
-	return c, c != nil
+func (v *View) Cert(peerID peer.ID) (*cert.Cert, bool) {
+	memberCert := pick(v.live(peerID, time.Now()))
+	return memberCert, memberCert != nil
 }
 
 // CertIn is the cert view of the peer's live admission in one circle —
 // what an authorization question about that circle goes by (Codex review,
 // 2026-11-05: the summary must not decide access in another circle).
-func (v *View) CertIn(p peer.ID, circleDID string) (*cert.Cert, bool) {
-	for _, d := range v.live(p, time.Now()) {
-		if d.roster.Honours(circleDID) {
-			c := view(d.dev)
-			return c, c != nil
+func (v *View) CertIn(peerID peer.ID, circleDID string) (*cert.Cert, bool) {
+	for _, entry := range v.live(peerID, time.Now()) {
+		if entry.roster.Honours(circleDID) {
+			memberCert := view(entry.dev)
+			return memberCert, memberCert != nil
 		}
 	}
 	return nil, false
@@ -653,15 +657,15 @@ func (v *View) CertIn(p peer.ID, circleDID string) (*cert.Cert, bool) {
 
 // LapsedCert returns the expired cert a former member is remembered by, if
 // the peer is live nowhere and lapsed somewhere.
-func (v *View) LapsedCert(p peer.ID) (*cert.Cert, bool) {
+func (v *View) LapsedCert(peerID peer.ID) (*cert.Cert, bool) {
 	now := time.Now()
-	if len(v.live(p, now)) > 0 {
+	if len(v.live(peerID, now)) > 0 {
 		return nil, false
 	}
-	for _, d := range v.byPeer[p] {
-		if d.dev.LapsedAt(now) {
-			if c := view(d.dev); c != nil {
-				return c, true
+	for _, entry := range v.byPeer[peerID] {
+		if entry.dev.LapsedAt(now) {
+			if memberCert := view(entry.dev); memberCert != nil {
+				return memberCert, true
 			}
 		}
 	}
@@ -675,19 +679,19 @@ func (v *View) Snapshot() (members map[peer.ID]*cert.Cert, revoked map[peer.ID]t
 	now := time.Now()
 	members = make(map[peer.ID]*cert.Cert)
 	revoked = make(map[peer.ID]time.Time)
-	for p := range v.byPeer {
-		if c := pick(v.live(p, now)); c != nil {
-			members[p] = c
+	for peerID := range v.byPeer {
+		if memberCert := pick(v.live(peerID, now)); memberCert != nil {
+			members[peerID] = memberCert
 		}
 	}
-	for _, r := range v.rosters {
-		for deviceDID, until := range r.Tombstones(now) {
-			p, err := PeerOfDID(deviceDID)
-			if err != nil || members[p] != nil {
+	for _, roster := range v.rosters {
+		for deviceDID, until := range roster.Tombstones(now) {
+			peerID, err := PeerOfDID(deviceDID)
+			if err != nil || members[peerID] != nil {
 				continue // re-admitted after a sweep: a member, not a tombstone
 			}
-			if cur, ok := revoked[p]; !ok || until.After(cur) {
-				revoked[p] = until
+			if cur, ok := revoked[peerID]; !ok || until.After(cur) {
+				revoked[peerID] = until
 			}
 		}
 	}
@@ -700,9 +704,9 @@ func (v *View) Snapshot() (members map[peer.ID]*cert.Cert, revoked map[peer.ID]t
 // revoked.
 func (v *View) Lapsed() map[peer.ID]*cert.Cert {
 	out := make(map[peer.ID]*cert.Cert)
-	for p := range v.byPeer {
-		if c, ok := v.LapsedCert(p); ok {
-			out[p] = c
+	for peerID := range v.byPeer {
+		if memberCert, ok := v.LapsedCert(peerID); ok {
+			out[peerID] = memberCert
 		}
 	}
 	return out
@@ -710,16 +714,16 @@ func (v *View) Lapsed() map[peer.ID]*cert.Cert {
 
 // IsRevoked reports whether the peer is refused as revoked: live nowhere,
 // and dead or swept somewhere.
-func (v *View) IsRevoked(p peer.ID, now time.Time) bool {
-	if len(v.live(p, now)) > 0 {
+func (v *View) IsRevoked(peerID peer.ID, now time.Time) bool {
+	if len(v.live(peerID, now)) > 0 {
 		return false
 	}
-	deviceDID, err := DeviceDID(p)
+	deviceDID, err := DeviceDID(peerID)
 	if err != nil {
 		return false
 	}
-	for _, r := range v.rosters {
-		if _, ok := r.Revoked(deviceDID, now); ok {
+	for _, roster := range v.rosters {
+		if _, ok := roster.Revoked(deviceDID, now); ok {
 			return true
 		}
 	}
@@ -730,13 +734,13 @@ func (v *View) IsRevoked(p peer.ID, now time.Time) bool {
 func (v *View) LiveIn(circleDID string) []peer.ID {
 	now := time.Now()
 	var out []peer.ID
-	for _, r := range v.rosters {
-		if !r.Honours(circleDID) {
+	for _, roster := range v.rosters {
+		if !roster.Honours(circleDID) {
 			continue
 		}
-		for _, dev := range r.LiveDevices(now) {
-			if p, err := PeerOfDID(dev.DID); err == nil {
-				out = append(out, p)
+		for _, dev := range roster.LiveDevices(now) {
+			if peerID, err := PeerOfDID(dev.DID); err == nil {
+				out = append(out, peerID)
 			}
 		}
 	}
@@ -746,15 +750,15 @@ func (v *View) LiveIn(circleDID string) []peer.ID {
 // addrEntry is the entry that gives the peer its overlay address right now:
 // its overlay-circle entry, when it carries one and admits the device at
 // this moment — the one address Route, AddrOf and Resolve all answer with.
-func (v *View) addrEntry(p peer.ID, now time.Time) (deviceIn, bool) {
-	d, ok := v.addrs[p]
-	if !ok || !d.dev.Admits(now) {
+func (v *View) addrEntry(peerID peer.ID, now time.Time) (deviceIn, bool) {
+	entry, ok := v.addrs[peerID]
+	if !ok || !entry.dev.Admits(now) {
 		return deviceIn{}, false
 	}
-	if h, _ := v.holder(d.addr, now); h != p {
+	if holderPeer, _ := v.holder(entry.addr, now); holderPeer != peerID {
 		return deviceIn{}, false // another device's later admission holds the address
 	}
-	return d, true
+	return entry, true
 }
 
 // Route answers the bridge: which live device of the overlay circle holds
@@ -769,9 +773,9 @@ func (v *View) Route(dst netip.Addr, now time.Time) (peer.ID, bool) {
 // holder is the device behind an address right now: the first of the
 // address's claimants, later admission first, whose entry admits it.
 func (v *View) holder(addr netip.Addr, now time.Time) (peer.ID, bool) {
-	for _, p := range v.holders[addr] {
-		if d, ok := v.addrs[p]; ok && d.dev.Admits(now) {
-			return p, true
+	for _, peerID := range v.holders[addr] {
+		if entry, ok := v.addrs[peerID]; ok && entry.dev.Admits(now) {
+			return peerID, true
 		}
 	}
 	return "", false
@@ -781,13 +785,13 @@ func (v *View) holder(addr netip.Addr, now time.Time) (peer.ID, bool) {
 // another device's later admission holds it right now: the device has no
 // route and no inbound address until an owner renumbers one of them, or
 // the holder's admission runs out.
-func (v *View) AddrConflict(p peer.ID, now time.Time) (netip.Addr, bool) {
-	d, ok := v.addrs[p]
-	if !ok || !d.dev.Admits(now) {
+func (v *View) AddrConflict(peerID peer.ID, now time.Time) (netip.Addr, bool) {
+	entry, ok := v.addrs[peerID]
+	if !ok || !entry.dev.Admits(now) {
 		return netip.Addr{}, false
 	}
-	if h, ok := v.holder(d.addr, now); ok && h != p {
-		return d.addr, true
+	if holderPeer, ok := v.holder(entry.addr, now); ok && holderPeer != peerID {
+		return entry.addr, true
 	}
 	return netip.Addr{}, false
 }
@@ -795,17 +799,17 @@ func (v *View) AddrConflict(p peer.ID, now time.Time) (netip.Addr, bool) {
 // AddrOf is the overlay address a live device of the overlay circle holds
 // — what inbound frames from it must carry as source, and the only
 // address Route sends to it.
-func (v *View) AddrOf(p peer.ID, now time.Time) (netip.Addr, bool) {
-	d, ok := v.addrEntry(p, now)
-	return d.addr, ok
+func (v *View) AddrOf(peerID peer.ID, now time.Time) (netip.Addr, bool) {
+	entry, ok := v.addrEntry(peerID, now)
+	return entry.addr, ok
 }
 
 // Resolve answers `<name>.fabric`: the current overlay address of the live
 // device of the overlay circle labelled name.
 func (v *View) Resolve(name string, now time.Time) (netip.Addr, bool) {
-	for _, p := range v.names[strings.ToLower(name)] {
-		if a, ok := v.AddrOf(p, now); ok {
-			return a, true
+	for _, peerID := range v.names[strings.ToLower(name)] {
+		if addr, ok := v.AddrOf(peerID, now); ok {
+			return addr, true
 		}
 	}
 	return netip.Addr{}, false
@@ -815,11 +819,11 @@ func (v *View) Resolve(name string, now time.Time) (netip.Addr, bool) {
 
 // view reads a admission as a cert (name, IP, scope, expiry).
 func view(dev *circle.Device) *cert.Cert {
-	c, err := cert.FromStatement(dev.Stmt)
+	memberCert, err := cert.FromStatement(dev.Stmt)
 	if err != nil {
 		return nil
 	}
-	return c
+	return memberCert
 }
 
 // pick is the cert view a peer is summarised by: the admission carrying an
@@ -827,16 +831,16 @@ func view(dev *circle.Device) *cert.Cert {
 // first roster's.
 func pick(devs []deviceIn) *cert.Cert {
 	var first *cert.Cert
-	for _, d := range devs {
-		c := view(d.dev)
-		if c == nil {
+	for _, entry := range devs {
+		memberCert := view(entry.dev)
+		if memberCert == nil {
 			continue
 		}
-		if c.Payload.Meta.IP != "" {
-			return c
+		if memberCert.Payload.Meta.IP != "" {
+			return memberCert
 		}
 		if first == nil {
-			first = c
+			first = memberCert
 		}
 	}
 	return first
@@ -844,33 +848,33 @@ func pick(devs []deviceIn) *cert.Cert {
 
 // DeviceDID is the did:key of a peer's identity key (ed25519 keys are
 // embedded in the peer ID).
-func DeviceDID(p peer.ID) (string, error) {
-	pub, err := p.ExtractPublicKey()
+func DeviceDID(peerID peer.ID) (string, error) {
+	pub, err := peerID.ExtractPublicKey()
 	if err != nil {
-		return "", fmt.Errorf("peer %s: %w", p, err)
+		return "", fmt.Errorf("peer %s: %w", peerID, err)
 	}
 	raw, err := pub.Raw()
 	if err != nil {
 		return "", err
 	}
 	if pub.Type() != crypto.Ed25519 {
-		return "", fmt.Errorf("peer %s: not an ed25519 identity", p)
+		return "", fmt.Errorf("peer %s: not an ed25519 identity", peerID)
 	}
 	return did.ForKey(ed25519.PublicKey(raw)), nil
 }
 
 // PeerOfDID is the inverse of DeviceDID.
 func PeerOfDID(deviceDID string) (peer.ID, error) {
-	k, err := did.KeyFor(deviceDID)
+	pubKey, err := did.KeyFor(deviceDID)
 	if err != nil {
 		return "", err
 	}
-	return PeerIDForKey(k)
+	return PeerIDForKey(pubKey)
 }
 
-func shortDID(d string) string {
-	if len(d) > 16 {
-		return d[:16] + "…"
+func shortDID(didStr string) string {
+	if len(didStr) > 16 {
+		return didStr[:16] + "…"
 	}
-	return d
+	return didStr
 }

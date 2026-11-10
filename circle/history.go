@@ -99,10 +99,10 @@ func (c *Circle) AddHandover(st *statement.Statement) (bool, error) {
 }
 
 // SaveHandovers writes a circle directory's key history atomically.
-func SaveHandovers(dir string, hs []*statement.Statement) error {
-	list := make([][]byte, 0, len(hs))
-	for _, h := range hs {
-		raw, err := h.Bytes()
+func SaveHandovers(dir string, handovers []*statement.Statement) error {
+	list := make([][]byte, 0, len(handovers))
+	for _, handover := range handovers {
+		raw, err := handover.Bytes()
 		if err != nil {
 			return err
 		}
@@ -151,11 +151,11 @@ func (c *Circle) Rotate(passphrase string, compromised bool, now time.Time) (*st
 		return nil, err
 	}
 	next := ed25519.NewKeyFromSeed(seed)
-	h, err := statement.Handover(old, next.Public().(ed25519.PublicKey), c.Config.DID, compromised, now, roots.RootProof())
+	handover, err := statement.Handover(old, next.Public().(ed25519.PublicKey), c.Config.DID, compromised, now, roots.RootProof())
 	if err != nil {
 		return nil, err
 	}
-	if _, err := roots.Learn(h); err != nil {
+	if _, err := roots.Learn(handover); err != nil {
 		return nil, err
 	}
 	// History first, then the key: a crash between leaves a device whose
@@ -172,7 +172,7 @@ func (c *Circle) Rotate(passphrase string, compromised bool, now time.Time) (*st
 	if err := os.Rename(tmp, keyPath(c.Path)); err != nil {
 		return nil, err
 	}
-	return h, nil
+	return handover, nil
 }
 
 // Signer unlocks the circle's current key and returns it with the proof a

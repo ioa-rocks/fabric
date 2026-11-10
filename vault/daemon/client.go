@@ -40,8 +40,8 @@ func NewClient(statePath string) *Client {
 		// No overall timeout: puts and gets stream blob-sized bodies.
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "unix", sock)
+				var dialer net.Dialer
+				return dialer.DialContext(ctx, "unix", sock)
 			},
 		},
 	}}
@@ -97,11 +97,11 @@ func (c *Client) send(method, path string, body any, out any) error {
 }
 
 func (c *Client) Status() (*StatusReply, error) {
-	var s StatusReply
-	if err := c.get("/v0/status", &s); err != nil {
+	var status StatusReply
+	if err := c.get("/v0/status", &status); err != nil {
 		return nil, err
 	}
-	return &s, nil
+	return &status, nil
 }
 
 // Ping round-trips the control socket to prove the daemon is still serving.
@@ -135,12 +135,12 @@ func bucketPath(bucket, tail string) string {
 }
 
 func (c *Client) List(bucket string, tags []string) ([]ObjectInfo, error) {
-	q := ""
+	query := ""
 	if len(tags) > 0 {
-		q = "?tags=" + url.QueryEscape(strings.Join(tags, ","))
+		query = "?tags=" + url.QueryEscape(strings.Join(tags, ","))
 	}
 	var out []ObjectInfo
-	if err := c.get(bucketPath(bucket, "/objects")+q, &out); err != nil {
+	if err := c.get(bucketPath(bucket, "/objects")+query, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -149,9 +149,9 @@ func (c *Client) List(bucket string, tags []string) ([]ObjectInfo, error) {
 // ListPage uses a separate endpoint so an older daemon cannot silently return
 // its entire object list when it does not understand pagination parameters.
 func (c *Client) ListPage(ctx context.Context, bucket, after string, tags []string) (ObjectPage, error) {
-	q := url.Values{"after": {after}, "tags": {strings.Join(tags, ",")}}
+	query := url.Values{"after": {after}, "tags": {strings.Join(tags, ",")}}
 	var out ObjectPage
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://vault"+bucketPath(bucket, "/objects/page")+"?"+q.Encode(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://vault"+bucketPath(bucket, "/objects/page")+"?"+query.Encode(), nil)
 	if err != nil {
 		return out, err
 	}
@@ -167,15 +167,15 @@ func (c *Client) ListPage(ctx context.Context, bucket, after string, tags []stri
 	return out, err
 }
 
-func (c *Client) Put(bucket, name string, r io.Reader, tags []string) (ObjectInfo, error) {
+func (c *Client) Put(bucket, name string, src io.Reader, tags []string) (ObjectInfo, error) {
 	var out ObjectInfo
-	q := "?name=" + url.QueryEscape(name)
+	query := "?name=" + url.QueryEscape(name)
 	if len(tags) > 0 {
-		q += "&tags=" + url.QueryEscape(strings.Join(tags, ","))
+		query += "&tags=" + url.QueryEscape(strings.Join(tags, ","))
 	}
 	// The HTTP client always closes request bodies. Wrap the reader so a FUSE
 	// staging file survives an early Flush caused by a duplicated file descriptor.
-	resp, err := c.http.Post("http://vault"+bucketPath(bucket, "/objects")+q, "application/octet-stream", io.NopCloser(r))
+	resp, err := c.http.Post("http://vault"+bucketPath(bucket, "/objects")+query, "application/octet-stream", io.NopCloser(src))
 	if err != nil {
 		return out, fmt.Errorf("is the daemon running? %w", err)
 	}
@@ -200,9 +200,9 @@ func (c *Client) Get(bucket, ref string) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
-func (c *Client) Replace(bucket, ref string, r io.Reader) (ObjectInfo, error) {
+func (c *Client) Replace(bucket, ref string, src io.Reader) (ObjectInfo, error) {
 	var out ObjectInfo
-	req, err := http.NewRequest(http.MethodPut, "http://vault"+bucketPath(bucket, "/content")+"?ref="+url.QueryEscape(ref), io.NopCloser(r))
+	req, err := http.NewRequest(http.MethodPut, "http://vault"+bucketPath(bucket, "/content")+"?ref="+url.QueryEscape(ref), io.NopCloser(src))
 	if err != nil {
 		return out, err
 	}

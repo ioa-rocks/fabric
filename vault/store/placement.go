@@ -33,12 +33,12 @@ type Placement struct {
 
 // UnmarshalJSON accepts the pre-2026-10 shape (a bare mode string) as well
 // as the record.
-func (p *Placement) UnmarshalJSON(b []byte) error {
-	if len(b) > 0 && b[0] == '"' {
-		return json.Unmarshal(b, &p.Mode)
+func (p *Placement) UnmarshalJSON(data []byte) error {
+	if len(data) > 0 && data[0] == '"' {
+		return json.Unmarshal(data, &p.Mode)
 	}
 	type plain Placement
-	return json.Unmarshal(b, (*plain)(p))
+	return json.Unmarshal(data, (*plain)(p))
 }
 
 func (c *Store) subsPath() string { return filepath.Join(c.Path, "subs.json") }
@@ -68,8 +68,8 @@ func (c *Store) Placements() (map[string]Placement, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make(map[string]Placement, len(c.placements))
-	for k, v := range c.placements {
-		out[k] = v
+	for bucketID, placement := range c.placements {
+		out[bucketID] = placement
 	}
 	return out, nil
 }
@@ -81,8 +81,8 @@ func (c *Store) Subscriptions() (map[string]string, error) {
 		return nil, err
 	}
 	out := make(map[string]string, len(ps))
-	for k, v := range ps {
-		out[k] = v.Mode
+	for bucketID, placement := range ps {
+		out[bucketID] = placement.Mode
 	}
 	return out, nil
 }
@@ -102,34 +102,34 @@ func (c *Store) Subscription(bucketID string) string {
 // SetSubscription changes a bucket's mode, keeping its root. SubNone
 // removes the record (root included).
 func (c *Store) SetSubscription(bucketID, mode string) error {
-	p := c.Placement(bucketID)
-	p.Mode = mode
-	return c.SetPlacement(bucketID, p)
+	placement := c.Placement(bucketID)
+	placement.Mode = mode
+	return c.SetPlacement(bucketID, placement)
 }
 
 // SetPlacement records this device's placement commitment for a bucket.
 // Mode SubNone removes the entry. Root must be absolute (or empty for the
 // default store); naming the default store explicitly is the same as
 // leaving it empty.
-func (c *Store) SetPlacement(bucketID string, p Placement) error {
-	if p.Mode != SubFull && p.Mode != SubCache && p.Mode != SubNone {
-		return fmt.Errorf("unknown subscription mode %q (full, cache, or none)", p.Mode)
+func (c *Store) SetPlacement(bucketID string, placement Placement) error {
+	if placement.Mode != SubFull && placement.Mode != SubCache && placement.Mode != SubNone {
+		return fmt.Errorf("unknown subscription mode %q (full, cache, or none)", placement.Mode)
 	}
-	if p.Root != "" {
-		if !filepath.IsAbs(p.Root) {
+	if placement.Root != "" {
+		if !filepath.IsAbs(placement.Root) {
 			return fmt.Errorf("placement root must be an absolute path")
 		}
-		p.Root = filepath.Clean(p.Root)
-		if p.Root == c.defaultBlobsDir() {
-			p.Root = ""
+		placement.Root = filepath.Clean(placement.Root)
+		if placement.Root == c.defaultBlobsDir() {
+			placement.Root = ""
 		}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if p.Mode == SubNone {
+	if placement.Mode == SubNone {
 		delete(c.placements, bucketID)
 	} else {
-		c.placements[bucketID] = p
+		c.placements[bucketID] = placement
 	}
 	raw, err := json.MarshalIndent(c.placements, "", "  ")
 	if err != nil {
@@ -142,15 +142,15 @@ func (c *Store) SetPlacement(bucketID string, p Placement) error {
 // root that cannot be opened (an array not mounted) yields an error each
 // time, never a silent fallback: writes must not land on the wrong disk.
 func (c *Store) rootStore(root string) (*blobstore.Store, error) {
-	if s, ok := c.roots[root]; ok {
-		return s, nil
+	if blobs, ok := c.roots[root]; ok {
+		return blobs, nil
 	}
-	s, err := blobstore.Open(root)
+	blobs, err := blobstore.Open(root)
 	if err != nil {
 		return nil, fmt.Errorf("placement root %s: %w", root, err)
 	}
-	c.roots[root] = s
-	return s, nil
+	c.roots[root] = blobs
+	return blobs, nil
 }
 
 // holderFor is where a bucket's blobs go on this device when it has no
@@ -160,36 +160,36 @@ func (c *Store) rootStore(root string) (*blobstore.Store, error) {
 func (c *Store) holderFor(bucketID string) Holder {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	p := c.placements[bucketID]
-	h := &rootedHolder{primary: c.Blobs}
-	if p.Root != "" {
-		s, err := c.rootStore(p.Root)
+	placement := c.placements[bucketID]
+	holder := &rootedHolder{primary: c.Blobs}
+	if placement.Root != "" {
+		blobs, err := c.rootStore(placement.Root)
 		if err != nil {
-			h.primary, h.primaryErr = nil, err
+			holder.primary, holder.primaryErr = nil, err
 			log.Printf("vault: bucket %.12s: %v (reads fall back, writes refused)", bucketID, err)
 		} else {
-			h.primary = s
+			holder.primary = blobs
 		}
-		h.fallbacks = append(h.fallbacks, c.Blobs)
+		holder.fallbacks = append(holder.fallbacks, c.Blobs)
 	}
 	for _, root := range c.sortedRootsLocked() {
-		if root == p.Root {
+		if root == placement.Root {
 			continue
 		}
-		if s, err := c.rootStore(root); err == nil {
-			h.fallbacks = append(h.fallbacks, s)
+		if blobs, err := c.rootStore(root); err == nil {
+			holder.fallbacks = append(holder.fallbacks, blobs)
 		}
 	}
-	return h
+	return holder
 }
 
 func (c *Store) sortedRootsLocked() []string {
 	seen := map[string]bool{}
 	var roots []string
-	for _, p := range c.placements {
-		if p.Root != "" && !seen[p.Root] {
-			seen[p.Root] = true
-			roots = append(roots, p.Root)
+	for _, placement := range c.placements {
+		if placement.Root != "" && !seen[placement.Root] {
+			seen[placement.Root] = true
+			roots = append(roots, placement.Root)
 		}
 	}
 	sort.Strings(roots)
@@ -199,18 +199,18 @@ func (c *Store) sortedRootsLocked() []string {
 // BlobPath finds a held blob in the default store or any placement root —
 // what the blob-serving stream and projections ask.
 func (c *Store) BlobPath(hash string) (string, error) {
-	if p, err := c.Blobs.Path(hash); err == nil {
-		return p, nil
+	if blobPath, err := c.Blobs.Path(hash); err == nil {
+		return blobPath, nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, root := range c.sortedRootsLocked() {
-		s, err := c.rootStore(root)
+		blobs, err := c.rootStore(root)
 		if err != nil {
 			continue
 		}
-		if p, err := s.Path(hash); err == nil {
-			return p, nil
+		if blobPath, err := blobs.Path(hash); err == nil {
+			return blobPath, nil
 		}
 	}
 	return "", fmt.Errorf("blob %s: not held here", hash)
@@ -225,19 +225,19 @@ type rootedHolder struct {
 	fallbacks  []*blobstore.Store
 }
 
-func (h *rootedHolder) Put(r io.Reader) (string, int64, error) {
+func (h *rootedHolder) Put(src io.Reader) (string, int64, error) {
 	if h.primary == nil {
 		return "", 0, h.primaryErr
 	}
-	return h.primary.Put(r)
+	return h.primary.Put(src)
 }
 
 func (h *rootedHolder) each(fn func(s *blobstore.Store) bool) {
 	if h.primary != nil && fn(h.primary) {
 		return
 	}
-	for _, s := range h.fallbacks {
-		if fn(s) {
+	for _, blobs := range h.fallbacks {
+		if fn(blobs) {
 			return
 		}
 	}
@@ -245,9 +245,9 @@ func (h *rootedHolder) each(fn func(s *blobstore.Store) bool) {
 
 func (h *rootedHolder) Open(hash string) (rc io.ReadCloser, err error) {
 	err = fmt.Errorf("blob %s: not held here", hash)
-	h.each(func(s *blobstore.Store) bool {
-		if f, e := s.Open(hash); e == nil {
-			rc, err = f, nil
+	h.each(func(blobs *blobstore.Store) bool {
+		if file, openErr := blobs.Open(hash); openErr == nil {
+			rc, err = file, nil
 			return true
 		}
 		return false
@@ -255,16 +255,16 @@ func (h *rootedHolder) Open(hash string) (rc io.ReadCloser, err error) {
 	return rc, err
 }
 
-func (h *rootedHolder) Path(hash string) (p string, err error) {
+func (h *rootedHolder) Path(hash string) (blobPath string, err error) {
 	err = fmt.Errorf("blob %s: not held here", hash)
-	h.each(func(s *blobstore.Store) bool {
-		if q, e := s.Path(hash); e == nil {
-			p, err = q, nil
+	h.each(func(blobs *blobstore.Store) bool {
+		if foundPath, pathErr := blobs.Path(hash); pathErr == nil {
+			blobPath, err = foundPath, nil
 			return true
 		}
 		return false
 	})
-	return p, err
+	return blobPath, err
 }
 
 func (h *rootedHolder) Has(hash string) (ok bool) {
@@ -272,14 +272,14 @@ func (h *rootedHolder) Has(hash string) (ok bool) {
 	return ok
 }
 
-func (h *rootedHolder) Size(hash string) (n int64, err error) {
+func (h *rootedHolder) Size(hash string) (size int64, err error) {
 	err = fmt.Errorf("blob %s: not held here", hash)
-	h.each(func(s *blobstore.Store) bool {
-		if m, e := s.Size(hash); e == nil {
-			n, err = m, nil
+	h.each(func(blobs *blobstore.Store) bool {
+		if foundSize, sizeErr := blobs.Size(hash); sizeErr == nil {
+			size, err = foundSize, nil
 			return true
 		}
 		return false
 	})
-	return n, err
+	return size, err
 }

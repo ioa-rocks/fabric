@@ -102,53 +102,53 @@ type PendingEntry struct {
 	PeerID string `json:"peer_id"`
 }
 
-func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleOverview(writer http.ResponseWriter, _ *http.Request) {
 	st, err := s.client.Status()
 	if err != nil {
-		httpError(w, http.StatusBadGateway, fmt.Errorf("daemon: %w", err))
+		httpError(writer, http.StatusBadGateway, fmt.Errorf("daemon: %w", err))
 		return
 	}
 	members, err := s.client.Members()
 	if err != nil {
-		httpError(w, http.StatusBadGateway, err)
+		httpError(writer, http.StatusBadGateway, err)
 		return
 	}
 	events, err := s.client.Events()
 	if err != nil {
-		httpError(w, http.StatusBadGateway, err)
+		httpError(writer, http.StatusBadGateway, err)
 		return
 	}
-	o := Overview{Status: st, Members: members, Events: events, Master: s.master}
+	overview := Overview{Status: st, Members: members, Events: events, Master: s.master}
 	if links, err := s.client.Graph(); err == nil {
-		o.Links = links
+		overview.Links = links
 	}
 	if cl := vaultdaemon.TryClient(s.vaultPath); cl != nil {
 		if vst, err := cl.Status(); err == nil {
-			v := &VaultOverview{Status: vst}
+			vaultView := &VaultOverview{Status: vst}
 			if buckets, err := cl.Buckets(); err == nil {
-				v.Buckets = buckets
+				vaultView.Buckets = buckets
 			}
-			o.Vault = v
+			overview.Vault = vaultView
 		}
 	}
 	if ast, err := astraldaemon.NewClient(s.astralPath).Status(); err == nil {
-		o.Astral = &AstralOverview{
+		overview.Astral = &AstralOverview{
 			Status:     ast,
 			Capability: "per circle: every verb is checked against the caller's admission in the subject's circle",
 		}
 	}
 	if st.Master {
 		if pending, err := s.client.Pending(); err == nil {
-			for _, p := range pending {
-				entry := PendingEntry{PendingInfo: p}
-				if id, err := fabricnet.PeerIDForKey(p.DevicePub); err == nil {
+			for _, pendingItem := range pending {
+				entry := PendingEntry{PendingInfo: pendingItem}
+				if id, err := fabricnet.PeerIDForKey(pendingItem.DevicePub); err == nil {
 					entry.PeerID = id.String()
 				}
-				o.Pending = append(o.Pending, entry)
+				overview.Pending = append(overview.Pending, entry)
 			}
 		}
 	}
-	writeJSON(w, o)
+	writeJSON(writer, overview)
 }
 
 type signedRequest struct {
@@ -176,15 +176,15 @@ func (s *Server) unlock(pass string) (ed25519.PrivateKey, error) {
 	return ed25519.NewKeyFromSeed(seed), nil
 }
 
-func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleApprove(writer http.ResponseWriter, httpReq *http.Request) {
 	var req signedRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, err)
+	if err := json.NewDecoder(httpReq.Body).Decode(&req); err != nil {
+		httpError(writer, http.StatusBadRequest, err)
 		return
 	}
 	pending, err := s.client.Pending()
 	if err != nil {
-		httpError(w, http.StatusBadGateway, err)
+		httpError(writer, http.StatusBadGateway, err)
 		return
 	}
 	var match *admission.PendingInfo
@@ -195,16 +195,16 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if match == nil {
-		httpError(w, http.StatusNotFound, fmt.Errorf("no pending request %q", req.Fingerprint))
+		httpError(writer, http.StatusNotFound, fmt.Errorf("no pending request %q", req.Fingerprint))
 		return
 	}
 	if match.Status != admission.StatusPending {
-		httpError(w, http.StatusConflict, fmt.Errorf("request is already %s", match.Status))
+		httpError(writer, http.StatusConflict, fmt.Errorf("request is already %s", match.Status))
 		return
 	}
 	members, err := s.client.Members()
 	if err != nil {
-		httpError(w, http.StatusBadGateway, err)
+		httpError(writer, http.StatusBadGateway, err)
 		return
 	}
 	scopeTokens := req.Scope
@@ -213,7 +213,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 	}
 	scope, err := cert.NormalizeScope(scopeTokens)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, err)
+		httpError(writer, http.StatusBadRequest, err)
 		return
 	}
 	var ip string
@@ -222,61 +222,61 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		if ip = daemon.ReturningMemberIP(members, match.Fingerprint); ip == "" {
 			ip, err = daemon.AllocateOverlayIP(s.dir, members)
 			if err != nil {
-				httpError(w, http.StatusInternalServerError, err)
+				httpError(writer, http.StatusInternalServerError, err)
 				return
 			}
 		}
 	}
 	rootPriv, err := s.unlock(req.Passphrase)
 	if err != nil {
-		httpError(w, http.StatusForbidden, err)
+		httpError(writer, http.StatusForbidden, err)
 		return
 	}
 	circleDID, proof, err := daemon.HomeSigner(s.dir, rootPriv)
 	if err != nil {
-		httpError(w, http.StatusForbidden, err)
+		httpError(writer, http.StatusForbidden, err)
 		return
 	}
 	now := time.Now()
-	c, err := cert.IssueAs(rootPriv, proof, circleDID, ed25519.PublicKey(match.DevicePub), cert.CmdMember, cert.Meta{Name: match.Name, IP: ip, Scope: scope}, now, cert.DefaultValidity)
+	issuedCert, err := cert.IssueAs(rootPriv, proof, circleDID, ed25519.PublicKey(match.DevicePub), cert.CmdMember, cert.Meta{Name: match.Name, IP: ip, Scope: scope}, now, cert.DefaultValidity)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, err)
+		httpError(writer, http.StatusInternalServerError, err)
 		return
 	}
-	signed, err := c.Marshal()
+	signed, err := issuedCert.Marshal()
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, err)
+		httpError(writer, http.StatusInternalServerError, err)
 		return
 	}
 	if err := s.client.Approve(match.Fingerprint, signed); err != nil {
-		httpError(w, http.StatusBadGateway, err)
+		httpError(writer, http.StatusBadGateway, err)
 		return
 	}
-	writeJSON(w, map[string]string{"result": "approved", "name": match.Name})
+	writeJSON(writer, map[string]string{"result": "approved", "name": match.Name})
 }
 
-func (s *Server) handleDeny(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleDeny(writer http.ResponseWriter, httpReq *http.Request) {
 	var req signedRequest // passphrase unused: deny signs nothing
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, err)
+	if err := json.NewDecoder(httpReq.Body).Decode(&req); err != nil {
+		httpError(writer, http.StatusBadRequest, err)
 		return
 	}
 	if err := s.client.Deny(req.Fingerprint); err != nil {
-		httpError(w, http.StatusBadGateway, err)
+		httpError(writer, http.StatusBadGateway, err)
 		return
 	}
-	writeJSON(w, map[string]string{"result": "denied"})
+	writeJSON(writer, map[string]string{"result": "denied"})
 }
 
-func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRevoke(writer http.ResponseWriter, httpReq *http.Request) {
 	var req signedRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, err)
+	if err := json.NewDecoder(httpReq.Body).Decode(&req); err != nil {
+		httpError(writer, http.StatusBadRequest, err)
 		return
 	}
 	members, err := s.client.Members()
 	if err != nil {
-		httpError(w, http.StatusBadGateway, err)
+		httpError(writer, http.StatusBadGateway, err)
 		return
 	}
 	var match *daemon.MemberInfo
@@ -289,23 +289,23 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if match == nil {
-		httpError(w, http.StatusNotFound, fmt.Errorf("no member with fingerprint %q", req.Fingerprint))
+		httpError(writer, http.StatusNotFound, fmt.Errorf("no member with fingerprint %q", req.Fingerprint))
 		return
 	}
 	rootPriv, err := s.unlock(req.Passphrase)
 	if err != nil {
-		httpError(w, http.StatusForbidden, err)
+		httpError(writer, http.StatusForbidden, err)
 		return
 	}
 	if _, err := daemon.RevokeDevice(s.dir, rootPriv, cert.DIDForKey(ed25519.PublicKey(match.DevicePub)), time.Now()); err != nil {
-		httpError(w, http.StatusInternalServerError, err)
+		httpError(writer, http.StatusInternalServerError, err)
 		return
 	}
 	if _, err := s.client.CircleRefresh(); err != nil {
-		httpError(w, http.StatusBadGateway, fmt.Errorf("revocation recorded, but the daemon did not push it: %w", err))
+		httpError(writer, http.StatusBadGateway, fmt.Errorf("revocation recorded, but the daemon did not push it: %w", err))
 		return
 	}
-	writeJSON(w, map[string]string{"result": "revoked", "name": match.Name})
+	writeJSON(writer, map[string]string{"result": "revoked", "name": match.Name})
 }
 
 // handleRenew re-signs an existing member's cert with a fresh validity
@@ -313,15 +313,15 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 // roster is re-signed, so name, role, and overlay IP cannot drift — and
 // recorded as the device's admission and gossiped. Works on any member, this node
 // included.
-func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRenew(writer http.ResponseWriter, httpReq *http.Request) {
 	var req signedRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, err)
+	if err := json.NewDecoder(httpReq.Body).Decode(&req); err != nil {
+		httpError(writer, http.StatusBadRequest, err)
 		return
 	}
 	members, err := s.client.Members()
 	if err != nil {
-		httpError(w, http.StatusBadGateway, err)
+		httpError(writer, http.StatusBadGateway, err)
 		return
 	}
 	var match *daemon.MemberInfo
@@ -332,39 +332,39 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if match == nil {
-		httpError(w, http.StatusNotFound, fmt.Errorf("no member with fingerprint %q", req.Fingerprint))
+		httpError(writer, http.StatusNotFound, fmt.Errorf("no member with fingerprint %q", req.Fingerprint))
 		return
 	}
 	if match.Expired {
-		httpError(w, http.StatusConflict, fmt.Errorf("%q's cert expired %s — an expired device cannot receive a renewal; run 'fabric join' on it (it keeps its name and address)", match.Name, match.Expiry.Format(time.RFC3339)))
+		httpError(writer, http.StatusConflict, fmt.Errorf("%q's cert expired %s — an expired device cannot receive a renewal; run 'fabric join' on it (it keeps its name and address)", match.Name, match.Expiry.Format(time.RFC3339)))
 		return
 	}
 	old, err := cert.Unmarshal(match.Cert)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, fmt.Errorf("roster cert: %w", err))
+		httpError(writer, http.StatusInternalServerError, fmt.Errorf("roster cert: %w", err))
 		return
 	}
 	rootPriv, err := s.unlock(req.Passphrase)
 	if err != nil {
-		httpError(w, http.StatusForbidden, err)
+		httpError(writer, http.StatusForbidden, err)
 		return
 	}
 	now := time.Now()
 	renewed, err := cert.Renew(rootPriv, old, now, cert.DefaultValidity)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, err)
+		httpError(writer, http.StatusInternalServerError, err)
 		return
 	}
 	signed, err := renewed.Marshal()
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, err)
+		httpError(writer, http.StatusInternalServerError, err)
 		return
 	}
 	if _, err := s.client.CircleAdmit(signed); err != nil {
-		httpError(w, http.StatusBadGateway, err)
+		httpError(writer, http.StatusBadGateway, err)
 		return
 	}
-	writeJSON(w, map[string]string{
+	writeJSON(writer, map[string]string{
 		"result": "renewed", "name": match.Name,
 		"expires": renewed.Expiry().Format(time.RFC3339),
 	})
@@ -372,66 +372,66 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 
 // handleVaultObjects browses one bounded page (?bucket=<ref>&after=<cursor>&tags=t1,t2).
 // Read-only browse — content stays behind the CLI/API for now.
-func (s *Server) handleVaultObjects(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleVaultObjects(writer http.ResponseWriter, req *http.Request) {
 	cl := vaultdaemon.TryClient(s.vaultPath)
 	if cl == nil {
-		httpError(w, http.StatusBadGateway, errors.New("vault daemon not running"))
+		httpError(writer, http.StatusBadGateway, errors.New("vault daemon not running"))
 		return
 	}
-	bucket := r.URL.Query().Get("bucket")
+	bucket := req.URL.Query().Get("bucket")
 	if bucket == "" {
-		httpError(w, http.StatusBadRequest, errors.New("bucket query parameter is required"))
+		httpError(writer, http.StatusBadRequest, errors.New("bucket query parameter is required"))
 		return
 	}
 	var tags []string
-	for _, t := range strings.Split(r.URL.Query().Get("tags"), ",") {
-		if t = strings.TrimSpace(t); t != "" {
-			tags = append(tags, t)
+	for _, tag := range strings.Split(req.URL.Query().Get("tags"), ",") {
+		if tag = strings.TrimSpace(tag); tag != "" {
+			tags = append(tags, tag)
 		}
 	}
-	objs, err := cl.ListPage(r.Context(), bucket, r.URL.Query().Get("after"), tags)
+	objs, err := cl.ListPage(req.Context(), bucket, req.URL.Query().Get("after"), tags)
 	if err != nil {
-		httpError(w, http.StatusBadGateway, err)
+		httpError(writer, http.StatusBadGateway, err)
 		return
 	}
-	writeJSON(w, objs)
+	writeJSON(writer, objs)
 }
 
 // handleVaultSub sets this device's placement commitment for a bucket —
 // the one vault write the UI offers. Not a signing operation: the
 // subscription is per-device state, not circle state.
-func (s *Server) handleVaultSub(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleVaultSub(writer http.ResponseWriter, httpReq *http.Request) {
 	cl := vaultdaemon.TryClient(s.vaultPath)
 	if cl == nil {
-		httpError(w, http.StatusBadGateway, errors.New("vault daemon not running"))
+		httpError(writer, http.StatusBadGateway, errors.New("vault daemon not running"))
 		return
 	}
 	var req struct {
 		Bucket string `json:"bucket"`
 		Mode   string `json:"mode"` // "full" | "cache" | "none"
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, err)
+	if err := json.NewDecoder(httpReq.Body).Decode(&req); err != nil {
+		httpError(writer, http.StatusBadRequest, err)
 		return
 	}
 	if req.Mode != "full" && req.Mode != "cache" && req.Mode != "none" {
-		httpError(w, http.StatusBadRequest, fmt.Errorf("mode %q: want full, cache, or none", req.Mode))
+		httpError(writer, http.StatusBadRequest, fmt.Errorf("mode %q: want full, cache, or none", req.Mode))
 		return
 	}
 	if err := cl.Sub(req.Bucket, req.Mode); err != nil {
-		httpError(w, http.StatusBadGateway, err)
+		httpError(writer, http.StatusBadGateway, err)
 		return
 	}
-	writeJSON(w, map[string]string{"result": "subscribed", "bucket": req.Bucket, "mode": req.Mode})
+	writeJSON(writer, map[string]string{"result": "subscribed", "bucket": req.Bucket, "mode": req.Mode})
 }
 
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+func writeJSON(writer http.ResponseWriter, payload any) {
+	writer.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(writer).Encode(payload)
 }
 
-func httpError(w http.ResponseWriter, code int, err error) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+func httpError(writer http.ResponseWriter, code int, err error) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(code)
+	_ = json.NewEncoder(writer).Encode(map[string]string{"error": err.Error()})
 }

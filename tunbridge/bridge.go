@@ -44,7 +44,7 @@ type link struct {
 // single-writer-store).
 type RouteSource interface {
 	Route(dst netip.Addr) (peer.ID, bool)
-	AddrOf(p peer.ID) (netip.Addr, bool)
+	AddrOf(peerID peer.ID) (netip.Addr, bool)
 }
 
 type Bridge struct {
@@ -67,19 +67,19 @@ type Bridge struct {
 // device's own overlay address with the circle's prefix: the fence every
 // packet is held to (see handleInbound and readLoop). gate wraps the inbound
 // handler with the membership check.
-func New(h host.Host, dev io.ReadWriteCloser, local netip.Prefix, routes RouteSource, gate func(network.StreamHandler) network.StreamHandler) *Bridge {
-	b := &Bridge{
-		h: h, dev: dev, routes: routes, local: local,
+func New(localHost host.Host, dev io.ReadWriteCloser, local netip.Prefix, routes RouteSource, gate func(network.StreamHandler) network.StreamHandler) *Bridge {
+	bridge := &Bridge{
+		h: localHost, dev: dev, routes: routes, local: local,
 		links:  map[peer.ID]*link{},
 		closed: make(chan struct{}),
 	}
-	h.SetStreamHandler(ProtocolID, gate(b.handleInbound))
-	go b.readLoop()
-	return b
+	localHost.SetStreamHandler(ProtocolID, gate(bridge.handleInbound))
+	go bridge.readLoop()
+	return bridge
 }
 
 // inRange says whether an address lies in this bridge's overlay range.
-func (b *Bridge) inRange(a netip.Addr) bool { return b.local.Masked().Contains(a) }
+func (b *Bridge) inRange(addr netip.Addr) bool { return b.local.Masked().Contains(addr) }
 
 // logDrop notes a fenced packet at most once a minute: a steady stream of
 // them means the kernel is handing the bridge traffic it should not — a
@@ -102,12 +102,12 @@ func (b *Bridge) Close() {
 	_ = b.dev.Close()
 	b.linksMu.Lock()
 	defer b.linksMu.Unlock()
-	for _, l := range b.links {
-		l.mu.Lock()
-		if l.s != nil {
-			_ = l.s.Reset()
+	for _, peerLink := range b.links {
+		peerLink.mu.Lock()
+		if peerLink.s != nil {
+			_ = peerLink.s.Reset()
 		}
-		l.mu.Unlock()
+		peerLink.mu.Unlock()
 	}
 }
 
@@ -119,7 +119,7 @@ func (b *Bridge) Close() {
 func (b *Bridge) readLoop() {
 	buf := make([]byte, maxFrameSize)
 	for {
-		n, err := b.dev.Read(buf)
+		size, err := b.dev.Read(buf)
 		if err != nil {
 			select {
 			case <-b.closed:
@@ -128,11 +128,11 @@ func (b *Bridge) readLoop() {
 			}
 			return
 		}
-		src, ok := srcIPv4(buf[:n])
+		src, ok := srcIPv4(buf[:size])
 		if !ok {
 			continue // non-IPv4 (v6 not bridged yet) — drop
 		}
-		dst, _ := dstIPv4(buf[:n])
+		dst, _ := dstIPv4(buf[:size])
 		if src != b.local.Addr() {
 			b.logDrop("source is not this device's address", src, dst)
 			continue
@@ -141,60 +141,60 @@ func (b *Bridge) readLoop() {
 			b.logDrop("destination outside this circle's range", src, dst)
 			continue
 		}
-		p, known := b.routes.Route(dst)
+		peerID, known := b.routes.Route(dst)
 		if !known {
 			continue // not a member address (broadcast, scans, …)
 		}
-		b.send(p, buf[:n])
+		b.send(peerID, buf[:size])
 	}
 }
 
 // send writes one packet to a peer, dialing its stream lazily. Failures
 // drop the packet — IP is lossy by contract — and back off redialing.
-func (b *Bridge) send(p peer.ID, pkt []byte) {
+func (b *Bridge) send(peerID peer.ID, pkt []byte) {
 	b.linksMu.Lock()
-	l, ok := b.links[p]
+	peerLink, ok := b.links[peerID]
 	if !ok {
-		l = &link{}
-		b.links[p] = l
+		peerLink = &link{}
+		b.links[peerID] = peerLink
 	}
 	b.linksMu.Unlock()
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.s != nil && l.s.Conn().IsClosed() {
-		_ = l.s.Reset()
-		l.s = nil
-		l.failedAt = time.Time{}
+	peerLink.mu.Lock()
+	defer peerLink.mu.Unlock()
+	if peerLink.s != nil && peerLink.s.Conn().IsClosed() {
+		_ = peerLink.s.Reset()
+		peerLink.s = nil
+		peerLink.failedAt = time.Time{}
 	}
-	if l.s == nil {
-		if time.Since(l.failedAt) < redialBackoff {
+	if peerLink.s == nil {
+		if time.Since(peerLink.failedAt) < redialBackoff {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 		started := time.Now()
-		s, err := b.h.NewStream(network.WithAllowLimitedConn(ctx, "fabric TUN"), p, ProtocolID)
+		stream, err := b.h.NewStream(network.WithAllowLimitedConn(ctx, "fabric TUN"), peerID, ProtocolID)
 		cancel()
 		if err != nil {
-			l.failedAt = time.Now()
-			if time.Since(l.loggedAt) >= time.Minute {
-				l.loggedAt = time.Now()
-				log.Printf("tun: peer=%s candidates=%v elapsed=%s stream_error=%q", p, b.h.Peerstore().Addrs(p), time.Since(started).Round(time.Millisecond), err)
+			peerLink.failedAt = time.Now()
+			if time.Since(peerLink.loggedAt) >= time.Minute {
+				peerLink.loggedAt = time.Now()
+				log.Printf("tun: peer=%s candidates=%v elapsed=%s stream_error=%q", peerID, b.h.Peerstore().Addrs(peerID), time.Since(started).Round(time.Millisecond), err)
 			}
 			return
 		}
-		l.s = s
+		peerLink.s = stream
 	}
 	// A stale transport must not block the device read loop indefinitely.
-	_ = l.s.SetWriteDeadline(time.Now().Add(dialTimeout))
-	if err := wire.WriteFrame(l.s, pkt); err != nil {
-		if time.Since(l.loggedAt) >= time.Minute {
-			l.loggedAt = time.Now()
-			log.Printf("tun: peer=%s path=%s write_error=%q", p, l.s.Conn().RemoteMultiaddr(), err)
+	_ = peerLink.s.SetWriteDeadline(time.Now().Add(dialTimeout))
+	if err := wire.WriteFrame(peerLink.s, pkt); err != nil {
+		if time.Since(peerLink.loggedAt) >= time.Minute {
+			peerLink.loggedAt = time.Now()
+			log.Printf("tun: peer=%s path=%s write_error=%q", peerID, peerLink.s.Conn().RemoteMultiaddr(), err)
 		}
-		_ = l.s.Reset()
-		l.s = nil
-		l.failedAt = time.Now()
+		_ = peerLink.s.Reset()
+		peerLink.s = nil
+		peerLink.failedAt = time.Now()
 	}
 }
 
@@ -205,11 +205,11 @@ func (b *Bridge) send(p peer.ID, pkt []byte) {
 // another member, not into another overlay this box may also sit in
 // (defense in depth on top of the membership gate; Codex review 2026-11-05,
 // fence completed 2026-11-08).
-func (b *Bridge) handleInbound(s network.Stream) {
-	defer s.Close()
-	remote := s.Conn().RemotePeer()
+func (b *Bridge) handleInbound(stream network.Stream) {
+	defer stream.Close()
+	remote := stream.Conn().RemotePeer()
 	for {
-		pkt, err := wire.ReadFrame(s, maxFrameSize)
+		pkt, err := wire.ReadFrame(stream, maxFrameSize)
 		if err != nil {
 			return
 		}

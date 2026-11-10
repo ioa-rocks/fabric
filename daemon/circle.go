@@ -97,9 +97,9 @@ var (
 // authority is dropped — a revocation arrived, a device was forgotten — so
 // a data plane can re-check what it holds under that authority (leases,
 // waits, subscriptions) at once instead of at the next verb.
-func (s *CircleService) OnInvalidate(f func()) {
+func (s *CircleService) OnInvalidate(fn func()) {
 	s.mu.Lock()
-	s.onInvalidate = append(s.onInvalidate, f)
+	s.onInvalidate = append(s.onInvalidate, fn)
 	s.mu.Unlock()
 }
 
@@ -108,8 +108,8 @@ func (s *CircleService) invalidated() {
 	s.mu.RLock()
 	hooks := append([]func(){}, s.onInvalidate...)
 	s.mu.RUnlock()
-	for _, f := range hooks {
-		go f()
+	for _, fn := range hooks {
+		go fn()
 	}
 }
 
@@ -130,21 +130,21 @@ type homeChain struct {
 
 // NewCircleService attaches the exchange to the host for the circles under
 // root (listed on demand — circles added later need no restart).
-func NewCircleService(h host.Host, auth *fabricnet.AuthService, root string) *CircleService {
-	s := &CircleService{h: h, auth: auth, root: root, homeChains: map[peer.ID]homeChain{}, presented: map[peer.ID]map[presentKey]presentedChain{}, extraRevs: map[string]*statement.RevocationSet{}}
-	s.loadExtraRevs()
-	nb := &network.NotifyBundle{DisconnectedF: func(n network.Network, conn network.Conn) {
-		p := conn.RemotePeer()
-		if n.Connectedness(p) != network.Connected {
-			s.mu.Lock()
-			delete(s.homeChains, p)
-			delete(s.presented, p)
-			s.mu.Unlock()
+func NewCircleService(libp2pHost host.Host, auth *fabricnet.AuthService, root string) *CircleService {
+	svc := &CircleService{h: libp2pHost, auth: auth, root: root, homeChains: map[peer.ID]homeChain{}, presented: map[peer.ID]map[presentKey]presentedChain{}, extraRevs: map[string]*statement.RevocationSet{}}
+	svc.loadExtraRevs()
+	nb := &network.NotifyBundle{DisconnectedF: func(netw network.Network, conn network.Conn) {
+		peerID := conn.RemotePeer()
+		if netw.Connectedness(peerID) != network.Connected {
+			svc.mu.Lock()
+			delete(svc.homeChains, peerID)
+			delete(svc.presented, peerID)
+			svc.mu.Unlock()
 		}
 	}}
-	h.Network().Notify(nb)
-	s.stop = func() { h.Network().StopNotify(nb) }
-	return s
+	libp2pHost.Network().Notify(nb)
+	svc.stop = func() { libp2pHost.Network().StopNotify(nb) }
+	return svc
 }
 
 // Root is the circle root this node serves.
@@ -158,13 +158,13 @@ func (s *CircleService) SetHome(home func() string, roots statement.Roots, certO
 
 // SetOwnCert lets the service present the node's membership cert as its
 // home-circle renewal (see ownCert).
-func (s *CircleService) SetOwnCert(f func() *cert.Cert) { s.ownCert = f }
+func (s *CircleService) SetOwnCert(fn func() *cert.Cert) { s.ownCert = fn }
 
 // SetPeerTable wires the union peer table: circle revocations reach the
 // rosters transport goes by, and the v2 handshake presents this node's
 // admissions per shared circle (hello) and ingests the peer's revocations.
-func (s *CircleService) SetPeerTable(t *fabricnet.PeerTable) {
-	s.table = t
+func (s *CircleService) SetPeerTable(table *fabricnet.PeerTable) {
+	s.table = table
 	s.Circles() // rosters for every circle directory
 	// Revocations learned for a circle not held here (a gate's first
 	// circle) were restored from disk into this service; the table's
@@ -181,10 +181,10 @@ func (s *CircleService) SetPeerTable(t *fabricnet.PeerTable) {
 		})
 		// A key history learned on the handshake goes the way of one
 		// learned from the gossip: pushed to the members, then applied.
-		s.auth.SetHandoverSink(func(p peer.ID, raws [][]byte) {
+		s.auth.SetHandoverSink(func(peerID peer.ID, raws [][]byte) {
 			for _, raw := range raws {
 				if _, err := s.Handover(raw); err != nil {
-					log.Printf("auth: key handover from %s: %v", p, err)
+					log.Printf("auth: key handover from %s: %v", peerID, err)
 				}
 			}
 		})
@@ -209,18 +209,18 @@ func (s *CircleService) AttachSync(sync *fabricnet.EventSync) {
 
 // OnAdmitted registers the daemon's observer of admissions new to the
 // table — recorded here or learned from a peer (fabricnet.CircleHooks).
-func (s *CircleService) OnAdmitted(f func(from peer.ID, st *statement.Statement)) {
+func (s *CircleService) OnAdmitted(fn func(from peer.ID, st *statement.Statement)) {
 	s.mu.Lock()
-	s.admitted = f
+	s.admitted = fn
 	s.mu.Unlock()
 }
 
 func (s *CircleService) noteAdmitted(from peer.ID, st *statement.Statement) {
 	s.mu.RLock()
-	f := s.admitted
+	fn := s.admitted
 	s.mu.RUnlock()
-	if f != nil {
-		f(from, st)
+	if fn != nil {
+		fn(from, st)
 	}
 }
 
@@ -231,8 +231,8 @@ func (s *CircleService) ownAllows(family string) bool {
 	if family == "" {
 		return true
 	}
-	for _, o := range s.ownAdmissions(time.Now()) {
-		if c, err := cert.FromStatement(o.stmt); err == nil && c.Allows(family) {
+	for _, own := range s.ownAdmissions(time.Now()) {
+		if memberCert, err := cert.FromStatement(own.stmt); err == nil && memberCert.Allows(family) {
 			return true
 		}
 	}
@@ -242,11 +242,11 @@ func (s *CircleService) ownAllows(family string) bool {
 // ownAdmissionsFor is this node's admissions in one circle, wire bytes.
 func (s *CircleService) ownAdmissionsFor(circleDID string) [][]byte {
 	var out [][]byte
-	for _, o := range s.ownAdmissions(time.Now()) {
-		if !o.roster.Honours(circleDID) {
+	for _, own := range s.ownAdmissions(time.Now()) {
+		if !own.roster.Honours(circleDID) {
 			continue
 		}
-		if raw, err := o.stmt.Bytes(); err == nil {
+		if raw, err := own.stmt.Bytes(); err == nil {
 			out = append(out, raw)
 		}
 	}
@@ -277,34 +277,34 @@ func (s *CircleService) ownAdmissions(now time.Time) []ownAdmission {
 		own = s.auth.Own()
 	}
 	if own != nil {
-		if r, ok := s.table.RosterFor(own.Payload.Sub); ok {
-			out = append(out, ownAdmission{roster: r, circle: own.Payload.Sub, stmt: own.Stmt})
-			seen[r] = true
+		if roster, ok := s.table.RosterFor(own.Payload.Sub); ok {
+			out = append(out, ownAdmission{roster: roster, circle: own.Payload.Sub, stmt: own.Stmt})
+			seen[roster] = true
 		}
 	}
-	for _, c := range s.Circles() {
-		r, ok := s.table.RosterFor(c.Config.DID)
-		if !ok || seen[r] {
+	for _, held := range s.Circles() {
+		roster, ok := s.table.RosterFor(held.Config.DID)
+		if !ok || seen[roster] {
 			continue
 		}
-		a := s.liveAdmission(c, now)
-		if a == nil {
+		admission := s.liveAdmission(held, now)
+		if admission == nil {
 			continue
 		}
-		out = append(out, ownAdmission{roster: r, circle: c.Config.DID, stmt: a.Stmt})
-		seen[r] = true
+		out = append(out, ownAdmission{roster: roster, circle: held.Config.DID, stmt: admission.Stmt})
+		seen[roster] = true
 	}
 	return out
 }
 
 // hinted reports whether the circle's gate hints name the peer.
-func (s *CircleService) hinted(circleDID string, p peer.ID) bool {
-	c := s.circleByDID(circleDID)
-	if c == nil {
+func (s *CircleService) hinted(circleDID string, peerID peer.ID) bool {
+	held := s.circleByDID(circleDID)
+	if held == nil {
 		return false
 	}
-	for _, hint := range c.Config.Gates {
-		if info, err := peer.AddrInfoFromString(hint); err == nil && info.ID == p {
+	for _, hint := range held.Config.Gates {
+		if info, err := peer.AddrInfoFromString(hint); err == nil && info.ID == peerID {
 			return true
 		}
 	}
@@ -327,31 +327,31 @@ func (s *CircleService) hinted(circleDID string, p peer.ID) bool {
 // owner's admission from the hello before any data plane asks. The circle
 // exchange did this until slice G retired it (Astral's placement gossip
 // on first contact caught the gap, 2026-11-06).
-func (s *CircleService) hello(p peer.ID, verified []string) fabricnet.Hello {
+func (s *CircleService) hello(peerID peer.ID, verified []string) fabricnet.Hello {
 	now := time.Now()
 	var chosen []ownAdmission
-	deviceDID, _ := fabricnet.DeviceDID(p)
-	for _, o := range s.ownAdmissions(now) {
-		_, known := o.roster.Device(deviceDID)
+	deviceDID, _ := fabricnet.DeviceDID(peerID)
+	for _, own := range s.ownAdmissions(now) {
+		_, known := own.roster.Device(deviceDID)
 		switch {
 		case verified != nil:
-			if known || slices.Contains(verified, o.roster.CircleDID()) {
-				chosen = append(chosen, o)
+			if known || slices.Contains(verified, own.roster.CircleDID()) {
+				chosen = append(chosen, own)
 			}
 		default:
-			if known || s.hinted(o.circle, p) {
-				chosen = append(chosen, o)
+			if known || s.hinted(own.circle, peerID) {
+				chosen = append(chosen, own)
 			}
 		}
 	}
 	var hello fabricnet.Hello
-	for _, o := range chosen {
-		if raw, err := o.stmt.Bytes(); err == nil {
+	for _, own := range chosen {
+		if raw, err := own.stmt.Bytes(); err == nil {
 			hello.Admissions = append(hello.Admissions, raw)
 		}
 	}
-	for _, o := range chosen {
-		hello.Revocations = append(hello.Revocations, s.revocationsOf(o.circle, now)...)
+	for _, own := range chosen {
+		hello.Revocations = append(hello.Revocations, s.revocationsOf(own.circle, now)...)
 	}
 	return hello
 }
@@ -360,10 +360,10 @@ func (s *CircleService) hello(p peer.ID, verified []string) fabricnet.Hello {
 // both forms (a v2 peer decodes both).
 func (s *CircleService) revocationsOf(circleDID string, now time.Time) [][]byte {
 	var out [][]byte
-	if c := s.circleByDID(circleDID); c != nil {
-		if rs, err := c.Revocations(now); err == nil {
-			for _, r := range rs {
-				if raw, err := r.Marshal(); err == nil {
+	if held := s.circleByDID(circleDID); held != nil {
+		if revs, err := held.Revocations(now); err == nil {
+			for _, revocation := range revs {
+				if raw, err := revocation.Marshal(); err == nil {
 					out = append(out, raw)
 				}
 			}
@@ -388,11 +388,11 @@ func (s *CircleService) revocationsOf(circleDID string, now time.Time) [][]byte 
 // connection was required to tell a v2 peer from one on the old binary,
 // which got the circle exchange instead; a member known from gossip alone
 // was served by the exchange then and is served by the table now.)
-func (s *CircleService) tableCircles(p peer.ID) ([]string, bool) {
+func (s *CircleService) tableCircles(peerID peer.ID) ([]string, bool) {
 	if s.table == nil {
 		return nil, false
 	}
-	return s.table.Circles(p, time.Now()), true
+	return s.table.Circles(peerID, time.Now()), true
 }
 
 // Admit records a device admission an owner signed here (`circle admit`)
@@ -402,28 +402,28 @@ func (s *CircleService) tableCircles(p peer.ID) ([]string, bool) {
 // holds; the socket carries no authority of its own. Reports whether the
 // roster changed.
 func (s *CircleService) Admit(raw []byte) (bool, error) {
-	a, err := circle.UnmarshalAdmission(raw)
+	admission, err := circle.UnmarshalAdmission(raw)
 	if err != nil {
 		return false, err
 	}
-	if err := a.VerifySignature(); err != nil {
+	if err := admission.VerifySignature(); err != nil {
 		return false, err
 	}
 	if s.table == nil {
 		return false, errors.New("no peer table attached")
 	}
-	if _, ok := s.table.RosterFor(a.Circle); !ok {
-		return false, fmt.Errorf("circle %s is not held by this node", shortDID(a.Circle))
+	if _, ok := s.table.RosterFor(admission.Circle); !ok {
+		return false, fmt.Errorf("circle %s is not held by this node", shortDID(admission.Circle))
 	}
-	fresh, err := s.table.AddAdmission(a.Stmt, time.Now())
+	fresh, err := s.table.AddAdmission(admission.Stmt, time.Now())
 	if err != nil {
 		return false, err
 	}
 	if fresh {
 		if s.sync != nil {
-			s.sync.PublishStatements(a.Circle, [][]byte{raw}, nil)
+			s.sync.PublishStatements(admission.Circle, [][]byte{raw}, nil)
 		}
-		s.noteAdmitted("", a.Stmt)
+		s.noteAdmitted("", admission.Stmt)
 	}
 	return fresh, nil
 }
@@ -447,14 +447,14 @@ func (s *CircleService) Handover(raw []byte) (bool, error) {
 	if s.circleByDID(st.Payload.Sub) == nil {
 		return false, fmt.Errorf("circle %s is not held by this node", shortDID(st.Payload.Sub))
 	}
-	r, ok := s.table.RosterFor(st.Payload.Sub)
+	roster, ok := s.table.RosterFor(st.Payload.Sub)
 	if !ok {
 		return false, fmt.Errorf("no roster for circle %s", shortDID(st.Payload.Sub))
 	}
 	// Verified before it is pushed (Codex review, 2026-11-07): a handover
 	// that does not extend the history is never relayed. A known one still
 	// reaches the table, which pays a failed save's debt on the retry.
-	extends, err := r.Roots().Extends(st)
+	extends, err := roster.Roots().Extends(st)
 	if err != nil {
 		return false, err
 	}
@@ -478,14 +478,14 @@ func (s *CircleService) Handover(raw []byte) (bool, error) {
 // node's own standing: an admission of its own that the history no
 // longer honours is the operator's cue to be admitted again, and the
 // device heard it, through the gossip or on a handshake a member refused.
-func (s *CircleService) noteRetired(h *statement.Statement) {
+func (s *CircleService) noteRetired(handover *statement.Statement) {
 	now := time.Now()
-	for _, o := range s.ownAdmissions(now) {
-		if !o.roster.Honours(h.Payload.Sub) {
+	for _, own := range s.ownAdmissions(now) {
+		if !own.roster.Honours(handover.Payload.Sub) {
 			continue
 		}
-		if err := o.roster.Judge(o.stmt, now); err != nil {
-			log.Printf("THIS DEVICE'S ADMISSION TO CIRCLE %s IS VOID — the circle's key was handed over (compromised=%v): %v; ask an owner to admit it again", shortDID(h.Payload.Sub), h.Payload.Compromised, err)
+		if err := own.roster.Judge(own.stmt, now); err != nil {
+			log.Printf("THIS DEVICE'S ADMISSION TO CIRCLE %s IS VOID — the circle's key was handed over (compromised=%v): %v; ask an owner to admit it again", shortDID(handover.Payload.Sub), handover.Payload.Compromised, err)
 		}
 	}
 }
@@ -498,13 +498,13 @@ func (s *CircleService) reloadRevocations() {
 		return
 	}
 	now := time.Now()
-	for _, c := range s.Circles() {
-		rs, err := c.Revocations(now)
+	for _, held := range s.Circles() {
+		revs, err := held.Revocations(now)
 		if err != nil {
 			continue
 		}
-		for _, r := range rs {
-			s.rosterRevoked(r)
+		for _, revocation := range revs {
+			s.rosterRevoked(revocation)
 		}
 	}
 	s.replayExtraRevs()
@@ -520,61 +520,61 @@ func (s *CircleService) replayExtraRevs() {
 	var revs []*circle.Revocation
 	for _, set := range s.extraRevs {
 		for _, st := range set.All() {
-			if r, err := circle.RevocationFromStatement(st); err == nil {
-				revs = append(revs, r)
+			if revocation, err := circle.RevocationFromStatement(st); err == nil {
+				revs = append(revs, revocation)
 			}
 		}
 	}
 	s.mu.RUnlock()
-	for _, r := range revs {
-		s.rosterRevoked(r)
+	for _, revocation := range revs {
+		s.rosterRevoked(revocation)
 	}
 }
 
 // rosterRevoked pushes a revocation into the circle's roster, if the table
 // holds one for it.
-func (s *CircleService) rosterRevoked(r *circle.Revocation) {
+func (s *CircleService) rosterRevoked(revocation *circle.Revocation) {
 	if s.table == nil {
 		return
 	}
-	if _, ok := s.table.RosterFor(r.Circle); !ok {
+	if _, ok := s.table.RosterFor(revocation.Circle); !ok {
 		return
 	}
-	_, _ = s.table.AddRevocation(r.Circle, r.Stmt)
+	_, _ = s.table.AddRevocation(revocation.Circle, revocation.Stmt)
 }
 
-// homeAdmission returns the node's cert read as an admission into c,
-// when c is the node's home circle; nil otherwise.
-func (s *CircleService) homeAdmission(c *circle.Circle) *circle.Admission {
+// homeAdmission returns the node's cert read as an admission into held,
+// when held is the node's home circle; nil otherwise.
+func (s *CircleService) homeAdmission(held *circle.Circle) *circle.Admission {
 	if s.ownCert == nil {
 		return nil
 	}
 	own := s.ownCert()
-	if own == nil || own.Payload.Sub != c.Config.DID {
+	if own == nil || own.Payload.Sub != held.Config.DID {
 		return nil
 	}
 	raw, err := own.Marshal()
 	if err != nil {
 		return nil
 	}
-	a, err := circle.UnmarshalAdmission(raw)
+	admission, err := circle.UnmarshalAdmission(raw)
 	if err != nil {
 		return nil
 	}
-	return a
+	return admission
 }
 
-// liveAdmission is the admission this node presents for c: the
-// membership cert when c is the circle the device was joined in (the cert
+// liveAdmission is the admission this node presents for held: the
+// membership cert when held is the circle the device was joined in (the cert
 // carries the name and overlay address; a bare `circle renew` file must
 // not shadow it), else the stored admission when live. nil when the node
 // has none.
-func (s *CircleService) liveAdmission(c *circle.Circle, now time.Time) *circle.Admission {
-	if a := s.homeAdmission(c); a != nil && a.Valid(now) == nil && !c.Revoked(a, now) {
-		return a
+func (s *CircleService) liveAdmission(held *circle.Circle, now time.Time) *circle.Admission {
+	if admission := s.homeAdmission(held); admission != nil && admission.Valid(now) == nil && !held.Revoked(admission, now) {
+		return admission
 	}
-	if a, err := c.LoadAdmission(); err == nil && a.Valid(now) == nil && !c.Revoked(a, now) {
-		return a
+	if admission, err := held.LoadAdmission(); err == nil && admission.Valid(now) == nil && !held.Revoked(admission, now) {
+		return admission
 	}
 	return nil
 }
@@ -585,14 +585,14 @@ func (s *CircleService) liveAdmission(c *circle.Circle, now time.Time) *circle.A
 func (s *CircleService) Circles() []*circle.Circle {
 	cs, _ := circle.List(s.root)
 	if s.table != nil {
-		for _, c := range cs {
-			if _, ok := s.table.RosterFor(c.Config.DID); ok {
+		for _, held := range cs {
+			if _, ok := s.table.RosterFor(held.Config.DID); ok {
 				continue
 			}
-			roster, err := circle.OpenRoster(c, time.Now())
+			roster, err := circle.OpenRoster(held, time.Now())
 			if err != nil {
-				log.Printf("circle %q: roster unreadable, starting empty: %v", c.Config.Name, err)
-				roster = circle.NewRoster(statement.NewDIDRoot(c.Config.DID))
+				log.Printf("circle %q: roster unreadable, starting empty: %v", held.Config.Name, err)
+				roster = circle.NewRoster(statement.NewDIDRoot(held.Config.DID))
 			}
 			s.table.AddRoster(roster)
 		}
@@ -606,9 +606,9 @@ func (s *CircleService) Has(did string) bool {
 }
 
 func (s *CircleService) circleByDID(did string) *circle.Circle {
-	for _, c := range s.Circles() {
-		if c.Config.DID == did {
-			return c
+	for _, held := range s.Circles() {
+		if held.Config.DID == did {
+			return held
 		}
 	}
 	return nil
@@ -617,8 +617,8 @@ func (s *CircleService) circleByDID(did string) *circle.Circle {
 // Admitted reports whether this device holds a live admission for a
 // circle — valid now and not revoked by the circle. Without one, no peer
 // treats it as part of that circle.
-func (s *CircleService) Admitted(c *circle.Circle) bool {
-	return s.liveAdmission(c, time.Now()) != nil
+func (s *CircleService) Admitted(held *circle.Circle) bool {
+	return s.liveAdmission(held, time.Now()) != nil
 }
 
 // CircleInfo is the lifecycle view of one circle this node holds, for
@@ -640,34 +640,34 @@ type CircleInfo struct {
 // Info reports the lifecycle state of every circle this node holds.
 func (s *CircleService) Info(now time.Time) []CircleInfo {
 	var out []CircleInfo
-	for _, c := range s.Circles() {
-		ci := CircleInfo{Name: c.Config.Name, DID: c.Config.DID, Prefix: c.Config.Prefix, Role: circle.RoleDevice}
-		if c.HasKey() {
+	for _, held := range s.Circles() {
+		ci := CircleInfo{Name: held.Config.Name, DID: held.Config.DID, Prefix: held.Config.Prefix, Role: circle.RoleDevice}
+		if held.HasKey() {
 			ci.Role = circle.RoleOwner
 		}
-		if rs, err := c.Revocations(now); err == nil {
+		if rs, err := held.Revocations(now); err == nil {
 			ci.Revocations = len(rs)
 		}
 		if s.table != nil {
-			if r, ok := s.table.RosterFor(c.Config.DID); ok {
-				ci.Devices = len(r.LiveDevices(now))
+			if roster, ok := s.table.RosterFor(held.Config.DID); ok {
+				ci.Devices = len(roster.LiveDevices(now))
 			}
 		}
-		a, err := c.LoadAdmission()
-		if err != nil || a.Valid(now) != nil {
+		admission, err := held.LoadAdmission()
+		if err != nil || admission.Valid(now) != nil {
 			// No file, or a stale one left from before the mesh-root merge:
 			// the home-circle cert is the admission now.
-			if h := s.homeAdmission(c); h != nil {
-				a = h
+			if homeAdm := s.homeAdmission(held); homeAdm != nil {
+				admission = homeAdm
 			}
 		}
-		if a != nil {
-			exp := a.Expiry()
+		if admission != nil {
+			exp := admission.Expiry()
 			ci.Expiry = &exp
-			ci.Revoked = c.Revoked(a, now)
-			ci.Admitted = a.Valid(now) == nil && !ci.Revoked
-			if !c.HasKey() {
-				ci.Role = a.Role()
+			ci.Revoked = held.Revoked(admission, now)
+			ci.Admitted = admission.Valid(now) == nil && !ci.Revoked
+			if !held.HasKey() {
+				ci.Role = admission.Role()
 			}
 		}
 		out = append(out, ci)
@@ -679,17 +679,17 @@ func (s *CircleService) Info(now time.Time) []CircleInfo {
 func (s *CircleService) Close() { s.stop() }
 
 // Verify answers one authorization question about a connected member: may
-// the device p do want.Verb on want.Res in circle want.Sub? The chain is
+// the device peerID do want.Verb on want.Res in circle want.Sub? The chain is
 // the device's current admission in that circle (the roster's entry) or,
 // for the home circle, its membership cert; want.PresentingKey is set here
 // from the transport-authenticated peer key. Check runs on every call
 // (window, scope, roots still honoured, revocations); only the crypto is
 // cached.
-func (s *CircleService) Verify(ctx context.Context, p peer.ID, want statement.Want) error {
+func (s *CircleService) Verify(ctx context.Context, peerID peer.ID, want statement.Want) error {
 	if want.Sub == "" {
 		return errors.New("verify: circle required")
 	}
-	presenter, err := deviceDIDOf(p)
+	presenter, err := deviceDIDOf(peerID)
 	if err != nil {
 		return err
 	}
@@ -698,16 +698,16 @@ func (s *CircleService) Verify(ctx context.Context, p peer.ID, want statement.Wa
 		want.Now = time.Now()
 	}
 	if s.home != nil && want.Sub == s.home() && s.certOf != nil {
-		return s.verifyHome(p, want)
+		return s.verifyHome(peerID, want)
 	}
-	c := s.circleByDID(want.Sub)
-	if c == nil {
+	held := s.circleByDID(want.Sub)
+	if held == nil {
 		return fmt.Errorf("circle %s is not held by this node", shortDID(want.Sub))
 	}
 	if s.table == nil {
 		return errors.New("verify: no peer table")
 	}
-	chain, ok := s.table.Chain(p, want.Sub, want.Now)
+	chain, ok := s.table.Chain(peerID, want.Sub, want.Now)
 	if !ok {
 		return fmt.Errorf("%s is not a device of circle %s", shortDID(presenter), shortDID(want.Sub))
 	}
@@ -725,23 +725,23 @@ func (s *CircleService) Verify(ctx context.Context, p peer.ID, want statement.Wa
 
 // verifyHome is Verify for the home circle: the chain is the membership
 // cert the member store holds for the peer.
-func (s *CircleService) verifyHome(p peer.ID, want statement.Want) error {
-	c, ok := s.certOf(p, want.Sub)
+func (s *CircleService) verifyHome(peerID peer.ID, want statement.Want) error {
+	memberCert, ok := s.certOf(peerID, want.Sub)
 	if !ok {
-		return fmt.Errorf("%s is not a member of circle %s", p, shortDID(want.Sub))
+		return fmt.Errorf("%s is not a member of circle %s", peerID, shortDID(want.Sub))
 	}
-	id := c.Stmt.ID()
+	id := memberCert.Stmt.ID()
 	s.mu.RLock()
-	hc := s.homeChains[p]
+	hc := s.homeChains[peerID]
 	s.mu.RUnlock()
 	if hc.chain == nil || hc.certID != id {
-		chain, err := statement.Compile(c.Stmt, nil, want.Sub, s.roots)
+		chain, err := statement.Compile(memberCert.Stmt, nil, want.Sub, s.roots)
 		if err != nil {
 			return fmt.Errorf("membership cert: %w", err)
 		}
 		hc = homeChain{certID: id, chain: chain}
 		s.mu.Lock()
-		s.homeChains[p] = hc
+		s.homeChains[peerID] = hc
 		s.mu.Unlock()
 	}
 	return hc.chain.Check(s.roots, s.revsFor(want.Sub, want.Now), want)
@@ -751,8 +751,8 @@ func (s *CircleService) verifyHome(p peer.ID, want statement.Want) error {
 // held here, else what the exchange delivered for it (a gate without a
 // circle directory still learns revocations for its home circle).
 func (s *CircleService) revsFor(circleDID string, now time.Time) statement.Revocations {
-	if c := s.circleByDID(circleDID); c != nil {
-		if set, err := c.RevocationSet(now); err == nil {
+	if held := s.circleByDID(circleDID); held != nil {
+		if set, err := held.RevocationSet(now); err == nil {
 			return set
 		}
 	}
@@ -762,8 +762,8 @@ func (s *CircleService) revsFor(circleDID string, now time.Time) statement.Revoc
 }
 
 func (s *CircleService) revsForLocked(circleDID string, now time.Time) statement.Revocations {
-	if c := s.circleByDID(circleDID); c != nil {
-		if set, err := c.RevocationSet(now); err == nil {
+	if held := s.circleByDID(circleDID); held != nil {
+		if set, err := held.RevocationSet(now); err == nil {
 			return set
 		}
 	}
@@ -790,28 +790,28 @@ func (s *CircleService) CheckChain(raw []byte, want statement.Want) error {
 	if err != nil {
 		return err
 	}
-	c, err := statement.Compile(st, nil, st.Payload.Sub, roots)
+	chain, err := statement.Compile(st, nil, st.Payload.Sub, roots)
 	if err != nil {
 		return err
 	}
 	if want.Now.IsZero() {
 		want.Now = time.Now()
 	}
-	want.Sub, want.PresentingKey = c.Sub, c.PresentingKey
+	want.Sub, want.PresentingKey = chain.Sub, chain.PresentingKey
 	if want.Verb == "" {
-		want.Res, want.Verb = firstRes(c), firstVerb(c)
+		want.Res, want.Verb = firstRes(chain), firstVerb(chain)
 	}
-	if err := c.Check(roots, s.revsFor(c.Sub, want.Now), want); err != nil {
+	if err := chain.Check(roots, s.revsFor(chain.Sub, want.Now), want); err != nil {
 		return err
 	}
-	return s.capByRoster(c, want)
+	return s.capByRoster(chain, want)
 }
 
 // PresentedChain returns the bytes of a chain presented on a connection.
-func (s *CircleService) PresentedChain(p peer.ID, auth [32]byte, key string) ([]byte, bool) {
+func (s *CircleService) PresentedChain(peerID peer.ID, auth [32]byte, key string) ([]byte, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	pc, ok := s.presented[p][presentKey{auth: auth, key: key}]
+	pc, ok := s.presented[peerID][presentKey{auth: auth, key: key}]
 	if !ok {
 		return nil, false
 	}
@@ -821,8 +821,8 @@ func (s *CircleService) PresentedChain(p peer.ID, auth [32]byte, key string) ([]
 // AddRevocation ingests a verified revocation signed for one of this
 // node's circles (or its home circle) as if a peer had sent it: stored,
 // caches dropped, holders re-checked. The CLI uses it after signing.
-func (s *CircleService) AddRevocation(r *circle.Revocation) error {
-	raw, err := r.Marshal()
+func (s *CircleService) AddRevocation(revocation *circle.Revocation) error {
+	raw, err := revocation.Marshal()
 	if err != nil {
 		return err
 	}
@@ -831,16 +831,16 @@ func (s *CircleService) AddRevocation(r *circle.Revocation) error {
 		return err
 	}
 	if s.sync != nil {
-		s.sync.PublishStatements(r.Circle, nil, fresh)
+		s.sync.PublishStatements(revocation.Circle, nil, fresh)
 	}
 	return nil
 }
 
-func shortDID(d string) string {
-	if len(d) > 16 {
-		return d[:16] + "…"
+func shortDID(didStr string) string {
+	if len(didStr) > 16 {
+		return didStr[:16] + "…"
 	}
-	return d
+	return didStr
 }
 
 // forgetDevice drops what is cached for every connected peer whose key is
@@ -848,14 +848,14 @@ func shortDID(d string) string {
 // question about it is judged afresh against the revocation set.
 func (s *CircleService) forgetDevice(deviceDID string) {
 	s.mu.Lock()
-	for p := range s.presented {
-		if did, err := deviceDIDOf(p); err == nil && did == deviceDID {
-			delete(s.presented, p)
+	for peerID := range s.presented {
+		if did, err := deviceDIDOf(peerID); err == nil && did == deviceDID {
+			delete(s.presented, peerID)
 		}
 	}
-	for p := range s.homeChains {
-		if did, err := deviceDIDOf(p); err == nil && did == deviceDID {
-			delete(s.homeChains, p)
+	for peerID := range s.homeChains {
+		if did, err := deviceDIDOf(peerID); err == nil && did == deviceDID {
+			delete(s.homeChains, peerID)
 		}
 	}
 	s.mu.Unlock()
@@ -880,36 +880,36 @@ func (s *CircleService) Sweep() {
 	now := time.Now()
 	s.mu.Lock()
 	type dead struct {
-		p    peer.ID
-		keys []presentKey
+		peerID peer.ID
+		keys   []presentKey
 	}
 	var deads []dead
-	for p, m := range s.presented {
-		d := dead{p: p}
-		for k, pc := range m {
+	for peerID, chains := range s.presented {
+		entry := dead{peerID: peerID}
+		for presentK, pc := range chains {
 			if err := s.validLocked(pc.comp, now); err != nil {
-				d.keys = append(d.keys, k)
+				entry.keys = append(entry.keys, presentK)
 			}
 		}
-		if len(d.keys) > 0 {
-			deads = append(deads, d)
+		if len(entry.keys) > 0 {
+			deads = append(deads, entry)
 		}
 	}
 	var drop []peer.ID
-	for _, d := range deads {
-		for _, k := range d.keys {
-			delete(s.presented[d.p], k)
+	for _, entry := range deads {
+		for _, presentK := range entry.keys {
+			delete(s.presented[entry.peerID], presentK)
 		}
-		if len(s.presented[d.p]) == 0 {
-			delete(s.presented, d.p)
-			drop = append(drop, d.p)
+		if len(s.presented[entry.peerID]) == 0 {
+			delete(s.presented, entry.peerID)
+			drop = append(drop, entry.peerID)
 		}
 	}
 	s.mu.Unlock()
-	for _, p := range drop {
-		if s.auth != nil && p != s.h.ID() && !s.auth.Allows(p, controlProtocol) {
-			log.Printf("circle: stranger %s has no live chain left — dropped", p)
-			s.auth.Drop(p)
+	for _, peerID := range drop {
+		if s.auth != nil && peerID != s.h.ID() && !s.auth.Allows(peerID, controlProtocol) {
+			log.Printf("circle: stranger %s has no live chain left — dropped", peerID)
+			s.auth.Drop(peerID)
 		}
 	}
 }
@@ -920,16 +920,16 @@ func (s *CircleService) Sweep() {
 // question about its lineage, not about one verb — a sub-key granting
 // publish and read stays live when its device loses publish, and the
 // verb is settled at use (Codex review, 2026-11-06).
-func (s *CircleService) validLocked(c *statement.Compiled, now time.Time) error {
-	roots, err := s.rootsForLocked(c.Sub)
+func (s *CircleService) validLocked(chain *statement.Compiled, now time.Time) error {
+	roots, err := s.rootsForLocked(chain.Sub)
 	if err != nil {
 		return err
 	}
-	want := statement.Want{Sub: c.Sub, Res: firstRes(c), Verb: firstVerb(c), PresentingKey: c.PresentingKey, Now: now}
-	if err := c.Check(roots, s.revsForLocked(c.Sub, now), want); err != nil {
+	want := statement.Want{Sub: chain.Sub, Res: firstRes(chain), Verb: firstVerb(chain), PresentingKey: chain.PresentingKey, Now: now}
+	if err := chain.Check(roots, s.revsForLocked(chain.Sub, now), want); err != nil {
 		return err
 	}
-	return s.capByRoster(c, statement.Want{Sub: c.Sub, Now: now})
+	return s.capByRoster(chain, statement.Want{Sub: chain.Sub, Now: now})
 }
 
 // ErrNotPresented is a verb under a chain this connection never presented.
@@ -946,8 +946,8 @@ func (s *CircleService) rootsFor(circleDID string) (statement.Roots, error) {
 		return nil, fmt.Errorf("circle %s is not held by this node", shortDID(circleDID))
 	}
 	if s.table != nil {
-		if r, ok := s.table.RosterFor(circleDID); ok {
-			return r.Roots(), nil
+		if roster, ok := s.table.RosterFor(circleDID); ok {
+			return roster.Roots(), nil
 		}
 	}
 	return statement.NewDIDRoot(circleDID), nil
@@ -957,7 +957,7 @@ func (s *CircleService) rootsFor(circleDID string) (statement.Roots, error) {
 // (or beside) itself — a sub-key, later a foreign grantee — and remembers
 // it for the connection under (authority leaf, presenting key). The
 // expensive half runs once; VerifyPresented runs Check per verb.
-func (s *CircleService) Present(p peer.ID, raw []byte) (*statement.Compiled, error) {
+func (s *CircleService) Present(peerID peer.ID, raw []byte) (*statement.Compiled, error) {
 	st, err := statement.Decode(raw)
 	if err != nil {
 		return nil, fmt.Errorf("presented chain: %w", err)
@@ -966,65 +966,65 @@ func (s *CircleService) Present(p peer.ID, raw []byte) (*statement.Compiled, err
 	if err != nil {
 		return nil, err
 	}
-	c, err := statement.Compile(st, nil, st.Payload.Sub, roots)
+	chain, err := statement.Compile(st, nil, st.Payload.Sub, roots)
 	if err != nil {
 		return nil, fmt.Errorf("presented chain: %w", err)
 	}
 	// A chain that compiles is not yet one that passes Check (window,
 	// revocations); do that once here so a dead chain cannot keep a
 	// stranger's connection open.
-	if err := c.Check(roots, s.revsFor(st.Payload.Sub, time.Now()), statement.Want{
-		Sub: st.Payload.Sub, Res: firstRes(c), Verb: firstVerb(c),
-		PresentingKey: c.PresentingKey, Now: time.Now(),
+	if err := chain.Check(roots, s.revsFor(st.Payload.Sub, time.Now()), statement.Want{
+		Sub: st.Payload.Sub, Res: firstRes(chain), Verb: firstVerb(chain),
+		PresentingKey: chain.PresentingKey, Now: time.Now(),
 	}); err != nil {
 		return nil, fmt.Errorf("presented chain: %w", err)
 	}
-	self := p == s.h.ID()
-	if !self && s.h.Network().Connectedness(p) != network.Connected {
+	self := peerID == s.h.ID()
+	if !self && s.h.Network().Connectedness(peerID) != network.Connected {
 		return nil, errors.New("presented chain: peer is not connected")
 	}
-	key := presentKey{auth: c.AuthLeafID(), key: c.PresentingKey}
+	key := presentKey{auth: chain.AuthLeafID(), key: chain.PresentingKey}
 	s.mu.Lock()
-	m := s.presented[p]
-	if m == nil {
-		m = map[presentKey]presentedChain{}
+	chains := s.presented[peerID]
+	if chains == nil {
+		chains = map[presentKey]presentedChain{}
 	}
-	if _, have := m[key]; !have {
-		if len(m) >= MaxPresentedPerPeer {
+	if _, have := chains[key]; !have {
+		if len(chains) >= MaxPresentedPerPeer {
 			s.mu.Unlock()
 			return nil, fmt.Errorf("presented chain: too many chains on this connection (%d)", MaxPresentedPerPeer)
 		}
-		if !self && s.auth != nil && !s.auth.Allows(p, controlProtocol) {
-			n := 0
-			for q, qm := range s.presented {
-				if q == p {
+		if !self && s.auth != nil && !s.auth.Allows(peerID, controlProtocol) {
+			count := 0
+			for otherPeer, otherChains := range s.presented {
+				if otherPeer == peerID {
 					continue
 				}
-				for k := range qm {
-					if k.key == c.PresentingKey {
-						n++
+				for presentK := range otherChains {
+					if presentK.key == chain.PresentingKey {
+						count++
 						break
 					}
 				}
 			}
-			if n >= MaxKeptPerKey {
+			if count >= MaxKeptPerKey {
 				s.mu.Unlock()
-				return nil, fmt.Errorf("presented chain: key %s already holds %d connections here", shortDID(c.PresentingKey), n)
+				return nil, fmt.Errorf("presented chain: key %s already holds %d connections here", shortDID(chain.PresentingKey), count)
 			}
 		}
 	}
-	m[key] = presentedChain{comp: c, raw: raw}
-	s.presented[p] = m
+	chains[key] = presentedChain{comp: chain, raw: raw}
+	s.presented[peerID] = chains
 	s.mu.Unlock()
-	return c, nil
+	return chain, nil
 }
 
 // Keep pins a stranger's connection past the grace disconnect. Called
 // once the caller has proven it holds a presented chain's key — a chain
 // alone is public bytes (Codex review, 2026-11-03).
-func (s *CircleService) Keep(p peer.ID) {
-	if s.auth != nil && p != s.h.ID() {
-		s.auth.Keep(p)
+func (s *CircleService) Keep(peerID peer.ID) {
+	if s.auth != nil && peerID != s.h.ID() {
+		s.auth.Keep(peerID)
 	}
 }
 
@@ -1032,24 +1032,24 @@ func (s *CircleService) Keep(p peer.ID) {
 // in a circle (its membership cert for the home circle), for a data plane
 // that must re-check a holder after it has gone: a chain re-verifies from
 // its bytes alone (CheckChain).
-func (s *CircleService) DeviceChain(p peer.ID, circleDID string) ([]byte, bool) {
+func (s *CircleService) DeviceChain(peerID peer.ID, circleDID string) ([]byte, bool) {
 	if s.home != nil && circleDID == s.home() && s.certOf != nil {
-		c, ok := s.certOf(p, circleDID)
+		memberCert, ok := s.certOf(peerID, circleDID)
 		if !ok {
 			return nil, false
 		}
-		b, err := c.Stmt.Bytes()
-		return b, err == nil
+		raw, err := memberCert.Stmt.Bytes()
+		return raw, err == nil
 	}
 	if s.table == nil {
 		return nil, false
 	}
-	chain, ok := s.table.Chain(p, circleDID, time.Now())
+	chain, ok := s.table.Chain(peerID, circleDID, time.Now())
 	if !ok || len(chain.Auth) == 0 {
 		return nil, false
 	}
-	b, err := chain.Auth[len(chain.Auth)-1].Stmt.Bytes()
-	return b, err == nil
+	raw, err := chain.Auth[len(chain.Auth)-1].Stmt.Bytes()
+	return raw, err == nil
 }
 
 // VerifyPresentedValid is VerifyPresented without a verb: is the presented
@@ -1057,9 +1057,9 @@ func (s *CircleService) DeviceChain(p peer.ID, circleDID string) ([]byte, bool) 
 // right to act comes from host-side state — a claimant acking its own
 // lease, a requester reading its reply slot — but the chain must still
 // be alive (agy review, 2026-11-03).
-func (s *CircleService) VerifyPresentedValid(p peer.ID, auth [32]byte, key string) error {
+func (s *CircleService) VerifyPresentedValid(peerID peer.ID, auth [32]byte, key string) error {
 	s.mu.RLock()
-	pc, ok := s.presented[p][presentKey{auth: auth, key: key}]
+	pc, ok := s.presented[peerID][presentKey{auth: auth, key: key}]
 	s.mu.RUnlock()
 	if !ok {
 		return ErrNotPresented
@@ -1069,8 +1069,8 @@ func (s *CircleService) VerifyPresentedValid(p peer.ID, auth [32]byte, key strin
 
 // firstRes is a resource the chain's leaf names, for a Check that asks
 // only about window and revocations (its own scope always covers it).
-func firstRes(c *statement.Compiled) statement.Resource {
-	leaf := c.Auth[len(c.Auth)-1].Stmt.Payload
+func firstRes(chain *statement.Compiled) statement.Resource {
+	leaf := chain.Auth[len(chain.Auth)-1].Stmt.Payload
 	if len(leaf.Res) > 0 {
 		return statement.Resource{Kind: leaf.Res[0].Kind, Name: leaf.Res[0].Name}
 	}
@@ -1078,8 +1078,8 @@ func firstRes(c *statement.Compiled) statement.Resource {
 }
 
 // firstVerb is any verb the chain's leaf carries, for a scope-free Check.
-func firstVerb(c *statement.Compiled) string {
-	leaf := c.Auth[len(c.Auth)-1].Stmt.Payload
+func firstVerb(chain *statement.Compiled) string {
+	leaf := chain.Auth[len(chain.Auth)-1].Stmt.Payload
 	if len(leaf.Verbs) > 0 {
 		return leaf.Verbs[0]
 	}
@@ -1088,16 +1088,16 @@ func firstVerb(c *statement.Compiled) string {
 
 // VerifyPresented is Verify for a presented chain: the principal named by
 // key, under the authority leaf auth, on this connection.
-func (s *CircleService) VerifyPresented(p peer.ID, auth [32]byte, key string, want statement.Want) error {
+func (s *CircleService) VerifyPresented(peerID peer.ID, auth [32]byte, key string, want statement.Want) error {
 	s.mu.RLock()
-	pc, ok := s.presented[p][presentKey{auth: auth, key: key}]
+	pc, ok := s.presented[peerID][presentKey{auth: auth, key: key}]
 	s.mu.RUnlock()
 	if !ok {
 		return ErrNotPresented
 	}
-	c := pc.comp
+	chain := pc.comp
 	if want.Sub == "" {
-		want.Sub = c.Sub
+		want.Sub = chain.Sub
 	}
 	want.PresentingKey = key
 	if want.Now.IsZero() {
@@ -1107,10 +1107,10 @@ func (s *CircleService) VerifyPresented(p peer.ID, auth [32]byte, key string, wa
 	if err != nil {
 		return err
 	}
-	if err := c.Check(roots, s.revsFor(want.Sub, want.Now), want); err != nil {
+	if err := chain.Check(roots, s.revsFor(want.Sub, want.Now), want); err != nil {
 		return err
 	}
-	return s.capByRoster(c, want)
+	return s.capByRoster(chain, want)
 }
 
 // capByRoster is circle.Roster.Cap for a circle this node holds: sweeps
@@ -1120,21 +1120,21 @@ func (s *CircleService) VerifyPresented(p peer.ID, auth [32]byte, key string, wa
 // so a stored hold cannot keep what a fresh request is refused (Codex
 // review, 2026-11-06). A chain in a circle this node does not hold is
 // unchanged: a gate can only check what was presented.
-func (s *CircleService) capByRoster(c *statement.Compiled, want statement.Want) error {
+func (s *CircleService) capByRoster(chain *statement.Compiled, want statement.Want) error {
 	if s.table == nil {
 		return nil
 	}
-	if r, ok := s.table.RosterFor(want.Sub); ok {
-		if err := r.Cap(c, want); err != nil {
+	if roster, ok := s.table.RosterFor(want.Sub); ok {
+		if err := roster.Cap(chain, want); err != nil {
 			return err
 		}
 	}
 	// An identity chain anchored in another circle this node holds is
 	// judged by that circle's roster, on standing alone: the verb was that
 	// of the grant, settled above.
-	if len(c.Ident) > 0 && c.Ident[0].Sub != want.Sub {
-		if r, ok := s.table.RosterFor(c.Ident[0].Sub); ok {
-			return r.Cap(c, statement.Want{Sub: c.Ident[0].Sub, Now: want.Now})
+	if len(chain.Ident) > 0 && chain.Ident[0].Sub != want.Sub {
+		if roster, ok := s.table.RosterFor(chain.Ident[0].Sub); ok {
+			return roster.Cap(chain, statement.Want{Sub: chain.Ident[0].Sub, Now: want.Now})
 		}
 	}
 	return nil
@@ -1142,14 +1142,16 @@ func (s *CircleService) capByRoster(c *statement.Compiled, want statement.Want) 
 
 // CirclesOf returns the circles held here that the member is a live device
 // of, once it has completed a handshake on this connection.
-func (s *CircleService) CirclesOf(p peer.ID) (dids []string, known bool) { return s.tableCircles(p) }
+func (s *CircleService) CirclesOf(peerID peer.ID) (dids []string, known bool) {
+	return s.tableCircles(peerID)
+}
 
 // Ensure returns the circles held here that the member is a live device of
 // — the peer table's view, filled by the handshake, per-circle gossip and
 // the event log. (Until slice G this also ran the circle exchange toward a
 // peer on the old binary; ctx is kept for the callers.)
-func (s *CircleService) Ensure(_ context.Context, p peer.ID) ([]string, error) {
-	dids, ok := s.tableCircles(p)
+func (s *CircleService) Ensure(_ context.Context, peerID peer.ID) ([]string, error) {
+	dids, ok := s.tableCircles(peerID)
 	if !ok {
 		return nil, errors.New("no peer table")
 	}
@@ -1168,34 +1170,34 @@ func (s *CircleService) Refresh(ctx context.Context) int {
 	// from disk too, so transport membership follows at once.
 	s.reloadRevocations()
 	s.forgetAll()
-	n := 0
-	for _, p := range s.h.Network().Peers() {
-		if !s.auth.Allows(p, controlProtocol) {
+	reached := 0
+	for _, peerID := range s.h.Network().Peers() {
+		if !s.auth.Allows(peerID, controlProtocol) {
 			continue
 		}
-		if _, ok := s.auth.Handshake(p); !ok {
+		if _, ok := s.auth.Handshake(peerID); !ok {
 			continue
 		}
-		if err := s.auth.Authenticate(ctx, p); err == nil {
-			n++
+		if err := s.auth.Authenticate(ctx, peerID); err == nil {
+			reached++
 		}
 	}
-	return n
+	return reached
 }
 
 // SharedKnown is Shared from the cache alone — the circles this node
 // holds that the member's last exchange verified it into — never running
 // an exchange. For status views that must not block on the network.
-func (s *CircleService) SharedKnown(p peer.ID) []string {
-	theirs, ok := s.CirclesOf(p)
+func (s *CircleService) SharedKnown(peerID peer.ID) []string {
+	theirs, ok := s.CirclesOf(peerID)
 	if !ok {
 		return nil
 	}
 	var out []string
-	for _, c := range s.Circles() {
-		for _, d := range theirs {
-			if d == c.Config.DID {
-				out = append(out, d)
+	for _, held := range s.Circles() {
+		for _, circleDID := range theirs {
+			if circleDID == held.Config.DID {
+				out = append(out, circleDID)
 				break
 			}
 		}
@@ -1205,11 +1207,11 @@ func (s *CircleService) SharedKnown(p peer.ID) []string {
 
 // PresentedCircles lists the circles of the chains a connection has
 // presented (a grantee's grant, a sub-key's circle), for status views.
-func (s *CircleService) PresentedCircles(p peer.ID) []string {
+func (s *CircleService) PresentedCircles(peerID peer.ID) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var out []string
-	for _, pc := range s.presented[p] {
+	for _, pc := range s.presented[peerID] {
 		if !slices.Contains(out, pc.comp.Sub) {
 			out = append(out, pc.comp.Sub)
 		}
@@ -1219,16 +1221,16 @@ func (s *CircleService) PresentedCircles(p peer.ID) []string {
 }
 
 // Shared returns the circles this node and the member verifiably share.
-func (s *CircleService) Shared(ctx context.Context, p peer.ID) []string {
-	theirs, err := s.Ensure(ctx, p)
+func (s *CircleService) Shared(ctx context.Context, peerID peer.ID) []string {
+	theirs, err := s.Ensure(ctx, peerID)
 	if err != nil {
 		return nil
 	}
 	var out []string
-	for _, c := range s.Circles() {
-		for _, d := range theirs {
-			if d == c.Config.DID {
-				out = append(out, d)
+	for _, held := range s.Circles() {
+		for _, circleDID := range theirs {
+			if circleDID == held.Config.DID {
+				out = append(out, circleDID)
 				break
 			}
 		}
@@ -1240,10 +1242,10 @@ func (s *CircleService) Shared(ctx context.Context, p peer.ID) []string {
 // carries verb on a resource of kind: what a data plane asks before it
 // hands a peer that circle's state. A gate (`member, host`) of family
 // shares family but may not `sync` or `blob` it (Codex review, 2026-11-05).
-func (s *CircleService) SharedWith(ctx context.Context, p peer.ID, kind, verb string) []string {
+func (s *CircleService) SharedWith(ctx context.Context, peerID peer.ID, kind, verb string) []string {
 	var out []string
-	for _, did := range s.Shared(ctx, p) {
-		if s.Verify(ctx, p, statement.Want{Sub: did, Res: statement.Resource{Kind: kind, Name: statement.Any}, Verb: verb}) == nil {
+	for _, did := range s.Shared(ctx, peerID) {
+		if s.Verify(ctx, peerID, statement.Want{Sub: did, Res: statement.Resource{Kind: kind, Name: statement.Any}, Verb: verb}) == nil {
 			out = append(out, did)
 		}
 	}
@@ -1252,9 +1254,9 @@ func (s *CircleService) SharedWith(ctx context.Context, p peer.ID, kind, verb st
 
 // InCircle reports whether the member is a verified device of one of this
 // node's circles, the one named by did.
-func (s *CircleService) InCircle(ctx context.Context, p peer.ID, did string) bool {
-	for _, d := range s.Shared(ctx, p) {
-		if d == did {
+func (s *CircleService) InCircle(ctx context.Context, peerID peer.ID, did string) bool {
+	for _, circleDID := range s.Shared(ctx, peerID) {
+		if circleDID == did {
 			return true
 		}
 	}
@@ -1263,11 +1265,11 @@ func (s *CircleService) InCircle(ctx context.Context, p peer.ID, did string) boo
 
 // InCircleWith is InCircle with a verb on a resource kind: the device's
 // admission in that circle must carry it.
-func (s *CircleService) InCircleWith(ctx context.Context, p peer.ID, did, kind, verb string) bool {
-	if !s.InCircle(ctx, p, did) {
+func (s *CircleService) InCircleWith(ctx context.Context, peerID peer.ID, did, kind, verb string) bool {
+	if !s.InCircle(ctx, peerID, did) {
 		return false
 	}
-	return s.Verify(ctx, p, statement.Want{Sub: did, Res: statement.Resource{Kind: kind, Name: statement.Any}, Verb: verb}) == nil
+	return s.Verify(ctx, peerID, statement.Want{Sub: did, Res: statement.Resource{Kind: kind, Name: statement.Any}, Verb: verb}) == nil
 }
 
 // RequireAny wraps a stream handler so that only members sharing at least
@@ -1293,28 +1295,28 @@ func (s *CircleService) RequireAny(next network.StreamHandler) network.StreamHan
 // the wire bytes of the ones that were new, for the relay.
 func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) (fresh [][]byte, err error) {
 	for _, item := range list {
-		r, err := circle.UnmarshalRevocation(item)
+		revocation, err := circle.UnmarshalRevocation(item)
 		if err != nil {
 			return fresh, err
 		}
-		if err := r.Verify(); err != nil {
+		if err := revocation.Verify(); err != nil {
 			return fresh, fmt.Errorf("peer revocation: %w", err)
 		}
-		c := s.circleByDID(r.Circle)
-		if c == nil {
+		held := s.circleByDID(revocation.Circle)
+		if held == nil {
 			// Not held here: only the home circle matters (a gate hosts
 			// and verifies for it without a circle directory). Anything
 			// else is noise a member could flood us with.
-			if s.home == nil || r.Circle != s.home() || r.Spent(now) {
+			if s.home == nil || revocation.Circle != s.home() || revocation.Spent(now) {
 				continue
 			}
 			s.mu.Lock()
-			set := s.extraRevs[r.Circle]
+			set := s.extraRevs[revocation.Circle]
 			if set == nil {
 				set = statement.NewRevocationSet()
-				s.extraRevs[r.Circle] = set
+				s.extraRevs[revocation.Circle] = set
 			}
-			isNew, err := set.Add(r.Stmt)
+			isNew, err := set.Add(revocation.Stmt)
 			if isNew {
 				s.saveExtraRevsLocked()
 			}
@@ -1323,28 +1325,28 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) (fresh [
 				return fresh, fmt.Errorf("peer revocation: %w", err)
 			}
 			if isNew {
-				log.Printf("circle %s: statement revoked (learned from a peer; circle not held here)", shortDID(r.Circle))
+				log.Printf("circle %s: statement revoked (learned from a peer; circle not held here)", shortDID(revocation.Circle))
 				fresh = append(fresh, item)
-				s.rosterRevoked(r)
+				s.rosterRevoked(revocation)
 				s.forgetAll()
 				s.relaySoon()
 			}
 			continue
 		}
-		added, err := c.AddRevocations(now, r)
+		added, err := held.AddRevocations(now, revocation)
 		if err != nil {
-			return fresh, fmt.Errorf("storing revocation for circle %q: %w", c.Config.Name, err)
+			return fresh, fmt.Errorf("storing revocation for circle %q: %w", held.Config.Name, err)
 		}
-		for _, r := range added {
-			if raw, err := r.Marshal(); err == nil {
+		for _, rev := range added {
+			if raw, err := rev.Marshal(); err == nil {
 				fresh = append(fresh, raw)
 			}
-			s.rosterRevoked(r)
-			if r.Device != "" {
-				log.Printf("circle %q: device %s revoked as of %s (learned from a peer)", c.Config.Name, r.Device, r.Time().Format(time.RFC3339))
-				s.forgetDevice(r.Device)
+			s.rosterRevoked(rev)
+			if rev.Device != "" {
+				log.Printf("circle %q: device %s revoked as of %s (learned from a peer)", held.Config.Name, rev.Device, rev.Time().Format(time.RFC3339))
+				s.forgetDevice(rev.Device)
 			} else {
-				log.Printf("circle %q: statement %s revoked (learned from a peer)", c.Config.Name, r.ID()[:8])
+				log.Printf("circle %q: statement %s revoked (learned from a peer)", held.Config.Name, rev.ID()[:8])
 				s.forgetAll()
 			}
 		}
@@ -1357,8 +1359,8 @@ func (s *CircleService) ingestRevocations(list [][]byte, now time.Time) (fresh [
 
 // deviceDIDOf derives the device DID of a peer from its ID (ed25519 keys
 // are embedded in the peer ID).
-func deviceDIDOf(p peer.ID) (string, error) {
-	pk, err := p.ExtractPublicKey()
+func deviceDIDOf(peerID peer.ID) (string, error) {
+	pk, err := peerID.ExtractPublicKey()
 	if err != nil {
 		return "", err
 	}
@@ -1403,14 +1405,14 @@ func (s *CircleService) loadExtraRevs() {
 		if err != nil {
 			continue
 		}
-		r, err := circle.RevocationFromStatement(st)
-		if err != nil || r.Verify() != nil || r.Spent(now) {
+		revocation, err := circle.RevocationFromStatement(st)
+		if err != nil || revocation.Verify() != nil || revocation.Spent(now) {
 			continue
 		}
-		set := s.extraRevs[r.Circle]
+		set := s.extraRevs[revocation.Circle]
 		if set == nil {
 			set = statement.NewRevocationSet()
-			s.extraRevs[r.Circle] = set
+			s.extraRevs[revocation.Circle] = set
 		}
 		_, _ = set.Add(st)
 	}
@@ -1422,12 +1424,12 @@ func (s *CircleService) saveExtraRevsLocked() {
 	var list [][]byte
 	for _, set := range s.extraRevs {
 		for _, st := range set.All() {
-			if r, err := circle.RevocationFromStatement(st); err != nil || r.Spent(now) {
+			if revocation, err := circle.RevocationFromStatement(st); err != nil || revocation.Spent(now) {
 				set.Remove(st.ID())
 				continue
 			}
-			if b, err := st.Bytes(); err == nil {
-				list = append(list, b)
+			if raw, err := st.Bytes(); err == nil {
+				list = append(list, raw)
 			}
 		}
 	}

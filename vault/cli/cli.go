@@ -194,11 +194,11 @@ func (p paths) openOwner(ownerDID string) (*circle.Circle, error) {
 // Passphrase reads the circle passphrase from $CIRCLE_PASSPHRASE (or the
 // pre-hoist $VAULT_PASSPHRASE) or an interactive no-echo prompt.
 func Passphrase() (string, error) {
-	if p := os.Getenv("CIRCLE_PASSPHRASE"); p != "" {
-		return p, nil
+	if pass := os.Getenv("CIRCLE_PASSPHRASE"); pass != "" {
+		return pass, nil
 	}
-	if p := os.Getenv("VAULT_PASSPHRASE"); p != "" {
-		return p, nil
+	if pass := os.Getenv("VAULT_PASSPHRASE"); pass != "" {
+		return pass, nil
 	}
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return "", fmt.Errorf("no terminal for passphrase prompt; set CIRCLE_PASSPHRASE")
@@ -235,23 +235,23 @@ func NewPassphrase() (string, error) {
 
 func prompt(label string) (string, error) {
 	fmt.Fprint(os.Stderr, label)
-	b, err := term.ReadPassword(int(os.Stdin.Fd()))
+	raw, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		return "", err
 	}
-	return string(b), nil
+	return string(raw), nil
 }
 
-func splitTags(s string) []string {
-	if s == "" {
+func splitTags(raw string) []string {
+	if raw == "" {
 		return nil
 	}
-	parts := strings.Split(s, ",")
+	parts := strings.Split(raw, ",")
 	var out []string
-	for _, p := range parts {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
 		}
 	}
 	return out
@@ -259,7 +259,7 @@ func splitTags(s string) []string {
 
 func cmdCreate(args []string) error {
 	fs := flag.NewFlagSet("create", flag.ExitOnError)
-	p := pathFlags(fs)
+	pth := pathFlags(fs)
 	circleName := fs.String("circle", "", "owning circle (required when this device holds several)")
 	pos := parse(fs, args, -1)
 	if len(pos) != 1 {
@@ -267,7 +267,7 @@ func cmdCreate(args []string) error {
 	}
 	// Signing happens here, where the passphrase prompt is — the daemon
 	// only ever receives the signed genesis + policy.
-	c, err := p.openCircle(*circleName)
+	heldCircle, err := pth.openCircle(*circleName)
 	if err != nil {
 		return err
 	}
@@ -275,7 +275,7 @@ func cmdCreate(args []string) error {
 	if err != nil {
 		return err
 	}
-	priv, err := c.Unlock(pass)
+	priv, err := heldCircle.Unlock(pass)
 	if err != nil {
 		return err
 	}
@@ -283,24 +283,24 @@ func cmdCreate(args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := openStore(p)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	b, err := st.CreateBucket(genesis, policy)
+	bkt, err := st.CreateBucket(genesis, policy)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("bucket created: %q  %s  in circle %q\n", b.Name, b.ID, c.Config.Name)
+	fmt.Printf("bucket created: %q  %s  in circle %q\n", bkt.Name, bkt.ID, heldCircle.Config.Name)
 	return nil
 }
 
 func cmdList(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	p := pathFlags(fs)
+	pth := pathFlags(fs)
 	parse(fs, args, -1)
-	st, err := openStore(p)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
@@ -313,83 +313,83 @@ func cmdList(args []string) error {
 		fmt.Println("no buckets — create one with: fabric bucket create <name>")
 		return nil
 	}
-	for _, b := range buckets {
-		fmt.Printf("%s  %-6s %3d/%-3d  %s%s\n", b.ID[:16], placementWord(b), b.Held, b.Objects, b.Name, placementWhere(b))
+	for _, bkt := range buckets {
+		fmt.Printf("%s  %-6s %3d/%-3d  %s%s\n", bkt.ID[:16], placementWord(bkt), bkt.Held, bkt.Objects, bkt.Name, placementWhere(bkt))
 	}
 	return nil
 }
 
 // placementWord is the one-word placement column: none, cache, full, or
 // folder (a folder replica is a full placement with a directory).
-func placementWord(b daemon.BucketInfo) string {
+func placementWord(bkt daemon.BucketInfo) string {
 	switch {
-	case b.Folder != "":
+	case bkt.Folder != "":
 		return "folder"
-	case b.Sub == "":
+	case bkt.Sub == "":
 		return "none"
 	}
-	return b.Sub
+	return bkt.Sub
 }
 
-func placementWhere(b daemon.BucketInfo) string {
+func placementWhere(bkt daemon.BucketInfo) string {
 	where := ""
-	if b.Folder != "" {
-		where = "  " + b.Folder
-	} else if b.Root != "" {
-		where = "  at " + b.Root
+	if bkt.Folder != "" {
+		where = "  " + bkt.Folder
+	} else if bkt.Root != "" {
+		where = "  at " + bkt.Root
 	}
-	for _, m := range b.Mounts {
-		where += "  mount " + m
+	for _, mountDir := range bkt.Mounts {
+		where += "  mount " + mountDir
 	}
 	return where
 }
 
-func printObject(o daemon.ObjectInfo) {
+func printObject(obj daemon.ObjectInfo) {
 	tagCol := ""
-	if len(o.Tags) > 0 {
-		tagCol = "  [" + strings.Join(o.Tags, " ") + "]"
+	if len(obj.Tags) > 0 {
+		tagCol = "  [" + strings.Join(obj.Tags, " ") + "]"
 	}
-	fmt.Printf("%s  %s%s\n", o.ID[:12], o.Name, tagCol)
+	fmt.Printf("%s  %s%s\n", obj.ID[:12], obj.Name, tagCol)
 }
 
 func cmdPut(args []string) error {
 	fs := flag.NewFlagSet("put", flag.ExitOnError)
-	p := pathFlags(fs)
+	pth := pathFlags(fs)
 	tags := fs.String("tag", "", "comma-separated tags for the new objects")
 	pos := parse(fs, args, -1)
 	if len(pos) < 2 {
 		return fmt.Errorf("usage: fabric bucket put <bucket> <file...> [-tag t1,t2]")
 	}
-	st, err := openStore(p)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 	for _, path := range pos[1:] {
-		f, err := os.Open(path)
+		file, err := os.Open(path)
 		if err != nil {
 			return err
 		}
 		name := strings.TrimLeft(path, "./")
-		o, err := st.Put(pos[0], name, f, splitTags(*tags))
-		f.Close()
+		obj, err := st.Put(pos[0], name, file, splitTags(*tags))
+		file.Close()
 		if err != nil {
 			return err
 		}
-		fmt.Printf("put %s  %s  blob %s\n", o.ID[:12], o.Name, o.Blob[:12])
+		fmt.Printf("put %s  %s  blob %s\n", obj.ID[:12], obj.Name, obj.Blob[:12])
 	}
 	return nil
 }
 
 func cmdLs(args []string) error {
 	fs := flag.NewFlagSet("ls", flag.ExitOnError)
-	p := pathFlags(fs)
+	pth := pathFlags(fs)
 	tags := fs.String("tag", "", "comma-separated tags; objects must carry all (facet intersection)")
 	pos := parse(fs, args, -1)
 	if len(pos) != 1 {
 		return fmt.Errorf("usage: fabric bucket ls <bucket> [-tag t1,t2]")
 	}
-	st, err := openStore(p)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
@@ -398,15 +398,15 @@ func cmdLs(args []string) error {
 	if err != nil {
 		return err
 	}
-	for _, o := range objs {
-		printObject(o)
+	for _, obj := range objs {
+		printObject(obj)
 	}
 	return nil
 }
 
 func cmdTag(args []string) error {
 	fs := flag.NewFlagSet("tag", flag.ExitOnError)
-	p := pathFlags(fs)
+	pth := pathFlags(fs)
 	// Flags stop being recognized after <bucket> <object-ref> — from there
 	// on "-x" means "remove tag x", not a flag.
 	pos := parse(fs, args, 2)
@@ -414,83 +414,83 @@ func cmdTag(args []string) error {
 		return fmt.Errorf("usage: fabric bucket tag <bucket> <object-ref> [+tag ...] [-tag ...]")
 	}
 	var add, remove []string
-	for _, m := range pos[2:] {
+	for _, mod := range pos[2:] {
 		switch {
-		case strings.HasPrefix(m, "+"):
-			add = append(add, m[1:])
-		case strings.HasPrefix(m, "-"):
-			remove = append(remove, m[1:])
+		case strings.HasPrefix(mod, "+"):
+			add = append(add, mod[1:])
+		case strings.HasPrefix(mod, "-"):
+			remove = append(remove, mod[1:])
 		default:
-			add = append(add, m)
+			add = append(add, mod)
 		}
 	}
-	st, err := openStore(p)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	o, err := st.Tag(pos[0], pos[1], add, remove)
+	obj, err := st.Tag(pos[0], pos[1], add, remove)
 	if err != nil {
 		return err
 	}
-	printObject(o)
+	printObject(obj)
 	return nil
 }
 
 func cmdGet(args []string) error {
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
-	p := pathFlags(fs)
+	pth := pathFlags(fs)
 	out := fs.String("o", "", "output file (default: stdout)")
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
 		return fmt.Errorf("usage: fabric bucket get <bucket> <object-ref> [-o file]")
 	}
-	st, err := openStore(p)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	r, err := st.Get(pos[0], pos[1])
+	rc, err := st.Get(pos[0], pos[1])
 	if err != nil {
 		return err
 	}
-	defer r.Close()
+	defer rc.Close()
 	dst := io.Writer(os.Stdout)
 	if *out != "" {
-		f, err := os.Create(*out)
+		file, err := os.Create(*out)
 		if err != nil {
 			return err
 		}
-		defer f.Close()
-		dst = f
+		defer file.Close()
+		dst = file
 	}
-	_, err = io.Copy(dst, r)
+	_, err = io.Copy(dst, rc)
 	return err
 }
 
 func cmdRm(args []string) error {
 	fs := flag.NewFlagSet("rm", flag.ExitOnError)
-	p := pathFlags(fs)
+	pth := pathFlags(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
 		return fmt.Errorf("usage: fabric bucket rm <bucket> <object-ref>")
 	}
-	st, err := openStore(p)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	o, err := st.Rm(pos[0], pos[1])
+	obj, err := st.Rm(pos[0], pos[1])
 	if err != nil {
 		return err
 	}
-	fmt.Printf("tombstoned %s (%s) — blob retained per trash policy\n", o.ID[:12], o.Name)
+	fmt.Printf("tombstoned %s (%s) — blob retained per trash policy\n", obj.ID[:12], obj.Name)
 	return nil
 }
 
 func cmdProject(args []string) error {
 	fs := flag.NewFlagSet("project", flag.ExitOnError)
-	p := pathFlags(fs)
+	pth := pathFlags(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) != 2 {
 		return fmt.Errorf("usage: fabric bucket project <bucket> <dir>")
@@ -499,22 +499,22 @@ func cmdProject(args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := openStore(p)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	n, err := st.Project(pos[0], dir)
+	count, err := st.Project(pos[0], dir)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("projected %d objects into %s (read-only view — edits there are not writes)\n", n, dir)
+	fmt.Printf("projected %d objects into %s (read-only view — edits there are not writes)\n", count, dir)
 	return nil
 }
 
 func cmdMount(args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
-	p := pathFlags(fs)
+	pth := pathFlags(fs)
 	debug := fs.Bool("debug", false, "show FUSE protocol logging (foreground only)")
 	write := fs.Bool("write", false, "enable staged filesystem writes")
 	foreground := fs.Bool("foreground", false, "serve the mount from this process instead of declaring it (debugging; dies with the terminal)")
@@ -526,29 +526,29 @@ func cmdMount(args []string) error {
 	if err != nil {
 		return err
 	}
-	cl := daemon.TryClient(*p.store)
+	cl := daemon.TryClient(*pth.store)
 	if cl == nil {
-		return fmt.Errorf("mount requires the running node daemon on %s", daemon.SocketPath(*p.store))
+		return fmt.Errorf("mount requires the running node daemon on %s", daemon.SocketPath(*pth.store))
 	}
 	if *foreground {
-		return foregroundMount(cl, *p.store, pos[0], mountpoint, *write, *debug)
+		return foregroundMount(cl, *pth.store, pos[0], mountpoint, *write, *debug)
 	}
-	m, err := cl.AddMount(mountpoint, pos[0], *write)
+	mount, err := cl.AddMount(mountpoint, pos[0], *write)
 	if err != nil {
 		return err
 	}
 	mode := "read-only"
-	if m.Write {
+	if mount.Write {
 		mode = "writable"
 	}
-	fmt.Printf("mount declared: the daemon serves bucket %.16s %s at %s\n", m.Bucket, mode, m.Dir)
-	fmt.Printf("it persists across daemon restarts; remove with: fabric bucket unmount %s\n", m.Dir)
+	fmt.Printf("mount declared: the daemon serves bucket %.16s %s at %s\n", mount.Bucket, mode, mount.Dir)
+	fmt.Printf("it persists across daemon restarts; remove with: fabric bucket unmount %s\n", mount.Dir)
 	return nil
 }
 
 func cmdUnmount(args []string) error {
 	fs := flag.NewFlagSet("unmount", flag.ExitOnError)
-	p := pathFlags(fs)
+	pth := pathFlags(fs)
 	pos := parse(fs, args, -1)
 	if len(pos) != 1 {
 		return fmt.Errorf("usage: fabric bucket unmount <dir>")
@@ -557,9 +557,9 @@ func cmdUnmount(args []string) error {
 	if err != nil {
 		return err
 	}
-	cl := daemon.TryClient(*p.store)
+	cl := daemon.TryClient(*pth.store)
 	if cl == nil {
-		return fmt.Errorf("unmount requires the running node daemon on %s", daemon.SocketPath(*p.store))
+		return fmt.Errorf("unmount requires the running node daemon on %s", daemon.SocketPath(*pth.store))
 	}
 	if err := cl.RemoveMount(dir); err != nil {
 		return err
@@ -570,23 +570,23 @@ func cmdUnmount(args []string) error {
 
 // PrintMounts renders mount lines (shared with 'fabric circle status').
 func PrintMounts(mounts []daemon.MountInfo) {
-	for _, m := range mounts {
+	for _, mount := range mounts {
 		mode := "ro"
-		if m.Write {
+		if mount.Write {
 			mode = "rw"
 		}
 		state := "mounted"
 		switch {
-		case m.Error != "":
-			state = "error: " + m.Error
-		case !m.Mounted:
+		case mount.Error != "":
+			state = "error: " + mount.Error
+		case !mount.Mounted:
 			state = "not mounted (daemon will retry)"
 		}
-		name := m.Name
+		name := mount.Name
 		if name == "" {
-			name = m.Bucket[:min(16, len(m.Bucket))]
+			name = mount.Bucket[:min(16, len(mount.Bucket))]
 		}
-		fmt.Printf("  %s  %s  %s  %s\n", m.Dir, mode, name, state)
+		fmt.Printf("  %s  %s  %s  %s\n", mount.Dir, mode, name, state)
 	}
 }
 

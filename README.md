@@ -901,9 +901,8 @@ flow) is in `.claude/skills/verify/SKILL.md`.
 `chain`, `hold`, `request` — not `p`, `c`, `h`, `r`. One-letter names are
 fine only for receivers, loop indices and a two-line closure; anything
 that lives past a screenful, crosses a function boundary or shadows a
-package name (`d` for a daemon next to `did`) gets a word. Existing code
-is renamed as it is touched; one dedicated sweep (no behaviour change)
-follows build-queue step 5 (operator, 2026-11-04).
+package name (`d` for a daemon next to `did`) gets a word (dedicated
+sweep completed 2026-11-10 after build-queue step 5).
 
 License: MPL-2.0.
 

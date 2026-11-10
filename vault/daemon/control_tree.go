@@ -66,53 +66,53 @@ func (d *Daemon) treeRoutes(mux *http.ServeMux) {
 }
 
 // handlePutEntry creates a directory or symlink record (ADR 0001 §6).
-func (d *Daemon) handlePutEntry(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handlePutEntry(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	var body entryBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	if body.Kind != index.KindDir && body.Kind != index.KindSymlink {
-		httpErr(w, fmt.Errorf("entry kind must be dir or symlink, got %q", body.Kind))
+		httpErr(resp, fmt.Errorf("entry kind must be dir or symlink, got %q", body.Kind))
 		return
 	}
-	o, err := h.PutEntry(body.Name, index.Revision{Kind: body.Kind, Target: body.Target, Mode: body.Mode}, nil)
+	obj, err := handle.PutEntry(body.Name, index.Revision{Kind: body.Kind, Target: body.Target, Mode: body.Mode}, nil)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	d.kickFolders(h.ID())
+	d.kickFolders(handle.ID())
 	d.kickSync()
-	writeJSON(w, Info(o))
+	writeJSON(resp, Info(obj))
 }
 
 // handleSetAttr records a mode or source-mtime change as a revision.
-func (d *Daemon) handleSetAttr(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleSetAttr(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	var body attrBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
-	o, err := h.ResolveObject(body.Ref)
+	obj, err := handle.ResolveObject(body.Ref)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	if body.Mode == nil && body.MTime == nil {
-		writeJSON(w, Info(o))
+		writeJSON(resp, Info(obj))
 		return
 	}
-	o, err = h.Revise(o, func(rev *index.Revision) {
+	obj, err = handle.Revise(obj, func(rev *index.Revision) {
 		if body.Mode != nil {
 			rev.Mode = *body.Mode & 0o777
 		}
@@ -121,179 +121,179 @@ func (d *Daemon) handleSetAttr(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	d.kickFolders(h.ID())
+	d.kickFolders(handle.ID())
 	d.kickSync()
-	writeJSON(w, Info(o))
+	writeJSON(resp, Info(obj))
 }
 
-func (d *Daemon) handlePolicy(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handlePolicy(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	writeJSON(w, h.CurrentPolicy())
+	writeJSON(resp, handle.CurrentPolicy())
 }
 
-func (d *Daemon) handleSetPolicy(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleSetPolicy(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	var body policyBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
 	raw, err := base64.StdEncoding.DecodeString(body.PolicyB64)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	if _, err := h.UpdatePolicy(raw); err != nil {
-		httpErr(w, err)
+	if _, err := handle.UpdatePolicy(raw); err != nil {
+		httpErr(resp, err)
 		return
 	}
-	d.kickFolders(h.ID())
+	d.kickFolders(handle.ID())
 	d.kickSync()
-	writeJSON(w, h.CurrentPolicy())
+	writeJSON(resp, handle.CurrentPolicy())
 }
 
-func (d *Daemon) handleTrash(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleTrash(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	objs, err := h.Trash()
+	objs, err := handle.Trash()
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	out := []ObjectInfo{}
-	for _, o := range objs {
-		out = append(out, Info(o))
+	for _, obj := range objs {
+		out = append(out, Info(obj))
 	}
-	writeJSON(w, out)
+	writeJSON(resp, out)
 }
 
-func (d *Daemon) handleRestore(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleRestore(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	var body refBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
-	o, err := h.ResolveTrashed(body.Ref)
+	obj, err := handle.ResolveTrashed(body.Ref)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	if o, err = h.Restore(o); err != nil {
-		httpErr(w, err)
+	if obj, err = handle.Restore(obj); err != nil {
+		httpErr(resp, err)
 		return
 	}
-	d.kickFolders(h.ID())
+	d.kickFolders(handle.ID())
 	d.kickSync()
-	writeJSON(w, Info(o))
+	writeJSON(resp, Info(obj))
 }
 
-func (d *Daemon) handleConflicts(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleConflicts(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	cs, err := h.Conflicts()
+	cs, err := handle.Conflicts()
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	writeJSON(w, ConflictEntries(cs))
+	writeJSON(resp, ConflictEntries(cs))
 }
 
 func ConflictEntries(cs []store.Conflict) []ConflictEntry {
 	out := []ConflictEntry{}
-	for _, c := range cs {
-		r := c.Revision
-		out = append(out, ConflictEntry{Object: Info(c.Object), Copy: ConflictInfo{Name: c.Name, Blob: r.Blob, Size: r.Size, Kind: r.KindOrFile(), MTime: r.MTime, TS: r.TS, By: r.By}})
+	for _, conflict := range cs {
+		rev := conflict.Revision
+		out = append(out, ConflictEntry{Object: Info(conflict.Object), Copy: ConflictInfo{Name: conflict.Name, Blob: rev.Blob, Size: rev.Size, Kind: rev.KindOrFile(), MTime: rev.MTime, TS: rev.TS, By: rev.By}})
 	}
 	return out
 }
 
-func (d *Daemon) handleResolve(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleResolve(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	var body refBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httpErr(w, err)
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
 		return
 	}
-	o, err := h.ResolveObject(body.Ref)
+	obj, err := handle.ResolveObject(body.Ref)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	if o, err = h.Resolve(o); err != nil {
-		httpErr(w, err)
+	if obj, err = handle.Resolve(obj); err != nil {
+		httpErr(resp, err)
 		return
 	}
-	d.kickFolders(h.ID())
+	d.kickFolders(handle.ID())
 	d.kickSync()
-	writeJSON(w, Info(o))
+	writeJSON(resp, Info(obj))
 }
 
-func (d *Daemon) handleHeld(w http.ResponseWriter, r *http.Request) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) handleHeld(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	list, err := h.ListHeld()
+	list, err := handle.ListHeld()
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
 	out := []HeldEntry{}
-	for _, e := range list {
-		out = append(out, HeldEntry{ID: e.ID, Name: e.Name, From: e.From, FirstSeen: e.FirstSeen})
+	for _, item := range list {
+		out = append(out, HeldEntry{ID: item.ID, Name: item.Name, From: item.From, FirstSeen: item.FirstSeen})
 	}
-	writeJSON(w, out)
+	writeJSON(resp, out)
 }
 
-func (d *Daemon) handleHeldAccept(w http.ResponseWriter, r *http.Request) {
-	d.heldDecision(w, r, (*store.Handle).AcceptHeld)
+func (d *Daemon) handleHeldAccept(resp http.ResponseWriter, req *http.Request) {
+	d.heldDecision(resp, req, (*store.Handle).AcceptHeld)
 }
 
-func (d *Daemon) handleHeldReject(w http.ResponseWriter, r *http.Request) {
-	d.heldDecision(w, r, (*store.Handle).RejectHeld)
+func (d *Daemon) handleHeldReject(resp http.ResponseWriter, req *http.Request) {
+	d.heldDecision(resp, req, (*store.Handle).RejectHeld)
 }
 
-func (d *Daemon) heldDecision(w http.ResponseWriter, r *http.Request, decide func(*store.Handle) (int, error)) {
-	h, err := d.handle(r.PathValue("bucket"))
+func (d *Daemon) heldDecision(resp http.ResponseWriter, req *http.Request, decide func(*store.Handle) (int, error)) {
+	handle, err := d.handle(req.PathValue("bucket"))
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	n, err := decide(h)
+	count, err := decide(handle)
 	if err != nil {
-		httpErr(w, err)
+		httpErr(resp, err)
 		return
 	}
-	d.kickFolders(h.ID())
+	d.kickFolders(handle.ID())
 	d.kickSync()
-	writeJSON(w, countBody{Count: n})
+	writeJSON(resp, countBody{Count: count})
 }
 
 // Client side.

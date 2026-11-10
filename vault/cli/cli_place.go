@@ -25,7 +25,7 @@ import (
 
 func cmdPlace(args []string) error {
 	fs := flag.NewFlagSet("place", flag.ExitOnError)
-	p := pathFlags(fs)
+	pth := pathFlags(fs)
 	rescan := fs.Bool("rescan", false, "ask the daemon to scan the folder replica now")
 	at := fs.String("at", "", "blob store root for a full/cache placement (absolute dir, or 'default')")
 	pos := parse(fs, args, -1)
@@ -34,16 +34,16 @@ func cmdPlace(args []string) error {
 		return errors.New(usage)
 	}
 	ref := pos[0]
-	st, err := openStore(p)
+	st, err := openStore(pth)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	b, err := findBucket(st, ref)
+	bkt, err := findBucket(st, ref)
 	if err != nil {
 		return err
 	}
-	cl := daemon.TryClient(*p.store) // folder operations need the daemon
+	cl := daemon.TryClient(*pth.store) // folder operations need the daemon
 
 	if len(pos) > 1 {
 		mode := pos[1]
@@ -62,15 +62,15 @@ func cmdPlace(args []string) error {
 			if cl == nil {
 				return fmt.Errorf("folders are served by the daemon: is 'fabric up' running?")
 			}
-			if b.Folder == dir {
-				fmt.Printf("already placed: %s is kept at %s\n", b.Name, dir)
+			if bkt.Folder == dir {
+				fmt.Printf("already placed: %s is kept at %s\n", bkt.Name, dir)
 			} else {
-				if b.Folder != "" {
-					if err := cl.RemoveFolder(b.Folder); err != nil {
+				if bkt.Folder != "" {
+					if err := cl.RemoveFolder(bkt.Folder); err != nil {
 						return err
 					}
 				}
-				info, err := cl.AddFolder(dir, b.ID)
+				info, err := cl.AddFolder(dir, bkt.ID)
 				if err != nil {
 					return err
 				}
@@ -80,29 +80,29 @@ func cmdPlace(args []string) error {
 			if len(pos) != 2 {
 				return errors.New(usage)
 			}
-			if b.Folder != "" {
+			if bkt.Folder != "" {
 				if cl == nil {
-					return fmt.Errorf("%s is a folder replica; withdrawing it needs the daemon ('fabric up')", b.Name)
+					return fmt.Errorf("%s is a folder replica; withdrawing it needs the daemon ('fabric up')", bkt.Name)
 				}
-				if err := cl.RemoveFolder(b.Folder); err != nil {
+				if err := cl.RemoveFolder(bkt.Folder); err != nil {
 					return err
 				}
-				fmt.Printf("folder declaration withdrawn: %s (the directory is untouched)\n", b.Folder)
+				fmt.Printf("folder declaration withdrawn: %s (the directory is untouched)\n", bkt.Folder)
 			}
 			var root *string
 			if *at != "" {
-				r := *at
-				if r != "default" {
-					if r, err = filepath.Abs(r); err != nil {
+				resolvedRoot := *at
+				if resolvedRoot != "default" {
+					if resolvedRoot, err = filepath.Abs(resolvedRoot); err != nil {
 						return err
 					}
 				}
-				root = &r
+				root = &resolvedRoot
 			}
-			if err := st.Place(b.ID, mode, root); err != nil {
+			if err := st.Place(bkt.ID, mode, root); err != nil {
 				return err
 			}
-			fmt.Printf("placed: %s -> %s\n", b.Name, mode)
+			fmt.Printf("placed: %s -> %s\n", bkt.Name, mode)
 			if root != nil && *root != "default" {
 				fmt.Printf("blobs for this bucket now land in %s; any already in the default store stay there, readable\n", *root)
 			}
@@ -112,49 +112,49 @@ func cmdPlace(args []string) error {
 		default:
 			return fmt.Errorf("unknown placement %q — full, cache, none, or folder <dir>", mode)
 		}
-		if b, err = findBucket(st, ref); err != nil {
+		if bkt, err = findBucket(st, ref); err != nil {
 			return err
 		}
 	}
 
 	if *rescan {
-		if cl == nil || b.Folder == "" {
+		if cl == nil || bkt.Folder == "" {
 			return fmt.Errorf("-rescan needs a folder replica served by the running daemon")
 		}
-		if err := cl.RescanFolder(b.Folder); err != nil {
+		if err := cl.RescanFolder(bkt.Folder); err != nil {
 			return err
 		}
-		fmt.Printf("rescan requested: %s\n", b.Folder)
+		fmt.Printf("rescan requested: %s\n", bkt.Folder)
 	}
 
 	// The detailed view.
-	mode := b.Sub
+	mode := bkt.Sub
 	if mode == "" {
 		mode = "none (catalog + index only)"
 	}
-	if b.Folder != "" {
-		mode = "folder " + b.Folder
-	} else if b.Root != "" {
-		mode += " at " + b.Root
+	if bkt.Folder != "" {
+		mode = "folder " + bkt.Folder
+	} else if bkt.Root != "" {
+		mode += " at " + bkt.Root
 	}
-	fmt.Printf("%s  %s: %s — holding %d/%d blobs\n", b.ID[:16], b.Name, mode, b.Held, b.Objects)
+	fmt.Printf("%s  %s: %s — holding %d/%d blobs\n", bkt.ID[:16], bkt.Name, mode, bkt.Held, bkt.Objects)
 	if cl == nil {
 		return nil
 	}
-	if b.Folder != "" {
+	if bkt.Folder != "" {
 		if infos, err := cl.Folders(); err == nil {
-			for _, f := range infos {
-				if f.Dir == b.Folder {
-					printFolder(f)
+			for _, folderInfo := range infos {
+				if folderInfo.Dir == bkt.Folder {
+					printFolder(folderInfo)
 				}
 			}
 		}
 	}
 	if mounts, err := cl.Mounts(); err == nil {
 		var mine []daemon.MountInfo
-		for _, m := range mounts {
-			if m.Bucket == b.ID {
-				mine = append(mine, m)
+		for _, mount := range mounts {
+			if mount.Bucket == bkt.ID {
+				mine = append(mine, mount)
 			}
 		}
 		if len(mine) > 0 {
@@ -172,44 +172,44 @@ func findBucket(st store_, ref string) (daemon.BucketInfo, error) {
 	if err != nil {
 		return daemon.BucketInfo{}, err
 	}
-	for _, b := range buckets {
-		if b.Name == ref || strings.HasPrefix(b.ID, ref) {
-			return b, nil
+	for _, bkt := range buckets {
+		if bkt.Name == ref || strings.HasPrefix(bkt.ID, ref) {
+			return bkt, nil
 		}
 	}
 	return daemon.BucketInfo{}, fmt.Errorf("no bucket matches %q", ref)
 }
 
-func printFolder(f daemon.FolderInfo) {
+func printFolder(folderInfo daemon.FolderInfo) {
 	state := "closed"
 	switch {
-	case f.Open && f.Available:
+	case folderInfo.Open && folderInfo.Available:
 		state = "open"
-	case f.Open:
+	case folderInfo.Open:
 		state = "unavailable (directory or marker missing)"
 	}
-	fmt.Printf("folder %s  %s\n", f.Dir, state)
-	if f.Open {
+	fmt.Printf("folder %s  %s\n", folderInfo.Dir, state)
+	if folderInfo.Open {
 		last := "never"
-		if f.LastScan != 0 {
-			last = time.Unix(0, f.LastScan).Format(time.RFC3339)
+		if folderInfo.LastScan != 0 {
+			last = time.Unix(0, folderInfo.LastScan).Format(time.RFC3339)
 		}
 		fmt.Printf("    files %d  pending down %d  pending up %d  conflicts %d  held %d  excluded repos %d  ignored %d  last scan %s\n",
-			f.Files, f.PendingDown, f.PendingUp, f.Conflicts, f.Held, f.Excluded, f.Ignored, last)
+			folderInfo.Files, folderInfo.PendingDown, folderInfo.PendingUp, folderInfo.Conflicts, folderInfo.Held, folderInfo.Excluded, folderInfo.Ignored, last)
 	}
-	if f.Error != "" {
-		fmt.Printf("    error: %s\n", f.Error)
+	if folderInfo.Error != "" {
+		fmt.Printf("    error: %s\n", folderInfo.Error)
 	}
 }
 
 // PrintFolders renders folder state lines (shared with 'fabric circle status').
 func PrintFolders(infos []daemon.FolderInfo) {
-	for _, f := range infos {
-		name := f.Name
+	for _, folderInfo := range infos {
+		name := folderInfo.Name
 		if name == "" {
-			name = f.Bucket[:min(16, len(f.Bucket))]
+			name = folderInfo.Bucket[:min(16, len(folderInfo.Bucket))]
 		}
 		fmt.Printf("  %s  ", name)
-		printFolder(f)
+		printFolder(folderInfo)
 	}
 }

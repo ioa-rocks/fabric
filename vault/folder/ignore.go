@@ -27,24 +27,24 @@ var DefaultIgnore = []string{".vault-folder", "node_modules/", ".venv/", "__pyca
 
 func NewIgnore(patterns []string) *Ignore {
 	ig := &Ignore{}
-	for _, p := range append(append([]string(nil), DefaultIgnore...), patterns...) {
-		p = strings.TrimSpace(p)
-		if p == "" || strings.HasPrefix(p, "#") {
+	for _, pat := range append(append([]string(nil), DefaultIgnore...), patterns...) {
+		pat = strings.TrimSpace(pat)
+		if pat == "" || strings.HasPrefix(pat, "#") {
 			continue
 		}
-		r := rule{}
-		if strings.HasSuffix(p, "/") {
-			r.dirOnly = true
-			p = strings.TrimSuffix(p, "/")
+		item := rule{}
+		if strings.HasSuffix(pat, "/") {
+			item.dirOnly = true
+			pat = strings.TrimSuffix(pat, "/")
 		}
-		if strings.HasPrefix(p, "/") {
-			r.anchored = true
-			p = strings.TrimPrefix(p, "/")
-		} else if strings.Contains(p, "/") {
-			r.anchored = true
+		if strings.HasPrefix(pat, "/") {
+			item.anchored = true
+			pat = strings.TrimPrefix(pat, "/")
+		} else if strings.Contains(pat, "/") {
+			item.anchored = true
 		}
-		r.pattern = p
-		ig.rules = append(ig.rules, r)
+		item.pattern = pat
+		ig.rules = append(ig.rules, item)
 	}
 	return ig
 }
@@ -56,21 +56,21 @@ func (ig *Ignore) Match(rel string, isDir bool) bool {
 	if ig == nil {
 		return false
 	}
-	for _, r := range ig.rules {
-		if r.dirOnly && !isDir {
+	for _, item := range ig.rules {
+		if item.dirOnly && !isDir {
 			// A dir-only rule still covers files beneath a matching directory.
-			if matchesParent(r, rel) {
+			if matchesParent(item, rel) {
 				return true
 			}
 			continue
 		}
-		if r.anchored {
-			if globMatch(r.pattern, rel) || matchesParent(r, rel) {
+		if item.anchored {
+			if globMatch(item.pattern, rel) || matchesParent(item, rel) {
 				return true
 			}
 			continue
 		}
-		if globMatch(r.pattern, path.Base(rel)) || matchesParent(r, rel) {
+		if globMatch(item.pattern, path.Base(rel)) || matchesParent(item, rel) {
 			return true
 		}
 	}
@@ -79,15 +79,15 @@ func (ig *Ignore) Match(rel string, isDir bool) bool {
 
 // matchesParent reports whether any proper ancestor directory of rel
 // matches the rule.
-func matchesParent(r rule, rel string) bool {
+func matchesParent(item rule, rel string) bool {
 	parts := strings.Split(rel, "/")
 	for i := 1; i < len(parts); i++ {
 		dir := strings.Join(parts[:i], "/")
-		if r.anchored {
-			if globMatch(r.pattern, dir) {
+		if item.anchored {
+			if globMatch(item.pattern, dir) {
 				return true
 			}
-		} else if globMatch(r.pattern, parts[i-1]) {
+		} else if globMatch(item.pattern, parts[i-1]) {
 			return true
 		}
 	}

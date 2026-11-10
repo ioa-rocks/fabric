@@ -109,30 +109,30 @@ type EventSync struct {
 // notification here. The host's own signed address record is tracked via
 // the event bus and re-pushed to connected members whenever it changes
 // (network transitions).
-func NewEventSync(h host.Host, store *MemberStore) *EventSync {
-	cab, _ := h.Peerstore().(peerstore.CertifiedAddrBook)
-	s := &EventSync{h: h, store: store, cab: cab, lastSeq: map[peer.ID]uint64{}}
-	h.SetStreamHandler(SyncProtocolV2ID, s.handleSyncV2)
+func NewEventSync(localHost host.Host, store *MemberStore) *EventSync {
+	cab, _ := localHost.Peerstore().(peerstore.CertifiedAddrBook)
+	syncSvc := &EventSync{h: localHost, store: store, cab: cab, lastSeq: map[peer.ID]uint64{}}
+	localHost.SetStreamHandler(SyncProtocolV2ID, syncSvc.handleSyncV2)
 	// A roster change — a device admitted here, a verdict flipped — is
 	// news for every peer in that circle: re-run anti-entropy with the
 	// connected members shortly. Converges because a second exchange that
 	// changes nothing kicks nothing.
 	go func() {
 		for range store.Watch() {
-			s.kick()
+			syncSvc.kick()
 		}
 	}()
-	nb := &network.NotifyBundle{ConnectedF: func(_ network.Network, c network.Conn) {
-		p := c.RemotePeer()
-		if s.store.IsMember(p, time.Now()) {
-			s.ExchangeAsync(p)
+	nb := &network.NotifyBundle{ConnectedF: func(_ network.Network, conn network.Conn) {
+		peerID := conn.RemotePeer()
+		if syncSvc.store.IsMember(peerID, time.Now()) {
+			syncSvc.ExchangeAsync(peerID)
 		}
 	}}
-	h.Network().Notify(nb)
-	s.stop = append(s.stop, func() { h.Network().StopNotify(nb) })
-	s.watchOwnRecord()
-	s.republishRecords()
-	return s
+	localHost.Network().Notify(nb)
+	syncSvc.stop = append(syncSvc.stop, func() { localHost.Network().StopNotify(nb) })
+	syncSvc.watchOwnRecord()
+	syncSvc.republishRecords()
+	return syncSvc
 }
 
 // republishRecords re-pushes every record we hold to connected members on a
@@ -149,15 +149,15 @@ func NewEventSync(h host.Host, store *MemberStore) *EventSync {
 // costs one small message per connected member per interval and cannot
 // cascade.
 func (s *EventSync) republishRecords() {
-	t := time.NewTicker(recordRepublishInterval)
+	ticker := time.NewTicker(recordRepublishInterval)
 	done := make(chan struct{})
-	s.stop = append(s.stop, func() { close(done); t.Stop() })
+	s.stop = append(s.stop, func() { close(done); ticker.Stop() })
 	go func() {
 		for {
 			select {
 			case <-done:
 				return
-			case <-t.C:
+			case <-ticker.C:
 				s.pushRecordsExcept(s.knownRecords(), "")
 			}
 		}
@@ -168,9 +168,9 @@ func (s *EventSync) republishRecords() {
 // SetCircleHooks lends the gossip the circle service's view (see
 // CircleHooks). Without them, v2 carries rosters and events but no own
 // admissions or revocations — a pure-connectivity node.
-func (s *EventSync) SetCircleHooks(h CircleHooks) {
+func (s *EventSync) SetCircleHooks(hooks CircleHooks) {
 	s.mu.Lock()
-	s.hooks = h
+	s.hooks = hooks
 	s.mu.Unlock()
 }
 
@@ -194,9 +194,9 @@ func (s *EventSync) kick() {
 		s.kicking = false
 		s.mu.Unlock()
 		now := time.Now()
-		for _, p := range s.h.Network().Peers() {
-			if s.store.IsMember(p, now) {
-				s.ExchangeAsync(p)
+		for _, peerID := range s.h.Network().Peers() {
+			if s.store.IsMember(peerID, now) {
+				s.ExchangeAsync(peerID)
 			}
 		}
 	})
@@ -204,8 +204,8 @@ func (s *EventSync) kick() {
 
 func (s *EventSync) Close() {
 	s.h.RemoveStreamHandler(SyncProtocolV2ID)
-	for _, f := range s.stop {
-		f()
+	for _, stopFn := range s.stop {
+		stopFn()
 	}
 }
 
@@ -228,11 +228,11 @@ func (s *EventSync) watchOwnRecord() {
 				if !ok {
 					return
 				}
-				e := ev.(libp2pevent.EvtLocalAddressesUpdated)
-				if e.SignedPeerRecord == nil {
+				evt := ev.(libp2pevent.EvtLocalAddressesUpdated)
+				if evt.SignedPeerRecord == nil {
 					continue
 				}
-				data, err := e.SignedPeerRecord.Marshal()
+				data, err := evt.SignedPeerRecord.Marshal()
 				if err != nil {
 					continue
 				}
@@ -250,11 +250,11 @@ func (s *EventSync) watchOwnRecord() {
 
 // ExchangeAsync runs a full-state exchange with a peer in the background,
 // tolerating failure — anti-entropy retries on every future connect.
-func (s *EventSync) ExchangeAsync(p peer.ID) {
+func (s *EventSync) ExchangeAsync(peerID peer.ID) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout)
 		defer cancel()
-		_ = s.exchange(ctx, p)
+		_ = s.exchange(ctx, peerID)
 	}()
 }
 
@@ -284,23 +284,23 @@ func (s *EventSync) publishSets(sets []circleSet, except peer.ID) {
 		return
 	}
 	now := time.Now()
-	for _, p := range s.h.Network().Peers() {
-		if p == except || !s.store.IsMember(p, now) {
+	for _, peerID := range s.h.Network().Peers() {
+		if peerID == except || !s.store.IsMember(peerID, now) {
 			continue
 		}
 		var mine []circleSet
 		for _, set := range sets {
-			if s.store.In(p, set.DID, now) {
+			if s.store.In(peerID, set.DID, now) {
 				mine = append(mine, set)
 			}
 		}
 		if len(mine) == 0 {
 			continue
 		}
-		go func(p peer.ID, sets []circleSet) {
+		go func(peerID peer.ID, sets []circleSet) {
 			ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout)
 			defer cancel()
-			str, err := s.h.NewStream(ctx, p, SyncProtocolV2ID)
+			str, err := s.h.NewStream(ctx, peerID, SyncProtocolV2ID)
 			if err != nil {
 				return
 			}
@@ -311,7 +311,7 @@ func (s *EventSync) publishSets(sets []circleSet, except peer.ID) {
 			if writeSyncV2(str, syncPayloadV2{Circles: sets}) == nil {
 				_, _ = readSyncV2(str)
 			}
-		}(p, mine)
+		}(peerID, mine)
 	}
 }
 
@@ -319,19 +319,19 @@ func (s *EventSync) publishSets(sets []circleSet, except peer.ID) {
 // the peer is a live device of here, with the circle's key history, every
 // admission the roster holds, this node's own, and the circle's live
 // revocations.
-func (s *EventSync) setsFor(p peer.ID) []circleSet {
+func (s *EventSync) setsFor(peerID peer.ID) []circleSet {
 	now := time.Now()
 	hooks := s.circleHooks()
 	var out []circleSet
-	for _, r := range s.store.Rosters() {
-		did := r.CircleDID()
-		if !s.store.In(p, did, now) {
+	for _, roster := range s.store.Rosters() {
+		circleDID := roster.CircleDID()
+		if !s.store.In(peerID, circleDID, now) {
 			continue
 		}
-		set := circleSet{DID: did, Roots: []string{did}}
+		set := circleSet{DID: circleDID, Roots: []string{circleDID}}
 		{
-			for _, h := range r.Roots().Handovers(did) {
-				if raw, err := h.Bytes(); err == nil {
+			for _, handover := range roster.Roots().Handovers(circleDID) {
+				if raw, err := handover.Bytes(); err == nil {
 					set.Handovers = append(set.Handovers, raw)
 				}
 			}
@@ -339,18 +339,18 @@ func (s *EventSync) setsFor(p peer.ID) []circleSet {
 			// entry alone: a restoration held beside a stale renewal is
 			// what a peer needs when the removal reaches it later (Codex
 			// review, 2026-11-06).
-			for _, dev := range r.Devices() {
-				for _, d := range r.Held(dev.DID) {
-					if raw, err := d.Stmt.Bytes(); err == nil {
+			for _, dev := range roster.Devices() {
+				for _, heldDev := range roster.Held(dev.DID) {
+					if raw, err := heldDev.Stmt.Bytes(); err == nil {
 						set.Admissions = append(set.Admissions, raw)
 					}
 				}
 			}
 			if hooks.OwnAdmissions != nil {
-				set.Admissions = append(set.Admissions, hooks.OwnAdmissions(did)...)
+				set.Admissions = append(set.Admissions, hooks.OwnAdmissions(circleDID)...)
 			}
 			if hooks.Revocations != nil {
-				set.Revocations = hooks.Revocations(did)
+				set.Revocations = hooks.Revocations(circleDID)
 			}
 		}
 		out = append(out, set)
@@ -371,24 +371,24 @@ func (s *EventSync) pushRecordsExcept(recs [][]byte, except peer.ID) {
 	for i, data := range recs {
 		subjects[i], _ = recordSubject(data)
 	}
-	for _, p := range s.h.Network().Peers() {
-		if p == except || !s.store.IsMember(p, now) {
+	for _, peerID := range s.h.Network().Peers() {
+		if peerID == except || !s.store.IsMember(peerID, now) {
 			continue
 		}
 		// A record goes only to peers that share a circle with its subject.
 		var mine [][]byte
 		for i, data := range recs {
-			if subjects[i] == "" || subjects[i] == s.h.ID() || s.sharesCircle(subjects[i], p) {
+			if subjects[i] == "" || subjects[i] == s.h.ID() || s.sharesCircle(subjects[i], peerID) {
 				mine = append(mine, data)
 			}
 		}
 		if len(mine) == 0 {
 			continue
 		}
-		go func(p peer.ID, recs [][]byte) {
+		go func(peerID peer.ID, recs [][]byte) {
 			ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout)
 			defer cancel()
-			str, err := s.h.NewStream(ctx, p, SyncProtocolV2ID)
+			str, err := s.h.NewStream(ctx, peerID, SyncProtocolV2ID)
 			if err != nil {
 				return
 			}
@@ -399,14 +399,14 @@ func (s *EventSync) pushRecordsExcept(recs [][]byte, except peer.ID) {
 			if writeSyncV2(str, syncPayloadV2{Records: recs}) == nil {
 				_, _ = readSyncV2(str) // drain so the responder isn't left hanging
 			}
-		}(p, mine)
+		}(peerID, mine)
 	}
 }
 
 // exchange sends state to a peer (anti-entropy: the whole roster of every
 // shared circle) and applies whatever it answers with.
-func (s *EventSync) exchange(ctx context.Context, p peer.ID) error {
-	str, err := s.h.NewStream(ctx, p, SyncProtocolV2ID)
+func (s *EventSync) exchange(ctx context.Context, peerID peer.ID) error {
+	str, err := s.h.NewStream(ctx, peerID, SyncProtocolV2ID)
 	if err != nil {
 		return err
 	}
@@ -414,7 +414,7 @@ func (s *EventSync) exchange(ctx context.Context, p peer.ID) error {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = str.SetDeadline(deadline)
 	}
-	if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(p), Records: s.knownRecordsFor(p)}); err != nil {
+	if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(peerID), Records: s.knownRecordsFor(peerID)}); err != nil {
 		return err
 	}
 	theirs, err := readSyncV2(str)
@@ -422,7 +422,7 @@ func (s *EventSync) exchange(ctx context.Context, p peer.ID) error {
 		str.Reset()
 		return err
 	}
-	s.applyV2(theirs, p)
+	s.applyV2(theirs, peerID)
 	return nil
 }
 
@@ -431,8 +431,8 @@ func (s *EventSync) exchange(ctx context.Context, p peer.ID) error {
 func (s *EventSync) handleSyncV2(str network.Stream) {
 	defer str.Close()
 	_ = str.SetDeadline(time.Now().Add(exchangeTimeout))
-	p := str.Conn().RemotePeer()
-	if !s.store.IsMember(p, time.Now()) {
+	peerID := str.Conn().RemotePeer()
+	if !s.store.IsMember(peerID, time.Now()) {
 		str.Reset()
 		return
 	}
@@ -441,11 +441,11 @@ func (s *EventSync) handleSyncV2(str network.Stream) {
 		str.Reset()
 		return
 	}
-	if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(p), Records: s.knownRecordsFor(p)}); err != nil {
+	if err := writeSyncV2(str, syncPayloadV2{Circles: s.setsFor(peerID), Records: s.knownRecordsFor(peerID)}); err != nil {
 		str.Reset()
 		return
 	}
-	s.applyV2(theirs, p)
+	s.applyV2(theirs, peerID)
 }
 
 // applyV2 ingests per-circle sets: each into the roster of its circle (a
@@ -603,9 +603,9 @@ func (s *EventSync) consumeRecord(data []byte, now time.Time) bool {
 
 // SetOnRecord installs a callback for strictly newer, verified member address
 // records. It runs outside the sync lock; callers should return promptly.
-func (s *EventSync) SetOnRecord(f func(peer.ID, uint64)) {
+func (s *EventSync) SetOnRecord(fn func(peer.ID, uint64)) {
 	s.mu.Lock()
-	s.onRecord = f
+	s.onRecord = fn
 	s.mu.Unlock()
 }
 
@@ -615,13 +615,13 @@ func (s *EventSync) SetOnRecord(f func(peer.ID, uint64)) {
 // normal anti-entropy on connect).
 func (s *EventSync) SeedRecords(recs [][]byte) {
 	now := time.Now()
-	n := 0
+	restored := 0
 	for _, data := range recs {
 		if s.consumeRecord(data, now) {
-			n++
+			restored++
 		}
 	}
-	log.Printf("address cache: %d member record(s) restored", n)
+	log.Printf("address cache: %d member record(s) restored", restored)
 }
 
 // KnownRecords returns this node's own signed address record plus the
@@ -636,7 +636,7 @@ func (s *EventSync) knownRecords() [][]byte { return s.recordsFor(nil) }
 // knownRecordsFor is knownRecords narrowed to what one peer may learn:
 // our own record and the records of members that share a circle with it.
 // Where a device lives is its circle's business (Codex review, 2026-11-04).
-func (s *EventSync) knownRecordsFor(p peer.ID) [][]byte { return s.recordsFor(&p) }
+func (s *EventSync) knownRecordsFor(peerID peer.ID) [][]byte { return s.recordsFor(&peerID) }
 
 func (s *EventSync) recordsFor(to *peer.ID) [][]byte {
 	var out [][]byte
@@ -649,11 +649,11 @@ func (s *EventSync) recordsFor(to *peer.ID) [][]byte {
 		return out
 	}
 	members, _ := s.store.Snapshot()
-	for p := range members {
-		if p == s.h.ID() || (to != nil && !s.sharesCircle(p, *to)) {
+	for peerID := range members {
+		if peerID == s.h.ID() || (to != nil && !s.sharesCircle(peerID, *to)) {
 			continue
 		}
-		if env := s.cab.GetPeerRecord(p); env != nil {
+		if env := s.cab.GetPeerRecord(peerID); env != nil {
 			if data, err := env.Marshal(); err == nil {
 				out = append(out, data)
 			}
@@ -664,15 +664,15 @@ func (s *EventSync) recordsFor(to *peer.ID) [][]byte {
 
 // sharesCircle reports whether two members are live devices of a common
 // circle held here.
-func (s *EventSync) sharesCircle(a, b peer.ID) bool {
-	if a == b {
+func (s *EventSync) sharesCircle(firstPeer, secondPeer peer.ID) bool {
+	if firstPeer == secondPeer {
 		return true
 	}
 	now := time.Now()
-	in := s.store.Circles(b, now)
-	for _, c := range s.store.Circles(a, now) {
-		for _, d := range in {
-			if c == d {
+	in := s.store.Circles(secondPeer, now)
+	for _, firstCircle := range s.store.Circles(firstPeer, now) {
+		for _, secondCircle := range in {
+			if firstCircle == secondCircle {
 				return true
 			}
 		}

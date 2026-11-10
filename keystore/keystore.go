@@ -26,14 +26,14 @@ func SaveSeed(path string, seed []byte, passphrase string) error {
 		return fmt.Errorf("building scrypt recipient: %w", err)
 	}
 	var buf bytes.Buffer
-	w, err := age.Encrypt(&buf, recipient)
+	writer, err := age.Encrypt(&buf, recipient)
 	if err != nil {
 		return fmt.Errorf("starting encryption: %w", err)
 	}
-	if _, err := w.Write(seed); err != nil {
+	if _, err := writer.Write(seed); err != nil {
 		return fmt.Errorf("encrypting seed: %w", err)
 	}
-	if err := w.Close(); err != nil {
+	if err := writer.Close(); err != nil {
 		return fmt.Errorf("finalizing encryption: %w", err)
 	}
 	return os.WriteFile(path, buf.Bytes(), 0o600)
@@ -41,20 +41,20 @@ func SaveSeed(path string, seed []byte, passphrase string) error {
 
 // LoadSeed decrypts an ed25519 seed from path with the passphrase.
 func LoadSeed(path, passphrase string) ([]byte, error) {
-	f, err := os.Open(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer file.Close()
 	identity, err := age.NewScryptIdentity(passphrase)
 	if err != nil {
 		return nil, fmt.Errorf("building scrypt identity: %w", err)
 	}
-	r, err := age.Decrypt(f, identity)
+	reader, err := age.Decrypt(file, identity)
 	if err != nil {
 		return nil, fmt.Errorf("decrypting keystore: %w", err)
 	}
-	seed, err := io.ReadAll(r)
+	seed, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("reading seed: %w", err)
 	}

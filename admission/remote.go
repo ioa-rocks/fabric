@@ -41,30 +41,30 @@ type queueResp struct {
 // with the membership check; isAdmin narrows it to the master's device;
 // admit records the delivered cert (a device admission) in the local roster
 // (and gossip) after a successful approve.
-func AttachQueue(h host.Host, q *Queue, gate func(network.StreamHandler) network.StreamHandler, isAdmin func(peer.ID) bool, admit func(certBytes []byte) error) {
-	h.SetStreamHandler(QueueProtocolID, gate(func(s network.Stream) {
-		defer s.Close()
-		_ = s.SetDeadline(time.Now().Add(30 * time.Second))
-		if !isAdmin(s.Conn().RemotePeer()) {
-			s.Reset()
+func AttachQueue(localHost host.Host, queue *Queue, gate func(network.StreamHandler) network.StreamHandler, isAdmin func(peer.ID) bool, admit func(certBytes []byte) error) {
+	localHost.SetStreamHandler(QueueProtocolID, gate(func(stream network.Stream) {
+		defer stream.Close()
+		_ = stream.SetDeadline(time.Now().Add(30 * time.Second))
+		if !isAdmin(stream.Conn().RemotePeer()) {
+			stream.Reset()
 			return
 		}
-		data, err := wire.ReadFrame(s, maxQueueWireSize)
+		data, err := wire.ReadFrame(stream, maxQueueWireSize)
 		if err != nil {
-			s.Reset()
+			stream.Reset()
 			return
 		}
 		var req queueReq
 		if err := cbor.Unmarshal(data, &req); err != nil {
-			s.Reset()
+			stream.Reset()
 			return
 		}
 		var resp queueResp
 		switch req.Op {
 		case "list":
-			resp.Pending = q.List()
+			resp.Pending = queue.List()
 		case "approve":
-			err := q.Approve(req.Fingerprint, req.Cert)
+			err := queue.Approve(req.Fingerprint, req.Cert)
 			if err == nil && admit != nil {
 				err = admit(req.Cert)
 			}
@@ -72,7 +72,7 @@ func AttachQueue(h host.Host, q *Queue, gate func(network.StreamHandler) network
 				resp.Err = err.Error()
 			}
 		case "deny":
-			if err := q.Deny(req.Fingerprint); err != nil {
+			if err := queue.Deny(req.Fingerprint); err != nil {
 				resp.Err = err.Error()
 			}
 		default:
@@ -80,30 +80,30 @@ func AttachQueue(h host.Host, q *Queue, gate func(network.StreamHandler) network
 		}
 		out, err := cbor.Marshal(resp)
 		if err != nil {
-			s.Reset()
+			stream.Reset()
 			return
 		}
-		_ = wire.WriteFrame(s, out)
+		_ = wire.WriteFrame(stream, out)
 	}))
 }
 
-func queueRoundTrip(ctx context.Context, h host.Host, target peer.ID, req queueReq) (*queueResp, error) {
-	s, err := h.NewStream(ctx, target, QueueProtocolID)
+func queueRoundTrip(ctx context.Context, localHost host.Host, target peer.ID, req queueReq) (*queueResp, error) {
+	stream, err := localHost.NewStream(ctx, target, QueueProtocolID)
 	if err != nil {
 		return nil, fmt.Errorf("reaching queue host: %w", err)
 	}
-	defer s.Close()
+	defer stream.Close()
 	if deadline, ok := ctx.Deadline(); ok {
-		_ = s.SetDeadline(deadline)
+		_ = stream.SetDeadline(deadline)
 	}
 	data, err := cbor.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
-	if err := wire.WriteFrame(s, data); err != nil {
+	if err := wire.WriteFrame(stream, data); err != nil {
 		return nil, err
 	}
-	respData, err := wire.ReadFrame(s, maxQueueWireSize)
+	respData, err := wire.ReadFrame(stream, maxQueueWireSize)
 	if err != nil {
 		return nil, fmt.Errorf("reading queue response: %w", err)
 	}
@@ -118,8 +118,8 @@ func queueRoundTrip(ctx context.Context, h host.Host, target peer.ID, req queueR
 }
 
 // RemoteList fetches a queue host's pending queue.
-func RemoteList(ctx context.Context, h host.Host, target peer.ID) ([]PendingInfo, error) {
-	resp, err := queueRoundTrip(ctx, h, target, queueReq{Op: "list"})
+func RemoteList(ctx context.Context, localHost host.Host, target peer.ID) ([]PendingInfo, error) {
+	resp, err := queueRoundTrip(ctx, localHost, target, queueReq{Op: "list"})
 	if err != nil {
 		return nil, err
 	}
@@ -127,13 +127,13 @@ func RemoteList(ctx context.Context, h host.Host, target peer.ID) ([]PendingInfo
 }
 
 // RemoteApprove hands a locally signed cert to a queue host for delivery.
-func RemoteApprove(ctx context.Context, h host.Host, target peer.ID, fingerprint string, certBytes []byte) error {
-	_, err := queueRoundTrip(ctx, h, target, queueReq{Op: "approve", Fingerprint: fingerprint, Cert: certBytes})
+func RemoteApprove(ctx context.Context, localHost host.Host, target peer.ID, fingerprint string, certBytes []byte) error {
+	_, err := queueRoundTrip(ctx, localHost, target, queueReq{Op: "approve", Fingerprint: fingerprint, Cert: certBytes})
 	return err
 }
 
 // RemoteDeny marks a request denied on a queue host.
-func RemoteDeny(ctx context.Context, h host.Host, target peer.ID, fingerprint string) error {
-	_, err := queueRoundTrip(ctx, h, target, queueReq{Op: "deny", Fingerprint: fingerprint})
+func RemoteDeny(ctx context.Context, localHost host.Host, target peer.ID, fingerprint string) error {
+	_, err := queueRoundTrip(ctx, localHost, target, queueReq{Op: "deny", Fingerprint: fingerprint})
 	return err
 }

@@ -74,8 +74,8 @@ func networkFingerprint() (string, error) {
 	return strings.Join(entries, ","), nil
 }
 
-func usableConnection(c network.Connectedness) bool {
-	return c == network.Connected || c == network.Limited
+func usableConnection(state network.Connectedness) bool {
+	return state == network.Connected || state == network.Limited
 }
 
 // A small, known mesh cannot supply representative samples for libp2p's
@@ -92,9 +92,9 @@ func recoveryTransportOption() libp2p.Option {
 	)
 }
 
-func (d *Daemon) hasDirectConnection(p peer.ID) bool {
-	for _, c := range d.Host.Network().ConnsToPeer(p) {
-		if _, relayed := transportOf(c.RemoteMultiaddr()); !c.IsClosed() && !relayed {
+func (d *Daemon) hasDirectConnection(peerID peer.ID) bool {
+	for _, conn := range d.Host.Network().ConnsToPeer(peerID) {
+		if _, relayed := transportOf(conn.RemoteMultiaddr()); !conn.IsClosed() && !relayed {
 			return true
 		}
 	}
@@ -103,15 +103,15 @@ func (d *Daemon) hasDirectConnection(p peer.ID) bool {
 
 // Probe direct addresses without closing the usable relay. Host.Connect would
 // otherwise return success immediately by reusing that existing connection.
-func (d *Daemon) retryDirect(p peer.ID) {
+func (d *Daemon) retryDirect(peerID peer.ID) {
 	var addrs []ma.Multiaddr
-	for _, addr := range d.Host.Peerstore().Addrs(p) {
+	for _, addr := range d.Host.Peerstore().Addrs(peerID) {
 		if _, relayed := transportOf(addr); !relayed {
 			addrs = append(addrs, addr)
 		}
 	}
 	if len(addrs) > 0 {
-		d.startDial(peer.AddrInfo{ID: p, Addrs: addrs}, "direct")
+		d.startDial(peer.AddrInfo{ID: peerID, Addrs: addrs}, "direct")
 	}
 }
 
@@ -200,44 +200,44 @@ func (d *Daemon) recoverNetwork(reason string, staleConnections bool) {
 	// Closing transports also invalidates relay reservations and cached streams;
 	// autorelay re-reserves after reconnect. Offline retries leave live links alone.
 	if staleConnections {
-		for _, c := range d.Host.Network().Conns() {
-			_ = c.Close()
+		for _, conn := range d.Host.Network().Conns() {
+			_ = conn.Close()
 		}
 	}
 	d.teleMu.Lock()
 	clear(d.lastDial)
 	clear(d.rtt)
 	d.teleMu.Unlock()
-	if s, ok := d.Host.Network().(*swarm.Swarm); ok {
-		for _, p := range d.Host.Peerstore().Peers() {
-			s.Backoff().Clear(p)
+	if netSwarm, ok := d.Host.Network().(*swarm.Swarm); ok {
+		for _, peerID := range d.Host.Peerstore().Peers() {
+			netSwarm.Backoff().Clear(peerID)
 		}
 		for _, info := range groupedBootstrap(d.bootstrapAddrs()) {
-			s.Backoff().Clear(info.ID)
+			netSwarm.Backoff().Clear(info.ID)
 		}
 	}
 }
 
 // New owner-signed endpoints are a reason to retry immediately, even if the
 // previous address set just failed. Duplicate gossip never reaches this hook.
-func (d *Daemon) addressesUpdated(p peer.ID, seq uint64) {
-	if d.hasDirectConnection(p) {
+func (d *Daemon) addressesUpdated(peerID peer.ID, seq uint64) {
+	if d.hasDirectConnection(peerID) {
 		return
 	}
 	d.teleMu.Lock()
-	delete(d.lastDial, p)
+	delete(d.lastDial, peerID)
 	d.teleMu.Unlock()
-	if s, ok := d.Host.Network().(*swarm.Swarm); ok {
-		s.Backoff().Clear(p)
+	if netSwarm, ok := d.Host.Network().(*swarm.Swarm); ok {
+		netSwarm.Backoff().Clear(peerID)
 	}
-	log.Printf("reconnect: peer=%s address_seq=%d refreshed", p, seq)
-	if usableConnection(d.Host.Network().Connectedness(p)) {
-		if !d.startPunch(p) {
-			d.retryDirect(p)
+	log.Printf("reconnect: peer=%s address_seq=%d refreshed", peerID, seq)
+	if usableConnection(d.Host.Network().Connectedness(peerID)) {
+		if !d.startPunch(peerID) {
+			d.retryDirect(peerID)
 		}
 		return
 	}
-	d.startDial(peer.AddrInfo{ID: p, Addrs: d.Host.Peerstore().Addrs(p)}, "addresses")
+	d.startDial(peer.AddrInfo{ID: peerID, Addrs: d.Host.Peerstore().Addrs(peerID)}, "addresses")
 }
 
 // Fabric has a small, known lighthouse set. Waiting for libp2p's default

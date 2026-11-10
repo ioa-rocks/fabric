@@ -148,17 +148,17 @@ func New(ownerPriv ed25519.PrivateKey, name string, now time.Time) (*Bucket, err
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, fmt.Errorf("generating nonce: %w", err)
 	}
-	g := Genesis{
+	genesis := Genesis{
 		Owner:     cert.DIDForKey(ownerPriv.Public().(ed25519.PublicKey)),
 		Name:      name,
 		Nonce:     nonce,
 		CreatedAt: now.Unix(),
 	}
-	msg, err := encMode.Marshal(g)
+	msg, err := encMode.Marshal(genesis)
 	if err != nil {
 		return nil, fmt.Errorf("encoding genesis: %w", err)
 	}
-	return &Bucket{Genesis: g, Sig: ed25519.Sign(ownerPriv, msg)}, nil
+	return &Bucket{Genesis: genesis, Sig: ed25519.Sign(ownerPriv, msg)}, nil
 }
 
 // ID returns the bucket ID: BLAKE3 of the deterministic genesis encoding,
@@ -191,11 +191,11 @@ func (b *Bucket) Verify() error {
 func (b *Bucket) Marshal() ([]byte, error) { return encMode.Marshal(b) }
 
 func Unmarshal(data []byte) (*Bucket, error) {
-	var b Bucket
-	if err := cbor.Unmarshal(data, &b); err != nil {
+	var bkt Bucket
+	if err := cbor.Unmarshal(data, &bkt); err != nil {
 		return nil, fmt.Errorf("decoding bucket: %w", err)
 	}
-	return &b, nil
+	return &bkt, nil
 }
 
 // DefaultPolicy returns the v2 defaults for a fresh bucket.
@@ -204,17 +204,17 @@ func DefaultPolicy(bucketID string) Policy {
 }
 
 // SignPolicy signs a policy revision with the owner key.
-func SignPolicy(ownerPriv ed25519.PrivateKey, p Policy) (*SignedPolicy, error) {
-	msg, err := encMode.Marshal(p)
+func SignPolicy(ownerPriv ed25519.PrivateKey, policy Policy) (*SignedPolicy, error) {
+	msg, err := encMode.Marshal(policy)
 	if err != nil {
 		return nil, err
 	}
-	return &SignedPolicy{Policy: p, Sig: ed25519.Sign(ownerPriv, msg)}, nil
+	return &SignedPolicy{Policy: policy, Sig: ed25519.Sign(ownerPriv, msg)}, nil
 }
 
 // VerifyPolicy checks a signed policy against the bucket's owner and ID.
-func VerifyPolicy(sp *SignedPolicy, b *Bucket) error {
-	id, err := b.ID()
+func VerifyPolicy(sp *SignedPolicy, bkt *Bucket) error {
+	id, err := bkt.ID()
 	if err != nil {
 		return err
 	}
@@ -224,7 +224,7 @@ func VerifyPolicy(sp *SignedPolicy, b *Bucket) error {
 	if err := sp.Policy.Validate(); err != nil {
 		return err
 	}
-	pub, err := cert.KeyForDID(b.Genesis.Owner)
+	pub, err := cert.KeyForDID(bkt.Genesis.Owner)
 	if err != nil {
 		return err
 	}

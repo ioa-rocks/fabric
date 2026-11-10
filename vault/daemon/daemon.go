@@ -107,13 +107,13 @@ func (d *Daemon) end() { d.wg.Done() }
 //
 // Attach before fd.Run(): handlers and the auth hook must be in place
 // when the first peer authenticates.
-func New(c *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
-	if c == nil {
+func New(vaultStore *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
+	if vaultStore == nil {
 		return nil, errors.New("vault subsystem: no store")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &Daemon{
-		Store:        c,
+	srv := &Daemon{
+		Store:        vaultStore,
 		handles:      make(map[string]*store.Handle),
 		liveMounts:   make(map[string]*liveMount),
 		mountErrs:    make(map[string]string),
@@ -134,23 +134,23 @@ func New(c *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		if fd.Circle == nil {
 			return nil, errors.New("vault subsystem: the fabric daemon has no circle service (the composition root must attach NewCircleService for the store's circle root)")
 		}
-		if fd.Circle.Root() != c.CircleRoot {
-			return nil, fmt.Errorf("vault subsystem: fabric serves circles under %s but the store uses %s", fd.Circle.Root(), c.CircleRoot)
+		if fd.Circle.Root() != vaultStore.CircleRoot {
+			return nil, fmt.Errorf("vault subsystem: fabric serves circles under %s but the store uses %s", fd.Circle.Root(), vaultStore.CircleRoot)
 		}
-		fd.Host.SetStreamHandler(HelloProtocol, fd.Auth.RequireMember(d.handleHello))
-		fd.Host.SetStreamHandler(SyncProtocol, fd.Circle.RequireAny(d.handleSync))
-		fd.Host.SetStreamHandler(BlobProtocol, fd.Circle.RequireAny(d.handleBlob))
+		fd.Host.SetStreamHandler(HelloProtocol, fd.Auth.RequireMember(srv.handleHello))
+		fd.Host.SetStreamHandler(SyncProtocol, fd.Circle.RequireAny(srv.handleSync))
+		fd.Host.SetStreamHandler(BlobProtocol, fd.Circle.RequireAny(srv.handleBlob))
 		// Chain onto fabric's own on-auth hook (it drives membership-event
 		// anti-entropy) rather than replacing it.
-		fd.Auth.SetOnAuthenticated(func(p peer.ID) {
-			fd.Sync.ExchangeAsync(p)
-			go d.syncPeer(p)
+		fd.Auth.SetOnAuthenticated(func(peerID peer.ID) {
+			fd.Sync.ExchangeAsync(peerID)
+			go srv.syncPeer(peerID)
 		})
 		// Location records written from here on carry the mesh identity.
-		c.NodeID = fd.Host.ID().String()
-		d.Fabric = fd
+		vaultStore.NodeID = fd.Host.ID().String()
+		srv.Fabric = fd
 	}
-	return d, nil
+	return srv, nil
 }
 
 // Run serves the control API and the sync loop until Stop. The fabric
@@ -163,10 +163,10 @@ func (d *Daemon) Run() error {
 	}
 	defer stopControl()
 
-	for _, c := range d.Store.Circles() {
-		log.Printf("vault subsystem up: circle %q (%s)", c.Config.Name, c.Config.DID)
-		if d.Fabric != nil && !d.Fabric.Circle.Admitted(c) {
-			log.Printf("vault: this device holds no admission for circle %q — its peers will not sync with it until 'fabric circle renew' runs here (no restart needed)", c.Config.Name)
+	for _, heldCircle := range d.Store.Circles() {
+		log.Printf("vault subsystem up: circle %q (%s)", heldCircle.Config.Name, heldCircle.Config.DID)
+		if d.Fabric != nil && !d.Fabric.Circle.Admitted(heldCircle) {
+			log.Printf("vault: this device holds no admission for circle %q — its peers will not sync with it until 'fabric circle renew' runs here (no restart needed)", heldCircle.Config.Name)
 		}
 	}
 
@@ -212,8 +212,8 @@ func (d *Daemon) Stop() { d.cancel() }
 func (d *Daemon) closeHandles() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for id, h := range d.handles {
-		_ = h.Close()
+	for id, handle := range d.handles {
+		_ = handle.Close()
 		delete(d.handles, id)
 	}
 }
@@ -227,15 +227,15 @@ func (d *Daemon) handle(ref string) (*store.Handle, error) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if h, ok := d.handles[id]; ok {
-		return h, nil
+	if handle, ok := d.handles[id]; ok {
+		return handle, nil
 	}
-	h, err := d.Store.OpenBucket(id)
+	handle, err := d.Store.OpenBucket(id)
 	if err != nil {
 		return nil, err
 	}
-	d.handles[id] = h
-	return h, nil
+	d.handles[id] = handle
+	return handle, nil
 }
 
 // adopt stores a signed bucket and caches its handle. The whole
@@ -252,53 +252,53 @@ func (d *Daemon) adopt(genesis, policy []byte) (*store.Handle, error) {
 	if prev, ok := d.handles[id]; ok {
 		return prev, nil // already adopted and open
 	}
-	h, err := d.Store.AdoptBucket(genesis, policy)
+	handle, err := d.Store.AdoptBucket(genesis, policy)
 	if err != nil {
 		return nil, err
 	}
-	d.handles[id] = h
-	return h, nil
+	d.handles[id] = handle
+	return handle, nil
 }
 
-func (d *Daemon) handleHello(s network.Stream) {
-	defer s.Close()
-	_ = s.SetDeadline(time.Now().Add(5 * time.Second))
+func (d *Daemon) handleHello(stream network.Stream) {
+	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	card := d.helloCardFor(ctx, s.Conn().RemotePeer())
+	card := d.helloCardFor(ctx, stream.Conn().RemotePeer())
 	cancel()
-	_ = json.NewEncoder(s).Encode(card)
+	_ = json.NewEncoder(stream).Encode(card)
 }
 
 // hello asks a peer for its vault card.
-func (d *Daemon) hello(ctx context.Context, p peer.ID) (*Hello, error) {
-	s, err := d.Fabric.Host.NewStream(ctx, p, HelloProtocol)
+func (d *Daemon) hello(ctx context.Context, peerID peer.ID) (*Hello, error) {
+	stream, err := d.Fabric.Host.NewStream(ctx, peerID, HelloProtocol)
 	if err != nil {
 		return nil, err
 	}
-	defer s.Close()
-	_ = s.SetDeadline(time.Now().Add(5 * time.Second))
-	var h Hello
-	if err := json.NewDecoder(s).Decode(&h); err != nil {
+	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
+	var card Hello
+	if err := json.NewDecoder(stream).Decode(&card); err != nil {
 		return nil, err
 	}
-	return &h, nil
+	return &card, nil
 }
 
-// helloCardFor is what this node tells p on HelloProtocol: its version
+// helloCardFor is what this node tells peerID on HelloProtocol: its version
 // and the circles the two verifiably share — never the others (Codex
 // review, 2026-11-05: the card listed every circle held here to any
 // member).
-func (d *Daemon) helloCardFor(ctx context.Context, p peer.ID) Hello {
-	h := Hello{Version: Version}
+func (d *Daemon) helloCardFor(ctx context.Context, peerID peer.ID) Hello {
+	card := Hello{Version: Version}
 	var shared []string
 	if d.Fabric != nil && d.Fabric.Circle != nil {
-		shared = d.Fabric.Circle.Shared(ctx, p)
+		shared = d.Fabric.Circle.Shared(ctx, peerID)
 	}
-	for _, c := range d.Store.Circles() {
-		if !slices.Contains(shared, c.Config.DID) {
+	for _, heldCircle := range d.Store.Circles() {
+		if !slices.Contains(shared, heldCircle.Config.DID) {
 			continue
 		}
-		h.Circles = append(h.Circles, HelloCircle{DID: c.Config.DID, Name: c.Config.Name})
+		card.Circles = append(card.Circles, HelloCircle{DID: heldCircle.Config.DID, Name: heldCircle.Config.Name})
 	}
-	return h
+	return card
 }

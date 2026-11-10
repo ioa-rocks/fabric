@@ -61,8 +61,8 @@ func VerbsForRole(role string) ([]string, error) {
 // RoleOf names the role a verb set amounts to: gate when nothing beyond
 // GateVerbs is carried, else device. Ownership is not a verb (see Circle.HasKey).
 func RoleOf(verbs []string) string {
-	for _, v := range verbs {
-		if !hasVerb(GateVerbs, v) {
+	for _, verb := range verbs {
+		if !hasVerb(GateVerbs, verb) {
 			return RoleDevice
 		}
 	}
@@ -155,8 +155,8 @@ func RenewWith(priv ed25519.PrivateKey, proof, prev *statement.Statement, circle
 			verbs = prev.Payload.Verbs
 		}
 		if prev.Payload.Meta != nil && (prev.Payload.Meta.Name != "" || prev.Payload.Meta.IP != "") {
-			m := *prev.Payload.Meta
-			meta = &m
+			copied := *prev.Payload.Meta
+			meta = &copied
 		}
 	}
 	return Issue(priv, proof, circleDID, devicePub, now, validity, Terms{Verbs: verbs, Meta: meta, Acks: acks})
@@ -196,7 +196,7 @@ func Issue(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, 
 	if meta != nil && meta.IP != "" && !hasVerb(verbs, statement.VerbTun) {
 		return nil, errors.New("an overlay address needs the tun verb")
 	}
-	s, err := statement.Sign(priv, statement.Payload{
+	signed, err := statement.Sign(priv, statement.Payload{
 		Aud: did.ForKey(devicePub),
 		Sub: circleDID,
 		// Any resource in any circle, as for certs: lets the device present
@@ -213,30 +213,30 @@ func Issue(priv ed25519.PrivateKey, own *statement.Statement, circleDID string, 
 	if err != nil {
 		return nil, err
 	}
-	return fromStatement(s)
+	return fromStatement(signed)
 }
 
-func fromStatement(s *statement.Statement) (*Admission, error) {
-	p := s.Payload
-	if p.Typ != statement.TypeAssert {
+func fromStatement(stmt *statement.Statement) (*Admission, error) {
+	payload := stmt.Payload
+	if payload.Typ != statement.TypeAssert {
 		return nil, errors.New("not an admission: statement is not an admission")
 	}
-	if !hasVerb(p.Verbs, statement.VerbMember) {
+	if !hasVerb(payload.Verbs, statement.VerbMember) {
 		return nil, errors.New("not an admission: statement does not carry member")
 	}
-	a := &Admission{Circle: p.Sub, Device: p.Aud, Iat: p.Iat, Nbf: p.Nbf, Exp: p.Exp, Sig: s.Sig, Stmt: s, Verbs: p.Verbs}
-	if p.Meta != nil {
-		a.Name, a.IP = p.Meta.Name, p.Meta.IP
+	admission := &Admission{Circle: payload.Sub, Device: payload.Aud, Iat: payload.Iat, Nbf: payload.Nbf, Exp: payload.Exp, Sig: stmt.Sig, Stmt: stmt, Verbs: payload.Verbs}
+	if payload.Meta != nil {
+		admission.Name, admission.IP = payload.Meta.Name, payload.Meta.IP
 	}
-	return a, nil
+	return admission, nil
 }
 
 // Role is the role the admission's verbs amount to.
 func (a *Admission) Role() string { return RoleOf(a.Verbs) }
 
-func hasVerb(verbs []string, v string) bool {
-	for _, h := range verbs {
-		if h == v {
+func hasVerb(verbs []string, verb string) bool {
+	for _, held := range verbs {
+		if held == verb {
 			return true
 		}
 	}
@@ -264,12 +264,12 @@ func (a *Admission) PastHalfLife(now time.Time) bool {
 // Valid checks only the validity window, of the whole chain.
 func (a *Admission) Valid(now time.Time) error {
 	nbf, exp := a.NotBefore(), a.Expiry()
-	for _, l := range a.Stmt.Chain() {
-		if l.NotBefore().After(nbf) {
-			nbf = l.NotBefore()
+	for _, link := range a.Stmt.Chain() {
+		if link.NotBefore().After(nbf) {
+			nbf = link.NotBefore()
 		}
-		if l.Expiry().Before(exp) {
-			exp = l.Expiry()
+		if link.Expiry().Before(exp) {
+			exp = link.Expiry()
 		}
 	}
 	if now.Before(nbf) {
@@ -311,14 +311,14 @@ func (a *Admission) Compile() (*statement.Compiled, error) { return a.compile() 
 // compile runs the structural verifier over a statement admission, with
 // the circle DID resolved to its root key.
 func (a *Admission) compile() (*statement.Compiled, error) {
-	c, err := statement.Compile(a.Stmt, nil, a.Circle, didKeyRoots{})
+	compiled, err := statement.Compile(a.Stmt, nil, a.Circle, didKeyRoots{})
 	if err != nil {
 		return nil, fmt.Errorf("admission: %w", err)
 	}
-	if !c.Allows(a.Circle, statement.Resource{Kind: statement.KindRole, Name: statement.VerbMember}, statement.VerbMember) {
+	if !compiled.Allows(a.Circle, statement.Resource{Kind: statement.KindRole, Name: statement.VerbMember}, statement.VerbMember) {
 		return nil, errors.New("admission does not grant member")
 	}
-	return c, nil
+	return compiled, nil
 }
 
 // Marshal encodes the admission for the wire or disk: the statement's
@@ -329,22 +329,22 @@ func (a *Admission) Marshal() ([]byte, error) { return a.Stmt.Bytes() }
 // admission minted before statements (2026-11-02) no longer decodes:
 // re-admit the device.
 func UnmarshalAdmission(data []byte) (*Admission, error) {
-	s, err := statement.Decode(data)
+	stmt, err := statement.Decode(data)
 	if err != nil {
 		return nil, fmt.Errorf("decoding admission: %w (a pre-statement admission? re-admit the device)", err)
 	}
-	return fromStatement(s)
+	return fromStatement(stmt)
 }
 
 // AdmissionPath is where this node's device admission lives.
 func (c *Circle) AdmissionPath() string { return filepath.Join(c.Path, admissionFile) }
 
 // SaveAdmission stores the node's device admission beside the circle.
-func (c *Circle) SaveAdmission(a *Admission) error {
-	if a.Circle != c.Config.DID {
+func (c *Circle) SaveAdmission(admission *Admission) error {
+	if admission.Circle != c.Config.DID {
 		return errors.New("admission is for a different circle")
 	}
-	raw, err := a.Marshal()
+	raw, err := admission.Marshal()
 	if err != nil {
 		return err
 	}
@@ -359,12 +359,12 @@ func (c *Circle) LoadAdmission() (*Admission, error) {
 	if err != nil {
 		return nil, err
 	}
-	a, err := UnmarshalAdmission(raw)
+	admission, err := UnmarshalAdmission(raw)
 	if err != nil {
 		return nil, err
 	}
-	if a.Circle != c.Config.DID {
+	if admission.Circle != c.Config.DID {
 		return nil, errors.New("stored admission is for a different circle")
 	}
-	return a, nil
+	return admission, nil
 }
