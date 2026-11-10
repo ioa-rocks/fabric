@@ -233,6 +233,20 @@ func (h *rootedHolder) Put(src io.Reader) (string, int64, error) {
 	return h.primary.Put(src)
 }
 
+func (h *rootedHolder) Partial(hash string) (*os.File, error) {
+	if h.primary == nil {
+		return nil, h.primaryErr
+	}
+	return h.primary.Partial(hash)
+}
+
+func (h *rootedHolder) Commit(hash string) error {
+	if h.primary == nil {
+		return h.primaryErr
+	}
+	return h.primary.Commit(hash)
+}
+
 func (h *rootedHolder) each(fn func(s *blobstore.Store) bool) {
 	if h.primary != nil && fn(h.primary) {
 		return

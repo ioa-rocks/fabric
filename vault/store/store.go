@@ -405,6 +405,10 @@ type Holder interface {
 	Path(hash string) (string, error)
 	Has(hash string) bool
 	Size(hash string) (int64, error)
+	// Partial opens the resumable file a blob is received into; Commit
+	// turns the completed file into held content (blobstore.Store).
+	Partial(hash string) (*os.File, error)
+	Commit(hash string) error
 }
 
 // Handle is an opened bucket: genesis + policy + index over its holder.

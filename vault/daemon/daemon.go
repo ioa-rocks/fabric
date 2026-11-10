@@ -13,12 +13,14 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
 
 	fabricdaemon "ioa.rocks/fabric/daemon"
 	"ioa.rocks/fabric/vault/store"
+	"ioa.rocks/fabric/vault/verified"
 
 	"fmt"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -80,6 +82,10 @@ type Daemon struct {
 	syncInterval time.Duration // snapshot of SyncInterval at New
 	fetchMu      sync.Mutex    // one blob-fetch sweep at a time
 
+	outboards *verified.Outboards // hash trees of the blobs served by range
+	flightMu  sync.Mutex
+	flights   map[string]*flight // blob hash -> transfer in progress
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -111,9 +117,15 @@ func New(vaultStore *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
 	if vaultStore == nil {
 		return nil, errors.New("vault subsystem: no store")
 	}
+	outboards, err := verified.OpenOutboards(filepath.Join(vaultStore.Path, "outboard"))
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	srv := &Daemon{
 		Store:        vaultStore,
+		outboards:    outboards,
+		flights:      make(map[string]*flight),
 		handles:      make(map[string]*store.Handle),
 		liveMounts:   make(map[string]*liveMount),
 		mountErrs:    make(map[string]string),
@@ -140,6 +152,7 @@ func New(vaultStore *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		fd.Host.SetStreamHandler(HelloProtocol, fd.Auth.RequireMember(srv.handleHello))
 		fd.Host.SetStreamHandler(SyncProtocol, fd.Circle.RequireAny(srv.handleSync))
 		fd.Host.SetStreamHandler(BlobProtocol, fd.Circle.RequireAny(srv.handleBlob))
+		fd.Host.SetStreamHandler(BlobRangeProtocol, fd.Circle.RequireAny(srv.handleBlobRange))
 		// Chain onto fabric's own on-auth hook (it drives membership-event
 		// anti-entropy) rather than replacing it.
 		fd.Auth.SetOnAuthenticated(func(peerID peer.ID) {

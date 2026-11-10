@@ -5,6 +5,7 @@ go 1.25.7
 require (
 	filippo.io/age v1.3.1
 	github.com/cockroachdb/pebble v1.1.5
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/hanwen/go-fuse/v2 v2.8.0
@@ -17,6 +18,7 @@ require (
 	github.com/zeebo/blake3 v0.2.4
 	go.uber.org/fx v1.24.0
 	golang.org/x/term v0.44.0
+	lukechampine.com/blake3 v1.4.1
 )
 
 require (
@@ -36,7 +38,6 @@ require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/dunglas/httpsfv v1.1.0 // indirect
 	github.com/flynn/noise v1.1.0 // indirect
-	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/getsentry/sentry-go v0.27.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
@@ -118,5 +119,4 @@ require (
 	golang.org/x/time v0.12.0 // indirect
 	golang.org/x/tools v0.41.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
-	lukechampine.com/blake3 v1.4.1 // indirect
 )

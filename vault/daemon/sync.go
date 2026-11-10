@@ -15,6 +15,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -33,7 +34,7 @@ import (
 
 const (
 	SyncProtocol = "/vault/sync/2" // 2: revision heads (ADR 0001); 1 nodes do not interoperate
-	BlobProtocol = "/vault/blob/2" // 2: request names the bucket, so the holder can authorize per circle
+	BlobProtocol = "/vault/blob/2" // 2: request names the bucket, so the holder can authorize per circle; superseded by BlobRangeProtocol
 )
 
 // SyncInterval is the anti-entropy timer. Connect events and local writes
@@ -334,14 +335,39 @@ func (d *Daemon) fetchMissing(handle *store.Handle) {
 
 // fetchAnywhere tries every connected vault peer until one serves the
 // blob. Location records will drive smarter source selection when fleets
-// outgrow "just ask everyone".
+// outgrow "just ask everyone". Callers wanting the same blob at once share
+// one transfer.
 func (d *Daemon) fetchAnywhere(handle *store.Handle, hash string) error {
 	if d.Fabric == nil {
 		return fmt.Errorf("not on a mesh")
 	}
+	d.flightMu.Lock()
+	if running := d.flights[hash]; running != nil {
+		d.flightMu.Unlock()
+		<-running.done
+		return running.err
+	}
+	running := &flight{done: make(chan struct{})}
+	d.flights[hash] = running
+	d.flightMu.Unlock()
+	running.err = d.fetchFromPeers(handle, hash)
+	d.flightMu.Lock()
+	delete(d.flights, hash)
+	d.flightMu.Unlock()
+	close(running.done)
+	return running.err
+}
+
+// flight is one blob transfer in progress and, once done, its outcome.
+type flight struct {
+	done chan struct{}
+	err  error
+}
+
+func (d *Daemon) fetchFromPeers(handle *store.Handle, hash string) error {
 	var lastErr error = fmt.Errorf("no connected vault peer holds it")
 	for _, peerID := range d.Fabric.Host.Network().Peers() {
-		if !d.Fabric.Auth.Allows(peerID, BlobProtocol) {
+		if !d.Fabric.Auth.Allows(peerID, BlobRangeProtocol) && !d.Fabric.Auth.Allows(peerID, BlobProtocol) {
 			continue
 		}
 		cctx, ccancel := context.WithTimeout(d.ctx, 10*time.Second)
@@ -361,7 +387,19 @@ func (d *Daemon) fetchAnywhere(handle *store.Handle, hash string) error {
 	return lastErr
 }
 
+// fetchBlob brings one blob from one peer: resumably and checked as it
+// arrives where the peer serves ranges, in one piece where it does not.
 func (d *Daemon) fetchBlob(handle *store.Handle, peerID peer.ID, hash string) error {
+	err := d.fetchResumable(handle, peerID, hash)
+	if errors.Is(err, errNoRangeProtocol) && d.Fabric.Auth.Allows(peerID, BlobProtocol) {
+		return d.fetchWhole(handle, peerID, hash)
+	}
+	return err
+}
+
+// fetchWhole is the /vault/blob/2 transfer: the whole blob on one stream,
+// checked only at the end, restarted from zero if it breaks.
+func (d *Daemon) fetchWhole(handle *store.Handle, peerID peer.ID, hash string) error {
 	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Minute)
 	defer cancel()
 	stream, err := d.Fabric.Host.NewStream(ctx, peerID, BlobProtocol)
@@ -410,18 +448,8 @@ func (d *Daemon) handleBlob(stream network.Stream) {
 		return
 	}
 	enc := cbor.NewEncoder(stream)
-	// Authorize: the requester must hold `blob` on the bucket it names, and
-	// that bucket must actually reference the blob — otherwise a device
-	// could name a bucket it may read and fetch another's bytes by hash.
-	handle, err := d.handle(req.Bucket)
-	if err != nil {
-		_ = enc.Encode(blobResp{Found: false})
-		return
-	}
-	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
-	in := d.peerMay(ctx, stream.Conn().RemotePeer(), handle.Bucket.Genesis.Owner, handle.ID(), statement.VerbBlob)
-	cancel()
-	if !in || !handle.References(req.Hash) {
+	handle, allowed := d.mayServe(stream.Conn().RemotePeer(), req.Bucket, req.Hash)
+	if !allowed {
 		_ = enc.Encode(blobResp{Found: false})
 		return
 	}

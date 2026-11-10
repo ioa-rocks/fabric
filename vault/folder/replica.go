@@ -320,3 +320,8 @@ func (r *Replica) Size(hash string) (int64, error) {
 func (r *Replica) Put(rd io.Reader) (string, int64, error) {
 	return r.shadow.Put(rd)
 }
+
+// Partial and Commit receive a peer's blob resumably, into the shadow store.
+func (r *Replica) Partial(hash string) (*os.File, error) { return r.shadow.Partial(hash) }
+
+func (r *Replica) Commit(hash string) error { return r.shadow.Commit(hash) }
