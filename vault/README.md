@@ -150,12 +150,21 @@ Only the circle travels — `blobs/`, `buckets/`, `subs.json`,
 
 ## Sync & placement
 
-Anti-entropy on `/vault/sync/1` (fabric spec-§5 pattern): a full
+Anti-entropy on `/vault/sync/2` (fabric spec-§5 pattern): a full
 catalog + index swap on every connect, on a 30 s timer, and pushed
 after local writes — the CRDT merge (LWW / OR-Set / tombstones) makes
 repetition and reordering harmless. Unknown buckets are adopted after
-signature verification. Blobs move separately on `/vault/blob/1`,
-driven by subscriptions (memo §5 — pull, not push):
+signature verification. A peer sees a bucket only with `sync` on it,
+has its records merged only with `write`, and is served content only
+with `blob` — each asked of its admission in the owning circle.
+
+Blobs move separately on `/vault/blob/3`: byte ranges, each checked
+against the blob's BLAKE3 hash as it arrives (Bao slices), so a broken
+transfer continues where it stopped and a file that is not held can be
+read from the middle (`GET …/content` with `Range`, the web UI, a
+mount). `/vault/blob/2` (whole blobs) is still served for peers a
+release behind. Movement is driven by subscriptions (memo §5 — pull,
+not push):
 
 ```sh
 fabric bucket place photos full          # hold a complete copy; fetch what's missing

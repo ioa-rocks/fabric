@@ -18,6 +18,7 @@ import (
 // bucket, and a reader that knows the bucket and holds none of its content.
 type blobPair struct {
 	holder, reader             *daemon.Daemon
+	stopHolder, stopReader     func()
 	holderClient, readerClient *daemon.Client
 	readerState                string
 }
@@ -37,10 +38,10 @@ func newBlobPair(t *testing.T) *blobPair {
 	roster := []*cert.Cert{holder.cert, reader.cert}
 	holder.writeConfig(t, root, "holder", nil, roster...)
 	pair := &blobPair{readerState: reader.statePath}
-	pair.holder = startDaemon(t, holder.statePath)
+	pair.holder, pair.stopHolder = runDaemon(t, holder.statePath)
 	bootstrap := pair.holder.Fabric.Host.Addrs()[0].String() + "/p2p/" + pair.holder.Fabric.Host.ID().String()
 	reader.writeConfig(t, root, "reader", []string{bootstrap}, roster...)
-	pair.reader = startDaemon(t, reader.statePath)
+	pair.reader, pair.stopReader = runDaemon(t, reader.statePath)
 	pair.holderClient = daemon.NewClient(holder.statePath)
 	pair.readerClient = daemon.NewClient(reader.statePath)
 	genesis, policy := signBucket(t, holder.statePath, "pw", "films")
@@ -86,6 +87,28 @@ func (p *blobPair) partialPath(hash string) string {
 	return filepath.Join(p.readerState, "blobs", "partial", hash)
 }
 
+func (p *blobPair) readRange(t *testing.T, ref string, offset, length int64) ([]byte, error) {
+	t.Helper()
+	body, err := p.readerClient.GetRange("films", ref, "", offset, length)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+	return io.ReadAll(body)
+}
+
+// heldOnReader is how many of the bucket's objects the reader holds.
+func (p *blobPair) heldOnReader(t *testing.T) int {
+	t.Helper()
+	// Summaries are cached per index generation; a commit writes a
+	// location record, which moves it.
+	buckets, err := p.readerClient.Buckets()
+	if err != nil || len(buckets) != 1 {
+		t.Fatalf("reader buckets: %+v %v", buckets, err)
+	}
+	return buckets[0].Held
+}
+
 func film(size int) []byte {
 	content := make([]byte, size)
 	if _, err := rand.Read(content); err != nil {
@@ -94,74 +117,106 @@ func film(size int) []byte {
 	return content
 }
 
-// A blob crosses the mesh as checked ranges, and a transfer that broke
-// part-way continues from what it had instead of starting over.
-func TestBlobFetchResumes(t *testing.T) {
+// Reading a blob the device does not hold brings it in as it is read; when
+// the last byte has arrived the device holds it like any other.
+func TestRemoteBlobIsReadThrough(t *testing.T) {
 	pair := newBlobPair(t)
 	// Only the ranged protocol is on offer: everything below travels on it.
 	pair.holder.Fabric.Host.RemoveStreamHandler(daemon.BlobProtocol)
 	content := film(3<<20 + 12345)
-
-	whole := pair.put(t, "whole.mkv", content)
-	got, err := pair.read(t, whole.ID)
+	object := pair.put(t, "whole.mkv", content)
+	got, err := pair.read(t, object.ID)
 	if err != nil || !bytes.Equal(got, content) {
-		t.Fatalf("plain fetch: %d bytes, %v", len(got), err)
+		t.Fatalf("read-through: %d bytes, %v", len(got), err)
 	}
-	if _, err := os.Stat(pair.partialPath(whole.Blob)); !os.IsNotExist(err) {
-		t.Fatalf("the partial file outlived its transfer: %v", err)
+	if held := pair.heldOnReader(t); held != 1 {
+		t.Fatalf("held after a complete read = %d, want 1", held)
 	}
-
-	// An earlier attempt left the first megabyte and a ragged tail.
-	other := film(2<<20 + 999)
-	resumed := pair.put(t, "resumed.mkv", other)
-	if err := os.MkdirAll(filepath.Dir(pair.partialPath(resumed.Blob)), 0o700); err != nil {
-		t.Fatal(err)
+	for _, leftover := range []string{pair.partialPath(object.Blob), pair.partialPath(object.Blob) + ".map"} {
+		if _, err := os.Stat(leftover); !os.IsNotExist(err) {
+			t.Fatalf("%s outlived the transfer: %v", filepath.Base(leftover), err)
+		}
 	}
-	if err := os.WriteFile(pair.partialPath(resumed.Blob), other[:1<<20+777], 0o600); err != nil {
-		t.Fatal(err)
-	}
-	got, err = pair.read(t, resumed.ID)
-	if err != nil || !bytes.Equal(got, other) {
-		t.Fatalf("resumed fetch: %d bytes, %v", len(got), err)
-	}
-
-	// The kept prefix really is kept: when it is wrong, the result is
-	// refused at the door rather than papered over by a fresh download —
-	// and the bad file is gone, so the next attempt is clean.
-	third := film(1<<20 + 5)
-	spoiled := pair.put(t, "spoiled.mkv", third)
-	wrong := append([]byte(nil), third[:512<<10]...)
-	wrong[1000] ^= 1
-	if err := os.WriteFile(pair.partialPath(spoiled.Blob), wrong, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pair.read(t, spoiled.ID); err == nil {
-		t.Fatal("a blob assembled on a damaged prefix was accepted")
-	}
-	got, err = pair.read(t, spoiled.ID)
-	if err != nil || !bytes.Equal(got, third) {
-		t.Fatalf("fetch after the refusal: %d bytes, %v", len(got), err)
-	}
-
-	// A partial file longer than the blob cannot be a prefix of it.
-	fourth := film(100 << 10)
-	oversized := pair.put(t, "oversized.mkv", fourth)
-	if err := os.WriteFile(pair.partialPath(oversized.Blob), film(200<<10), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pair.read(t, oversized.ID); err == nil {
-		t.Fatal("an oversized partial file was accepted")
-	}
-	got, err = pair.read(t, oversized.ID)
-	if err != nil || !bytes.Equal(got, fourth) {
-		t.Fatalf("fetch after the oversized partial: %d bytes, %v", len(got), err)
-	}
-
 	// Empty content is a blob like any other.
 	empty := pair.put(t, "empty.mkv", nil)
 	got, err = pair.read(t, empty.ID)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("empty blob: %d bytes, %v", len(got), err)
+	}
+	// A blob nobody serves is an error status, not a broken body.
+	pair.holder.Fabric.Host.RemoveStreamHandler(daemon.BlobRangeProtocol)
+	unreachable := pair.put(t, "unreachable.mkv", film(100<<10))
+	if _, err := pair.read(t, unreachable.ID); err == nil {
+		t.Fatal("a blob no peer serves was read")
+	}
+}
+
+// A seek into a blob that is not held fetches that part of it, not what
+// lies before; what was fetched is kept across a restart and served with
+// no peer in reach.
+func TestRemoteRangeFetchesOnlyWhatIsRead(t *testing.T) {
+	pair := newBlobPair(t)
+	content := film(6<<20 + 4321)
+	object := pair.put(t, "film.mkv", content)
+	offset, length := int64(4<<20+123), int64(200_000)
+	got, err := pair.readRange(t, object.ID, offset, length)
+	if err != nil || !bytes.Equal(got, content[offset:offset+length]) {
+		t.Fatalf("ranged read: %d bytes, %v", len(got), err)
+	}
+	// The tail too, as a player reading a container's index does.
+	tail, err := pair.readRange(t, object.ID, int64(len(content))-1000, -1)
+	if err != nil || !bytes.Equal(tail, content[len(content)-1000:]) {
+		t.Fatalf("tail read: %d bytes, %v", len(tail), err)
+	}
+	if held := pair.heldOnReader(t); held != 0 {
+		t.Fatalf("a partly read blob counts as held (%d)", held)
+	}
+
+	pair.stopReader()
+	groupMap, err := os.ReadFile(pair.partialPath(object.Blob) + ".map")
+	if err != nil {
+		t.Fatalf("no map of the partial blob after shutdown: %v", err)
+	}
+	groupsIn := 0
+	for _, octet := range groupMap[8:] {
+		for ; octet != 0; octet &= octet - 1 {
+			groupsIn++
+		}
+	}
+	groupsAll := (len(content) + 16383) / 16384
+	if groupsIn == 0 || groupsIn > groupsAll/2 {
+		t.Fatalf("%d of %d groups fetched for two small reads", groupsIn, groupsAll)
+	}
+
+	// With the holder gone, what was kept still reads; the rest does not.
+	pair.stopHolder()
+	pair.reader, pair.stopReader = runDaemon(t, pair.readerState)
+	got, err = pair.readRange(t, object.ID, offset, length)
+	if err != nil || !bytes.Equal(got, content[offset:offset+length]) {
+		t.Fatalf("ranged read from the kept part: %d bytes, %v", len(got), err)
+	}
+	if _, err := pair.readRange(t, object.ID, 0, 1000); err == nil {
+		t.Fatal("a part never fetched was read with no peer in reach")
+	}
+}
+
+// A whole-blob fetch (a full subscription filling in) continues from what a
+// reader already brought, and a reader meanwhile shares the same file.
+func TestFullSubscriptionCompletesAPartialBlob(t *testing.T) {
+	pair := newBlobPair(t)
+	content := film(5<<20 + 77)
+	object := pair.put(t, "series.mkv", content)
+	offset, length := int64(3<<20), int64(100_000)
+	if got, err := pair.readRange(t, object.ID, offset, length); err != nil || !bytes.Equal(got, content[offset:offset+length]) {
+		t.Fatalf("ranged read: %d bytes, %v", len(got), err)
+	}
+	if err := pair.readerClient.Sub("films", "full"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the blob held under the full subscription", func() bool { return pair.heldOnReader(t) == 1 })
+	got, err := pair.read(t, object.ID)
+	if err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("read after the fill: %d bytes, %v", len(got), err)
 	}
 }
 

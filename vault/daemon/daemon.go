@@ -84,7 +84,9 @@ type Daemon struct {
 
 	outboards *verified.Outboards // hash trees of the blobs served by range
 	flightMu  sync.Mutex
-	flights   map[string]*flight // blob hash -> transfer in progress
+	flights   map[string]*flight // blob hash -> whole-blob transfer in progress
+	sparseMu  sync.Mutex
+	sparse    map[string]*sparseBlob // blob hash -> partial blob open for reading or filling
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -126,6 +128,7 @@ func New(vaultStore *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		Store:        vaultStore,
 		outboards:    outboards,
 		flights:      make(map[string]*flight),
+		sparse:       make(map[string]*sparseBlob),
 		handles:      make(map[string]*store.Handle),
 		liveMounts:   make(map[string]*liveMount),
 		mountErrs:    make(map[string]string),
@@ -184,6 +187,7 @@ func (d *Daemon) Run() error {
 	}
 
 	if d.Fabric != nil {
+		go d.sparseJanitor()
 		go func() { defer close(d.syncDone); d.syncLoop() }()
 	} else {
 		close(d.syncDone)
@@ -215,6 +219,7 @@ func (d *Daemon) Run() error {
 	d.closed = true
 	d.mu.Unlock()
 	d.wg.Wait()
+	d.closeIdleSparse(0) // saves the maps of blobs received in part
 	d.closeHandles()
 	return nil
 }

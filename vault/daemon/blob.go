@@ -3,7 +3,7 @@
 // verified), so the receiver checks every 16 KiB against the blob's hash
 // as it arrives and keeps what passed. That is what makes a transfer
 // resumable — a broken one continues from the last good byte — and what
-// lets a reader take the middle of a blob it does not hold.
+// lets a reader take the middle of a blob it does not hold (sparse.go).
 package daemon
 
 import (
@@ -195,34 +195,4 @@ func (d *Daemon) fetchRange(handle *store.Handle, peerID peer.ID, hash string, o
 		return resp.Size, fmt.Errorf("from %s: %w", peerID, err)
 	}
 	return resp.Size, nil
-}
-
-// fetchResumable brings a whole blob into the bucket's holder through its
-// partial file: only checked bytes are ever written there, so whatever an
-// earlier attempt left is a good prefix and this one starts after it.
-func (d *Daemon) fetchResumable(handle *store.Handle, peerID peer.ID, hash string) error {
-	holder := handle.Holder()
-	partial, err := holder.Partial(hash)
-	if err != nil {
-		return err
-	}
-	defer partial.Close()
-	info, err := partial.Stat()
-	if err != nil {
-		return err
-	}
-	have := info.Size() / verified.GroupSize * verified.GroupSize
-	if err := partial.Truncate(have); err != nil {
-		return err
-	}
-	if _, err := partial.Seek(have, io.SeekStart); err != nil {
-		return err
-	}
-	if _, err := d.fetchRange(handle, peerID, hash, have, 0, partial); err != nil {
-		if errors.Is(err, errPastEnd) {
-			_ = partial.Truncate(0) // longer than the blob, so not a prefix of it; start over next time
-		}
-		return err
-	}
-	return holder.Commit(hash)
 }

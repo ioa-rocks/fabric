@@ -333,14 +333,36 @@ func (d *Daemon) fetchMissing(handle *store.Handle) {
 	}
 }
 
-// fetchAnywhere tries every connected vault peer until one serves the
-// blob. Location records will drive smarter source selection when fleets
-// outgrow "just ask everyone". Callers wanting the same blob at once share
-// one transfer.
+// fetchAnywhere brings a whole blob into the bucket's holder from whichever
+// connected peers serve it. Location records will drive smarter source
+// selection when fleets outgrow "just ask everyone". It shares the blob's
+// partial file with anyone reading it meanwhile, and continues what an
+// earlier attempt left.
 func (d *Daemon) fetchAnywhere(handle *store.Handle, hash string) error {
 	if d.Fabric == nil {
 		return fmt.Errorf("not on a mesh")
 	}
+	partial, err := d.acquireSparse(handle, hash, 0)
+	if err != nil {
+		return err
+	}
+	err = partial.fill()
+	d.releaseSparse(partial)
+	if errors.Is(err, errNoRangeProtocol) {
+		return d.fetchWholeAnywhere(handle, hash)
+	}
+	return err
+}
+
+// flight is one whole-blob transfer in progress and, once done, its outcome.
+type flight struct {
+	done chan struct{}
+	err  error
+}
+
+// fetchWholeAnywhere is fetchAnywhere among peers a release behind: one
+// transfer per blob, however many callers want it.
+func (d *Daemon) fetchWholeAnywhere(handle *store.Handle, hash string) error {
 	d.flightMu.Lock()
 	if running := d.flights[hash]; running != nil {
 		d.flightMu.Unlock()
@@ -350,7 +372,7 @@ func (d *Daemon) fetchAnywhere(handle *store.Handle, hash string) error {
 	running := &flight{done: make(chan struct{})}
 	d.flights[hash] = running
 	d.flightMu.Unlock()
-	running.err = d.fetchFromPeers(handle, hash)
+	running.err = d.fetchWholeFromPeers(handle, hash)
 	d.flightMu.Lock()
 	delete(d.flights, hash)
 	d.flightMu.Unlock()
@@ -358,25 +380,13 @@ func (d *Daemon) fetchAnywhere(handle *store.Handle, hash string) error {
 	return running.err
 }
 
-// flight is one blob transfer in progress and, once done, its outcome.
-type flight struct {
-	done chan struct{}
-	err  error
-}
-
-func (d *Daemon) fetchFromPeers(handle *store.Handle, hash string) error {
+func (d *Daemon) fetchWholeFromPeers(handle *store.Handle, hash string) error {
 	var lastErr error = fmt.Errorf("no connected vault peer holds it")
 	for _, peerID := range d.Fabric.Host.Network().Peers() {
-		if !d.Fabric.Auth.Allows(peerID, BlobRangeProtocol) && !d.Fabric.Auth.Allows(peerID, BlobProtocol) {
+		if !d.Fabric.Auth.Allows(peerID, BlobProtocol) || !d.blobPeer(handle, peerID) {
 			continue
 		}
-		cctx, ccancel := context.WithTimeout(d.ctx, 10*time.Second)
-		in := d.peerMay(cctx, peerID, handle.Bucket.Genesis.Owner, handle.ID(), statement.VerbBlob)
-		ccancel()
-		if !in {
-			continue
-		}
-		if err := d.fetchBlob(handle, peerID, hash); err != nil {
+		if err := d.fetchWhole(handle, peerID, hash); err != nil {
 			lastErr = err
 			continue
 		}
@@ -385,16 +395,6 @@ func (d *Daemon) fetchFromPeers(handle *store.Handle, hash string) error {
 		return nil
 	}
 	return lastErr
-}
-
-// fetchBlob brings one blob from one peer: resumably and checked as it
-// arrives where the peer serves ranges, in one piece where it does not.
-func (d *Daemon) fetchBlob(handle *store.Handle, peerID peer.ID, hash string) error {
-	err := d.fetchResumable(handle, peerID, hash)
-	if errors.Is(err, errNoRangeProtocol) && d.Fabric.Auth.Allows(peerID, BlobProtocol) {
-		return d.fetchWhole(handle, peerID, hash)
-	}
-	return err
 }
 
 // fetchWhole is the /vault/blob/2 transfer: the whole blob on one stream,

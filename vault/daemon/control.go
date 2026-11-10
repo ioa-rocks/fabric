@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -600,23 +602,15 @@ func (d *Daemon) handleGet(resp http.ResponseWriter, req *http.Request) {
 	// On-demand fetch: a missing blob is a mesh lookup, not an error —
 	// vault get works on any node that can reach a holder (API-first; the
 	// cache axis without the bookkeeping).
-	if blob != "" && !handle.Holder().Has(blob) && d.Fabric != nil {
-		if err := d.fetchAnywhere(handle, blob); err != nil {
-			httpErr(resp, fmt.Errorf("blob not held here and no peer served it: %w", err))
-			return
-		}
-	}
-	file, err := handle.OpenBlob(blob)
-	if err != nil {
-		httpErr(resp, err)
-		return
-	}
-	defer file.Close()
 	// Last-Modified follows the revision being served; the blob hash is the
 	// validator, so a range resumed after the object changed starts over.
-	modified := time.Unix(0, obj.Modified())
+	modified, size := time.Unix(0, obj.Modified()), int64(0)
 	for _, rev := range obj.Heads {
-		if rev.Blob == blob && rev.MTime != 0 {
+		if rev.Blob != blob {
+			continue
+		}
+		size = rev.Size
+		if rev.MTime != 0 {
 			modified = time.Unix(0, rev.MTime)
 		}
 	}
@@ -625,9 +619,95 @@ func (d *Daemon) handleGet(resp http.ResponseWriter, req *http.Request) {
 	header.Set("ETag", `"`+blob+`"`)
 	header.Set("X-Vault-Object", obj.ID)
 	header.Set("X-Vault-Name", obj.Name.V)
+	// On-demand fetch: a missing blob is a mesh lookup, not an error —
+	// vault get works on any node that can reach a holder (API-first; the
+	// cache axis without the bookkeeping). The request is answered from
+	// the blob's partial file, which fetches the ranges being read: a seek
+	// into a film waits for that part of it, not for the film.
+	if blob != "" && !handle.Holder().Has(blob) && d.Fabric != nil {
+		served, err := d.serveRemote(resp, req, handle, blob, size, modified)
+		if served {
+			return
+		}
+		if !errors.Is(err, errNoRangeProtocol) {
+			clearContentHeaders(header)
+			httpErr(resp, fmt.Errorf("blob not held here and no peer served it: %w", err))
+			return
+		}
+		if err := d.fetchWholeAnywhere(handle, blob); err != nil {
+			clearContentHeaders(header)
+			httpErr(resp, fmt.Errorf("blob not held here and no peer served it: %w", err))
+			return
+		}
+	}
+	file, err := handle.OpenBlob(blob)
+	if err != nil {
+		clearContentHeaders(header)
+		httpErr(resp, err)
+		return
+	}
+	defer file.Close()
 	// ServeContent answers Range, If-Range and the conditional headers, and
 	// reads only the bytes asked for: a player seeks without a full read.
 	http.ServeContent(resp, req, "", modified, file)
+}
+
+// clearContentHeaders takes back the headers of a content answer that
+// turned into an error.
+func clearContentHeaders(header http.Header) {
+	for _, name := range []string{"Content-Type", "ETag", "X-Vault-Object", "X-Vault-Name"} {
+		header.Del(name)
+	}
+}
+
+// serveRemote answers a content request for a blob this device does not
+// hold, from its partial file. Before the first byte of the answer it
+// makes sure the start of what is asked for can be had, so "no peer has
+// it" is still an error status and not a broken body. served reports
+// whether the response was written.
+func (d *Daemon) serveRemote(resp http.ResponseWriter, req *http.Request, handle *store.Handle, blob string, size int64, modified time.Time) (served bool, err error) {
+	partial, err := d.acquireSparse(handle, blob, size)
+	if err != nil {
+		return false, err
+	}
+	defer d.releaseSparse(partial)
+	if size, err = partial.Size(); err != nil {
+		return false, err
+	}
+	if start := rangeStart(req.Header.Get("Range"), size); start < size {
+		var probe [1]byte
+		if _, err := partial.readSome(probe[:], start); err != nil {
+			return false, err
+		}
+	}
+	http.ServeContent(resp, req, "", modified, partial.reader(size))
+	return true, nil
+}
+
+// rangeStart is the first byte a Range header asks for, 0 when there is
+// none or it is not a plain single range (ServeContent then decides what
+// the answer is; this only chooses what to have ready).
+func rangeStart(header string, size int64) int64 {
+	spec, found := strings.CutPrefix(header, "bytes=")
+	if !found || strings.Contains(spec, ",") {
+		return 0
+	}
+	first, last, found := strings.Cut(spec, "-")
+	if !found {
+		return 0
+	}
+	if first == "" { // a suffix range: the last N bytes
+		count, err := strconv.ParseInt(last, 10, 64)
+		if err != nil || count <= 0 {
+			return 0
+		}
+		return max(size-count, 0)
+	}
+	start, err := strconv.ParseInt(first, 10, 64)
+	if err != nil || start < 0 || start >= size {
+		return 0
+	}
+	return start
 }
 
 // mediaTypes covers what a player or viewer must be told to seek and
