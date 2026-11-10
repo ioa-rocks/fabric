@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"lukechampine.com/blake3"
 	"lukechampine.com/blake3/bao"
 )
 
@@ -34,6 +35,11 @@ const GroupSize = 1024 << Group
 
 // headerSize is the length prefix of every encoding.
 const headerSize = 8
+
+// IsEmpty reports whether root is the hash of the empty blob.
+func IsEmpty(root [32]byte) bool {
+	return root == blake3.Sum256(nil)
+}
 
 // ErrMismatch is returned when received bytes do not belong to the blob.
 var ErrMismatch = errors.New("content does not match the blob's hash")

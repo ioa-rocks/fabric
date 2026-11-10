@@ -301,11 +301,11 @@ func (b *sparseBlob) fetch(offset int64) error {
 			}
 		}
 	}
-	preferred := b.lastPeer
+	preferred, knownSize := b.lastPeer, b.size
 	b.mu.Unlock()
 
 	sink := &offsetWriter{file: b.file, position: start}
-	size, from, err := b.daemon.rangeFromPeers(b.handle, b.hash, start, length, sink, preferred)
+	size, from, err := b.daemon.rangeFromPeers(b.handle, b.hash, knownSize, start, length, sink, preferred)
 
 	b.mu.Lock()
 	gained := 0
@@ -476,10 +476,11 @@ func (w *offsetWriter) Write(buffer []byte) (int, error) {
 	return count, err
 }
 
-// rangeFromPeers asks connected peers for a range until one sends bytes,
-// the preferred one first. It returns as soon as anything was written, so
+// rangeFromPeers asks connected peers for a range until one sends bytes
+// (or proves the blob empty), the preferred one first. A peer whose stated
+// size differs from knownSize (when that is not negative) is passed over. It returns as soon as anything was written, so
 // dst never receives two peers' answers to the same request.
-func (d *Daemon) rangeFromPeers(handle *store.Handle, hash string, offset, length int64, dst *offsetWriter, preferred peer.ID) (size int64, from peer.ID, err error) {
+func (d *Daemon) rangeFromPeers(handle *store.Handle, hash string, knownSize, offset, length int64, dst *offsetWriter, preferred peer.ID) (size int64, from peer.ID, err error) {
 	candidates := d.Fabric.Host.Network().Peers()
 	for position, candidate := range candidates {
 		if candidate == preferred {
@@ -497,7 +498,7 @@ func (d *Daemon) rangeFromPeers(handle *store.Handle, hash string, offset, lengt
 			continue
 		}
 		var attemptErr error
-		size, attemptErr = d.fetchRange(handle, peerID, hash, offset, length, dst)
+		size, attemptErr = d.fetchRange(handle, peerID, hash, knownSize, offset, length, dst)
 		if attemptErr == nil || dst.written > 0 {
 			return size, peerID, attemptErr
 		}

@@ -7,8 +7,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/fxamacker/cbor/v2"
+	"github.com/libp2p/go-libp2p/core/network"
 
 	"ioa.rocks/fabric/cert"
 	"ioa.rocks/fabric/vault/daemon"
@@ -230,5 +235,44 @@ func TestBlobFetchFallsBackToWholeTransfer(t *testing.T) {
 	got, err := pair.read(t, object.ID)
 	if err != nil || !bytes.Equal(got, content) {
 		t.Fatalf("fallback fetch: %d bytes, %v", len(got), err)
+	}
+}
+
+// A peer that claims a blob is empty (or of any size other than its own) is
+// not believed: the read fails without taking anything in, and the next
+// read, answered honestly, gets the content.
+func TestBlobSizeLieIsRefused(t *testing.T) {
+	pair := newBlobPair(t)
+	host := pair.holder.Fabric.Host
+	host.RemoveStreamHandler(daemon.BlobProtocol)
+	var lies atomic.Int32
+	lies.Store(1)
+	host.SetStreamHandler(daemon.BlobRangeProtocol, func(stream network.Stream) {
+		if lies.Add(-1) < 0 {
+			pair.holder.ServeBlobRange(stream)
+			return
+		}
+		defer stream.Close()
+		var request map[string]any
+		if err := cbor.NewDecoder(stream).Decode(&request); err != nil {
+			return
+		}
+		_ = cbor.NewEncoder(stream).Encode(map[string]any{"found": true, "size": 0})
+	})
+	content := film(3<<20 + 5)
+	object := pair.put(t, "film.mkv", content)
+	got, err := pair.read(t, object.ID)
+	if err == nil {
+		t.Fatalf("a read answered with a false size returned %d bytes and no error", len(got))
+	}
+	if !strings.Contains(err.Error(), "states 0 bytes") {
+		t.Fatalf("the false size was not what stopped the read: %v", err)
+	}
+	if held := pair.heldOnReader(t); held != 0 {
+		t.Fatalf("reader holds %d blobs after a refused answer", held)
+	}
+	got, err = pair.read(t, object.ID)
+	if err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("read after the refused answer: %d bytes, %v", len(got), err)
 	}
 }

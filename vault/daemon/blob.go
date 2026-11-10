@@ -155,8 +155,11 @@ func clipRange(offset, length, size int64) (int64, int64) {
 // fetchRange asks peerID for [offset, offset+length) of a blob (length 0:
 // to the end) and writes the bytes to dst as they pass the check. It
 // returns the blob's size as the peer states it, which is proven only once
-// the blob's last byte has been received.
-func (d *Daemon) fetchRange(handle *store.Handle, peerID peer.ID, hash string, offset, length int64, dst io.Writer) (size int64, err error) {
+// the blob's last byte has been received. knownSize is the size this
+// device already works with (negative: none yet); a peer that states
+// another is not used. A nil error with nothing written means the blob is
+// empty, and that too was checked against the hash.
+func (d *Daemon) fetchRange(handle *store.Handle, peerID peer.ID, hash string, knownSize, offset, length int64, dst io.Writer) (size int64, err error) {
 	root, err := verified.Root(hash)
 	if err != nil {
 		return 0, err
@@ -180,13 +183,24 @@ func (d *Daemon) fetchRange(handle *store.Handle, peerID peer.ID, hash string, o
 	if !resp.Found {
 		return 0, fmt.Errorf("%s does not hold it", peerID)
 	}
-	if resp.Size < 0 || offset > resp.Size {
-		return resp.Size, fmt.Errorf("%w: at %d of %d bytes", errPastEnd, offset, resp.Size)
+	if resp.Size < 0 {
+		return 0, fmt.Errorf("%s states a size of %d bytes", peerID, resp.Size)
+	}
+	if knownSize >= 0 && resp.Size != knownSize {
+		return 0, fmt.Errorf("%s states %d bytes for a blob of %d", peerID, resp.Size, knownSize)
+	}
+	if resp.Size == 0 && offset == 0 {
+		// No slice follows for an empty blob; the hash alone says whether
+		// this one is.
+		if !verified.IsEmpty(root) {
+			return 0, fmt.Errorf("from %s: %w", peerID, verified.ErrMismatch)
+		}
+		return 0, nil
+	}
+	if offset >= resp.Size {
+		return 0, fmt.Errorf("%w: at %d of %d bytes", errPastEnd, offset, resp.Size)
 	}
 	offset, length = clipRange(offset, length, resp.Size)
-	if length == 0 {
-		return resp.Size, nil
-	}
 	// The remainder of the stream is the slice (the decoder may have
 	// buffered its head).
 	body := io.MultiReader(dec.Buffered(), idleStream{stream})
