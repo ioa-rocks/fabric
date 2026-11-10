@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ioa.rocks/fabric/circle"
@@ -44,6 +45,9 @@ type Store struct {
 	mu         sync.Mutex
 	placements map[string]Placement        // bucket ID → this device's commitment (subs.json)
 	roots      map[string]*blobstore.Store // placement root → opened blob store
+	// placementEpoch moves whenever a placement does: which blob stores a
+	// bucket reads from is part of what a cached summary depends on.
+	placementEpoch atomic.Uint64
 }
 
 // Subscription modes (bucket-model memo §5): a per-node, per-bucket
@@ -418,6 +422,13 @@ type Handle struct {
 	policyMu      sync.Mutex
 	heldMu        sync.Mutex
 	recentDeletes []int64 // merge times of recent tombstones, for the bulk-hold window
+
+	summaryMu         sync.Mutex
+	summary           Summary
+	summaryGeneration uint64
+	summaryPlacement  uint64
+	summaryAt         time.Time
+	summaryValid      bool
 }
 
 // OpenBucket opens a bucket handle by exact ID.
@@ -477,6 +488,9 @@ func (h *Handle) SetHolder(holder Holder, form string) {
 	h.holderMu.Lock()
 	defer h.holderMu.Unlock()
 	h.holder, h.form = holder, form
+	h.summaryMu.Lock()
+	h.summaryValid = false
+	h.summaryMu.Unlock()
 }
 
 func (h *Handle) locationForm() string {
@@ -671,6 +685,51 @@ func (h *Handle) Stats() (objects, held int, err error) {
 		}
 	}
 	return objects, held, nil
+}
+
+// Summary is a bucket's dashboard line.
+type Summary struct {
+	Objects   int // live objects
+	Held      int // of those, how many have their content on this device
+	Conflicts int // rendered conflict copies
+}
+
+// summaryMaxAge bounds how long a cached summary stands when nothing wrote
+// to the index: content can arrive or leave a holder without an index write
+// (a working file edited before its scan).
+const summaryMaxAge = 30 * time.Second
+
+// Summary counts the bucket in one pass and keeps the answer until the
+// index, the bucket's holder or a placement next changes. The dashboard asks every few seconds; a scan per ask
+// is what this avoids.
+func (h *Handle) Summary() (Summary, error) {
+	generation, placement := h.Index.Generation(), h.store.placementEpoch.Load()
+	h.summaryMu.Lock()
+	defer h.summaryMu.Unlock()
+	if h.summaryValid && h.summaryGeneration == generation && h.summaryPlacement == placement && time.Since(h.summaryAt) < summaryMaxAge {
+		return h.summary, nil
+	}
+	objs, err := h.Index.ListObjects()
+	if err != nil {
+		return Summary{}, err
+	}
+	holder := h.Holder()
+	var summary Summary
+	for _, obj := range objs {
+		summary.Objects++
+		if blob := obj.Blob(); blob == "" || holder.Has(blob) {
+			summary.Held++
+		}
+		summary.Conflicts += len(obj.Conflicts())
+	}
+	h.summary, h.summaryGeneration, h.summaryPlacement, h.summaryAt, h.summaryValid = summary, generation, placement, time.Now(), true
+	return summary, nil
+}
+
+// References reports whether the bucket's index points at the blob.
+func (h *Handle) References(blob string) bool {
+	referenced, err := h.Index.ReferencesBlob(blob)
+	return err == nil && referenced
 }
 
 // ResolveObject finds one object by ID prefix (≥8 chars) or exact display

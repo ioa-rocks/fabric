@@ -138,3 +138,48 @@ func TestCircleLifecycle(t *testing.T) {
 		t.Fatalf("after delete: %d objects, err=%v", len(left), err)
 	}
 }
+
+// The dashboard's counts follow every index write and cost no scan between
+// writes.
+func TestSummaryFollowsTheIndex(t *testing.T) {
+	c, err := initStore(t.TempDir(), "alex", pass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := c.createBucket("notes", pass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	summaryOf := func() Summary {
+		t.Helper()
+		summary, err := h.Summary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return summary
+	}
+	if got := summaryOf(); got != (Summary{}) {
+		t.Fatalf("empty bucket: %+v", got)
+	}
+	obj, err := h.Put("a.txt", strings.NewReader("one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Put("b.txt", strings.NewReader("two")); err != nil {
+		t.Fatal(err)
+	}
+	if got := summaryOf(); got != (Summary{Objects: 2, Held: 2}) {
+		t.Fatalf("after two puts: %+v", got)
+	}
+	generation := h.Index.Generation()
+	if got := summaryOf(); got != (Summary{Objects: 2, Held: 2}) || h.Index.Generation() != generation {
+		t.Fatalf("a repeated ask changed the answer: %+v", got)
+	}
+	if err := h.Delete(obj); err != nil {
+		t.Fatal(err)
+	}
+	if got := summaryOf(); got != (Summary{Objects: 1, Held: 1}) {
+		t.Fatalf("after a delete: %+v", got)
+	}
+}

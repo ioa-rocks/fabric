@@ -5,16 +5,18 @@
 // correct regardless of order or repetition; deltas/digests are an
 // optimization for later, personal-scale indexes don't need them yet.
 //
-// Trust boundary today: any authenticated mesh member may sync and fetch
-// (the gater + RequireMember). Per-circle visibility and capability checks
-// arrive with grants — same-circle mesh assumption until then.
+// Trust boundary: a peer reaches these handlers only as a verified device
+// of a circle this node holds (RequireAny). Each bucket is then its own
+// question, asked of the peer's admission in the owning circle: `sync` to
+// see the bucket and its records, `write` to have its records merged here
+// (write implies sync), `blob` to be served content. The question names the
+// bucket, so an admission scoped to one bucket opens only that one.
 package daemon
 
 import (
 	"context"
 	"fmt"
 	"io"
-	"ioa.rocks/fabric/statement"
 	"log"
 	"os"
 	"time"
@@ -23,6 +25,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"ioa.rocks/fabric/statement"
 	"ioa.rocks/fabric/vault/bucket"
 	"ioa.rocks/fabric/vault/index"
 	"ioa.rocks/fabric/vault/store"
@@ -115,8 +118,7 @@ func (d *Daemon) syncPeer(peerID peer.ID) {
 	defer d.end()
 	ctx, cancel := context.WithTimeout(d.ctx, 60*time.Second)
 	defer cancel()
-	shared := d.Fabric.Circle.SharedWith(ctx, peerID, statement.KindBucket, statement.VerbSync)
-	if len(shared) == 0 {
+	if len(d.Fabric.Circle.Shared(ctx, peerID)) == 0 {
 		return // a member, but a device of none of our circles — nothing to exchange
 	}
 	stream, err := d.Fabric.Host.NewStream(ctx, peerID, SyncProtocol)
@@ -126,7 +128,7 @@ func (d *Daemon) syncPeer(peerID peer.ID) {
 	defer stream.Close()
 	_ = stream.SetDeadline(time.Now().Add(60 * time.Second))
 
-	out, err := d.dumpState(shared)
+	out, err := d.dumpState(ctx, peerID)
 	if err != nil {
 		log.Printf("sync: dumping local state: %v", err)
 		return
@@ -138,7 +140,7 @@ func (d *Daemon) syncPeer(peerID peer.ID) {
 	if err := cbor.NewDecoder(stream).Decode(&in); err != nil {
 		return
 	}
-	d.applyState(&in, peerID, shared)
+	d.applyState(ctx, &in, peerID)
 }
 
 // handleSync is the responder side: merge theirs, send ours.
@@ -154,14 +156,10 @@ func (d *Daemon) handleSync(stream network.Stream) {
 	if err := cbor.NewDecoder(stream).Decode(&in); err != nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
-	shared := d.Fabric.Circle.SharedWith(ctx, stream.Conn().RemotePeer(), statement.KindBucket, statement.VerbSync)
-	cancel()
-	if len(shared) == 0 {
-		stream.Reset()
-		return
-	}
-	out, err := d.dumpState(shared)
+	ctx, cancel := context.WithTimeout(d.ctx, 60*time.Second)
+	defer cancel()
+	peerID := stream.Conn().RemotePeer()
+	out, err := d.dumpState(ctx, peerID)
 	if err != nil {
 		log.Printf("sync: dumping local state: %v", err)
 		return
@@ -169,24 +167,30 @@ func (d *Daemon) handleSync(stream network.Stream) {
 	if err := cbor.NewEncoder(stream).Encode(out); err != nil {
 		return
 	}
-	d.applyState(&in, stream.Conn().RemotePeer(), shared)
+	d.applyState(ctx, &in, peerID)
 }
 
-// dumpState renders the buckets owned by the given circles — the ones the
-// peer verifiably shares with us. A bucket of a circle the peer is not in
-// never leaves this node, not even its catalog entry.
-func (d *Daemon) dumpState(owners []string) (*syncMsg, error) {
+// peerMay asks the peer's admission in the bucket's owning circle for verb
+// on this bucket.
+func (d *Daemon) peerMay(ctx context.Context, peerID peer.ID, owner, bucketID, verb string) bool {
+	return d.Fabric.Circle.Allows(ctx, peerID, owner, statement.Resource{Kind: statement.KindBucket, Name: bucketID}, verb)
+}
+
+// dumpState renders the buckets the peer may sync. A bucket it may not —
+// another circle's, or one its admission does not name — never leaves this
+// node, not even its catalog entry.
+func (d *Daemon) dumpState(ctx context.Context, peerID peer.ID) (*syncMsg, error) {
 	buckets, err := d.Store.Buckets()
 	if err != nil {
 		return nil, err
 	}
 	msg := &syncMsg{}
 	for _, bkt := range buckets {
-		if !inSet(owners, bkt.Genesis.Owner) {
-			continue
-		}
 		id, err := bkt.ID()
 		if err != nil {
+			continue
+		}
+		if !d.peerMay(ctx, peerID, bkt.Genesis.Owner, id, statement.VerbSync) {
 			continue
 		}
 		genesis, policy, err := d.Store.BucketRaw(id)
@@ -218,11 +222,11 @@ func (d *Daemon) dumpState(owners []string) (*syncMsg, error) {
 }
 
 // applyState merges a peer's dump: adopt unknown buckets (signatures
-// verify at adoption), merge every object and location record, then fetch
-// whatever our subscriptions now say we're missing.
-func (d *Daemon) applyState(msg *syncMsg, from peer.ID, shared []string) {
+// verify at adoption), merge the object and location records the peer may
+// write, then fetch whatever our subscriptions now say we're missing.
+func (d *Daemon) applyState(ctx context.Context, msg *syncMsg, from peer.ID) {
 	for _, sb := range msg.Buckets {
-		handle, isNew, err := d.adoptIfUnknown(sb.Genesis, sb.Policy, shared)
+		handle, isNew, err := d.adoptIfUnknown(ctx, sb.Genesis, sb.Policy, from)
 		if err != nil {
 			log.Printf("sync: rejecting bucket from %s: %v", from, err)
 			continue
@@ -233,6 +237,21 @@ func (d *Daemon) applyState(msg *syncMsg, from peer.ID, shared []string) {
 			log.Printf("sync: rejecting policy for %q from %s: %v", handle.Bucket.Genesis.Name, from, err)
 		} else if updated {
 			log.Printf("sync: bucket %q policy v%d from %s", handle.Bucket.Genesis.Name, handle.CurrentPolicy().Version, from)
+		}
+		// The catalog entry and the policy are the owner's signed words, so
+		// any peer that may see the bucket may relay them. Records are the
+		// sender's own claims: without `write` they stop here, and of the
+		// location records only the sender's word about itself is taken.
+		if !d.peerMay(ctx, from, handle.Bucket.Genesis.Owner, handle.ID(), statement.VerbWrite) {
+			for _, loc := range sb.Locations {
+				if loc.Node != from.String() {
+					continue
+				}
+				if err := handle.Index.PutLocation(loc); err != nil {
+					log.Printf("sync: merging location: %v", err)
+				}
+			}
+			continue
 		}
 		records := make([]*index.Object, 0, len(sb.Objects))
 		for _, raw := range sb.Objects {
@@ -262,20 +281,20 @@ func (d *Daemon) applyState(msg *syncMsg, from peer.ID, shared []string) {
 }
 
 // adoptIfUnknown returns the (possibly fresh) handle for a synced bucket.
-func (d *Daemon) adoptIfUnknown(genesis, policy []byte, shared []string) (*store.Handle, bool, error) {
-	// A peer may only speak for buckets of circles it verifiably shares
-	// with us — known or not. A compromised device of one circle must not
-	// touch another circle's buckets, nor plant one signed by a stray key.
+func (d *Daemon) adoptIfUnknown(ctx context.Context, genesis, policy []byte, from peer.ID) (*store.Handle, bool, error) {
+	// A peer may only speak for buckets it may itself sync — known here or
+	// not. A compromised device of one circle must not touch another
+	// circle's buckets, nor plant one signed by a stray key.
 	bkt, err := bucket.Unmarshal(genesis)
 	if err != nil {
 		return nil, false, err
 	}
-	if !inSet(shared, bkt.Genesis.Owner) {
-		return nil, false, fmt.Errorf("bucket %q is owned by %s, a circle this peer is not a device of — refusing", bkt.Genesis.Name, bkt.Genesis.Owner)
-	}
 	id, known, err := d.Store.KnowsBucket(genesis)
 	if err != nil {
 		return nil, false, err
+	}
+	if !d.peerMay(ctx, from, bkt.Genesis.Owner, id, statement.VerbSync) {
+		return nil, false, fmt.Errorf("bucket %q of circle %s: this peer may not sync it — refusing", bkt.Genesis.Name, bkt.Genesis.Owner)
 	}
 	if known {
 		handle, err := d.handle(id)
@@ -326,7 +345,7 @@ func (d *Daemon) fetchAnywhere(handle *store.Handle, hash string) error {
 			continue
 		}
 		cctx, ccancel := context.WithTimeout(d.ctx, 10*time.Second)
-		in := d.Fabric.Circle.InCircleWith(cctx, peerID, handle.Bucket.Genesis.Owner, statement.KindBucket, statement.VerbBlob)
+		in := d.peerMay(cctx, peerID, handle.Bucket.Genesis.Owner, handle.ID(), statement.VerbBlob)
 		ccancel()
 		if !in {
 			continue
@@ -391,28 +410,22 @@ func (d *Daemon) handleBlob(stream network.Stream) {
 		return
 	}
 	enc := cbor.NewEncoder(stream)
-	// Authorize: the requester must be a device of the circle owning the
-	// bucket it names, and that bucket must actually reference the blob —
-	// otherwise any shared-circle device could name its own bucket and
-	// fetch another circle's bytes by hash.
+	// Authorize: the requester must hold `blob` on the bucket it names, and
+	// that bucket must actually reference the blob — otherwise a device
+	// could name a bucket it may read and fetch another's bytes by hash.
 	handle, err := d.handle(req.Bucket)
 	if err != nil {
 		_ = enc.Encode(blobResp{Found: false})
 		return
 	}
 	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
-	in := d.Fabric.Circle.InCircleWith(ctx, stream.Conn().RemotePeer(), handle.Bucket.Genesis.Owner, statement.KindBucket, statement.VerbBlob)
+	in := d.peerMay(ctx, stream.Conn().RemotePeer(), handle.Bucket.Genesis.Owner, handle.ID(), statement.VerbBlob)
 	cancel()
-	if !in || !d.bucketReferences(handle, req.Hash) {
+	if !in || !handle.References(req.Hash) {
 		_ = enc.Encode(blobResp{Found: false})
 		return
 	}
-	path, err := d.blobPath(req.Hash)
-	if err != nil {
-		_ = enc.Encode(blobResp{Found: false})
-		return
-	}
-	file, err := os.Open(path)
+	file, err := d.openBlob(handle, req.Hash)
 	if err != nil {
 		_ = enc.Encode(blobResp{Found: false})
 		return
@@ -429,56 +442,34 @@ func (d *Daemon) handleBlob(stream network.Stream) {
 	_, _ = io.Copy(stream, file)
 }
 
-// blobPath finds a held blob in the device's blob stores (default and
-// every placement root) or any bucket's holder (a folder replica serves
-// its working files).
-func (d *Daemon) blobPath(hash string) (string, error) {
+// openBlob opens a held blob for serving: from the bucket's own holder
+// first (a folder replica serves its working file only while it is
+// unchanged), then the device's blob stores, then any other bucket's
+// holder — content is shared by hash, so another bucket's folder may be
+// the only place the bytes are.
+func (d *Daemon) openBlob(handle *store.Handle, hash string) (*os.File, error) {
+	if file, err := handle.OpenBlob(hash); err == nil {
+		return file, nil
+	}
 	if blobPath, err := d.Store.BlobPath(hash); err == nil {
-		return blobPath, nil
+		return os.Open(blobPath)
 	}
 	buckets, err := d.Store.Buckets()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	for _, bkt := range buckets {
 		id, err := bkt.ID()
+		if err != nil || id == handle.ID() {
+			continue
+		}
+		other, err := d.handle(id)
 		if err != nil {
 			continue
 		}
-		handle, err := d.handle(id)
-		if err != nil {
-			continue
-		}
-		if blobPath, err := handle.Holder().Path(hash); err == nil {
-			return blobPath, nil
+		if file, err := other.OpenBlob(hash); err == nil {
+			return file, nil
 		}
 	}
-	return "", fmt.Errorf("blob %.12s: not held here", hash)
-}
-
-// bucketReferences reports whether a bucket's index knows the blob: a
-// location record, or an object pointing at it.
-func (d *Daemon) bucketReferences(handle *store.Handle, hash string) bool {
-	if locs, err := handle.Index.Locations(hash); err == nil && len(locs) > 0 {
-		return true
-	}
-	objs, err := handle.Index.DumpObjects()
-	if err != nil {
-		return false
-	}
-	for _, obj := range objs {
-		if obj.Blob() == hash {
-			return true
-		}
-	}
-	return false
-}
-
-func inSet(set []string, target string) bool {
-	for _, item := range set {
-		if item == target {
-			return true
-		}
-	}
-	return false
+	return nil, fmt.Errorf("blob %.12s: not held here", hash)
 }

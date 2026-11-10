@@ -1,8 +1,10 @@
 // Pebble-backed persistence for one bucket's index (ADR 0009: adopt the KV,
 // build the semantics). Key layout:
 //
-//	o/<objectID>          -> Object (CBOR)
-//	l/<blobHash>/<nodeID> -> Location (CBOR)
+//	o/<objectID>            -> Object (CBOR)
+//	l/<blobHash>/<nodeID>   -> Location (CBOR)
+//	r/<blobHash>/<objectID> -> "" (which objects point at a blob)
+//	m/<name>                -> index bookkeeping
 //
 // List scans are prefix iterations — fine at personal-collection scale;
 // secondary indexes (tag -> objects) can come with the faceted surface.
@@ -13,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -21,9 +24,15 @@ import (
 // sequences, and both the control API and the sync engine write
 // concurrently once the daemon exists.
 type Store struct {
-	mu sync.Mutex
-	db *pebble.DB
+	mu         sync.Mutex
+	db         *pebble.DB
+	generation atomic.Uint64
 }
+
+// Generation changes with every write to the index. A summary computed at
+// one generation holds until the next: callers cache on it instead of
+// rescanning.
+func (s *Store) Generation() uint64 { return s.generation.Load() }
 
 // quietLogger drops Pebble's operational chatter (WAL replay notes etc.) —
 // it drowns CLI output; real errors still surface as returned errors.
@@ -40,7 +49,12 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening index: %w", err)
 	}
-	return &Store{db: db}, nil
+	store := &Store{db: db}
+	if err := store.backfillBlobRefs(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return store, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -59,10 +73,114 @@ func (s *Store) PutObject(obj *Object) (*Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.db.Set([]byte("o/"+obj.ID), raw, pebble.Sync); err != nil {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Set([]byte("o/"+obj.ID), raw, nil); err != nil {
 		return nil, err
 	}
+	if err := setBlobRefs(batch, obj); err != nil {
+		return nil, err
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return nil, err
+	}
+	s.generation.Add(1)
 	return obj, nil
+}
+
+// blobRefsKey marks an index whose r/ entries cover every object.
+const blobRefsKey = "m/blobrefs"
+
+func blobRefKey(blob, objectID string) []byte { return []byte("r/" + blob + "/" + objectID) }
+
+// setBlobRefs records which blobs an object's heads point at. Entries are
+// only ever added: a head that moved on leaves a stale one behind, which
+// ReferencesBlob checks against the object and drops.
+func setBlobRefs(batch *pebble.Batch, obj *Object) error {
+	for _, rev := range obj.Heads {
+		if rev.Blob == "" {
+			continue
+		}
+		if err := batch.Set(blobRefKey(rev.Blob, obj.ID), nil, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// backfillBlobRefs writes the r/ entries of an index created before they
+// existed. One pass, once.
+func (s *Store) backfillBlobRefs() error {
+	if _, closer, err := s.db.Get([]byte(blobRefsKey)); err == nil {
+		return closer.Close()
+	}
+	objs, err := s.DumpObjects()
+	if err != nil {
+		return err
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	for _, obj := range objs {
+		if err := setBlobRefs(batch, obj); err != nil {
+			return err
+		}
+	}
+	if err := batch.Set([]byte(blobRefsKey), []byte{1}, nil); err != nil {
+		return err
+	}
+	return batch.Commit(pebble.Sync)
+}
+
+// ReferencesBlob reports whether a head of any object, live or tombstoned,
+// points at the blob. A handful of point reads, whatever the index size.
+func (s *Store) ReferencesBlob(blob string) (bool, error) {
+	if blob == "" {
+		return false, nil
+	}
+	prefix := "r/" + blob + "/"
+	it, err := s.db.NewIter(prefixBounds(prefix))
+	if err != nil {
+		return false, err
+	}
+	defer it.Close()
+	var stale [][]byte
+	found := false
+	for it.First(); it.Valid() && !found; it.Next() {
+		obj, err := s.GetObject(strings.TrimPrefix(string(it.Key()), prefix))
+		if err == nil {
+			for _, rev := range obj.Heads {
+				if rev.Blob == blob {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			stale = append(stale, append([]byte(nil), it.Key()...))
+		}
+	}
+	if err := it.Error(); err != nil {
+		return false, err
+	}
+	// Dropping a stale entry races a write that re-adds it; take the write
+	// lock and look again before deleting.
+	for _, key := range stale {
+		s.dropStaleRef(blob, strings.TrimPrefix(string(key), prefix))
+	}
+	return found, nil
+}
+
+func (s *Store) dropStaleRef(blob, objectID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if obj, err := s.GetObject(objectID); err == nil {
+		for _, rev := range obj.Heads {
+			if rev.Blob == blob {
+				return
+			}
+		}
+	}
+	_ = s.db.Delete(blobRefKey(blob, objectID), pebble.NoSync)
 }
 
 // GetObject loads one object record.
@@ -146,7 +264,11 @@ func (s *Store) PutLocation(loc Location) error {
 	if err != nil {
 		return err
 	}
-	return s.db.Set(key, raw, pebble.Sync)
+	if err := s.db.Set(key, raw, pebble.Sync); err != nil {
+		return err
+	}
+	s.generation.Add(1)
+	return nil
 }
 
 // Locations lists the recorded holders of a blob.

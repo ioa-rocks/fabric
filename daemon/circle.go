@@ -1272,6 +1272,16 @@ func (s *CircleService) InCircleWith(ctx context.Context, peerID peer.ID, did, k
 	return s.Verify(ctx, peerID, statement.Want{Sub: did, Res: statement.Resource{Kind: kind, Name: statement.Any}, Verb: verb}) == nil
 }
 
+// Allows is InCircleWith for one named resource: the device's admission
+// in that circle must carry verb on res itself, so an admission scoped to
+// one bucket opens that bucket and no other.
+func (s *CircleService) Allows(ctx context.Context, peerID peer.ID, did string, res statement.Resource, verb string) bool {
+	if !s.InCircle(ctx, peerID, did) {
+		return false
+	}
+	return s.Verify(ctx, peerID, statement.Want{Sub: did, Res: res, Verb: verb}) == nil
+}
+
 // RequireAny wraps a stream handler so that only members sharing at least
 // one circle with this node reach it (on top of membership and scope,
 // which RequireMember enforces). Handlers then narrow per resource with

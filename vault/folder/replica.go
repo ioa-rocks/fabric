@@ -53,6 +53,9 @@ type Replica struct {
 	Dir    string
 	Handle *store.Handle
 	Fetch  Fetcher
+	// Local finds a blob this device already holds outside the folder (the
+	// bucket's blobs from before it became a folder); nil means nowhere.
+	Local func(hash string) (string, error)
 	// Log receives one-line notes about held and skipped work; nil discards.
 	Log func(format string, args ...any)
 

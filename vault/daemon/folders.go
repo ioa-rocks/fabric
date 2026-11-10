@@ -119,6 +119,7 @@ func (d *Daemon) openFolder(dir string, decl store.FolderDecl) error {
 		return err
 	}
 	rep.Log = log.Printf
+	rep.Local = d.Store.BlobPath
 	rep.Fetch = func(hash string) error { return d.fetchAnywhere(handle, hash) }
 	handle.SetHolder(rep, "path")
 	lf := &liveFolder{rep: rep, decl: decl, watched: map[string]bool{}, scan: make(chan struct{}, 1), mat: make(chan struct{}, 1), done: make(chan struct{})}

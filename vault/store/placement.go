@@ -126,6 +126,7 @@ func (c *Store) SetPlacement(bucketID string, placement Placement) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	defer c.placementEpoch.Add(1)
 	if placement.Mode == SubNone {
 		delete(c.placements, bucketID)
 	} else {

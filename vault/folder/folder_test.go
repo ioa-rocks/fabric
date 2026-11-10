@@ -506,3 +506,40 @@ func TestOpenFileNeverServesAChangedWorkingFile(t *testing.T) {
 		}
 	}
 }
+
+// A bucket this device already held in full becomes a folder without
+// asking the mesh for a single byte: the content is in the local blob
+// store, and Materialize takes it from there.
+func TestMaterializeTakesContentHeldLocally(t *testing.T) {
+	source := newDevice(t, "source", nil, nil)
+	write(t, source, "album/beach.jpg", "jpeg bytes")
+	scan(t, source)
+	genesis, policy, err := source.c.BucketRaw(source.h.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newDevice(t, "target", genesis, policy)
+	exchange(t, source, target)
+	blob := ""
+	objs, err := target.h.Index.ListObjects()
+	if err != nil || len(objs) != 1 {
+		t.Fatalf("target index: %v %v", objs, err)
+	}
+	blob = objs[0].Blob()
+	// The bytes sit in the device's blob store, as a full subscription left them.
+	if got, _, err := target.c.Blobs.Put(strings.NewReader("jpeg bytes")); err != nil || got != blob {
+		t.Fatalf("seeding the blob store: %s %v", got, err)
+	}
+	fetches := 0
+	target.rep.Fetch = func(string) error {
+		fetches++
+		return fmt.Errorf("the mesh must not be asked")
+	}
+	target.rep.Local = target.c.BlobPath
+	if report := materialize(t, target); report.Added != 1 {
+		t.Fatalf("materialize: %+v", report)
+	}
+	if got := read(t, target, "album/beach.jpg"); got != "jpeg bytes" || fetches != 0 {
+		t.Fatalf("content %q after %d fetches", got, fetches)
+	}
+}

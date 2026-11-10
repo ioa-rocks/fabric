@@ -407,9 +407,8 @@ func (d *Daemon) handleBuckets(resp http.ResponseWriter, _ *http.Request) {
 		}
 		sort.Strings(info.Mounts)
 		if handle, err := d.handle(id); err == nil {
-			info.Objects, info.Held, _ = handle.Stats()
-			if cs, err := handle.Conflicts(); err == nil {
-				info.Conflicts = len(cs)
+			if summary, err := handle.Summary(); err == nil {
+				info.Objects, info.Held, info.Conflicts = summary.Objects, summary.Held, summary.Conflicts
 			}
 			if set, err := handle.Held(); err == nil {
 				info.HeldDeletions = len(set)

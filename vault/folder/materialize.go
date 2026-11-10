@@ -212,6 +212,11 @@ func (r *Replica) place(rel, objectID string, rev index.Revision, conflictOf str
 		}
 	}
 	src, err := r.Path(rev.Blob)
+	if err != nil && r.Local != nil {
+		// Held on this device already: a bucket that was subscribed in full
+		// before it became a folder needs no peer to fill the folder.
+		src, err = r.Local(rev.Blob)
+	}
 	if err != nil {
 		if r.Fetch == nil {
 			return false, fmt.Errorf("content %.12s not held and no fetcher", rev.Blob)
