@@ -676,6 +676,11 @@ func (h *Handle) Stats() (objects, held int, err error) {
 // ResolveObject finds one object by ID prefix (≥8 chars) or exact display
 // name, erroring on ambiguity.
 func (h *Handle) ResolveObject(ref string) (*index.Object, error) {
+	// A whole ID is a point lookup: mounts and players name objects that
+	// way on every range they read, and must not pay a full index scan.
+	if obj, err := h.Index.GetObject(ref); err == nil && !obj.IsDeleted() {
+		return obj, nil
+	}
 	all, err := h.Index.ListObjects()
 	if err != nil {
 		return nil, err

@@ -120,6 +120,12 @@ func (s *memorySource) GetBlob(_, ref, blob string) (io.ReadCloser, error) {
 	defer s.mu.Unlock()
 	return io.NopCloser(bytes.NewReader(append([]byte(nil), s.data[blob]...))), nil
 }
+func (s *memorySource) GetRange(_, _, blob string, offset, length int64) (io.ReadCloser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data := s.data[blob]
+	return io.NopCloser(bytes.NewReader(append([]byte(nil), data[offset:min(offset+length, int64(len(data)))]...))), nil
+}
 func (s *memorySource) Resolve(_, ref string) (daemon.ObjectInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -155,6 +161,9 @@ func (fakeSource) SetAttr(string, string, *uint32, *int64) (daemon.ObjectInfo, e
 }
 func (fakeSource) GetBlob(string, string, string) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("conflict data")), nil
+}
+func (fakeSource) GetRange(string, string, string, int64, int64) (io.ReadCloser, error) {
+	return nil, errors.New("no ranges")
 }
 func (fakeSource) Resolve(string, string) (daemon.ObjectInfo, error) { return daemon.ObjectInfo{}, nil }
 

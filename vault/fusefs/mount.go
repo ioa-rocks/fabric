@@ -33,6 +33,8 @@ type source interface {
 	PutEntry(bucket, name, kind, target string, mode uint32) (daemon.ObjectInfo, error)
 	SetAttr(bucket, ref string, mode *uint32, mtime *int64) (daemon.ObjectInfo, error)
 	GetBlob(bucket, ref, blob string) (io.ReadCloser, error)
+	// GetRange reads length bytes of one head's content from offset.
+	GetRange(bucket, ref, blob string, offset, length int64) (io.ReadCloser, error)
 	Resolve(bucket, ref string) (daemon.ObjectInfo, error)
 	// Ping must reach the daemon every time it is called. close(2) relies on
 	// it to decide whether staged content can still be published, so a
@@ -576,6 +578,9 @@ func (f *fileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32,
 		if write {
 			return nil, 0, syscall.EPERM
 		}
+		if conflict.Size >= lazyReadMin {
+			return newRangeHandle(f.m, object.ID, conflict.Blob, conflict.Size), fuse.FOPEN_DIRECT_IO, 0
+		}
 		tmp, err := f.m.stage()
 		if err != nil {
 			return nil, 0, syscall.EIO
@@ -605,6 +610,9 @@ func (f *fileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32,
 	}
 	object := f.object
 	f.mu.Unlock()
+	if !write && object.ID != "" && object.Blob != "" && object.Size >= lazyReadMin {
+		return newRangeHandle(f.m, object.ID, object.Blob, object.Size), fuse.FOPEN_DIRECT_IO, 0
+	}
 	tmp, err := f.m.stage()
 	if err != nil {
 		f.cancelWriter(write)
@@ -733,6 +741,7 @@ func reserveUnpublished(dir, name string) (string, error) {
 	return taken, nil
 }
 
+var _ fs.FileReader = (*rangeHandle)(nil)
 var _ fs.NodeOnAdder = (*dirNode)(nil)
 var _ fs.NodeGetattrer = (*dirNode)(nil)
 var _ fs.NodeReaddirer = (*dirNode)(nil)
