@@ -35,6 +35,13 @@ func newMemorySource() *memorySource {
 	return &memorySource{objects: map[string]daemon.ObjectInfo{}, data: map[string][]byte{}}
 }
 func (s *memorySource) byName(name string) (daemon.ObjectInfo, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.byNameLocked(name)
+}
+
+// byNameLocked looks up an object while the caller holds s.mu.
+func (s *memorySource) byNameLocked(name string) (daemon.ObjectInfo, bool) {
 	for _, o := range s.objects {
 		if o.Name == name {
 			return o, true
@@ -245,9 +252,7 @@ func TestWritableMountLifecycle(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	src.mu.Lock()
 	_, publishedEarly := src.byName("2026/shell.txt")
-	src.mu.Unlock()
 	if publishedEarly {
 		t.Fatal("duplicated-descriptor flush published an incomplete file")
 	}
@@ -264,7 +269,7 @@ func TestWritableMountLifecycle(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for !published && time.Now().Before(deadline) {
 		src.mu.Lock()
-		shellObject, published = src.byName("2026/shell.txt")
+		shellObject, published = src.byNameLocked("2026/shell.txt")
 		shellData = string(src.data[shellObject.ID])
 		src.mu.Unlock()
 		if !published {

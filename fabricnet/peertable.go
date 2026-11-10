@@ -503,9 +503,11 @@ func (t *PeerTable) GC(now time.Time) {
 
 // ---- readers: thin wrappers over the current view ---------------------------
 
-func (t *PeerTable) Rosters() []*circle.Roster                         { return t.View().Rosters() }
-func (t *PeerTable) RosterFor(circleDID string) (*circle.Roster, bool) { return t.View().RosterFor(circleDID) }
-func (t *PeerTable) Roots() statement.Roots                            { return tableRoots{t} }
+func (t *PeerTable) Rosters() []*circle.Roster { return t.View().Rosters() }
+func (t *PeerTable) RosterFor(circleDID string) (*circle.Roster, bool) {
+	return t.View().RosterFor(circleDID)
+}
+func (t *PeerTable) Roots() statement.Roots { return tableRoots{t} }
 func (t *PeerTable) IsMember(peerID peer.ID, now time.Time) bool {
 	return t.View().IsMember(peerID, now)
 }
@@ -538,7 +540,9 @@ func (t *PeerTable) Route(dst netip.Addr) (peer.ID, bool) { return t.View().Rout
 func (t *PeerTable) AddrConflict(peerID peer.ID) (netip.Addr, bool) {
 	return t.View().AddrConflict(peerID, time.Now())
 }
-func (t *PeerTable) AddrOf(peerID peer.ID) (netip.Addr, bool) { return t.View().AddrOf(peerID, time.Now()) }
+func (t *PeerTable) AddrOf(peerID peer.ID) (netip.Addr, bool) {
+	return t.View().AddrOf(peerID, time.Now())
+}
 func (t *PeerTable) Resolve(name string) (netip.Addr, bool) {
 	return t.View().Resolve(name, time.Now())
 }
