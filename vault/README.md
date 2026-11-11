@@ -235,9 +235,12 @@ Next: live two-machine rollout (desk + NAS), then capability grants
 the projection consumer. 2026-11-10: a cache placement takes a budget
 (`-keep`) and drops by least recent read, verify-before-drop
 (`/vault/hold/1`). 2026-11-11: content nothing on the device retains is
-reclaimed hourly (`fabric bucket reclaim -dry-run` to preview) — overwritten
-revisions, deletions past `trash_days` — and held content is read back and
+reclaimed hourly (`fabric bucket reclaim -dry-run` to preview) — versions
+past `version_days`, deletions past `trash_days` — and held content is read back and
 repaired from a peer (`fabric bucket scrub [bucket]`, the whole device every
-30 days). Deferred: shard groups, health targets, delta sync. The
+30 days). The content a file had before it was overwritten is kept for the
+policy's `version_days` (unset: as long as the trash) and can be listed and
+made current again (`fabric bucket versions`, `fabric bucket revert`).
+Deferred: shard groups, health targets, delta sync. The
 years-old Python prototype lives at `../../vault_proto_py`
 (parts-bin).

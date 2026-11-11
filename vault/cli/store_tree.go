@@ -14,6 +14,8 @@ type treeStore interface {
 	SetPolicy(bucket string, policyRaw []byte) (bucket.Policy, error)
 	Trash(bucket string) ([]daemon.ObjectInfo, error)
 	Restore(bucket, ref string) (daemon.ObjectInfo, error)
+	Versions(bucket, ref string) ([]daemon.VersionEntry, error)
+	Revert(bucket, ref, version string) (daemon.ObjectInfo, error)
 	Conflicts(bucket string) ([]daemon.ConflictEntry, error)
 	Resolve(bucket, ref string) (daemon.ObjectInfo, error)
 	Held(bucket string) ([]daemon.HeldEntry, error)
@@ -54,6 +56,33 @@ func (s *directStore) Trash(name string) ([]daemon.ObjectInfo, error) {
 		out = append(out, daemon.Info(o))
 	}
 	return out, nil
+}
+
+func (s *directStore) Versions(name, ref string) ([]daemon.VersionEntry, error) {
+	handle, err := s.handle(name)
+	if err != nil {
+		return nil, err
+	}
+	obj, err := handle.ResolveObject(ref)
+	if err != nil {
+		return nil, err
+	}
+	return daemon.VersionsOf(handle, obj)
+}
+
+func (s *directStore) Revert(name, ref, version string) (daemon.ObjectInfo, error) {
+	handle, err := s.handle(name)
+	if err != nil {
+		return daemon.ObjectInfo{}, err
+	}
+	obj, err := handle.ResolveObject(ref)
+	if err != nil {
+		return daemon.ObjectInfo{}, err
+	}
+	if obj, err = handle.Revert(obj, version); err != nil {
+		return daemon.ObjectInfo{}, err
+	}
+	return daemon.Info(obj), nil
 }
 
 func (s *directStore) Restore(name, ref string) (daemon.ObjectInfo, error) {

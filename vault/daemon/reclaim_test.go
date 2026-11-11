@@ -4,15 +4,49 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"ioa.rocks/fabric/circle"
+	"ioa.rocks/fabric/vault/bucket"
 	"ioa.rocks/fabric/vault/daemon"
 	"ioa.rocks/fabric/vault/store"
 )
+
+// setVersionDays signs a policy revision for the bucket on the holder, and
+// waits for the reader to have it when the reader is to follow it.
+func (p *blobPair) setVersionDays(t *testing.T, bucketName string, days int, onReader bool) {
+	t.Helper()
+	owner, err := circle.Only(circle.Root(p.holderState))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := owner.Unlock("pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := p.holderClient.Policy(bucketName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed, err := store.SignPolicyRevision(key, current, func(policy *bucket.Policy) { policy.VersionDays = days })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.holderClient.SetPolicy(bucketName, signed); err != nil {
+		t.Fatal(err)
+	}
+	if onReader {
+		waitFor(t, "the reader to have the new policy", func() bool {
+			policy, err := p.readerClient.Policy(bucketName)
+			return err == nil && policy.VersionDays == days
+		})
+	}
+}
 
 // later moves the retention clock forward for the rest of the test.
 func later(t *testing.T, ahead time.Duration) {
@@ -31,12 +65,74 @@ func reclaimNow(t *testing.T, device *daemon.Daemon) daemon.ReclaimReport {
 	return report
 }
 
-// An overwritten file's old content leaves both the device that holds the
-// bucket in full and the cache, and the cache's budget is not left waiting
-// for a confirmation that can never come.
+// Content a file had before it was overwritten stays on the devices that
+// hold the bucket, is listed as a version and can be made current again;
+// once the bucket's window has passed it is reclaimed and no longer listed.
+func TestOverwrittenContentIsKeptForItsWindow(t *testing.T) {
+	pair := newBlobPair(t)
+	t.Cleanup(daemon.SetReclaimGrace(0))
+	first, second := film(1<<18), film(1<<18)
+	object := pair.put(t, "plan.md", first)
+	waitFor(t, "the bucket known on the reader", func() bool { return pair.readerClient.Sub("films", "full") == nil })
+	waitFor(t, "the reader to hold the first content", func() bool { return pair.reader.HoldsBlob("films", object.Blob) })
+	replaced, err := pair.holderClient.Replace("films", object.ID, bytes.NewReader(second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the reader to hold the second content", func() bool { return pair.reader.HoldsBlob("films", replaced.Blob) })
+
+	clients := map[string]*daemon.Client{"holder": pair.holderClient, "reader": pair.readerClient}
+	for name, device := range map[string]*daemon.Daemon{"holder": pair.holder, "reader": pair.reader} {
+		if report := reclaimNow(t, device); report.Blobs != 0 || !device.HoldsBlob("films", object.Blob) {
+			t.Fatalf("%s: %d blobs reclaimed right after the overwrite; want the earlier content kept", name, report.Blobs)
+		}
+		versions, err := clients[name].Versions("films", object.ID)
+		if err != nil || len(versions) != 1 || versions[0].Blob != object.Blob || !versions[0].Held {
+			t.Fatalf("%s lists versions %+v, %v; want the first content, held", name, versions, err)
+		}
+	}
+
+	// Bring the first content back from the reader: both devices follow,
+	// and the second content is now the version.
+	if _, err := pair.readerClient.Revert("films", object.ID, object.Blob[:12]); err != nil {
+		t.Fatalf("revert: %v", err)
+	}
+	waitFor(t, "the holder to serve the first content again", func() bool {
+		body, err := pair.holderClient.Get("films", object.ID)
+		if err != nil {
+			return false
+		}
+		defer body.Close()
+		got, err := io.ReadAll(body)
+		return err == nil && bytes.Equal(got, first)
+	})
+	waitFor(t, "the second content listed as the version on the holder", func() bool {
+		versions, err := pair.holderClient.Versions("films", object.ID)
+		return err == nil && len(versions) > 0 && versions[0].Blob == replaced.Blob
+	})
+
+	later(t, 31*24*time.Hour)
+	for name, device := range map[string]*daemon.Daemon{"holder": pair.holder, "reader": pair.reader} {
+		if report := reclaimNow(t, device); report.Blobs != 1 || device.HoldsBlob("films", replaced.Blob) {
+			t.Fatalf("%s, a month on: %d reclaimed; want the version past its window gone", name, report.Blobs)
+		}
+		if !device.HoldsBlob("films", object.Blob) {
+			t.Fatalf("%s lost the current content", name)
+		}
+		if versions, err := clients[name].Versions("films", object.ID); err != nil || len(versions) != 0 {
+			t.Fatalf("%s still lists versions %+v, %v", name, versions, err)
+		}
+	}
+}
+
+// With versions switched off for the bucket, an overwritten file's old
+// content leaves both the device that holds the bucket in full and the
+// cache, and the cache's budget is not left waiting for a confirmation that
+// can never come.
 func TestOverwriteReclaimsTheOldRevision(t *testing.T) {
 	pair := newBlobPair(t)
 	pair.cacheWithBudget(t, 3<<19) // 1.5 MiB: room for one film, not two
+	pair.setVersionDays(t, "films", -1, true)
 	t.Cleanup(daemon.SetReclaimGrace(0))
 	first, second := film(1<<20), film(1<<20)
 	object := pair.put(t, "film.mkv", first)
@@ -82,6 +178,7 @@ func TestOverwriteReclaimsTheOldRevision(t *testing.T) {
 // say: its record may not be written yet.
 func TestReclaimLeavesWhatJustArrived(t *testing.T) {
 	pair := newBlobPair(t)
+	pair.setVersionDays(t, "films", -1, false)
 	first := film(1 << 18)
 	object := pair.put(t, "note.txt", first)
 	if _, err := pair.holderClient.Replace("films", object.ID, bytes.NewReader(film(1<<18))); err != nil {
@@ -143,6 +240,8 @@ func TestReclaimKeepsWhatAnotherBucketStillNames(t *testing.T) {
 	if _, err := pair.holderClient.CreateBucket(genesis, policy); err != nil {
 		t.Fatal(err)
 	}
+	pair.setVersionDays(t, "films", -1, false)
+	pair.setVersionDays(t, "copies", -1, false)
 	content := film(1 << 18)
 	copied, err := pair.holderClient.Put("copies", "same.mkv", bytes.NewReader(content), nil)
 	if err != nil {
@@ -217,8 +316,9 @@ func TestScrubRepairsADamagedBlob(t *testing.T) {
 }
 
 // A folder replica keeps the bytes of a file it replaced in its own shadow
-// store. Once the bucket no longer retains them they are reclaimed from
-// there like from any other store, and the folder's file is untouched.
+// store, where they are the file's earlier version. Once the bucket no
+// longer retains them they are reclaimed from there like from any other
+// store, and the folder's file is untouched.
 func TestFolderShadowIsReclaimed(t *testing.T) {
 	oldSync, oldDebounce, oldDegraded := daemon.SyncInterval, daemon.FolderWatchDebounce, daemon.FolderDegradedScanInterval
 	daemon.SyncInterval, daemon.FolderWatchDebounce, daemon.FolderDegradedScanInterval = 300*time.Millisecond, 200*time.Millisecond, time.Second
@@ -280,8 +380,15 @@ func TestFolderShadowIsReclaimed(t *testing.T) {
 	if _, err := os.Stat(shadowCopy); err != nil {
 		t.Fatalf("precondition: the replaced bytes are in the shadow store: %v", err)
 	}
+	if report := reclaimNow(t, deskDaemon); report.Blobs != 0 {
+		t.Fatalf("reclaimed %d blobs on the desk while the replaced note is still a version", report.Blobs)
+	}
+	if versions, err := deskClient.Versions("notes", "plan.md"); err != nil || len(versions) != 1 || !versions[0].Held {
+		t.Fatalf("the desk lists versions %+v, %v; want the replaced note, held", versions, err)
+	}
+	later(t, 31*24*time.Hour)
 	if report := reclaimNow(t, deskDaemon); report.Blobs != 1 {
-		t.Fatalf("reclaimed %d blobs on the desk; want the one replaced note", report.Blobs)
+		t.Fatalf("a month on, reclaimed %d blobs on the desk; want the one replaced note", report.Blobs)
 	}
 	if _, err := os.Stat(shadowCopy); !os.IsNotExist(err) {
 		t.Fatalf("the replaced bytes are still in the shadow store: %v", err)

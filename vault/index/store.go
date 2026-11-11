@@ -5,6 +5,7 @@
 //	l/<blobHash>/<nodeID>   -> Location (CBOR)
 //	r/<blobHash>/<objectID> -> "" (which objects point at a blob)
 //	a/<blobHash>            -> when this device last read the blob (never synced)
+//	v/…, vb/…               -> earlier contents of objects (version.go; never synced)
 //	m/<name>                -> index bookkeeping
 //
 // List scans are prefix iterations — fine at personal-collection scale;
@@ -71,6 +72,8 @@ func (s *Store) PutObject(obj *Object) (*Object, error) {
 	cur, err := s.GetObject(obj.ID)
 	if err == nil {
 		obj = Merge(cur, obj)
+	} else {
+		cur = nil
 	}
 	raw, err := obj.Marshal()
 	if err != nil {
@@ -79,6 +82,9 @@ func (s *Store) PutObject(obj *Object) (*Object, error) {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	if err := batch.Set([]byte("o/"+obj.ID), raw, nil); err != nil {
+		return nil, err
+	}
+	if err := recordVersions(batch, cur, obj, time.Now().UnixNano()); err != nil {
 		return nil, err
 	}
 	if err := setBlobRefs(batch, obj); err != nil {

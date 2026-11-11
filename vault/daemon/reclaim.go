@@ -159,6 +159,22 @@ func (d *Daemon) forgetGone(hash string) {
 	}
 }
 
+// expireVersions drops, in every bucket, the records of earlier versions
+// that are past the bucket's window, so that the versions a user is shown
+// are the ones that can still be brought back.
+func (d *Daemon) expireVersions() {
+	handles, err := d.bucketHandles()
+	if err != nil {
+		return
+	}
+	now := store.Clock()
+	for _, handle := range handles {
+		if _, err := handle.ExpireVersions(now); err != nil {
+			log.Printf("reclaim: bucket %q: forgetting old versions: %v", handle.Bucket.Genesis.Name, err)
+		}
+	}
+}
+
 func (d *Daemon) reclaimLoop() {
 	ticker := time.NewTicker(ReclaimInterval)
 	defer ticker.Stop()
@@ -187,6 +203,9 @@ func (d *Daemon) reclaim(dryRun bool) (ReclaimReport, error) {
 	d.evictMu.Lock()
 	defer d.evictMu.Unlock()
 
+	if !dryRun {
+		d.expireVersions()
+	}
 	retained, err := d.retainedAnywhere(store.Clock())
 	if err != nil {
 		return report, err

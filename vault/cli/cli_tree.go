@@ -35,7 +35,7 @@ func cmdPolicy(args []string) error {
 		return nil
 	}
 	if pos[1] != "set" || len(pos) < 3 {
-		return fmt.Errorf("usage: fabric bucket policy <bucket> set key=value ... (keys: copies trash_days ignore symlinks nested_repos hold_min_count hold_min_percent)")
+		return fmt.Errorf("usage: fabric bucket policy <bucket> set key=value ... (keys: copies trash_days version_days ignore symlinks nested_repos hold_min_count hold_min_percent)")
 	}
 	// Signing happens here, where the passphrase prompt is — with the key
 	// of the circle that owns this bucket.
@@ -98,6 +98,12 @@ func setPolicyField(policy *bucket.Policy, key, val string) error {
 		policy.Copies, err = num()
 	case "trash_days":
 		policy.TrashDays, err = num()
+	case "version_days":
+		if val == "off" {
+			policy.VersionDays = -1
+		} else {
+			policy.VersionDays, err = num()
+		}
 	case "hold_min_count":
 		policy.HoldMinCount, err = num()
 	case "hold_min_percent":
@@ -126,8 +132,17 @@ func printPolicy(policy bucket.Policy) {
 	if enabled {
 		hold = fmt.Sprintf(">= %d objects and >= %d%% of the bucket", minCount, minPercent)
 	}
-	fmt.Printf("version       %d\ncopies        %d\ntrash_days    %d\nsymlinks      %s\nnested_repos  %s\nhold          %s\nignore        %s\n",
-		policy.Version, policy.Copies, policy.TrashDays, policy.SymlinkMode(), policy.NestedRepoMode(), hold, strings.Join(policy.Ignore, ", "))
+	versions := "off — overwritten content is not kept"
+	if window, forever := policy.VersionWindow(); forever {
+		versions = "kept for good"
+	} else if window > 0 {
+		versions = fmt.Sprintf("%d days", int(window/(24*time.Hour)))
+		if policy.VersionDays == 0 {
+			versions += " (follows trash_days)"
+		}
+	}
+	fmt.Printf("version       %d\ncopies        %d\ntrash_days    %d\nversion_days  %s\nsymlinks      %s\nnested_repos  %s\nhold          %s\nignore        %s\n",
+		policy.Version, policy.Copies, policy.TrashDays, versions, policy.SymlinkMode(), policy.NestedRepoMode(), hold, strings.Join(policy.Ignore, ", "))
 }
 
 func cmdTrash(args []string) error {
@@ -173,6 +188,58 @@ func cmdRestore(args []string) error {
 		return err
 	}
 	fmt.Printf("restored %s (%s)\n", obj.ID[:12], obj.Name)
+	return nil
+}
+
+func cmdVersions(args []string) error {
+	fs := flag.NewFlagSet("versions", flag.ExitOnError)
+	pth := pathFlags(fs)
+	pos := parse(fs, args, -1)
+	if len(pos) != 2 {
+		return fmt.Errorf("usage: fabric bucket versions <bucket> <object-ref>")
+	}
+	st, err := openStore(pth)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	versions, err := st.Versions(pos[0], pos[1])
+	if err != nil {
+		return err
+	}
+	if len(versions) == 0 {
+		fmt.Println("no earlier versions on record on this device")
+		return nil
+	}
+	for _, version := range versions {
+		where := "on this device"
+		if !version.Held {
+			where = "not on this device — fetched from another if one has it"
+		}
+		fmt.Printf("%s  %10s  written %s  replaced %s  %s\n", version.Blob[:12], formatSize(version.Size),
+			time.Unix(0, version.Written).Format("2006-01-02 15:04"), time.Unix(0, version.Replaced).Format("2006-01-02 15:04"), where)
+	}
+	fmt.Printf("bring one back with: fabric bucket revert %s %s <version>\n", pos[0], pos[1])
+	return nil
+}
+
+func cmdRevert(args []string) error {
+	fs := flag.NewFlagSet("revert", flag.ExitOnError)
+	pth := pathFlags(fs)
+	pos := parse(fs, args, -1)
+	if len(pos) != 3 {
+		return fmt.Errorf("usage: fabric bucket revert <bucket> <object-ref> <version>")
+	}
+	st, err := openStore(pth)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	obj, err := st.Revert(pos[0], pos[1], pos[2])
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s is back at version %.12s; what it held until now is kept as a version\n", obj.Name, obj.Blob)
 	return nil
 }
 

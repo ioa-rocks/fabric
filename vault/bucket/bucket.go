@@ -46,6 +46,10 @@ type Policy struct {
 	Version   int64  `cbor:"version" json:"version"`       // monotonic; higher wins
 	Copies    int    `cbor:"copies" json:"copies"`         // health target: want >= N complete copies
 	TrashDays int    `cbor:"trash_days" json:"trash_days"` // retention window for tombstoned objects
+	// VersionDays is how long the content a file had before it was
+	// overwritten stays available: 0 follows the trash window, a negative
+	// value keeps no earlier versions (vault ADR 0006).
+	VersionDays int `cbor:"version_days,omitempty" json:"version_days"`
 
 	// Sync axes (vault ADR 0001 §5): what a tree surface synchronizes is
 	// bucket state, signed like the rest, never a per-device setting.
@@ -213,6 +217,20 @@ func (p Policy) TrashWindow() (window time.Duration, ok bool) {
 		return DefaultTrashDays * 24 * time.Hour, true
 	}
 	return time.Duration(p.TrashDays) * 24 * time.Hour, true
+}
+
+// VersionWindow is how long overwritten content is kept: VersionDays, the
+// trash window when that is zero, nothing when it is negative. forever is
+// set when the trash window it follows has no end.
+func (p Policy) VersionWindow() (window time.Duration, forever bool) {
+	switch {
+	case p.VersionDays < 0:
+		return 0, false
+	case p.VersionDays == 0:
+		trash, limited := p.TrashWindow()
+		return trash, !limited
+	}
+	return time.Duration(p.VersionDays) * 24 * time.Hour, false
 }
 
 // DefaultPolicy returns the v2 defaults for a fresh bucket.

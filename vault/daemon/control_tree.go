@@ -26,6 +26,36 @@ type ConflictEntry struct {
 	Copy   ConflictInfo `json:"copy"`
 }
 
+// VersionEntry is an earlier content of an object that can still be
+// brought back (vault ADR 0006).
+type VersionEntry struct {
+	Blob     string `json:"blob"`
+	Size     int64  `json:"size"`
+	Written  int64  `json:"written"`  // when that content was written, Unix nanoseconds
+	By       string `json:"by"`       // the device that wrote it
+	Replaced int64  `json:"replaced"` // when this device saw it replaced
+	Held     bool   `json:"held"`     // its content is on this device
+}
+
+// VersionsOf renders an object's versions for the API.
+func VersionsOf(handle *store.Handle, obj *index.Object) ([]VersionEntry, error) {
+	versions, err := handle.Versions(obj)
+	if err != nil {
+		return nil, err
+	}
+	entries := []VersionEntry{}
+	for _, info := range versions {
+		rev := info.Version.Revision
+		entries = append(entries, VersionEntry{Blob: rev.Blob, Size: rev.Size, Written: rev.TS, By: rev.By, Replaced: info.Version.SupersededAt, Held: info.Held})
+	}
+	return entries, nil
+}
+
+type revertBody struct {
+	Ref     string `json:"ref"`
+	Version string `json:"version"` // the start of the version's content hash
+}
+
 // HeldEntry is one parked deletion (ADR 0001 §4).
 type HeldEntry struct {
 	ID        string `json:"id"`
@@ -58,6 +88,8 @@ func (d *Daemon) treeRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /v0/buckets/{bucket}/policy", d.handleSetPolicy)
 	mux.HandleFunc("GET /v0/buckets/{bucket}/trash", d.handleTrash)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/restore", d.handleRestore)
+	mux.HandleFunc("GET /v0/buckets/{bucket}/versions", d.handleVersions)
+	mux.HandleFunc("POST /v0/buckets/{bucket}/revert", d.handleRevert)
 	mux.HandleFunc("GET /v0/buckets/{bucket}/conflicts", d.handleConflicts)
 	mux.HandleFunc("POST /v0/buckets/{bucket}/resolve", d.handleResolve)
 	mux.HandleFunc("GET /v0/buckets/{bucket}/held", d.handleHeld)
@@ -161,6 +193,55 @@ func (d *Daemon) handleSetPolicy(resp http.ResponseWriter, req *http.Request) {
 	d.kickFolders(handle.ID())
 	d.kickSync()
 	writeJSON(resp, handle.CurrentPolicy())
+}
+
+func (d *Daemon) handleVersions(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
+	if err != nil {
+		httpErr(resp, err)
+		return
+	}
+	obj, err := handle.ResolveObject(req.URL.Query().Get("ref"))
+	if err != nil {
+		httpErr(resp, err)
+		return
+	}
+	entries, err := VersionsOf(handle, obj)
+	if err != nil {
+		httpErr(resp, err)
+		return
+	}
+	writeJSON(resp, entries)
+}
+
+func (d *Daemon) handleRevert(resp http.ResponseWriter, req *http.Request) {
+	handle, err := d.handle(req.PathValue("bucket"))
+	if err != nil {
+		httpErr(resp, err)
+		return
+	}
+	var body revertBody
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
+		return
+	}
+	obj, err := handle.ResolveObject(body.Ref)
+	if err != nil {
+		httpErr(resp, err)
+		return
+	}
+	if obj, err = handle.Revert(obj, body.Version); err != nil {
+		httpErr(resp, err)
+		return
+	}
+	// A device that holds the bucket in full and no longer has the earlier
+	// content fetches it like any other missing blob.
+	if d.Fabric != nil && d.Store.Subscription(handle.ID()) == store.SubFull {
+		go d.fetchMissing(handle)
+	}
+	d.kickFolders(handle.ID())
+	d.kickSync()
+	writeJSON(resp, Info(obj))
 }
 
 func (d *Daemon) handleTrash(resp http.ResponseWriter, req *http.Request) {
@@ -346,6 +427,18 @@ func (c *Client) Trash(bucket string) ([]ObjectInfo, error) {
 func (c *Client) Restore(bucket, ref string) (ObjectInfo, error) {
 	var out ObjectInfo
 	err := c.post(bucketPath(bucket, "/restore"), refBody{Ref: ref}, &out)
+	return out, err
+}
+
+func (c *Client) Versions(bucket, ref string) ([]VersionEntry, error) {
+	var out []VersionEntry
+	err := c.get(bucketPath(bucket, "/versions?ref="+url.QueryEscape(ref)), &out)
+	return out, err
+}
+
+func (c *Client) Revert(bucket, ref, version string) (ObjectInfo, error) {
+	var out ObjectInfo
+	err := c.post(bucketPath(bucket, "/revert"), revertBody{Ref: ref, Version: version}, &out)
 	return out, err
 }
 
