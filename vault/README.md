@@ -234,6 +234,10 @@ Next: live two-machine rollout (desk + NAS), then capability grants
 (second user key) and
 the projection consumer. 2026-11-10: a cache placement takes a budget
 (`-keep`) and drops by least recent read, verify-before-drop
-(`/vault/hold/1`). Deferred: shard groups, health targets, delta sync. The
+(`/vault/hold/1`). 2026-11-11: content nothing on the device retains is
+reclaimed hourly (`fabric bucket reclaim -dry-run` to preview) — overwritten
+revisions, deletions past `trash_days` — and held content is read back and
+repaired from a peer (`fabric bucket scrub [bucket]`, the whole device every
+30 days). Deferred: shard groups, health targets, delta sync. The
 years-old Python prototype lives at `../../vault_proto_py`
 (parts-bin).
