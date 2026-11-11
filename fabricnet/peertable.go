@@ -514,6 +514,9 @@ func (t *PeerTable) IsMember(peerID peer.ID, now time.Time) bool {
 func (t *PeerTable) Circles(peerID peer.ID, now time.Time) []string {
 	return t.View().Circles(peerID, now)
 }
+func (t *PeerTable) Roles(peerID peer.ID, now time.Time) map[string]string {
+	return t.View().Roles(peerID, now)
+}
 func (t *PeerTable) In(peerID peer.ID, circleDID string, now time.Time) bool {
 	return t.View().In(peerID, circleDID, now)
 }
@@ -602,6 +605,18 @@ func (v *View) Circles(peerID peer.ID, now time.Time) []string {
 		out = append(out, entry.roster.CircleDID())
 	}
 	return out
+}
+
+// Roles names what the peer is in each circle it is a live device of, by
+// circle DID: circle.RoleGate when its admission there carries the gate
+// verbs only, else circle.RoleDevice. Whether it holds a circle's key is
+// not something an admission says.
+func (v *View) Roles(peerID peer.ID, now time.Time) map[string]string {
+	roles := map[string]string{}
+	for _, entry := range v.live(peerID, now) {
+		roles[entry.roster.CircleDID()] = circle.RoleOf(entry.dev.Stmt.Payload.Verbs)
+	}
+	return roles
 }
 
 // In reports whether the peer is a live device of the circle.

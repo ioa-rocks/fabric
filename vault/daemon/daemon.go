@@ -93,6 +93,11 @@ type Daemon struct {
 	cacheMu     sync.Mutex
 	cacheStates map[string]cacheState // bucket ID -> outcome of the last pass
 
+	placeMu     sync.Mutex
+	peerPlaces  map[peer.ID]peerPlaces // what each peer last said of its placements
+	placeAsked  time.Time              // when the peers were last asked
+	placeAsking bool                   // a round of asking is under way
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -135,6 +140,7 @@ func New(vaultStore *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		flights:      make(map[string]*flight),
 		sparse:       make(map[string]*sparseBlob),
 		evictKick:    make(chan struct{}, 1),
+		peerPlaces:   make(map[peer.ID]peerPlaces),
 		handles:      make(map[string]*store.Handle),
 		liveMounts:   make(map[string]*liveMount),
 		mountErrs:    make(map[string]string),
@@ -163,6 +169,7 @@ func New(vaultStore *store.Store, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		fd.Host.SetStreamHandler(BlobProtocol, fd.Circle.RequireAny(srv.handleBlob))
 		fd.Host.SetStreamHandler(BlobRangeProtocol, fd.Circle.RequireAny(srv.handleBlobRange))
 		fd.Host.SetStreamHandler(HoldProtocol, fd.Circle.RequireAny(srv.handleHold))
+		fd.Host.SetStreamHandler(PlaceProtocol, fd.Circle.RequireAny(srv.handlePlace))
 		// Chain onto fabric's own on-auth hook (it drives membership-event
 		// anti-entropy) rather than replacing it.
 		fd.Auth.SetOnAuthenticated(func(peerID peer.ID) {

@@ -524,6 +524,10 @@ func TestGateSharesCircleButNotItsBuckets(t *testing.T) {
 	if got := desk.svc.SharedWith(ctx, gate.h.ID(), statement.KindBucket, statement.VerbSync); len(got) != 0 {
 		t.Fatalf("a gate may sync %v", got)
 	}
+	// Status names it a gate in that circle.
+	if role := desk.store.Roles(gate.h.ID(), time.Now())[familyDID]; role != circle.RoleGate {
+		t.Fatalf("the gate's role in family as the desk sees it: %q", role)
+	}
 	if desk.svc.InCircleWith(ctx, gate.h.ID(), familyDID, statement.KindBucket, statement.VerbBlob) {
 		t.Fatal("a gate may fetch blobs")
 	}

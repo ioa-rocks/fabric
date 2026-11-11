@@ -23,6 +23,8 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	relayproto "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
 
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -55,6 +57,19 @@ type StatusPeer struct {
 	// peer's other circles are not this node's business (memo §17). For a
 	// grantee, the circle(s) of the chain(s) it presented.
 	Circles []string `json:"circles,omitempty"`
+	// Roles is what the peer is in each of those circles, by circle DID:
+	// "device", or "gate" when its admission there carries the gate verbs
+	// only (a public hop that syncs nothing and reads nothing).
+	Roles map[string]string `json:"roles,omitempty"`
+	// What the peer does for the mesh, from the protocols it serves; only
+	// known while connected. QueueHost: it takes join requests (the
+	// lighthouse role). Relay: it carries traffic for devices that cannot
+	// reach each other directly.
+	QueueHost bool `json:"queue_host,omitempty"`
+	Relay     bool `json:"relay,omitempty"`
+	// Bootstrap: the operator named this peer as one this node dials first
+	// and trusts as a NAT oracle (join, peer add).
+	Bootstrap bool `json:"bootstrap,omitempty"`
 	// Grantee marks a non-member kept past the grace because it presented
 	// a verified chain on a listed node (a bare worker; memo §17 item 1).
 	Grantee bool `json:"grantee,omitempty"`
@@ -189,6 +204,12 @@ func (d *Daemon) serveControl() (func(), error) {
 	}, nil
 }
 
+// serves reports whether a connected peer announced the protocol.
+func (d *Daemon) serves(peerID peer.ID, protocolID protocol.ID) bool {
+	protocols, err := d.Host.Peerstore().SupportsProtocols(peerID, protocolID)
+	return err == nil && len(protocols) > 0
+}
+
 func (d *Daemon) handleStatus(resp http.ResponseWriter, _ *http.Request) {
 	now := time.Now()
 	reply := StatusReply{
@@ -248,6 +269,10 @@ func (d *Daemon) handleStatus(resp http.ResponseWriter, _ *http.Request) {
 			// The circles the peer table verified the peer in (handshake,
 			// gossip).
 			sp.Circles = d.Store.Circles(peerID, now)
+			sp.Roles = d.Store.Roles(peerID, now)
+			sp.QueueHost = d.serves(peerID, admission.QueueProtocolID)
+			sp.Relay = d.serves(peerID, relayproto.ProtoIDv2Hop)
+			sp.Bootstrap = d.isConfiguredBootstrap(peerID)
 		case !sp.Revoked && d.Auth.IsKept(peerID):
 			sp.Grantee = true
 			if d.Circle != nil {
@@ -264,7 +289,8 @@ func (d *Daemon) handleStatus(resp http.ResponseWriter, _ *http.Request) {
 	for peerID, memberCert := range members {
 		if !seen[peerID.String()] {
 			exp := memberCert.Expiry()
-			reply.Peers = append(reply.Peers, StatusPeer{ID: peerID.String(), Name: memberCert.Payload.Meta.Name, Member: true, IP: memberCert.Payload.Meta.IP, AddrConflict: d.addrConflict(peerID), Scope: memberCert.Payload.Meta.Scope, CertExpiry: &exp, KnownAddrs: d.knownAddrs(peerID)})
+			reply.Peers = append(reply.Peers, StatusPeer{ID: peerID.String(), Name: memberCert.Payload.Meta.Name, Member: true, IP: memberCert.Payload.Meta.IP, AddrConflict: d.addrConflict(peerID), Scope: memberCert.Payload.Meta.Scope, CertExpiry: &exp, KnownAddrs: d.knownAddrs(peerID),
+				Circles: d.Store.Circles(peerID, now), Roles: d.Store.Roles(peerID, now), Bootstrap: d.isConfiguredBootstrap(peerID)})
 			seen[peerID.String()] = true
 		}
 	}

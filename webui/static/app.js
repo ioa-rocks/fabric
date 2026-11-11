@@ -93,6 +93,63 @@ const KIND_LABEL = {
   expired: "expired — re-join needed", grantee: "grantee (no circle)",
 };
 
+/* ---------- roles ----------
+   What a node is on the mesh, beyond "device": a gate in a circle (admitted
+   to relay and host, never to sync or read), a lighthouse (takes join
+   requests), a relay (carries traffic for devices that cannot reach each
+   other), a bootstrap (this node dials it first). Roles per circle come
+   from the admissions; lighthouse and relay from the protocols a connected
+   peer serves. */
+
+const ROLE_HELP = {
+  master: "holds the root key: admits and revokes devices",
+  gate: "a public hop: relays and hosts for the circle, syncs nothing and reads nothing",
+  lighthouse: "takes join requests for the master to approve",
+  relay: "carries traffic between devices that cannot reach each other directly",
+  bootstrap: "this node dials it first and trusts it to judge its reachability",
+};
+
+/* Role of a node in one circle: "gate", "device", "owner"… or "". */
+function roleIn(d, n, did) {
+  if (n.kind === "self") return heldCircles(d).find(c => c.did === did)?.role || "";
+  return (n.roles || {})[did] || "";
+}
+
+/* A gate everywhere it is admitted — no circle has it as a device. */
+function isGate(d, n) {
+  const roles = circlesOf(d, n).map(did => roleIn(d, n, did)).filter(Boolean);
+  return roles.length > 0 && roles.every(role => role === "gate");
+}
+
+/* Short tags for the graph caption and the details panel. */
+function roleTags(d, n) {
+  const tags = [];
+  if (n.kind === "self") {
+    if (d.status.master) tags.push("master");
+    if (isGate(d, n)) tags.push("gate");
+    if (d.status.queue_host) tags.push("lighthouse");
+    return tags;
+  }
+  if (isGate(d, n)) tags.push("gate");
+  else if (Object.values(n.roles || {}).includes("gate")) tags.push("gate in " + Object.entries(n.roles).filter(([, role]) => role === "gate").map(([did]) => circleName(d, did)).join(", "));
+  if (n.queue_host) tags.push("lighthouse");
+  if (n.relay) tags.push("relay");
+  if (n.bootstrap) tags.push("bootstrap");
+  return tags;
+}
+
+function roleChips(tags) {
+  const wrap = document.createElement("span");
+  for (const tag of tags) {
+    const chip = document.createElement("span");
+    chip.className = "role-chip";
+    chip.textContent = tag;
+    chip.title = ROLE_HELP[tag.split(" ")[0]] || "";
+    wrap.append(chip);
+  }
+  return wrap;
+}
+
 /* ---------- circles ----------
    A circle's colour derives from its DID, so every node of the fleet paints
    the same circle the same way; its name is this node's own label for it
@@ -154,6 +211,54 @@ function renderTabs(d) {
   }
 }
 
+/* ---------- sections ----------
+   One page per plane: the mesh (topology, admission, activity), the vault
+   and astral. The choice lives in the URL fragment, so it survives a reload
+   and the bucket pages can link back to "/#vault". */
+
+const SECTIONS = [["mesh", "Mesh"], ["vault", "Vault"], ["astral", "Astral"]];
+
+function sectionOf(d) {
+  const available = { mesh: true, vault: !!d.vault, astral: !!d.astral };
+  const wanted = location.hash.slice(1);
+  return available[wanted] ? wanted : "mesh";
+}
+
+function renderSections(d, ns) {
+  const current = sectionOf(d);
+  const pending = d.status.master ? (d.pending || []).filter(p => p.status === "pending").length : 0;
+  const devices = ns.filter(n => n.kind === "member" || n.kind === "offline").length + 1;
+  const counts = {
+    mesh: `${devices} device${devices === 1 ? "" : "s"}`,
+    vault: d.vault ? `${(d.vault.buckets || []).length} bucket${(d.vault.buckets || []).length === 1 ? "" : "s"}` : "",
+    astral: d.astral ? `${((d.astral.status || {}).hosted || []).length} hosted` : "",
+  };
+  const box = document.getElementById("section-tabs");
+  box.replaceChildren();
+  for (const [key, label] of SECTIONS) {
+    document.getElementById("section-" + key).hidden = key !== current;
+    if (key !== "mesh" && !d[key]) continue;
+    const tab = document.createElement("button");
+    tab.type = "button";
+    tab.setAttribute("role", "tab");
+    tab.setAttribute("aria-selected", String(key === current));
+    tab.append(label);
+    const count = document.createElement("span");
+    count.className = "section-count";
+    count.textContent = counts[key];
+    tab.append(count);
+    if (key === "mesh" && pending) {
+      const alert = document.createElement("span");
+      alert.className = "section-alert";
+      alert.textContent = `${pending} pending`;
+      tab.append(alert);
+    }
+    tab.onclick = () => { location.hash = key; };
+    box.append(tab);
+  }
+  box.hidden = box.childElementCount < 2;
+}
+
 /* ---------- render ---------- */
 
 function render() {
@@ -175,6 +280,7 @@ function render() {
   const ns = nodes();
   if (!state.form || state.form.host !== "expiry") renderExpiryBanner(d);
   renderTabs(d);
+  renderSections(d, ns);
   // Revoked peers never connect again — they are tombstones, not topology.
   // The graph shows the live mesh; they get their own list until they GC.
   const live = ns.filter(n => n.kind !== "revoked");
@@ -346,19 +452,91 @@ function planeAlert(text) {
 
 /* ---------- vault card ---------- */
 
-/* Bucket summary. Links open dedicated detail pages; this overview never
-   loads file listings. Placement changes live on the detail page. */
+/* Buckets against devices: one row per bucket, one column per device, each
+   cell that device's placement. This device's column comes from its own
+   store; the others are what each peer last answered on /vault/place/1 —
+   unsigned, for the operator's eye only. Links open the bucket pages; this
+   view never loads file listings. */
+
+const PLACE_HELP = {
+  full: "keeps every file of the bucket",
+  folder: "a folder on disk that mirrors the bucket; keeps every file",
+  cache: "keeps what was read here; with a budget, drops the least recently read",
+  none: "the list of files only; content is fetched when asked for",
+};
+
+function placementKind(mode, folder) {
+  return folder ? "folder" : (mode || "none");
+}
+
+function placementPill(mode, folder, keep) {
+  const kind = placementKind(mode, folder);
+  const pill = document.createElement("span");
+  pill.className = "place " + kind;
+  pill.textContent = kind + (kind === "cache" && keep ? " · " + bytes(keep) : "");
+  pill.title = PLACE_HELP[kind] || "";
+  return pill;
+}
+
+/* One device's cell: placement, how much of the bucket is there, and for
+   this device what the last eviction pass found. */
+function placementCell(place) {
+  const cell = document.createElement("td");
+  cell.className = "place-cell";
+  cell.append(placementPill(place.mode, place.folder, place.keep));
+  const held = document.createElement("div");
+  held.className = "place-held";
+  held.textContent = `${place.held}/${place.objects} held`;
+  if (placementKind(place.mode, place.folder) !== "cache" && placementKind(place.mode, place.folder) !== "none") {
+    held.classList.add(place.held >= place.objects ? "held-ok" : "held-lag");
+    if (place.held < place.objects) held.textContent += " · fetching";
+  }
+  cell.append(held);
+  for (const [text, warn] of place.notes || []) {
+    const line = document.createElement("div");
+    line.className = "place-held" + (warn ? " held-lag" : "");
+    line.textContent = text;
+    cell.append(line);
+  }
+  if (place.stale) cell.classList.add("stale");
+  return cell;
+}
+
+function ownPlacement(b) {
+  const notes = [];
+  if (b.sub === "cache" && b.keep) {
+    if (b.cache_bytes) notes.push([`${bytes(b.cache_bytes)} of ${bytes(b.keep)} used`, b.cache_bytes > b.keep]);
+    if (b.cache_unconfirmed) notes.push([`${b.cache_unconfirmed} over budget kept: no full copy confirmed`, true]);
+  }
+  return { mode: b.sub, folder: !!b.folder, keep: b.keep, held: b.held, objects: b.objects, notes };
+}
+
+function peerPlacement(p) {
+  const notes = p.connected ? [] : [["offline · as of " + new Date(p.at / 1e6).toLocaleTimeString(), false]];
+  return { mode: p.mode, folder: p.folder, keep: p.keep, held: p.held, objects: p.objects, notes, stale: !p.connected };
+}
+
+/* The other devices to show: every one that answered for a visible bucket,
+   and vault peers sharing a circle that did not answer (an older release). */
+function placementColumns(vs, buckets) {
+  const columns = new Map();
+  for (const b of buckets) for (const p of b.peers || []) {
+    columns.set(p.peer_id, { id: p.peer_id, name: p.name || short(p.peer_id), answered: true });
+  }
+  for (const p of vs.peers || []) {
+    if (p.vault && (p.shared || []).length && !columns.has(p.peer_id)) {
+      columns.set(p.peer_id, { id: p.peer_id, name: p.name || short(p.peer_id), answered: false });
+    }
+  }
+  return [...columns.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
 function renderVault(d) {
   const card = document.getElementById("vault-card");
   card.hidden = !d.vault;
   if (card.hidden) { closeObjects(); return; }
   const vs = d.vault.status || {};
-
-  const vaultPeers = (vs.peers || []).filter(p => p.vault).map(p => p.name || short(p.peer_id));
   const buckets = d.vault.buckets || [];
-  document.getElementById("vault-summary").textContent =
-    `${buckets.length} bucket${buckets.length === 1 ? "" : "s"} · ` +
-    (vaultPeers.length ? `syncing with ${vaultPeers.join(", ")}` : "no vault peers connected");
 
   /* Declared mounts (ADR 0016): daemon-owned, listed with their live state. */
   const mounts = vs.mounts || [];
@@ -366,38 +544,53 @@ function renderVault(d) {
   mbox.replaceChildren();
   for (const m of mounts) {
     const line = document.createElement("div");
-    const state = m.error ? `error: ${m.error}` : (m.mounted ? "mounted" : "not mounted — daemon retries");
-    line.append(mono(m.dir), ` ${m.write ? "rw" : "ro"} · ${m.name || short(m.bucket)} — ${state}`);
+    const live = m.error ? `error: ${m.error}` : (m.mounted ? "mounted" : "not mounted — daemon retries");
+    line.append(mono(m.dir), ` ${m.write ? "rw" : "ro"} · ${m.name || short(m.bucket)} — ${live}`);
     mbox.append(line);
   }
-  mbox.hidden = !mounts.length;
+  document.getElementById("vault-mounts-card").hidden = !mounts.length;
 
   const box = document.getElementById("vault-buckets");
+  const legend = document.getElementById("vault-legend");
   box.innerHTML = "";
+  legend.replaceChildren();
+  legend.hidden = true;
+  const summary = document.getElementById("vault-summary");
+  summary.textContent = `${buckets.length} bucket${buckets.length === 1 ? "" : "s"}`;
   if (!buckets.length) {
     box.append(note("No buckets yet — create one with: vault bucket create <name>"));
     return;
   }
-  const table = document.createElement("table");
-  table.className = "buckets";
-  table.innerHTML = `<tr><th>bucket</th><th>circle</th><th>objects</th><th>held</th><th>placement</th></tr>`;
   const visible = state.circle ? buckets.filter(b => b.owner === state.circle) : buckets;
   if (!visible.length) {
     box.append(note(`No buckets owned by ${circleName(d, state.circle)}.`));
     return;
   }
+  const columns = placementColumns(vs, visible);
+  const silent = columns.filter(c => !c.answered);
+  summary.textContent += columns.length
+    ? ` · ${columns.length} other device${columns.length === 1 ? "" : "s"}`
+    : " · no other vault device connected";
+
+  const table = document.createElement("table");
+  table.className = "buckets placements";
+  const head = document.createElement("tr");
+  const th = (text, cls, title) => {
+    const cell = document.createElement("th");
+    cell.textContent = text;
+    if (cls) cell.className = cls;
+    if (title) cell.title = title;
+    head.append(cell);
+  };
+  th("bucket"); th("circle"); th("files");
+  th("full copies", "", "devices known to keep every file of the bucket");
+  th(`${d.status.name || "this device"} (here)`, "device own");
+  for (const column of columns) th(column.name, "device", column.id);
+  table.append(head);
+
   for (const b of visible) {
     const tr = document.createElement("tr");
     tr.className = "bucket-row";
-    const held = document.createElement("td");
-    if (b.sub === "full") {
-      held.textContent = `${b.held}/${b.objects}`;
-      // a full subscription is satisfied when every blob is local
-      held.className = b.held >= b.objects ? "held-ok" : "held-lag";
-      if (b.held < b.objects) held.textContent += " (fetching)";
-    } else {
-      held.textContent = `${b.held}/${b.objects}`;
-    }
     const link = document.createElement("a");
     link.href = "/buckets/" + encodeURIComponent(b.id);
     link.className = "bucket-link";
@@ -405,16 +598,53 @@ function renderVault(d) {
     const circleCell = document.createElement("td");
     if (b.owner) circleCell.append(dot(circleColor(b.owner)), " ");
     circleCell.append((vs.circles || []).find(c => c.did === b.owner)?.name || circleName(d, b.owner || "") || "Unknown");
-    tr.append(
-      td(link),
-      circleCell,
-      td(String(b.objects)),
-      held,
-      td(b.folder ? "folder" : (b.sub || "none")),
-    );
+
+    const byPeer = new Map((b.peers || []).map(p => [p.peer_id, p]));
+    const full = (b.sub === "full" || b.folder ? 1 : 0) + (b.peers || []).filter(p => p.mode === "full" || p.folder).length;
+    const copies = document.createElement("td");
+    copies.textContent = full + (silent.length ? " + ?" : "");
+    copies.className = full ? "held-ok" : "held-lag";
+    copies.title = full
+      ? "devices that said they keep every file" + (silent.length ? "; some devices did not say" : "")
+      : (silent.length ? "no device said it keeps every file; some did not say" : "no device keeps every file: a cache cannot drop anything, and nothing guarantees a copy");
+
+    tr.append(td(link), circleCell, td(String(b.objects)), copies);
+    const own = placementCell(ownPlacement(b));
+    own.classList.add("own");
+    tr.append(own);
+    for (const column of columns) {
+      const answer = byPeer.get(column.id);
+      if (answer) { tr.append(placementCell(peerPlacement(answer))); continue; }
+      const cell = document.createElement("td");
+      cell.className = "place-cell unknown";
+      cell.textContent = column.answered ? "—" : "?";
+      cell.title = column.answered
+        ? "this device does not have the bucket"
+        : "this device did not say: it runs a release that cannot be asked";
+      tr.append(cell);
+    }
     table.append(tr);
   }
-  box.append(table);
+  const scroll = document.createElement("div");
+  scroll.className = "table-scroll";
+  scroll.append(table);
+  box.append(scroll);
+
+  legend.hidden = false;
+  for (const kind of ["full", "folder", "cache", "none"]) {
+    const item = document.createElement("span");
+    item.append(placementPill(kind === "folder" ? "full" : (kind === "none" ? "" : kind), kind === "folder"), " " + PLACE_HELP[kind]);
+    legend.append(item);
+  }
+  if (silent.length) {
+    const item = document.createElement("span");
+    item.textContent = `? ${silent.map(c => c.name).join(", ")} did not say — an older release`;
+    legend.append(item);
+  }
+}
+
+function bytes(n) {
+  return n ? formatBytes(n) : "0 B";
 }
 
 function td(child) {
@@ -480,6 +710,12 @@ function renderBucketPage(d) {
       finally { state.placementBusy = false; select.disabled = false; select.blur(); renderBucketPage(state.data); }
     };
     field(local, "Placement", select);
+    if (b.sub === "cache") {
+      field(local, "Budget", b.keep ? bytes(b.keep) : "None — nothing is dropped");
+      if (b.keep && b.cache_bytes) field(local, "Used", `${bytes(b.cache_bytes)} of ${bytes(b.keep)}`);
+      if (b.cache_unconfirmed) field(local, "Over budget", `${b.cache_unconfirmed} files kept: no device holding the bucket in full confirmed them`);
+      if (!b.keep) local.append(note(`Set one with: fabric bucket place ${b.name} cache -keep 20G`));
+    }
     field(local, "Storage", b.root ? mono(b.root) : "Default store");
   }
   const folder = (vs.folders || []).find(f => f.bucket === b.id);
@@ -494,6 +730,21 @@ function renderBucketPage(d) {
   for (const m of (vs.mounts || []).filter(m => m.bucket === b.id)) {
     field(local, "Mount", mono(m.dir));
     field(local, "Mount status", m.error || `${m.mounted ? "Mounted" : "Waiting to mount"} · ${m.write ? "read/write" : "read-only"}`);
+  }
+  const others = document.getElementById("bucket-peers");
+  others.replaceChildren();
+  if (!(b.peers || []).length) {
+    others.append(note("No other device has said how it holds this bucket. A device answers once it is connected and runs a current release."));
+  } else {
+    const table = document.createElement("table");
+    table.className = "buckets placements";
+    table.innerHTML = "<tr><th>device</th><th>placement</th></tr>";
+    for (const p of b.peers) {
+      const tr = document.createElement("tr");
+      tr.append(td(p.name || short(p.peer_id)), placementCell(peerPlacement(p)));
+      table.append(tr);
+    }
+    others.append(table);
   }
   const localBox = document.getElementById("bucket-local");
   if (!state.placementBusy && !localBox.contains(document.activeElement)) localBox.replaceChildren(local);
@@ -640,8 +891,7 @@ function renderHeader(d) {
 
   const selfChip = document.getElementById("self-chip");
   selfChip.innerHTML = "";
-  let role = d.status.master ? "master" : "member";
-  if (d.status.queue_host && !d.status.master) role += " · queue host";
+  const role = roleTags(d, { kind: "self" }).join(" · ") || "device";
   selfChip.append(dot("var(--good)"), `${d.status.name} — ${role}`);
 
   const reach = document.getElementById("reach-chip");
@@ -753,9 +1003,14 @@ function drawNode(svg, x, y, n, radius, d, shown = true) {
     g.append(dotEl);
   });
   g.append(el("text", { x, y: y + radius + 16, "text-anchor": "middle" }, n.name || short(n.id)));
-  let sub = n.ip ? `${n.ip.split("/")[0]} · ${KIND_LABEL[n.kind]}` : KIND_LABEL[n.kind];
+  const gate = d && isGate(d, n) && (n.kind === "member" || n.kind === "offline");
+  const kindLabel = gate ? (n.kind === "offline" ? "gate (offline)" : "gate") : KIND_LABEL[n.kind];
+  let sub = n.ip ? `${n.ip.split("/")[0]} · ${kindLabel}` : kindLabel;
   if (n.addr_conflict) sub += " · ADDRESS CONFLICT";
   g.append(el("text", { x, y: y + radius + 30, "text-anchor": "middle", class: "sub" }, sub));
+  const tags = d ? roleTags(d, n).filter(tag => tag !== "gate") : [];
+  if (tags.length) g.append(el("text", { x, y: y + radius + 43, "text-anchor": "middle", class: "sub roles" }, tags.join(" · ")));
+  if (gate) g.classList.add("gate");
   g.onclick = () => {
     state.selected = n.id;
     state.form = null;
@@ -782,6 +1037,15 @@ function renderLegend(d, ns) {
     s.append(sw, KIND_LABEL[k]);
     lg.append(s);
   }
+  if (ns.some(n => isGate(d, n))) {
+    const s = document.createElement("span");
+    const sw = document.createElement("span");
+    sw.className = "swatch gate";
+    sw.style.borderColor = kindColor("member");
+    s.append(sw, "gate");
+    s.title = ROLE_HELP.gate;
+    lg.append(s);
+  }
   for (const c of heldCircles(d)) {
     const s = document.createElement("span");
     s.append(dot(circleColor(c.did)), ` ${c.name}`);
@@ -803,13 +1067,15 @@ function kindColor(k) {
 }
 
 /* A row of circle chips (name, colour) for the details panels. */
-function circleChips(d, dids) {
+function circleChips(d, dids, n) {
   const wrap = document.createElement("span");
   for (const did of dids.slice().sort()) {
     const chip = document.createElement("span");
     chip.className = "circle-chip";
     chip.title = did;
     chip.append(dot(circleColor(did)), circleName(d, did));
+    const role = n ? roleIn(d, n, did) : "";
+    if (role) { const r = document.createElement("span"); r.className = "tab-role"; r.textContent = role; chip.append(r); }
     wrap.append(chip);
   }
   return wrap;
@@ -824,11 +1090,17 @@ function renderDetails(d, ns) {
   const n = ns.find(x => x.id === state.selected);
   if (!n) { box.innerHTML = `<p class="muted">Select a node in the graph.</p>`; return; }
 
-  box.append(badge(n.kind));
+  const kindBadge = badge(n.kind);
+  if (isGate(d, n) && (n.kind === "member" || n.kind === "offline")) {
+    kindBadge.lastChild.textContent = n.kind === "offline" ? "gate (offline)" : "gate";
+  }
+  box.append(kindBadge);
   const kv = document.createElement("dl");
   kv.className = "kv";
   add(kv, "name", n.name || "—");
-  if ((n.circles || []).length) add(kv, n.kind === "grantee" ? "granted in" : "shares", circleChips(d, n.circles));
+  const tags = roleTags(d, n);
+  if (n.member) add(kv, "role", tags.length ? roleChips(tags) : "device");
+  if ((n.circles || []).length) add(kv, n.kind === "grantee" ? "granted in" : "shares", circleChips(d, n.circles, n));
   if (n.ip) add(kv, "overlay IP", mono(n.ip.split("/")[0]));
   if (n.addr_conflict) add(kv, "address conflict", `${n.addr_conflict} is held by another device's later admission — no route, no inbound until one of them is renumbered`);
   if (n.scope) add(kv, "scope", `mesh + ${n.scope.filter(f => f !== "mesh").join(" + ") || "nothing else"}`);
@@ -925,7 +1197,11 @@ function renderSelf(d, box) {
   kv.className = "kv";
   const overlayIP = (d.status.overlay_ip || "").split("/")[0];
   add(kv, "name", d.status.name);
-  add(kv, "role", d.status.master ? "master (holds the root key)" : "member");
+  const selfTags = roleTags(d, { kind: "self" });
+  add(kv, "role", selfTags.length ? roleChips(selfTags) : "device");
+  if (d.status.posture) add(kv, "inbound", d.status.posture === "listed"
+    ? "listed — accepts connections from devices it does not know yet"
+    : "dark — refuses connections from devices it does not know" + (d.status.refused_inbound ? ` (${d.status.refused_inbound} refused)` : ""));
   for (const c of heldCircles(d)) {
     const dd = add(kv, c === heldCircles(d)[0] ? "circles" : "", circleChips(d, [c.did]));
     dd.append(` ${c.role || "device"}${c.prefix ? " · overlay " + c.prefix : ""}${c.attested === false ? " · NOT admitted" : ""}`);
@@ -1166,6 +1442,7 @@ async function copy(text, elem) {
 document.getElementById("dashboard").hidden = !!state.bucketID;
 document.getElementById("bucket-page").hidden = !state.bucketID;
 initTheme();
+window.addEventListener("hashchange", () => { if (state.data) render(); });
 poll().then(() => {
   // deep-link: ?select=<name or peer id> opens that node's details
   const sel = new URLSearchParams(location.search).get("select");

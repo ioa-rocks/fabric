@@ -64,6 +64,10 @@ type BucketInfo struct {
 	// mounts over it.
 	Folder string   `json:"folder,omitempty"`
 	Mounts []string `json:"mounts,omitempty"`
+
+	// How the other devices hold it, as each last said (PlaceProtocol).
+	// A device on a release without that protocol is not listed.
+	Peers []PeerPlacement `json:"peers,omitempty"`
 }
 
 // ObjectInfo is the wire form of an object — the API view over the CRDT
@@ -399,13 +403,14 @@ func (d *Daemon) handleBuckets(resp http.ResponseWriter, _ *http.Request) {
 	folders, _ := d.Store.Folders()
 	mounts, _ := d.Store.Mounts()
 	out := []BucketInfo{}
+	peerPlacements := d.peerPlacements()
 	for _, bkt := range buckets {
 		id, err := bkt.ID()
 		if err != nil {
 			continue
 		}
 		pl := d.Store.Placement(id)
-		info := BucketInfo{ID: id, Owner: bkt.Genesis.Owner, Name: bkt.Genesis.Name, Sub: pl.Mode, Root: pl.Root, Keep: pl.Keep}
+		info := BucketInfo{ID: id, Owner: bkt.Genesis.Owner, Name: bkt.Genesis.Name, Sub: pl.Mode, Root: pl.Root, Keep: pl.Keep, Peers: peerPlacements[id]}
 		if state, ok := d.cacheStateOf(id); ok && pl.Keep > 0 {
 			info.CacheBytes, info.CacheUnconfirmed = state.Bytes, state.Unconfirmed
 		}

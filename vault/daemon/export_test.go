@@ -30,3 +30,11 @@ func (d *Daemon) LastRead(bucket, hash string) (int64, bool) {
 	}
 	return handle.Index.LastRead(hash)
 }
+
+// SetPlaceMaxAge makes listings ask the peers for their placements this
+// often, and returns the call that restores the default.
+func SetPlaceMaxAge(age time.Duration) (restore func()) {
+	old := placeMaxAge
+	placeMaxAge = age
+	return func() { placeMaxAge = old }
+}
