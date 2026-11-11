@@ -309,6 +309,22 @@ func (c *Client) Place(bucket, mode string, root *string, keep *int64) error {
 	return c.post(bucketPath(bucket, "/sub"), subBody{Mode: mode, Root: root, Keep: keep}, nil)
 }
 
+// Reclaim removes the content no bucket on the device retains; dry only
+// counts it.
+func (c *Client) Reclaim(dryRun bool) (ReclaimReport, error) {
+	var report ReclaimReport
+	err := c.post("/v0/reclaim", reclaimBody{DryRun: dryRun}, &report)
+	return report, err
+}
+
+// Scrub reads back held content — one bucket's, or the whole device's when
+// bucket is empty — and returns when the pass is over.
+func (c *Client) Scrub(bucket string) (ScrubReport, error) {
+	var report ScrubReport
+	err := c.post("/v0/scrub", scrubBody{Bucket: bucket}, &report)
+	return report, err
+}
+
 func (c *Client) Mounts() ([]MountInfo, error) {
 	var out []MountInfo
 	if err := c.get("/v0/mounts", &out); err != nil {

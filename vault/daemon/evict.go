@@ -109,6 +109,11 @@ func (d *Daemon) evictBucket(handle *store.Handle, keep int64) cacheState {
 		var hashes []string
 		for _, entry := range batch {
 			switch {
+			case !retains(handle, entry.Hash):
+				// Dead for this bucket — an overwritten revision, a deletion
+				// past its trash window. No holder would confirm it and no
+				// budget should wait for it: the reclaim pass removes it.
+				state.Bytes -= entry.Size
 			case entry.LastRead > recent, d.sparseOpen(entry.Hash):
 				// in use, or just was
 			case d.heldForAnother(handle, entry.Hash, recent):

@@ -30,8 +30,8 @@ type holdResp struct {
 	// Committed: this device holds the bucket in full, so what it has it
 	// keeps. A cache says false, and its copy protects nothing.
 	Committed bool `cbor:"committed"`
-	// Held answers Hashes one for one: the bucket references the blob and
-	// its content is on this device.
+	// Held answers Hashes one for one: the bucket retains the blob and its
+	// content is on this device.
 	Held []bool `cbor:"held"`
 }
 
@@ -59,7 +59,9 @@ func (d *Daemon) handleHold(stream network.Stream) {
 			resp.Committed = d.Store.Subscription(handle.ID()) == store.SubFull
 			holder := handle.Holder()
 			for position, hash := range req.Hashes {
-				resp.Held[position] = handle.References(hash) && holder.Has(hash)
+				// Retained, not merely named: an overwritten revision or an
+				// expired deletion is about to be reclaimed here.
+				resp.Held[position] = retains(handle, hash) && holder.Has(hash)
 			}
 		}
 	}

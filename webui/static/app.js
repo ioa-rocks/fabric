@@ -632,6 +632,13 @@ function renderVault(d) {
   scroll.append(table);
   box.append(scroll);
 
+  /* What the last read-back of held content found (scrub). */
+  const scrub = vs.scrub || {};
+  if (scrub.quarantined) box.append(planeAlert(
+    `${scrub.quarantined} damaged file${scrub.quarantined === 1 ? " is" : "s are"} set aside on this device and not yet replaced by a clean copy from another device.`));
+  if (scrub.folder_files) box.append(planeAlert(
+    `${scrub.folder_files} file${scrub.folder_files === 1 ? "" : "s"} in a synced folder changed without size or time changing — run: fabric bucket scrub`));
+
   legend.hidden = false;
   for (const kind of ["full", "folder", "cache", "none"]) {
     const item = document.createElement("span");

@@ -136,3 +136,81 @@ func TestDropRemovesABlobOnce(t *testing.T) {
 		t.Fatal("blob still held after Drop")
 	}
 }
+
+// A walk lists held blobs only — not a transfer in progress, not a copy set
+// aside as corrupt — and a blob set aside is no longer held.
+func TestWalkAndQuarantine(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := store.Put(strings.NewReader("first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := store.Put(strings.NewReader("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial, err := store.Partial(strings.Repeat("ab", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial.Close()
+	walk := func() map[string]bool {
+		t.Helper()
+		found := map[string]bool{}
+		for _, shard := range Shards() {
+			held, err := store.Walk(shard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, blob := range held {
+				found[blob.Hash] = true
+			}
+		}
+		return found
+	}
+	if found := walk(); len(found) != 2 || !found[first] || !found[second] {
+		t.Fatalf("walk found %v; want the two blobs and nothing else", found)
+	}
+	if err := store.Quarantine(first); err != nil {
+		t.Fatal(err)
+	}
+	if store.Has(first) || len(walk()) != 1 {
+		t.Fatal("a blob set aside still counts as held")
+	}
+	if set, err := store.Quarantined(); err != nil || len(set) != 1 || set[0] != first {
+		t.Fatalf("set aside: %v, %v", set, err)
+	}
+	if err := store.DropQuarantined(first); err != nil {
+		t.Fatal(err)
+	}
+	if set, _ := store.Quarantined(); len(set) != 0 {
+		t.Fatalf("still set aside after the removal: %v", set)
+	}
+}
+
+// Content put again while already held counts as newly arrived: the index
+// record that will name it is written after Put returns, and a reclaim pass
+// in between must not see an old, unnamed blob.
+func TestPutAgainRenewsTheArrivalTime(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, _, err := store.Put(strings.NewReader("content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	longAgo := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(store.path(hash), longAgo, longAgo); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Put(strings.NewReader("content")); err != nil {
+		t.Fatal(err)
+	}
+	if modified, err := store.ModTime(hash); err != nil || time.Since(modified) > time.Minute {
+		t.Fatalf("arrival time after putting again: %v, %v", modified, err)
+	}
+}

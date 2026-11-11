@@ -57,6 +57,7 @@ func (s *Store) Put(src io.Reader) (hash string, size int64, err error) {
 
 	dst := s.path(hash)
 	if _, err := os.Stat(dst); err == nil {
+		s.touch(hash)
 		return hash, size, nil // already have it
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
@@ -66,6 +67,14 @@ func (s *Store) Put(src io.Reader) (hash string, size int64, err error) {
 		return "", 0, err
 	}
 	return hash, size, nil
+}
+
+// touch marks a blob as wanted just now. Content that arrives again while
+// it is already held must not look old to the reclaim pass: the index
+// record that will name it is written after this returns.
+func (s *Store) touch(hash string) {
+	now := time.Now()
+	_ = os.Chtimes(s.path(hash), now, now)
 }
 
 // Partial opens the file a blob is being received into, creating it if
@@ -99,6 +108,7 @@ func (s *Store) Commit(hash string) error {
 		return fmt.Errorf("received content hashes to %.12s, wanted %.12s", got, hash)
 	}
 	if s.Has(hash) {
+		s.touch(hash)
 		return os.Remove(partialPath)
 	}
 	if err := file.Sync(); err != nil {
@@ -209,21 +219,134 @@ func (s *Store) Size(hash string) (int64, error) {
 	return info.Size(), nil
 }
 
+// ErrCorrupt marks held content that no longer hashes to its name.
+var ErrCorrupt = errors.New("content does not match its hash")
+
 // Verify re-hashes a held blob and reports corruption — the scrub primitive
-// (memo §8): bit-rot shows up as a hash mismatch and the blob can be
-// re-fetched from another complete copy.
+// (memo §8): bit-rot shows up as a hash mismatch (ErrCorrupt) and the blob
+// can be re-fetched from another complete copy. Any other error means the
+// blob could not be read, which says nothing about its content.
 func (s *Store) Verify(hash string) error {
-	file, err := s.Open(hash)
+	got, err := HashFile(s.path(hash))
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("blob %s: not held here", hash)
+	}
 	if err != nil {
 		return err
+	}
+	if got != hash {
+		return fmt.Errorf("blob %s: %w (it hashes to %s)", hash, ErrCorrupt, got)
+	}
+	return nil
+}
+
+// HashFile returns the blob ID the file's content amounts to.
+func HashFile(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
 	}
 	defer file.Close()
 	hasher := blake3.New()
 	if _, err := io.Copy(hasher, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// Root is the directory the store lives in.
+func (s *Store) Root() string { return s.root }
+
+// Shards lists the 256 two-character directories blobs are spread over, in
+// order. Walking a store shard by shard gives a long pass places to stop
+// and continue.
+func Shards() []string {
+	shards := make([]string, 0, 256)
+	for value := 0; value < 256; value++ {
+		shards = append(shards, fmt.Sprintf("%02x", value))
+	}
+	return shards
+}
+
+// Held is one blob as a walk finds it.
+type Held struct {
+	Hash    string
+	Size    int64
+	ModTime time.Time // when the content arrived, or was last put again
+}
+
+// Walk lists the blobs held in one shard, in hash order. Files being
+// received, set aside as corrupt or written by a Put in progress are not
+// blobs and are not listed.
+func (s *Store) Walk(shard string) ([]Held, error) {
+	entries, err := os.ReadDir(filepath.Join(s.root, shard))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var held []Held
+	for _, entry := range entries {
+		name := entry.Name()
+		if len(name) != 64 || !strings.HasPrefix(name, shard) || !entry.Type().IsRegular() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue // removed since the listing
+		}
+		held = append(held, Held{Hash: name, Size: info.Size(), ModTime: info.ModTime()})
+	}
+	return held, nil
+}
+
+// ModTime is when the blob arrived or was last put again.
+func (s *Store) ModTime(hash string) (time.Time, error) {
+	info, err := os.Stat(s.path(hash))
+	if err != nil {
+		return time.Time{}, err
+	}
+	return info.ModTime(), nil
+}
+
+func (s *Store) quarantinePath(hash string) string {
+	return filepath.Join(s.root, "corrupt", hash)
+}
+
+// Quarantine sets a blob aside: it is no longer held, but its bytes stay
+// under corrupt/ until a clean copy is back or nothing wants the blob. A
+// damaged copy may be the last one, and most of it is still the content.
+func (s *Store) Quarantine(hash string) error {
+	if err := os.MkdirAll(filepath.Join(s.root, "corrupt"), 0o700); err != nil {
 		return err
 	}
-	if got := hex.EncodeToString(hasher.Sum(nil)); got != hash {
-		return fmt.Errorf("blob %s corrupt: content hashes to %s", hash, got)
+	return os.Rename(s.path(hash), s.quarantinePath(hash))
+}
+
+// Quarantined lists the blobs set aside as corrupt.
+func (s *Store) Quarantined() ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(s.root, "corrupt"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
 	}
-	return nil
+	if err != nil {
+		return nil, err
+	}
+	var hashes []string
+	for _, entry := range entries {
+		if len(entry.Name()) == 64 {
+			hashes = append(hashes, entry.Name())
+		}
+	}
+	return hashes, nil
+}
+
+// DropQuarantined removes the bytes of a blob that was set aside.
+func (s *Store) DropQuarantined(hash string) error {
+	err := os.Remove(s.quarantinePath(hash))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fabricdaemon "ioa.rocks/fabric/daemon"
@@ -92,6 +93,9 @@ type Daemon struct {
 	evictMu     sync.Mutex    // one pass at a time
 	cacheMu     sync.Mutex
 	cacheStates map[string]cacheState // bucket ID -> outcome of the last pass
+
+	scrubMu   sync.Mutex  // one scrub pass at a time
+	scrubbing atomic.Bool // a pass is running (for status)
 
 	placeMu     sync.Mutex
 	peerPlaces  map[peer.ID]peerPlaces // what each peer last said of its placements
@@ -200,6 +204,8 @@ func (d *Daemon) Run() error {
 		}
 	}
 
+	go d.reclaimLoop()
+	go d.scrubLoop()
 	if d.Fabric != nil {
 		go d.sparseJanitor()
 		go d.evictLoop()

@@ -186,6 +186,46 @@ func (s *Store) dropStaleRef(blob, objectID string) {
 	_ = s.db.Delete(blobRefKey(blob, objectID), pebble.NoSync)
 }
 
+// BlobObjects returns the objects that have a head pointing at the blob,
+// live or tombstoned.
+func (s *Store) BlobObjects(blob string) ([]*Object, error) {
+	if blob == "" {
+		return nil, nil
+	}
+	prefix := "r/" + blob + "/"
+	it, err := s.db.NewIter(prefixBounds(prefix))
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var objects []*Object
+	for it.First(); it.Valid(); it.Next() {
+		obj, err := s.GetObject(strings.TrimPrefix(string(it.Key()), prefix))
+		if err != nil {
+			continue // a stale entry; ReferencesBlob clears those
+		}
+		for _, rev := range obj.Heads {
+			if rev.Blob == blob {
+				objects = append(objects, obj)
+				break
+			}
+		}
+	}
+	return objects, it.Error()
+}
+
+// Location returns the record one device wrote for a blob, whatever its
+// form, if it wrote one.
+func (s *Store) Location(blob, node string) (Location, bool) {
+	raw, closer, err := s.db.Get([]byte("l/" + blob + "/" + node))
+	if err != nil {
+		return Location{}, false
+	}
+	defer closer.Close()
+	location, err := unmarshalLocation(raw)
+	return location, err == nil
+}
+
 // GetObject loads one object record.
 func (s *Store) GetObject(id string) (*Object, error) {
 	raw, closer, err := s.db.Get([]byte("o/" + id))

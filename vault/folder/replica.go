@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -325,6 +326,53 @@ func (r *Replica) Put(rd io.Reader) (string, int64, error) {
 func (r *Replica) Partial(hash string) (*os.File, error) { return r.shadow.Partial(hash) }
 
 func (r *Replica) Commit(hash string) error { return r.shadow.Commit(hash) }
+
+// Shadow is the replica's own blob store: content received before it is
+// placed in the folder, and the bytes of files the folder replaced or
+// removed. The reclaim and scrub passes treat it like any other store.
+func (r *Replica) Shadow() *blobstore.Store { return r.shadow }
+
+// Damaged lists the files whose content no longer is the blob the scan
+// recorded although their size, time and inode are unchanged: a failing
+// disk, or a tool that rewrites a file and restores its timestamp. A scan
+// skips such a file, so nothing else notices. Files that did change by
+// their stat are the scan's business and are not read here.
+func (r *Replica) Damaged(stop func() bool) (checked int, damaged []string, err error) {
+	if !r.available() {
+		return 0, nil, ErrUnavailable
+	}
+	entries, err := r.entries()
+	if err != nil {
+		return 0, nil, err
+	}
+	for rel, entry := range entries {
+		if stop != nil && stop() {
+			break
+		}
+		if entry.Blob == "" {
+			continue
+		}
+		targetPath := filepath.Join(r.Dir, filepath.FromSlash(rel))
+		before, err := lstat(targetPath)
+		if err != nil || before.isDir || before.isLnk || !entry.unchanged(before) {
+			continue
+		}
+		got, err := blobstore.HashFile(targetPath)
+		if err != nil {
+			continue
+		}
+		// Written while it was being read: the scan will see it.
+		if after, err := lstat(targetPath); err != nil || !entry.unchanged(after) {
+			continue
+		}
+		checked++
+		if got != entry.Blob {
+			damaged = append(damaged, rel)
+		}
+	}
+	sort.Strings(damaged)
+	return checked, damaged, nil
+}
 
 // Drop is refused: a folder replica is a full copy, and its content is the
 // user's files.

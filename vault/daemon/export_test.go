@@ -38,3 +38,30 @@ func SetPlaceMaxAge(age time.Duration) (restore func()) {
 	placeMaxAge = age
 	return func() { placeMaxAge = old }
 }
+
+// ReclaimNow runs one reclaim pass.
+func (d *Daemon) ReclaimNow() (ReclaimReport, error) { return d.reclaim(false) }
+
+// SetReclaimGrace changes how long newly arrived content is safe from the
+// reclaim pass, and returns the call that restores the default.
+func SetReclaimGrace(grace time.Duration) (restore func()) {
+	old := reclaimGrace
+	reclaimGrace = grace
+	return func() { reclaimGrace = old }
+}
+
+// HoldsBlob reports whether the bucket's holder on this device has the
+// blob's content.
+func (d *Daemon) HoldsBlob(bucket, hash string) bool {
+	handle, err := d.handle(bucket)
+	return err == nil && handle.Holder().Has(hash)
+}
+
+// BlobFile is where the bucket's holder keeps a blob's content.
+func (d *Daemon) BlobFile(bucket, hash string) (string, error) {
+	handle, err := d.handle(bucket)
+	if err != nil {
+		return "", err
+	}
+	return handle.Holder().Path(hash)
+}

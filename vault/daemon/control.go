@@ -148,6 +148,7 @@ type StatusReply struct {
 	Peers    []PeerInfo   `json:"peers,omitempty"`   // connected members
 	Mounts   []MountInfo  `json:"mounts,omitempty"`  // declared FUSE mounts
 	Folders  []FolderInfo `json:"folders,omitempty"` // declared folder replicas
+	Scrub    ScrubInfo    `json:"scrub"`             // read-back of held content
 }
 
 type createBucketBody struct {
@@ -223,6 +224,8 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/buckets/{bucket}/sub", d.handleSub)
 	d.treeRoutes(mux)
 	d.folderRoutes(mux)
+	mux.HandleFunc("POST /v0/reclaim", d.handleReclaim)
+	mux.HandleFunc("POST /v0/scrub", d.handleScrub)
 	mux.HandleFunc("GET /v0/mounts", d.handleMounts)
 	mux.HandleFunc("POST /v0/mounts", d.handleAddMount)
 	mux.HandleFunc("POST /v0/mounts/remove", d.handleRemoveMount)
@@ -327,7 +330,48 @@ func (d *Daemon) handleStatus(resp http.ResponseWriter, req *http.Request) {
 	if mounts, err := d.mountInfos(); err == nil {
 		status.Mounts = mounts
 	}
+	status.Scrub = d.scrubInfo()
 	writeJSON(resp, status)
+}
+
+type reclaimBody struct {
+	DryRun bool `json:"dry_run"`
+}
+
+func (d *Daemon) handleReclaim(resp http.ResponseWriter, req *http.Request) {
+	var body reclaimBody
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
+		return
+	}
+	report, err := d.reclaim(body.DryRun)
+	if err != nil {
+		httpErr(resp, err)
+		return
+	}
+	writeJSON(resp, report)
+}
+
+type scrubBody struct {
+	Bucket string `json:"bucket"` // empty: the whole device
+}
+
+func (d *Daemon) handleScrub(resp http.ResponseWriter, req *http.Request) {
+	var body scrubBody
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		httpErr(resp, err)
+		return
+	}
+	report, err := d.scrub(req.Context(), body.Bucket, false)
+	if errors.Is(err, errScrubRunning) {
+		http.Error(resp, err.Error(), http.StatusConflict)
+		return
+	}
+	if err != nil {
+		httpErr(resp, err)
+		return
+	}
+	writeJSON(resp, report)
 }
 
 func (d *Daemon) handleMounts(resp http.ResponseWriter, _ *http.Request) {

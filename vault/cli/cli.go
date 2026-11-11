@@ -74,6 +74,10 @@ func Main(args []string) int {
 		err = cmdResolve(rest)
 	case "held":
 		err = cmdHeld(rest)
+	case "reclaim":
+		err = cmdReclaim(rest)
+	case "scrub":
+		err = cmdScrub(rest)
 	case "-h", "-help", "--help", "help":
 		usage()
 		return 0
@@ -119,11 +123,20 @@ or open the store directly when none runs.
   project  project <bucket> <dir> — materialize a read-only directory view
   policy   policy <bucket> [set key=value ...] — show or sign a policy revision
            (copies trash_days ignore symlinks nested_repos hold_min_count hold_min_percent)
+           trash_days: how long a deleted file stays restorable (0 reads
+           as 30; negative keeps it for good)
   trash    trash <bucket> — list tombstoned objects
   restore  restore <bucket> <object-ref> — revive a tombstoned object
+           (refused once its content left the trash)
   conflicts  conflicts <bucket> — list concurrent edits kept as conflict copies
   resolve  resolve <bucket> <object-ref> — settle a conflict for the kept version
   held     held <bucket> [accept|reject] — deletions parked for confirmation
+  reclaim  reclaim [-dry-run] — remove content no bucket on this device
+           retains: overwritten revisions, deletions past trash_days. The
+           daemon does this hourly; -dry-run only counts
+  scrub    scrub [bucket] — read back held content and check it against
+           its hash. Damaged content is set aside and fetched again from
+           a peer; the daemon reads the whole device back every 30 days
 
 Every command accepts -state <dir> (the store, default `+store.DefaultPath()+`)
 and -circle-state <dir> (the circle, default `+circle.DefaultPath()+`),

@@ -825,8 +825,8 @@ func (h *Handle) Tag(obj *index.Object, add, remove []string) (*index.Object, er
 	return h.Index.PutObject(obj)
 }
 
-// Delete tombstones an object. The blob stays until retention/drop-safety
-// machinery lands (memo §5 — deletion is intent, dropping is local).
+// Delete tombstones an object. Its content stays restorable for the
+// policy's trash window; after that each device reclaims it (ADR 0005).
 func (h *Handle) Delete(obj *index.Object) error {
 	_, err := h.Revise(obj, func(r *index.Revision) { r.Deleted = true })
 	return err
@@ -837,7 +837,18 @@ func (h *Handle) Restore(obj *index.Object) (*index.Object, error) {
 	if !obj.IsDeleted() {
 		return obj, nil
 	}
+	// Past the trash window the content is reclaimed everywhere. Bringing
+	// the object back then would list a file nobody can read — unless this
+	// device happens to still have the bytes.
+	if head := obj.Head(); head != nil && head.Blob != "" && !h.headRetains(*head, Clock()) && !h.Holder().Has(head.Blob) {
+		return nil, fmt.Errorf("%q left the trash: its content was reclaimed after %d days", obj.Name.V, h.trashDays())
+	}
 	return h.Revise(obj, func(r *index.Revision) { r.Deleted = false })
+}
+
+func (h *Handle) trashDays() int {
+	window, _ := h.CurrentPolicy().TrashWindow()
+	return int(window / (24 * time.Hour))
 }
 
 // Trash lists tombstoned objects, newest deletion first.
@@ -879,8 +890,8 @@ func (h *Handle) Conflicts() ([]Conflict, error) {
 }
 
 // Resolve settles an object's conflict in favor of its rendered head: a new
-// revision dominating every head. The losing content stays in the blob
-// store like any superseded version.
+// revision dominating every head. The losing content is no longer retained
+// and is reclaimed like any superseded version.
 func (h *Handle) Resolve(obj *index.Object) (*index.Object, error) {
 	if len(obj.Conflicts()) == 0 {
 		return obj, nil

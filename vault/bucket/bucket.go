@@ -198,9 +198,26 @@ func Unmarshal(data []byte) (*Bucket, error) {
 	return &bkt, nil
 }
 
+// DefaultTrashDays is how long a deleted object's content stays restorable
+// when the policy does not say.
+const DefaultTrashDays = 30
+
+// TrashWindow is how long a deleted object's content is kept: TrashDays,
+// the default when that is zero (a policy that never set it), and forever
+// (ok false) when it is negative.
+func (p Policy) TrashWindow() (window time.Duration, ok bool) {
+	switch {
+	case p.TrashDays < 0:
+		return 0, false
+	case p.TrashDays == 0:
+		return DefaultTrashDays * 24 * time.Hour, true
+	}
+	return time.Duration(p.TrashDays) * 24 * time.Hour, true
+}
+
 // DefaultPolicy returns the v2 defaults for a fresh bucket.
 func DefaultPolicy(bucketID string) Policy {
-	return Policy{Bucket: bucketID, Version: 1, Copies: 2, TrashDays: 30}
+	return Policy{Bucket: bucketID, Version: 1, Copies: 2, TrashDays: DefaultTrashDays}
 }
 
 // SignPolicy signs a policy revision with the owner key.

@@ -543,3 +543,43 @@ func TestMaterializeTakesContentHeldLocally(t *testing.T) {
 		t.Fatalf("content %q after %d fetches", got, fetches)
 	}
 }
+
+// A file whose bytes changed while its size, time and inode did not is
+// invisible to a scan; Damaged reads the content back and names it, and
+// leaves it as it is.
+func TestDamagedFindsContentChangedUnderAnUnchangedStat(t *testing.T) {
+	dev := newDevice(t, "alex", nil, nil)
+	write(t, dev, "notes/good.md", "all is well")
+	write(t, dev, "notes/rotten.md", "all is well here too")
+	if _, err := dev.rep.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if checked, damaged, err := dev.rep.Damaged(nil); err != nil || checked != 2 || len(damaged) != 0 {
+		t.Fatalf("healthy folder: %d checked, damaged %v, %v", checked, damaged, err)
+	}
+	// Flip a byte in place and put the timestamp back: same size, same
+	// time, same inode.
+	target := filepath.Join(dev.dir, "notes", "rotten.md")
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(target, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte("A"), 0); err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	if err := os.Chtimes(target, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	checked, damaged, err := dev.rep.Damaged(nil)
+	if err != nil || checked != 2 || len(damaged) != 1 || damaged[0] != "notes/rotten.md" {
+		t.Fatalf("after the damage: %d checked, damaged %v, %v", checked, damaged, err)
+	}
+	if raw, _ := os.ReadFile(target); string(raw) != "All is well here too" {
+		t.Fatalf("the damaged file was touched: %q", raw)
+	}
+}
