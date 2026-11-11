@@ -2,8 +2,11 @@ package daemon_test
 
 import (
 	"bytes"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/libp2p/go-libp2p/core/network"
 
 	"ioa.rocks/fabric/vault/daemon"
 )
@@ -236,5 +239,54 @@ func TestSharedBlobFollowsTheOtherPlacement(t *testing.T) {
 	}
 	if got, err := pair.read(t, object.ID); err != nil || !bytes.Equal(got, content) {
 		t.Fatalf("read after the drop: %d bytes, %v", len(got), err)
+	}
+}
+
+// A blob that another bucket starts keeping while the cache is asking a
+// holder about it is no longer the cache's to drop: the other bucket's
+// claim is looked at again after the answer, not only before the question.
+func TestEvictionSeesAnotherBucketTakeTheBlobWhileAsking(t *testing.T) {
+	pair := newBlobPair(t)
+	genesis, policy := signBucket(t, pair.holderState, "pw", "copies")
+	if _, err := pair.holderClient.CreateBucket(genesis, policy); err != nil {
+		t.Fatal(err)
+	}
+	content := film(1 << 20)
+	if _, err := pair.holderClient.Put("copies", "same.mkv", bytes.NewReader(content), nil); err != nil {
+		t.Fatal(err)
+	}
+	object := pair.put(t, "film.mkv", content)
+	waitFor(t, "both buckets known on the reader", func() bool {
+		buckets, err := pair.readerClient.Buckets()
+		return err == nil && len(buckets) == 2
+	})
+	t.Cleanup(daemon.SetEvictGrace(0))
+	if got, err := pair.read(t, object.ID); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("read: %d bytes, %v", len(got), err)
+	}
+	// From here nothing can bring the blob back: if a pass drops it, it
+	// stays dropped.
+	pair.holder.Fabric.Host.RemoveStreamHandler(daemon.BlobRangeProtocol)
+	pair.holder.Fabric.Host.RemoveStreamHandler(daemon.BlobProtocol)
+	// While the holder is being asked, the other bucket is placed in full.
+	var asked atomic.Bool
+	pair.holder.Fabric.Host.SetStreamHandler(daemon.HoldProtocol, func(stream network.Stream) {
+		if !asked.Swap(true) {
+			if err := pair.readerClient.Sub("copies", "full"); err != nil {
+				t.Errorf("placing the other bucket in full: %v", err)
+			}
+		}
+		pair.holder.ServeHold(stream)
+	})
+	budget := int64(1 << 19)
+	if err := pair.readerClient.Place("films", "cache", nil, &budget); err != nil {
+		t.Fatal(err)
+	}
+	pair.reader.EvictNow() // after the pass the new budget asked for, or instead of it
+	if !asked.Load() {
+		t.Fatal("no pass asked the holder; the test proved nothing")
+	}
+	if !pair.reader.HoldsBlob("copies", object.Blob) {
+		t.Fatal("the cache dropped a blob that another bucket had come to hold in full")
 	}
 }

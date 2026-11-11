@@ -65,3 +65,7 @@ func (d *Daemon) BlobFile(bucket, hash string) (string, error) {
 	}
 	return handle.Holder().Path(hash)
 }
+
+// ServeHold is the /vault/hold/1 handler, for tests that act while a
+// question is being answered.
+func (d *Daemon) ServeHold(stream network.Stream) { d.handleHold(stream) }

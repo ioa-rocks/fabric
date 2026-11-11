@@ -493,8 +493,10 @@ func (h *Handle) Holder() Holder {
 // open/close) race content operations on other goroutines, hence the lock.
 func (h *Handle) SetHolder(holder Holder, form string) {
 	h.holderMu.Lock()
-	defer h.holderMu.Unlock()
 	h.holder, h.form = holder, form
+	h.holderMu.Unlock()
+	// Not while holding holderMu: Summary takes summaryMu and then asks for
+	// the holder, and the two orders together deadlock.
 	h.summaryMu.Lock()
 	h.summaryValid = false
 	h.summaryMu.Unlock()

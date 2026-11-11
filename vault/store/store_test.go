@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"ioa.rocks/fabric/circle"
 	"ioa.rocks/fabric/vault/index"
@@ -193,5 +194,47 @@ func TestSummaryFollowsTheIndex(t *testing.T) {
 	}
 	if objects, files, held, err := h.Stats(); err != nil || objects != 2 || files != 1 || held != 1 {
 		t.Fatalf("Stats with a directory: %d objects, %d files, %d held, %v", objects, files, held, err)
+	}
+}
+
+// A folder attaching or leaving (SetHolder) while the dashboard asks for
+// the bucket's counts (Summary) must not stop either: the two take the same
+// pair of locks.
+func TestSummaryDuringAHolderChangeDoesNotDeadlock(t *testing.T) {
+	c, err := initStore(t.TempDir(), "alex", pass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := c.createBucket("notes", pass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if _, err := h.Put("a.txt", strings.NewReader("one")); err != nil {
+		t.Fatal(err)
+	}
+	const rounds = 5000
+	finished := make(chan struct{}, 2)
+	go func() {
+		for round := 0; round < rounds; round++ {
+			h.SetHolder(nil, "")
+		}
+		finished <- struct{}{}
+	}()
+	go func() {
+		for round := 0; round < rounds; round++ {
+			if _, err := h.Summary(); err != nil {
+				t.Error(err)
+				break
+			}
+		}
+		finished <- struct{}{}
+	}()
+	for waiting := 0; waiting < 2; waiting++ {
+		select {
+		case <-finished:
+		case <-time.After(30 * time.Second):
+			t.Fatal("Summary and SetHolder stopped each other")
+		}
 	}
 }

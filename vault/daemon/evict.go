@@ -142,6 +142,12 @@ func (d *Daemon) evictBucket(handle *store.Handle, keep int64) cacheState {
 				// should hold is no longer what this pass was told.
 				return state
 			}
+			if d.heldForAnother(handle, entry.Hash, recent) {
+				// So may another bucket's have: one that now keeps the blob
+				// makes it no longer this placement's to drop.
+				state.Bytes -= entry.Size
+				continue
+			}
 			if err := handle.Drop(entry.Hash); err != nil {
 				log.Printf("evict: blob %.12s: %v", entry.Hash, err)
 				continue
