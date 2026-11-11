@@ -43,7 +43,7 @@ func TestBulkDeletionIsHeld(t *testing.T) {
 	if held, err := h.ApplyRecords(small, "peer"); err != nil || held != 0 {
 		t.Fatalf("small deletion: held=%d err=%v", held, err)
 	}
-	if live, _, _ := h.Stats(); live != 38 {
+	if live, _, _, _ := h.Stats(); live != 38 {
 		t.Fatalf("small deletion did not merge: %d live", live)
 	}
 
@@ -58,7 +58,7 @@ func TestBulkDeletionIsHeld(t *testing.T) {
 	if held, err := h.ApplyRecords(big, "peer"); err != nil || held != 30 {
 		t.Fatalf("bulk deletion: held=%d err=%v", held, err)
 	}
-	if live, _, _ := h.Stats(); live != 38 {
+	if live, _, _, _ := h.Stats(); live != 38 {
 		t.Fatalf("held deletions must not apply: %d live", live)
 	}
 	list, err := h.ListHeld()
@@ -80,7 +80,7 @@ func TestBulkDeletionIsHeld(t *testing.T) {
 	if n, err := h.RejectHeld(); err != nil || n != 30 {
 		t.Fatalf("reject: n=%d err=%v", n, err)
 	}
-	if live, _, _ := h.Stats(); live != 38 {
+	if live, _, _, _ := h.Stats(); live != 38 {
 		t.Fatalf("after reject: %d live", live)
 	}
 	if list, _ = h.ListHeld(); len(list) != 0 {
@@ -89,7 +89,7 @@ func TestBulkDeletionIsHeld(t *testing.T) {
 	if held, err := h.ApplyRecords(big, "peer"); err != nil || held != 0 {
 		t.Fatalf("stale tombstones after reject: held=%d err=%v", held, err)
 	}
-	if live, _, _ := h.Stats(); live != 38 {
+	if live, _, _, _ := h.Stats(); live != 38 {
 		t.Fatalf("stale tombstone re-deleted after reject: %d live", live)
 	}
 	o, _ := h.Index.GetObject(objs[2].ID)
@@ -109,7 +109,7 @@ func TestBulkDeletionIsHeld(t *testing.T) {
 	if n, err := h.AcceptHeld(); err != nil || n != 30 {
 		t.Fatalf("accept: n=%d err=%v", n, err)
 	}
-	if live, _, _ := h.Stats(); live != 8 {
+	if live, _, _, _ := h.Stats(); live != 8 {
 		t.Fatalf("after accept: %d live", live)
 	}
 	if tr, _ := h.Trash(); len(tr) != 32 {
@@ -119,7 +119,7 @@ func TestBulkDeletionIsHeld(t *testing.T) {
 	if _, err := h.Restore(gone); err != nil {
 		t.Fatal(err)
 	}
-	if live, _, _ := h.Stats(); live != 9 {
+	if live, _, _, _ := h.Stats(); live != 9 {
 		t.Fatalf("restore: %d live", live)
 	}
 
@@ -142,7 +142,7 @@ func TestBulkDeletionIsHeld(t *testing.T) {
 		}
 		heldTotal += n
 	}
-	live, _, _ := h2.Stats()
+	live, _, _, _ := h2.Stats()
 	if heldTotal == 0 || live != 100-(60-heldTotal) || 60-heldTotal >= bucket.DefaultHoldMinCount {
 		t.Fatalf("trickle: held=%d live=%d", heldTotal, live)
 	}

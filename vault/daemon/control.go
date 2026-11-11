@@ -55,7 +55,8 @@ type BucketInfo struct {
 	CacheBytes       int64 `json:"cache_bytes,omitempty"`
 	CacheUnconfirmed int   `json:"cache_unconfirmed,omitempty"`
 	Objects          int   `json:"objects"` // live objects in the index
-	Held             int   `json:"held"`    // whose blobs this device holds
+	Files            int   `json:"files"`   // of those, the ones with content (a directory or a link has none)
+	Held             int   `json:"held"`    // of the files, how many have their content on this device
 
 	Conflicts     int `json:"conflicts,omitempty"`      // rendered conflict copies (ADR 0001 §3)
 	HeldDeletions int `json:"held_deletions,omitempty"` // parked deletions awaiting a decision (§4)
@@ -427,7 +428,7 @@ func (d *Daemon) handleBuckets(resp http.ResponseWriter, _ *http.Request) {
 		sort.Strings(info.Mounts)
 		if handle, err := d.handle(id); err == nil {
 			if summary, err := handle.Summary(); err == nil {
-				info.Objects, info.Held, info.Conflicts = summary.Objects, summary.Held, summary.Conflicts
+				info.Objects, info.Files, info.Held, info.Conflicts = summary.Objects, summary.Files, summary.Held, summary.Conflicts
 			}
 			if set, err := handle.Held(); err == nil {
 				info.HeldDeletions = len(set)

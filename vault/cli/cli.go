@@ -314,7 +314,7 @@ func cmdList(args []string) error {
 		return nil
 	}
 	for _, bkt := range buckets {
-		fmt.Printf("%s  %-6s %3d/%-3d  %s%s\n", bkt.ID[:16], placementWord(bkt), bkt.Held, bkt.Objects, bkt.Name, placementWhere(bkt))
+		fmt.Printf("%s  %-6s %3d/%-3d  %s%s\n", bkt.ID[:16], placementWord(bkt), bkt.Held, bkt.Files, bkt.Name, placementWhere(bkt))
 	}
 	return nil
 }

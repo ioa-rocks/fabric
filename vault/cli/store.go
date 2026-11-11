@@ -108,7 +108,7 @@ func (s *directStore) Buckets() ([]daemon.BucketInfo, error) {
 		pl := s.c.Placement(id)
 		info := daemon.BucketInfo{ID: id, Owner: bkt.Genesis.Owner, Name: bkt.Genesis.Name, Sub: pl.Mode, Root: pl.Root, Keep: pl.Keep}
 		if handle, err := s.handle(id); err == nil {
-			info.Objects, info.Held, _ = handle.Stats()
+			info.Objects, info.Files, info.Held, _ = handle.Stats()
 		}
 		out = append(out, info)
 	}

@@ -688,24 +688,30 @@ func (h *Handle) BackfillSize(obj *index.Object) (bool, error) {
 // Stats counts a bucket's live objects and how many of their blobs this
 // device holds — the seed of the health view (memo §5): "held < objects"
 // is what a fetch pass or another copy resolves.
-func (h *Handle) Stats() (objects, held int, err error) {
+func (h *Handle) Stats() (objects, files, held int, err error) {
 	objs, err := h.Index.ListObjects()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	for _, obj := range objs {
 		objects++
-		if blob := obj.Blob(); blob == "" || h.Holder().Has(blob) {
+		blob := obj.Blob()
+		if blob == "" {
+			continue
+		}
+		files++
+		if h.Holder().Has(blob) {
 			held++
 		}
 	}
-	return objects, held, nil
+	return objects, files, held, nil
 }
 
 // Summary is a bucket's dashboard line.
 type Summary struct {
 	Objects   int // live objects
-	Held      int // of those, how many have their content on this device
+	Files     int // of those, how many have content (a directory or a link has none)
+	Held      int // of the files, how many have their content on this device
 	Conflicts int // rendered conflict copies
 }
 
@@ -732,8 +738,11 @@ func (h *Handle) Summary() (Summary, error) {
 	var summary Summary
 	for _, obj := range objs {
 		summary.Objects++
-		if blob := obj.Blob(); blob == "" || holder.Has(blob) {
-			summary.Held++
+		if blob := obj.Blob(); blob != "" {
+			summary.Files++
+			if holder.Has(blob) {
+				summary.Held++
+			}
 		}
 		summary.Conflicts += len(obj.Conflicts())
 	}

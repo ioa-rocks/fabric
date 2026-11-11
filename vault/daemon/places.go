@@ -36,7 +36,11 @@ type placeEntry struct {
 	Folder  bool   `cbor:"folder,omitempty"`
 	Keep    int64  `cbor:"keep,omitempty"`
 	Objects int    `cbor:"objects"`
-	Held    int    `cbor:"held"`
+	// Files is how many of the objects have content; Held counts among
+	// those. A peer on the first release of this protocol sends no Files
+	// and counts every object without content as held.
+	Files *int `cbor:"files,omitempty"`
+	Held  int  `cbor:"held"`
 }
 
 type placeResp struct {
@@ -51,6 +55,7 @@ type PeerPlacement struct {
 	Folder    bool   `json:"folder,omitempty"`
 	Keep      int64  `json:"keep,omitempty"`
 	Objects   int    `json:"objects"`
+	Files     int    `json:"files"` // objects with content; Held counts among these
 	Held      int    `json:"held"`
 	Connected bool   `json:"connected"`
 	At        int64  `json:"at"` // when it answered, Unix nanoseconds
@@ -103,7 +108,7 @@ func (d *Daemon) placesFor(ctx context.Context, peerID peer.ID) []placeEntry {
 		}
 		if handle, err := d.handle(id); err == nil {
 			if summary, err := handle.Summary(); err == nil {
-				entry.Objects, entry.Held = summary.Objects, summary.Held
+				entry.Objects, entry.Files, entry.Held = summary.Objects, &summary.Files, summary.Held
 			}
 		}
 		places = append(places, entry)
@@ -199,7 +204,12 @@ func (d *Daemon) peerPlacements() map[string][]PeerPlacement {
 	for peerID, answer := range d.peerPlaces {
 		connected := d.Fabric.Host.Network().Connectedness(peerID) == network.Connected
 		for bucketID, entry := range answer.places {
+			files := entry.Objects
+			if entry.Files != nil {
+				files = *entry.Files
+			}
 			byBucket[bucketID] = append(byBucket[bucketID], PeerPlacement{
+				Files:  files,
 				PeerID: peerID.String(), Name: answer.name,
 				Mode: entry.Mode, Folder: entry.Folder, Keep: entry.Keep,
 				Objects: entry.Objects, Held: entry.Held,

@@ -385,7 +385,7 @@ func TestFolderConflictAndHold(t *testing.T) {
 	if _, err := a.rep.Scan(); err != ErrUnavailable {
 		t.Fatalf("scan without marker: %v", err)
 	}
-	live, _, _ := a.h.Stats()
+	live, _, _, _ := a.h.Stats()
 	if live != 5 {
 		t.Fatalf("missing marker changed the index: %d live", live)
 	}
@@ -422,7 +422,7 @@ func TestBulkDeleteWithConflict(t *testing.T) {
 			t.Fatalf("round %d: expected 30 held / 0 removed, got %s", round, rep)
 		}
 		exchange(t, a, b)
-		if live, _, _ := b.h.Stats(); live != 30 {
+		if live, _, _, _ := b.h.Stats(); live != 30 {
 			t.Fatalf("round %d: held deletion leaked to B (%d live)", round, live)
 		}
 		if cs, _ := b.h.Conflicts(); len(cs) != 1 {

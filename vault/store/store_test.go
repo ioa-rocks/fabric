@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"ioa.rocks/fabric/circle"
+	"ioa.rocks/fabric/vault/index"
 )
 
 const pass = "test-passphrase"
@@ -169,17 +170,28 @@ func TestSummaryFollowsTheIndex(t *testing.T) {
 	if _, err := h.Put("b.txt", strings.NewReader("two")); err != nil {
 		t.Fatal(err)
 	}
-	if got := summaryOf(); got != (Summary{Objects: 2, Held: 2}) {
+	if got := summaryOf(); got != (Summary{Objects: 2, Files: 2, Held: 2}) {
 		t.Fatalf("after two puts: %+v", got)
 	}
 	generation := h.Index.Generation()
-	if got := summaryOf(); got != (Summary{Objects: 2, Held: 2}) || h.Index.Generation() != generation {
+	if got := summaryOf(); got != (Summary{Objects: 2, Files: 2, Held: 2}) || h.Index.Generation() != generation {
 		t.Fatalf("a repeated ask changed the answer: %+v", got)
 	}
 	if err := h.Delete(obj); err != nil {
 		t.Fatal(err)
 	}
-	if got := summaryOf(); got != (Summary{Objects: 1, Held: 1}) {
+	if got := summaryOf(); got != (Summary{Objects: 1, Files: 1, Held: 1}) {
 		t.Fatalf("after a delete: %+v", got)
+	}
+	// A directory is an object with no content: it is counted as an
+	// object, not as a file, and never as held.
+	if _, err := h.PutEntry("album", index.Revision{Kind: index.KindDir}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := summaryOf(); got != (Summary{Objects: 2, Files: 1, Held: 1}) {
+		t.Fatalf("after adding a directory: %+v", got)
+	}
+	if objects, files, held, err := h.Stats(); err != nil || objects != 2 || files != 1 || held != 1 {
+		t.Fatalf("Stats with a directory: %d objects, %d files, %d held, %v", objects, files, held, err)
 	}
 }

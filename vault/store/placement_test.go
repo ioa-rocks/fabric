@@ -142,7 +142,7 @@ func TestPlacementRootHolder(t *testing.T) {
 	if got := content(t, h, o2); got != "after root" {
 		t.Fatalf("rooted blob: %q", got)
 	}
-	if objs, held, _ := h.Stats(); objs != 2 || held != 2 {
+	if objs, _, held, _ := h.Stats(); objs != 2 || held != 2 {
 		t.Fatalf("stats %d/%d, want 2/2", held, objs)
 	}
 	if p, err := c.BlobPath(o2.Blob()); err != nil || !strings.HasPrefix(p, array) {

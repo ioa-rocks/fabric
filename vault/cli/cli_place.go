@@ -156,7 +156,7 @@ func cmdPlace(args []string) error {
 	} else if bkt.Root != "" {
 		mode += " at " + bkt.Root
 	}
-	fmt.Printf("%s  %s: %s — holding %d/%d blobs\n", bkt.ID[:16], bkt.Name, mode, bkt.Held, bkt.Objects)
+	fmt.Printf("%s  %s: %s — holding %d of %d files\n", bkt.ID[:16], bkt.Name, mode, bkt.Held, bkt.Files)
 	if bkt.Keep > 0 {
 		line := "budget " + formatSize(bkt.Keep)
 		if bkt.CacheBytes > 0 {

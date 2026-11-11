@@ -76,7 +76,8 @@ func TestFolderReplicaOverMesh(t *testing.T) {
 	}
 	waitFor(t, "B to hold the imported files", func() bool {
 		bs, _ := clB.Buckets()
-		return len(bs) == 1 && bs[0].Objects == 31 && bs[0].Held == 31
+		// 30 notes and a link: the link is an object with no content to hold.
+		return len(bs) == 1 && bs[0].Objects == 31 && bs[0].Files == 30 && bs[0].Held == 30
 	})
 	rc, err := clB.Get("sync-lab", "docs/n07.md")
 	if err != nil {
@@ -135,7 +136,7 @@ func TestFolderReplicaOverMesh(t *testing.T) {
 	waitFor(t, "B to see and hold the conflict", func() bool {
 		cs, _ := clB.Conflicts("sync-lab")
 		bs, _ := clB.Buckets()
-		return len(cs) == 1 && len(bs) == 1 && bs[0].Objects == 32 && bs[0].Held == 32
+		return len(cs) == 1 && len(bs) == 1 && bs[0].Objects == 32 && bs[0].Files == 31 && bs[0].Held == 31
 	})
 
 	// rm -rf docs in the folder: held, not propagated.

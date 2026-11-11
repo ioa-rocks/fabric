@@ -486,10 +486,10 @@ function placementCell(place) {
   cell.append(placementPill(place.mode, place.folder, place.keep));
   const held = document.createElement("div");
   held.className = "place-held";
-  held.textContent = `${place.held}/${place.objects} held`;
+  held.textContent = `${place.held}/${place.files} held`;
   if (placementKind(place.mode, place.folder) !== "cache" && placementKind(place.mode, place.folder) !== "none") {
-    held.classList.add(place.held >= place.objects ? "held-ok" : "held-lag");
-    if (place.held < place.objects) held.textContent += " · fetching";
+    held.classList.add(place.held >= place.files ? "held-ok" : "held-lag");
+    if (place.held < place.files) held.textContent += " · fetching";
   }
   cell.append(held);
   for (const [text, warn] of place.notes || []) {
@@ -508,12 +508,12 @@ function ownPlacement(b) {
     if (b.cache_bytes) notes.push([`${bytes(b.cache_bytes)} of ${bytes(b.keep)} used`, b.cache_bytes > b.keep]);
     if (b.cache_unconfirmed) notes.push([`${b.cache_unconfirmed} over budget kept: no full copy confirmed`, true]);
   }
-  return { mode: b.sub, folder: !!b.folder, keep: b.keep, held: b.held, objects: b.objects, notes };
+  return { mode: b.sub, folder: !!b.folder, keep: b.keep, held: b.held, files: b.files, notes };
 }
 
 function peerPlacement(p) {
   const notes = p.connected ? [] : [["offline · as of " + new Date(p.at / 1e6).toLocaleTimeString(), false]];
-  return { mode: p.mode, folder: p.folder, keep: p.keep, held: p.held, objects: p.objects, notes, stale: !p.connected };
+  return { mode: p.mode, folder: p.folder, keep: p.keep, held: p.held, files: p.files, notes, stale: !p.connected };
 }
 
 /* The other devices to show: every one that answered for a visible bucket,
@@ -608,7 +608,9 @@ function renderVault(d) {
       ? "devices that said they keep every file" + (silent.length ? "; some devices did not say" : "")
       : (silent.length ? "no device said it keeps every file; some did not say" : "no device keeps every file: a cache cannot drop anything, and nothing guarantees a copy");
 
-    tr.append(td(link), circleCell, td(String(b.objects)), copies);
+    const fileCount = td(String(b.files));
+    fileCount.title = b.objects === b.files ? "" : `${b.objects} entries in all: ${b.objects - b.files} are directories or links, which have no content to hold`;
+    tr.append(td(link), circleCell, fileCount, copies);
     const own = placementCell(ownPlacement(b));
     own.classList.add("own");
     tr.append(own);
@@ -681,8 +683,9 @@ function renderBucketPage(d) {
     dl.append(dt, dd);
   };
   field(overview, "Circle", owner?.name || b.owner || "Unknown");
-  field(overview, "Objects", String(b.objects));
-  field(overview, "Content held locally", `${b.held} / ${b.objects}`);
+  field(overview, "Files", String(b.files));
+  if (b.objects !== b.files) field(overview, "Directories and links", String(b.objects - b.files));
+  field(overview, "Files held on this device", `${b.held} / ${b.files}`);
   field(overview, "Conflicts", String(b.conflicts || 0));
   field(overview, "Held deletions", String(b.held_deletions || 0));
   field(overview, "Bucket ID", mono(b.id));

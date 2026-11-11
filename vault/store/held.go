@@ -108,7 +108,7 @@ func (h *Handle) ApplyRecords(records []*index.Object, from string) (held int, e
 	if len(deleting) > 0 {
 		minCount, minPercent, enabled := h.CurrentPolicy().Hold()
 		if enabled {
-			live, _, err := h.Stats()
+			live, _, _, err := h.Stats()
 			if err != nil {
 				return 0, err
 			}
