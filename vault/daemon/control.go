@@ -43,11 +43,12 @@ func SocketPath(statePath string) string {
 // the local health seed: a full subscription is satisfied when Held ==
 // Objects.
 type BucketInfo struct {
-	Owner string `json:"owner,omitempty"` // owning circle DID
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Sub   string `json:"sub,omitempty"`  // this device's subscription mode
-	Root  string `json:"root,omitempty"` // blob store root this placement names (default store when empty)
+	Owner   string `json:"owner,omitempty"` // owning circle DID
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Sub     string `json:"sub,omitempty"`     // this device's subscription mode
+	Root    string `json:"root,omitempty"`    // blob store root this placement names (default store when empty)
+	Storage string `json:"storage,omitempty"` // physical blob/folder directory on this device
 	// A cache placement's budget in bytes (0: none, nothing is dropped),
 	// and what the last eviction pass found: the bucket's bytes held here
 	// and how many blobs over budget stayed for want of a confirmed copy.
@@ -138,6 +139,7 @@ type CircleInfo struct {
 
 // StatusReply is GET /v0/status.
 type StatusReply struct {
+	Storage string       `json:"storage,omitempty"` // this device's default blob directory
 	Circles []CircleInfo `json:"circles"`
 	Version string       `json:"version"`
 	Buckets int          `json:"buckets"`
@@ -258,6 +260,10 @@ func httpErr(resp http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	msg := err.Error()
 	switch {
+	case errors.Is(err, store.ErrReadOnlyPlacement):
+		code = http.StatusForbidden
+	case strings.Contains(msg, "bucket has a writable mount"):
+		code = http.StatusConflict
 	case strings.Contains(msg, "no bucket matches"),
 		strings.Contains(msg, "no object matches"),
 		strings.Contains(msg, "no mount declared"),
@@ -278,6 +284,7 @@ func (d *Daemon) handleStatus(resp http.ResponseWriter, req *http.Request) {
 		return
 	}
 	status := StatusReply{
+		Storage: d.Store.StoragePath(),
 		Version: Version,
 		Buckets: len(buckets),
 		Mesh:    d.Fabric != nil,
@@ -403,6 +410,16 @@ func (d *Daemon) handleAddMount(resp http.ResponseWriter, req *http.Request) {
 		return
 	}
 	decl := store.MountDecl{Bucket: id, Write: body.Write}
+	if decl.Write {
+		handle, err := d.handle(id)
+		if err == nil {
+			err = handle.Writable()
+		}
+		if err != nil {
+			httpErr(resp, err)
+			return
+		}
+	}
 	// Redeclaring a directory replaces its mount; release the old one first.
 	if err := d.releaseMount(body.Dir); err != nil {
 		httpErr(resp, err)
@@ -456,12 +473,17 @@ func (d *Daemon) handleBuckets(resp http.ResponseWriter, _ *http.Request) {
 		}
 		pl := d.Store.Placement(id)
 		info := BucketInfo{ID: id, Owner: bkt.Genesis.Owner, Name: bkt.Genesis.Name, Sub: pl.Mode, Root: pl.Root, Keep: pl.Keep, Peers: peerPlacements[id]}
+		info.Storage = d.Store.StoragePath()
+		if pl.Root != "" {
+			info.Storage = pl.Root
+		}
 		if state, ok := d.cacheStateOf(id); ok && pl.Keep > 0 {
 			info.CacheBytes, info.CacheUnconfirmed = state.Bytes, state.Unconfirmed
 		}
 		for dir, folderDecl := range folders {
 			if folderDecl.Bucket == id {
 				info.Folder = dir
+				info.Storage = dir
 			}
 		}
 		for dir, mountDecl := range mounts {

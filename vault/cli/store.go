@@ -38,6 +38,7 @@ type store_ interface {
 // openStore picks the backend: the daemon's socket when one serves the
 // store directory, a direct open (which needs the circle) otherwise.
 func openStore(pth paths) (store_, error) {
+	*pth.store = store.ExistingPath(*pth.store)
 	if cl := daemon.TryClient(*pth.store); cl != nil {
 		return clientStore{cl}, nil
 	}
@@ -106,7 +107,10 @@ func (s *directStore) Buckets() ([]daemon.BucketInfo, error) {
 			continue
 		}
 		pl := s.c.Placement(id)
-		info := daemon.BucketInfo{ID: id, Owner: bkt.Genesis.Owner, Name: bkt.Genesis.Name, Sub: pl.Mode, Root: pl.Root, Keep: pl.Keep}
+		info := daemon.BucketInfo{ID: id, Owner: bkt.Genesis.Owner, Name: bkt.Genesis.Name, Sub: pl.Mode, Root: pl.Root, Keep: pl.Keep, Storage: s.c.StoragePath()}
+		if pl.Root != "" {
+			info.Storage = pl.Root
+		}
 		if handle, err := s.handle(id); err == nil {
 			info.Objects, info.Files, info.Held, _ = handle.Stats()
 		}

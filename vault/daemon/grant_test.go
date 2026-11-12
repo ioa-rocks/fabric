@@ -81,6 +81,9 @@ func TestReaderDeviceCannotWrite(t *testing.T) {
 		t.Fatalf("reader read %q", content)
 	}
 	// Its own write stays its own.
+	if err := readerClient.Sub("album", "cache"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := readerClient.Put("album", "graffiti.jpg", bytes.NewReader([]byte("tag")), nil); err != nil {
 		t.Fatal(err)
 	}

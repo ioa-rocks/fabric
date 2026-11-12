@@ -462,7 +462,7 @@ const PLACE_HELP = {
   full: "keeps every file of the bucket",
   folder: "a folder on disk that mirrors the bucket; keeps every file",
   cache: "keeps what was read here; with a budget, drops the least recently read",
-  none: "the list of files only; content is fetched when asked for",
+  none: "read-only on this device; reads fetch and keep content locally",
 };
 
 function placementKind(mode, folder) {
@@ -504,6 +504,7 @@ function placementCell(place) {
 
 function ownPlacement(b) {
   const notes = [];
+  if (b.storage || b.root || state.data?.vault?.status?.storage) notes.push([b.storage || b.root || state.data.vault.status.storage, false]);
   if (b.sub === "cache" && b.keep) {
     if (b.cache_bytes) notes.push([`${bytes(b.cache_bytes)} of ${bytes(b.keep)} used`, b.cache_bytes > b.keep]);
     if (b.cache_unconfirmed) notes.push([`${b.cache_unconfirmed} over budget kept: no full copy confirmed`, true]);
@@ -557,6 +558,12 @@ function renderVault(d) {
   legend.hidden = true;
   const summary = document.getElementById("vault-summary");
   summary.textContent = `${buckets.length} bucket${buckets.length === 1 ? "" : "s"}`;
+  if (vs.storage) {
+    const storage = document.createElement("div");
+    storage.className = "storage-endpoint";
+    storage.append("Local blob store: ", mono(vs.storage));
+    box.append(storage);
+  }
   if (!buckets.length) {
     box.append(note("No buckets yet — create one with: vault bucket create <name>"));
     return;
@@ -710,6 +717,10 @@ function renderBucketPage(d) {
       const option = document.createElement("option");
       option.value = mode; option.textContent = mode;
       option.selected = (b.sub || "none") === mode;
+      if (mode === "none" && (vs.mounts || []).some(m => m.bucket === b.id && m.write)) {
+        option.disabled = true;
+        option.title = "Remount read-only before selecting none";
+      }
       select.append(option);
     }
     select.onchange = async () => {
@@ -720,14 +731,16 @@ function renderBucketPage(d) {
       finally { state.placementBusy = false; select.disabled = false; select.blur(); renderBucketPage(state.data); }
     };
     field(local, "Placement", select);
+    if ((vs.mounts || []).some(m => m.bucket === b.id && m.write)) local.append(note("Remount this bucket read-only before choosing none."));
     if (b.sub === "cache") {
       field(local, "Budget", b.keep ? bytes(b.keep) : "None — nothing is dropped");
       if (b.keep && b.cache_bytes) field(local, "Used", `${bytes(b.cache_bytes)} of ${bytes(b.keep)}`);
       if (b.cache_unconfirmed) field(local, "Over budget", `${b.cache_unconfirmed} files kept: no device holding the bucket in full confirmed them`);
       if (!b.keep) local.append(note(`Set one with: fabric bucket place ${b.name} cache -keep 20G`));
     }
-    field(local, "Storage", b.root ? mono(b.root) : "Default store");
+    if (!b.sub) local.append(note("Read-only on this device. Choose cache or full to write files."));
   }
+  field(local, "Storage endpoint", mono(b.storage || b.folder || b.root || vs.storage || "Not reported by this daemon"));
   const folder = (vs.folders || []).find(f => f.bucket === b.id);
   if (folder) {
     field(local, "Folder status", folder.error || (folder.available ? "Available" : "Unavailable"));

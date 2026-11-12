@@ -819,7 +819,7 @@ the UI and daemon use a non-default Astral state directory.
 | `fabric astral ...` | any member | inspect and use the coordination plane (`fabric astral -h`) |
 
 All commands take `-state <dir>` (default `~/.config/fabric`; for the
-`bucket` group it is the store, default `~/.config/vault`, with
+`bucket` group it is the store, default `~/.local/share/vault` (`$XDG_DATA_HOME/vault` when set), with
 `-circle-state` for the circle), so several nodes can run on one machine
 for testing. Flags go **before** positional arguments (`fabric approve
 -state DIR FP`; the bucket group also accepts them after). Set

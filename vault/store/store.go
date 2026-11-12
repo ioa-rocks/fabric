@@ -59,18 +59,10 @@ const (
 	SubNone  = ""      // catalog + index only
 )
 
-// DefaultPath returns ~/.config/vault (or the OS equivalent).
-func DefaultPath() string {
-	base, err := os.UserConfigDir()
-	if err != nil {
-		base = "."
-	}
-	return filepath.Join(base, "vault")
-}
-
 // Open opens (creating on first use) the store at path for the circles
 // under circleRoot.
 func Open(path string, circleRoot string) (*Store, error) {
+	path = ExistingPath(path)
 	if circleRoot == "" {
 		return nil, errors.New("opening store: no circle root")
 	}
@@ -124,6 +116,13 @@ func (c *Store) Mounts() (map[string]MountDecl, error) {
 
 // SetMount declares a mount at dir (an absolute path).
 func (c *Store) SetMount(dir string, mount MountDecl) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if mount.Write {
+		if err := c.writableLocked(mount.Bucket); err != nil {
+			return err
+		}
+	}
 	if !filepath.IsAbs(dir) {
 		return fmt.Errorf("mountpoint must be an absolute path")
 	}
@@ -137,6 +136,8 @@ func (c *Store) SetMount(dir string, mount MountDecl) error {
 
 // RemoveMount drops the declaration for dir.
 func (c *Store) RemoveMount(dir string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	mounts, err := c.Mounts()
 	if err != nil {
 		return err
@@ -188,7 +189,17 @@ func (c *Store) CreateBucket(owner *circle.Circle, name, passphrase string) (*Ha
 	if err != nil {
 		return nil, err
 	}
-	return c.AdoptBucket(raw, praw)
+	handle, err := c.AdoptBucket(raw, praw)
+	if err != nil {
+		return nil, err
+	}
+	// Creation commits this device to the content it writes, just as the
+	// daemon and direct CLI creation paths do. Peer adoption stays none.
+	if err := c.SetSubscription(handle.ID(), SubFull); err != nil {
+		handle.Close()
+		return nil, err
+	}
+	return handle, nil
 }
 
 // SignBucket produces a signed genesis + default policy for a new bucket.
@@ -526,6 +537,9 @@ func (h *Handle) Put(name string, src io.Reader, tags ...string) (*index.Object,
 // content; for a directory or symlink record src is ignored and the
 // revision's Kind/Target/Mode/MTime describe the entry (ADR 0001 §6).
 func (h *Handle) PutEntry(name string, rev index.Revision, src io.Reader, tags ...string) (*index.Object, error) {
+	if err := h.Writable(); err != nil {
+		return nil, err
+	}
 	if err := checkName(name); err != nil {
 		return nil, err
 	}
@@ -584,6 +598,9 @@ func checkName(name string) error {
 // Revise mints a local revision of an object (a copy of the rendered head
 // with fn applied) that supersedes every head this device knows.
 func (h *Handle) Revise(obj *index.Object, fn func(r *index.Revision)) (*index.Object, error) {
+	if err := h.Writable(); err != nil {
+		return nil, err
+	}
 	obj.Revise(h.store.NodeID, time.Now().UnixNano(), fn)
 	return h.Index.PutObject(obj)
 }
@@ -596,6 +613,9 @@ func (h *Handle) Replace(obj *index.Object, src io.Reader) (*index.Object, error
 }
 
 func (h *Handle) ReplaceAt(obj *index.Object, src io.Reader, mtime int64) (*index.Object, error) {
+	if err := h.Writable(); err != nil {
+		return nil, err
+	}
 	hash, size, err := h.Holder().Put(src)
 	if err != nil {
 		return nil, err
@@ -626,6 +646,9 @@ func (h *Handle) ReplaceHeld(obj *index.Object, hash string, size, mtime int64, 
 
 // Rename changes only the display path; object identity and content survive.
 func (h *Handle) Rename(obj *index.Object, name string) (*index.Object, error) {
+	if err := h.Writable(); err != nil {
+		return nil, err
+	}
 	if err := checkName(name); err != nil {
 		return nil, err
 	}
@@ -815,6 +838,9 @@ func resolveIn(all []*index.Object, ref string) (*index.Object, error) {
 
 // Tag applies +tag / -tag mutations to an object.
 func (h *Handle) Tag(obj *index.Object, add, remove []string) (*index.Object, error) {
+	if err := h.Writable(); err != nil {
+		return nil, err
+	}
 	now := time.Now().UnixNano()
 	for _, tag := range add {
 		if !obj.Tags.Has(tag) {

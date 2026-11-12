@@ -42,6 +42,10 @@ func newDevice(t *testing.T, name string, genesis, policy []byte) *device {
 	} else if h, err = c.AdoptBucket(genesis, policy); err != nil {
 		t.Fatal(err)
 	}
+	// Declaring a folder is a full placement, as in the daemon API.
+	if err := c.SetSubscription(h.ID(), store.SubFull); err != nil {
+		t.Fatal(err)
+	}
 	dir := filepath.Join(t.TempDir(), "Sync")
 	rep, err := Open(dir, t.TempDir(), h)
 	if err != nil {

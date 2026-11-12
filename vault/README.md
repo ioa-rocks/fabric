@@ -68,7 +68,8 @@ export CIRCLE_PASSPHRASE=test         # or omit for an interactive prompt
 ./fabric bucket project -state /tmp/v -circle-state /tmp/f/circle family-photos /tmp/album
 ```
 
-Defaults: circle `~/.config/fabric/circle`, store `~/.config/vault`. With a
+Defaults: circle `~/.config/fabric/circle`, store `~/.local/share/vault`
+(`$XDG_DATA_HOME/vault` when set). With a
 daemon running, bucket commands never need `-circle-state` (the daemon
 holds the circle); without one, the direct path opens it. Flags may come
 before or after positional arguments (after `tag`'s `<bucket>
@@ -76,10 +77,16 @@ before or after positional arguments (after `tag`'s `<bucket>
 
 ## Daemon & mesh
 
+On upgrade, the next default `fabric up` moves an existing
+`~/.config/vault` store to the data directory while the old daemon is
+stopped. Clients continue to find the old store until then. The migration
+refuses an active daemon or open index and never overwrites an existing
+destination. Explicit `-vault-state` paths keep their location.
+
 Vault is a **subsystem of the node daemon** (ADR 0013 — one process,
 one device identity per machine). `fabric up` activates it when the
 node has a circle (`<state>/circle`; the store defaults to
-`~/.config/vault`, override with `-vault-state`; `-no-vault` to skip)
+`~/.local/share/vault`, override with `-vault-state`; `-no-vault` to skip)
 and is pure connectivity otherwise. A circle still living in the store
 directory from before the hoist is adopted automatically at startup
 (the two files are copied; the originals stay, unused). The subsystem
@@ -149,6 +156,16 @@ Only the circle travels — `blobs/`, `buckets/`, `subs.json`,
 `mounts.json` and `folders.json` are per-device state that sync owns.
 
 ## Sync & placement
+
+The dashboard shows this device's actual blob storage directory and each
+bucket's override or folder endpoint. Paths stay device-local; the other
+devices' placement columns show who holds the content.
+
+Placement `none` is read-only for local object edits: choose `cache` or
+`full` before uploading, replacing, renaming, deleting or changing tags.
+It still receives metadata and can read content on demand; those reads
+may keep local bytes. Writable mounts require `cache` or `full`; remount
+read-only before changing a mounted bucket to `none`.
 
 Anti-entropy on `/vault/sync/2` (fabric spec-§5 pattern): a full
 catalog + index swap on every connect, on a 30 s timer, and pushed

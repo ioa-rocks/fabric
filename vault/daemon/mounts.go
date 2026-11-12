@@ -93,6 +93,15 @@ func (d *Daemon) reconcileMounts() {
 // establishMount performs one mount attempt and registers the watcher that
 // clears the live entry when the kernel releases the mount.
 func (d *Daemon) establishMount(dir string, decl store.MountDecl) error {
+	if decl.Write {
+		handle, err := d.handle(decl.Bucket)
+		if err != nil {
+			return err
+		}
+		if err := handle.Writable(); err != nil {
+			return err
+		}
+	}
 	if d.Mounter == nil {
 		return fmt.Errorf("this daemon has no mounter wired")
 	}

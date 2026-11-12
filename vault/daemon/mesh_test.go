@@ -276,6 +276,9 @@ func TestSharedCircleBesidePersonal(t *testing.T) {
 		t.Fatalf("her pc must hold exactly the album, got %+v %v", bs, err)
 	}
 	// Her writes reach the desk's copy of the album.
+	if err := clH.Sub("album", "cache"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := clH.Put("album", "reply.jpg", bytes.NewReader([]byte("jpeg2")), nil); err != nil {
 		t.Fatal(err)
 	}

@@ -110,7 +110,7 @@ or open the store directly when none runs.
   list     list buckets and how this device holds each
   place    place <bucket> — show this device's placement, in detail
            place <bucket> full|cache|none — hold a complete copy / what
-           gets accessed / catalog and index only
+           gets accessed / read-only catalog and on-demand content
            place <bucket> folder <dir> — keep the bucket as a real
            directory the daemon syncs (a full placement); -rescan now
            place <bucket> full|cache -at <dir> — keep this bucket's blobs
@@ -619,6 +619,16 @@ func PrintMounts(mounts []daemon.MountInfo) {
 // hatch: the mount is served by this process and dies with it, and is not
 // recorded in the daemon's mount table.
 func foregroundMount(cl *daemon.Client, statePath, bucket, mountpoint string, write, debug bool) error {
+	statePath = store.ExistingPath(statePath)
+	if write {
+		info, err := findBucket(clientStore{cl}, bucket)
+		if err != nil {
+			return err
+		}
+		if info.Sub != store.SubCache && info.Sub != store.SubFull {
+			return fmt.Errorf("%w: choose cache or full before mounting writable", store.ErrReadOnlyPlacement)
+		}
+	}
 	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
 		return err
 	}

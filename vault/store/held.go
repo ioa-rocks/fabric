@@ -190,6 +190,9 @@ func (h *Handle) ListHeld() ([]HeldInfo, error) {
 // tombstone, so the other replicas apply it without holding it again.
 // Returns how many were applied.
 func (h *Handle) AcceptHeld() (int, error) {
+	if err := h.Writable(); err != nil {
+		return 0, err
+	}
 	h.heldMu.Lock()
 	defer h.heldMu.Unlock()
 	set, err := h.Held()
@@ -223,6 +226,9 @@ func (h *Handle) AcceptHeld() (int, error) {
 // so dropping it leaves the index (including any unresolved conflicts) as it
 // was before the scan. Returns how many were restored.
 func (h *Handle) RejectHeld() (int, error) {
+	if err := h.Writable(); err != nil {
+		return 0, err
+	}
 	h.heldMu.Lock()
 	defer h.heldMu.Unlock()
 	set, err := h.Held()

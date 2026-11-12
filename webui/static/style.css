@@ -319,3 +319,5 @@ a:hover { color: var(--good); }
 .objects-list a { color: inherit; }
 .object-preview { display: block; max-width: 100%; max-height: 70vh; margin: 6px 0 8px; border-radius: 6px; background: #000; }
 audio.object-preview { background: none; width: min(100%, 480px); }
+.storage-endpoint { margin: 0 0 1rem; overflow-wrap: anywhere; }
+.place-cell .place-held { overflow-wrap: anywhere; }

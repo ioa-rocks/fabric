@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -357,6 +358,15 @@ func cmdUp(args []string) error {
 	if !*noVault {
 		root := circle.Root(*statePath)
 		if circle.Any(root) {
+			if *vaultState == vaultstore.DefaultPath() {
+				moved, err := vaultstore.MigrateDefaultPath(vaultdaemon.TryClient(vaultstore.LegacyPath()) != nil)
+				if err != nil {
+					return fmt.Errorf("vault store migration: %w", err)
+				}
+				if moved {
+					log.Printf("vault: moved store from %s to %s", vaultstore.LegacyPath(), *vaultState)
+				}
+			}
 			st, err := vaultstore.Open(*vaultState, root)
 			if err != nil {
 				return fmt.Errorf("vault subsystem: %w", err)

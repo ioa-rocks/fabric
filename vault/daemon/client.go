@@ -13,6 +13,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"ioa.rocks/fabric/vault/store"
 )
 
 // Client talks to a running daemon's control socket. It implements the same
@@ -24,6 +26,7 @@ type Client struct{ http http.Client }
 // socket, nil otherwise — the CLI's "route through the daemon when one is
 // running" switch.
 func TryClient(statePath string) *Client {
+	statePath = store.ExistingPath(statePath)
 	sock := SocketPath(statePath)
 	conn, err := net.DialTimeout("unix", sock, 250*time.Millisecond)
 	if err != nil {
@@ -35,6 +38,7 @@ func TryClient(statePath string) *Client {
 
 // NewClient builds a client for a state dir's control socket.
 func NewClient(statePath string) *Client {
+	statePath = store.ExistingPath(statePath)
 	sock := SocketPath(statePath)
 	return &Client{http: http.Client{
 		// No overall timeout: puts and gets stream blob-sized bodies.

@@ -141,6 +141,17 @@ func (c *Store) SetPlacement(bucketID string, placement Placement) error {
 	defer c.mu.Unlock()
 	defer c.placementEpoch.Add(1)
 	if placement.Mode == SubNone {
+		mounts, err := c.Mounts()
+		if err != nil {
+			return err
+		}
+		for directory, mount := range mounts {
+			if mount.Bucket == bucketID && mount.Write {
+				return fmt.Errorf("bucket has a writable mount at %s; remount it read-only before choosing none", directory)
+			}
+		}
+	}
+	if placement.Mode == SubNone {
 		delete(c.placements, bucketID)
 	} else {
 		c.placements[bucketID] = placement
