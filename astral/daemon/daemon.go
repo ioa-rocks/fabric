@@ -62,15 +62,6 @@ const maxWireSize = 256 * 1024
 // triggers a flush. Variable so tests can shrink it.
 var OutboxInterval = 10 * time.Second
 
-// DefaultPath is the astral state directory.
-func DefaultPath() string {
-	base, err := os.UserConfigDir()
-	if err != nil {
-		base = "."
-	}
-	return filepath.Join(base, "astral")
-}
-
 // Op names the verbs carried on Protocol.
 type Op string
 

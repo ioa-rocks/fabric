@@ -44,9 +44,10 @@ func (c *Client) sign(op Op, name, eventID, consumer, value string) *astral.Prin
 	return c.Signer.Sign(string(op), astral.Ref{Circle: c.Circle, Name: name}, eventID, consumer, value, time.Now())
 }
 
-// NewClient builds a client for a state dir's control socket.
+// NewClient builds a client for a state dir's control socket. The default
+// directory resolves to the legacy one until the daemon has migrated it.
 func NewClient(statePath string) *Client {
-	sock := SocketPath(statePath)
+	sock := SocketPath(ExistingPath(statePath))
 	return &Client{http: http.Client{
 		// Waits long-poll; the per-call timeout rides the request body.
 		Timeout: 15 * time.Minute,

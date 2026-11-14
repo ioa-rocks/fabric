@@ -788,6 +788,12 @@ the existing admission `queue on|off` command.
 The same operator state is visible in `fabric ui`; use `-astral-state` when
 the UI and daemon use a non-default Astral state directory.
 
+The journal (queues, their events, leases, acks and the outbox) lives in
+`~/.local/share/astral` (`$XDG_DATA_HOME/astral` when set). A daemon
+started on the default moves an existing `~/.config/astral` there once,
+while no other daemon is running on it; clients find the old directory
+until then. An explicit `-astral-state` is never moved.
+
 ## Commands
 
 | Command | Where | What |
@@ -820,7 +826,8 @@ the UI and daemon use a non-default Astral state directory.
 
 All commands take `-state <dir>` (default `~/.config/fabric`; for the
 `bucket` group it is the store, default `~/.local/share/vault` (`$XDG_DATA_HOME/vault` when set), with
-`-circle-state` for the circle), so several nodes can run on one machine
+`-circle-state` for the circle; for the `astral` group it is the journal
+directory, default `~/.local/share/astral`), so several nodes can run on one machine
 for testing. Flags go **before** positional arguments (`fabric approve
 -state DIR FP`; the bucket group also accepts them after). Set
 `FABRIC_PASSPHRASE` (root key) and `CIRCLE_PASSPHRASE` (circle

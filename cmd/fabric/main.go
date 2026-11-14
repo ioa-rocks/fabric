@@ -386,6 +386,20 @@ func cmdUp(args []string) error {
 	// chains onto vault's.
 	var ad *astraldaemon.Daemon
 	if !*noAstral {
+		if *astralState == astraldaemon.DefaultPath() {
+			legacy := astraldaemon.LegacyPath()
+			moved, err := astraldaemon.MigrateDefaultPath(astraldaemon.Running(legacy))
+			if err != nil {
+				return fmt.Errorf("astral state migration: %w", err)
+			}
+			if moved {
+				log.Printf("astral: moved state from %s to %s", legacy, *astralState)
+			} else if _, err := os.Stat(filepath.Join(legacy, "journal")); err == nil && legacy != *astralState {
+				// Both directories exist: the destination wins and the old
+				// journal is not merged, so say so rather than lose it quietly.
+				log.Printf("astral: legacy state at %s is not used; state is %s", legacy, *astralState)
+			}
+		}
 		ad, err = astraldaemon.New(*astralState, d)
 		if err != nil {
 			return fmt.Errorf("astral subsystem: %w", err)
