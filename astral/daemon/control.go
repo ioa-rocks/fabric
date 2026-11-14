@@ -63,6 +63,15 @@ type declareBody struct {
 	Accepts  []string        `json:"accepts,omitempty"`
 	IdleS    int             `json:"idle_s,omitempty"`     // idle TTL seconds; 0 = never (ephemeral names default)
 	MaxEv    int             `json:"max_events,omitempty"` // total-append cap; 0 = unlimited (ephemeral names default)
+	// Spread: true lets other nodes host the same name too (shared
+	// delivery only); false turns that off; absent leaves it as it is.
+	Spread *bool `json:"spread,omitempty"`
+}
+
+type drainBody struct {
+	Circle string `json:"circle,omitempty"`
+	Name   string `json:"name"`
+	Off    bool   `json:"off,omitempty"` // end the drain
 }
 
 type removeBody struct {
@@ -152,6 +161,7 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("GET /v0/status", d.ctlStatus)
 	mux.HandleFunc("POST /v0/subjects", d.ctlDeclare)
 	mux.HandleFunc("POST /v0/remove", d.ctlRemove)
+	mux.HandleFunc("POST /v0/drain", d.ctlDrain)
 	mux.HandleFunc("POST /v0/hosts", d.ctlHost)
 	mux.HandleFunc("POST /v0/append", d.ctlAppend)
 	mux.HandleFunc("POST /v0/claim", d.ctlClaim)
@@ -184,8 +194,11 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, astral.ErrUnknownSubject):
 		code = http.StatusNotFound
 	case errors.Is(err, astral.ErrKindRejected), errors.Is(err, astral.ErrBadName),
-		errors.Is(err, astral.ErrBadCircle), errors.Is(err, astral.ErrSubjectFull):
+		errors.Is(err, astral.ErrBadCircle), errors.Is(err, astral.ErrSubjectFull),
+		errors.Is(err, astral.ErrSpreadPolicy):
 		code = http.StatusBadRequest
+	case errors.Is(err, astral.ErrDraining):
+		code = http.StatusConflict
 	case errors.Is(err, ErrDenied):
 		code = http.StatusForbidden
 	}
@@ -224,7 +237,15 @@ func (d *Daemon) ctlStatus(w http.ResponseWriter, r *http.Request) {
 	if len(reply.Placements) > 0 {
 		reply.Placed = make(map[string]string, len(reply.Placements))
 		for _, p := range reply.Placements {
-			reply.Placed[d.display(p.Ref)] = d.hostLabel(p.Host)
+			label := d.hostLabel(p.Host)
+			if p.Draining {
+				label += " (draining)"
+			}
+			// A spread name has one placement per host.
+			if prev := reply.Placed[d.display(p.Ref)]; prev != "" {
+				label = prev + ", " + label
+			}
+			reply.Placed[d.display(p.Ref)] = label
 		}
 	}
 	reply.Monitors, _ = d.Store.Heartbeats()
@@ -254,7 +275,29 @@ func (d *Daemon) ctlDeclare(w http.ResponseWriter, r *http.Request) {
 	if err := d.Declare(astral.Subject{
 		Circle: ref.Circle, Name: ref.Name, Delivery: b.Delivery, Accepts: b.Accepts,
 		IdleTTLNS: int64(b.IdleS) * int64(time.Second), MaxEvents: b.MaxEv,
+		Spread: b.Spread != nil && *b.Spread,
 	}); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if b.Spread != nil && !*b.Spread {
+		// Spread is sticky across a redeclare; turning it off is explicit.
+		if err := d.SetSpread(ref, false); err != nil {
+			writeErr(w, err)
+			return
+		}
+	}
+	writeJSON(w, ref)
+}
+
+func (d *Daemon) ctlDrain(w http.ResponseWriter, r *http.Request) {
+	var b drainBody
+	if err := decode(w, r, &b); err != nil {
+		writeErr(w, err)
+		return
+	}
+	ref := d.Ref(b.Circle, b.Name)
+	if err := d.Drain(ref, !b.Off); err != nil {
 		writeErr(w, err)
 		return
 	}

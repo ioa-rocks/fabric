@@ -168,11 +168,17 @@ func (d *Daemon) Wait(ctx context.Context, pr *astral.Principal, ref astral.Ref,
 		} else if err := d.localAuthorize(pr, OpWait, ref, "", "", ""); err != nil {
 			return "", err
 		}
+		if m.Spread {
+			return d.waitSpread(ctx, pr, ref, true, timeout)
+		}
 		return d.waitHeld(ctx, ref, timeout, holdOf("", d.localPrincipal(pr), pr))
 	}
 	host, ok, err := d.Store.Host(ref)
-	if err != nil || !ok {
-		return "", orUnknown(err)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return d.waitSpread(ctx, pr, ref, false, timeout)
 	}
 	resp, err := d.remoteWithin(host, request{Op: OpWait, Circle: ref.Circle, Name: ref.Name, LeaseNS: int64(timeout), Principal: pr}, timeout+5*time.Second)
 	if err != nil {

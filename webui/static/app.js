@@ -358,7 +358,7 @@ function renderAstral(d) {
   const hosted = (a.hosted || []).filter(inCircle);
   const placedAll = (a.placements || []).filter(inCircle);
   const placed = state.circle
-    ? placedAll.map(p => [p.name, hostLabel(d, p.host)]).sort((x, y) => x[0].localeCompare(y[0]))
+    ? placedAll.map(p => [p.name, hostLabel(d, p.host) + (p.draining ? " (draining)" : "")]).sort((x, y) => x[0].localeCompare(y[0]))
     : Object.entries(a.placed || {}).sort((x, y) => x[0].localeCompare(y[0]));
   const claims = (a.claims || []).filter(inCircle);
   const monitors = a.monitors || [];

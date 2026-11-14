@@ -24,8 +24,12 @@ import (
 const usage = `usage: fabric astral <command> [flags] [args]
 
   status                               hosted subjects, placements, outbox, connected members
-  subject <subject:name> [-delivery exclusive|shared] [-accepts k1,k2] [-idle 10m] [-max 100]
-                                       -idle self-destructs after inactivity; -max caps appends
+  subject <subject:name> [-delivery exclusive|shared] [-accepts k1,k2] [-idle 10m] [-max 100] [-spread]
+                                       -idle self-destructs after inactivity; -max caps appends;
+                                       -spread lets other nodes host the same shared queue too:
+                                       declare it on each host (-spread=false turns it off here)
+  drain <name> [-off]                  this host of a spread queue takes no new events and keeps
+                                       serving claims; rm it once status shows nothing pending
   rm <name>                            remove a hosted subject and its journal
   host <name> <member|peer-id>         record that a node hosts <name> ("" clears)
   append <name> [-kind user] [-source tool] [-id id] [-ref artifact] [-reply] [-corr id] <content|->
@@ -63,6 +67,8 @@ func Main(args []string) int {
 		err = cmdStatus(rest)
 	case "subject":
 		err = cmdSubject(rest)
+	case "drain":
+		err = cmdDrain(rest)
 	case "rm":
 		err = cmdRm(rest)
 	case "host":
@@ -258,6 +264,12 @@ func cmdStatus(args []string) error {
 			if h.Circle != s.Home {
 				name = h.Name + " @ " + h.Circle
 			}
+			if h.Spread {
+				acc += "  spread"
+			}
+			if h.Draining {
+				acc += "  draining"
+			}
 			fmt.Printf("  %-32s pending %-4d accepts %s\n", name, h.Pending, acc)
 		}
 	}
@@ -279,19 +291,41 @@ func cmdSubject(args []string) error {
 	delivery := fs.String("delivery", string(astral.DeliveryExclusive), "exclusive or shared")
 	idle := fs.Duration("idle", 0, "self-destruct after this much inactivity (0 = never; _reply/ names default tight)")
 	maxEvents := fs.Int("max", 0, "cap on total appended events (0 = unlimited; _reply/ names default tight)")
+	spread := fs.Bool("spread", false, "let other nodes host this shared queue too (declare it on each); -spread=false turns it off here")
 	pos := parse(fs, args)
 	if len(pos) != 1 {
-		return fmt.Errorf("usage: subject <subject:name> [-delivery exclusive|shared] [-accepts k1,k2] [-idle 10m] [-max 100]")
+		return fmt.Errorf("usage: subject <subject:name> [-delivery exclusive|shared] [-accepts k1,k2] [-idle 10m] [-max 100] [-spread]")
 	}
 	var kinds []string
 	if *accepts != "" {
 		kinds = strings.Split(*accepts, ",")
 	}
 	cl := client(fs, st)
+	spreadSet := false
+	fs.Visit(func(f *flag.Flag) { spreadSet = spreadSet || f.Name == "spread" })
+	if spreadSet {
+		if *idle > 0 || *maxEvents > 0 {
+			return fmt.Errorf("-spread does not combine with -idle or -max")
+		}
+		if *spread {
+			return cl.DeclareSpread(pos[0], kinds)
+		}
+		return cl.SetSpread(pos[0], astral.Delivery(*delivery), kinds, false)
+	}
 	if *idle > 0 || *maxEvents > 0 {
 		return cl.DeclareExpiring(pos[0], astral.Delivery(*delivery), kinds, *idle, *maxEvents)
 	}
 	return cl.Declare(pos[0], astral.Delivery(*delivery), kinds)
+}
+
+func cmdDrain(args []string) error {
+	fs, st := flags("drain")
+	off := fs.Bool("off", false, "end the drain: accept new events again")
+	pos := parse(fs, args)
+	if len(pos) != 1 {
+		return fmt.Errorf("usage: drain <name> [-off]")
+	}
+	return client(fs, st).Drain(pos[0], !*off)
 }
 
 func cmdRm(args []string) error {

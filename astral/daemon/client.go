@@ -128,6 +128,27 @@ func (c *Client) DeclareExpiring(name string, delivery astral.Delivery, accepts 
 	}, nil)
 }
 
+// DeclareSpread hosts a shared subject here that other nodes may host too
+// (spread placement): publishers pick one host and fall over to the next,
+// consumers claim from all. Declare it on every node that should host it.
+func (c *Client) DeclareSpread(name string, accepts []string) error {
+	on := true
+	return c.post("/v0/subjects", declareBody{Circle: c.Circle, Name: name, Delivery: astral.DeliveryShared, Accepts: accepts, Spread: &on}, nil)
+}
+
+// SetSpread turns spread placement on or off for a subject hosted here,
+// leaving the rest of its declaration alone.
+func (c *Client) SetSpread(name string, delivery astral.Delivery, accepts []string, on bool) error {
+	return c.post("/v0/subjects", declareBody{Circle: c.Circle, Name: name, Delivery: delivery, Accepts: accepts, Spread: &on}, nil)
+}
+
+// Drain makes this host of a spread subject refuse new events while it
+// keeps serving claims (on=false ends the drain). Remove the subject once
+// status shows nothing pending.
+func (c *Client) Drain(name string, on bool) error {
+	return c.post("/v0/drain", drainBody{Circle: c.Circle, Name: name, Off: !on}, nil)
+}
+
 // Remove drops a subject hosted on this node, journal included.
 func (c *Client) Remove(name string) error {
 	return c.post("/v0/remove", removeBody{Circle: c.Circle, Name: name}, nil)

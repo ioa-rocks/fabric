@@ -330,3 +330,125 @@ func TestMonitorGenerations(t *testing.T) {
 }
 
 func deathNoticeID(e string, g uint64) string { return DeathNotice(e, g, 0).ID }
+
+func TestSpreadPlacementRules(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	jobs := Ref{Circle: "c", Name: "subject:jobs"}
+	inbox := Ref{Circle: "c", Name: "subject:inbox"}
+
+	// Two nodes spread the same name: both are hosts.
+	for _, host := range []string{"hostA", "hostB"} {
+		if err := st.ReplaceHosting(host, []Announced{{Ref: jobs, Spread: true}, {Ref: Ref{Circle: "c", Name: "subject:only-" + host}}}); err != nil {
+			t.Fatalf("%s: %v", host, err)
+		}
+	}
+	hosts, err := st.SpreadHosts(jobs)
+	if err != nil || len(hosts) != 2 {
+		t.Fatalf("spread hosts: %+v, %v", hosts, err)
+	}
+	// The rank is the same whatever order the hosts were learned in.
+	again := []Placement{{Ref: jobs, Host: "hostB"}, {Ref: jobs, Host: "hostA"}}
+	RankHosts(jobs, again)
+	if again[0].Host != hosts[0].Host || again[1].Host != hosts[1].Host {
+		t.Fatalf("rank depends on input order: %+v vs %+v", again, hosts)
+	}
+	if _, ok, _ := st.Host(jobs); ok {
+		t.Fatal("a spread name must not also have a single host")
+	}
+
+	// A private inbox two nodes both declare still collides.
+	if err := st.ReplaceHosting("hostA", []Announced{{Ref: jobs, Spread: true}, {Ref: inbox}}); err != nil {
+		t.Fatal(err)
+	}
+	err = st.ReplaceHosting("hostB", []Announced{{Ref: jobs, Spread: true}, {Ref: inbox}})
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) || len(conflict.Refs) != 1 || conflict.Refs[0] != inbox {
+		t.Fatalf("inbox contest: %v", err)
+	}
+	// A third node may not claim the spread name for itself alone, and a
+	// node may not spread a name another holds alone.
+	if err := st.ReplaceHosting("hostC", []Announced{{Ref: jobs}}); !errors.As(err, &conflict) {
+		t.Fatalf("single over spread: %v", err)
+	}
+	if err := st.ReplaceHosting("hostC", []Announced{{Ref: inbox, Spread: true}}); !errors.As(err, &conflict) {
+		t.Fatalf("spread over single: %v", err)
+	}
+
+	// Draining is carried per host; a refresh without the name drops it.
+	if err := st.ReplaceHosting("hostB", []Announced{{Ref: jobs, Spread: true, Draining: true}}); err != nil {
+		t.Fatal(err)
+	}
+	hosts, _ = st.SpreadHosts(jobs)
+	for _, h := range hosts {
+		if h.Draining != (h.Host == "hostB") {
+			t.Fatalf("draining flags: %+v", hosts)
+		}
+	}
+	if err := st.ReplaceHosting("hostB", nil); err != nil {
+		t.Fatal(err)
+	}
+	if hosts, _ = st.SpreadHosts(jobs); len(hosts) != 1 || hosts[0].Host != "hostA" {
+		t.Fatalf("after hostB left: %+v", hosts)
+	}
+	// The last host may turn the name back into a single-host one.
+	if err := st.ReplaceHosting("hostA", []Announced{{Ref: jobs}}); err != nil {
+		t.Fatal(err)
+	}
+	if host, ok, _ := st.Host(jobs); !ok || host != "hostA" {
+		t.Fatalf("back to single: %q %v", host, ok)
+	}
+	if hosts, _ = st.SpreadHosts(jobs); len(hosts) != 0 {
+		t.Fatalf("spread records left behind: %+v", hosts)
+	}
+}
+
+func TestSpreadAndDrainingOnASubject(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Declare(Subject{Circle: "c", Name: "subject:inbox", Delivery: DeliveryExclusive, Spread: true}); !errors.Is(err, ErrSpreadPolicy) {
+		t.Fatalf("exclusive spread: %v", err)
+	}
+	jobs := Ref{Circle: "c", Name: "subject:jobs"}
+	if err := st.Declare(Subject{Circle: "c", Name: "subject:jobs", Delivery: DeliveryShared, Spread: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Append(jobs, Event{ID: "e1", Kind: "user", Source: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetDraining(jobs, true); err != nil {
+		t.Fatal(err)
+	}
+	// A service that redeclares its queue at start changes neither flag.
+	if err := st.Declare(Subject{Circle: "c", Name: "subject:jobs", Delivery: DeliveryShared}); err != nil {
+		t.Fatal(err)
+	}
+	if m, _, _ := st.Subject(jobs); !m.Spread || !m.Draining {
+		t.Fatalf("flags after redeclare: %+v", m)
+	}
+	if _, err := st.Append(jobs, Event{ID: "e2", Kind: "user", Source: "t"}); !errors.Is(err, ErrDraining) {
+		t.Fatalf("append while draining: %v", err)
+	}
+	// What is already there can still be claimed.
+	if got, err := st.Claim(jobs, "w", time.Minute, 5); err != nil || len(got) != 1 || got[0].Event.ID != "e1" {
+		t.Fatalf("claim while draining: %+v, %v", got, err)
+	}
+	if err := st.SetDraining(jobs, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Append(jobs, Event{ID: "e2", Kind: "user", Source: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSpread(jobs, false); err != nil {
+		t.Fatal(err)
+	}
+	if m, _, _ := st.Subject(jobs); m.Spread {
+		t.Fatal("spread not turned off")
+	}
+}

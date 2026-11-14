@@ -686,6 +686,42 @@ as a manual/debug override, not normal mesh configuration. The stream
 protocol is `/astral/subject/2` (framed, circle on the wire); v1 is still
 served and dialed for one release, with bare names meaning the home circle.
 
+**A shared queue can be spread over several hosts** (ADR 0015, spread
+placement), so that losing one host does not stop the queue. Declare it
+with `-spread` on each node that should host it:
+
+```sh
+fabric astral subject subject:queues/crawl -delivery shared -spread   # on each host
+fabric astral status                                                  # anywhere: lists every host
+```
+
+Each host keeps its own journal; the hosts do not talk to each other.
+A publishing node ranks the hosts by a hash of the queue and host IDs,
+so all publishers prefer the same one, and moves to the next when a host
+is unreachable; the outbox is used only when none is. A request with a
+reply slot does the same, and its reply slot is on whichever host took
+it. A consuming node claims from every host and waits on all of them at
+once; each ack goes back to the host the event came from. Applications
+and workers see one queue and never name a host.
+
+What this does not give: nothing is replicated. Events already accepted
+by a host that goes down wait there until it returns, and are lost if
+its disk is. Order holds per host only. Delivery stays at-least-once: a
+publish that failed over after a lost answer can be on two hosts and is
+then handed out by both.
+
+Spread is opt-in per queue and for shared delivery only. A name two
+nodes declare without it is still a conflict with one winner, which is
+what keeps a private inbox from being split. The flag survives a plain
+redeclare (a service that declares its queue at every start does not
+take it out of the rotation); `-spread=false` turns it off on that host.
+
+To take a host out: `fabric astral drain <name>` there. It refuses new
+events, which publishers answer by using another host, and keeps serving
+claims. When `status` shows nothing pending, `fabric astral rm <name>`.
+`drain -off` cancels. Not covered yet: a grantee worker with only a key
+file talks to the one gate it dials, so it sees that host's share only.
+
 **Every verb is checked against the caller's chain.** The host asks the
 circle service whether the connection peer may do the verb on that
 `(circle, name)`: its device admission in that circle (from the circle

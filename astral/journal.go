@@ -132,6 +132,15 @@ type Subject struct {
 	IdleTTLNS int64 `json:"idle_ttl_ns,omitempty"`
 	MaxEvents int   `json:"max_events,omitempty"`
 
+	// Spread lets several nodes host this name at once (ADR 0015, spread
+	// placement): each keeps its own journal, publishers pick one and
+	// fall over to the next, consumers claim from all. Shared delivery
+	// only. Draining is this host's own state: it refuses new events but
+	// still serves claims, so the journal can empty before it is removed.
+	// Both are sticky across a redeclare (SetSpread, SetDraining).
+	Spread   bool `json:"spread,omitempty"`
+	Draining bool `json:"draining,omitempty"`
+
 	// A reply slot (memo §12.3): allocated by the host of a request subject
 	// when it accepts a publish that asked for one, in the request's
 	// circle and owned by the host. ReplyFor is the request event, ReplyOf its subject,
@@ -228,6 +237,10 @@ type LeaseInfo struct {
 type Placement struct {
 	Ref
 	Host string `json:"host"` // peer ID of the hosting node
+	// Spread marks one of several hosts of the same name; Draining is
+	// that host saying it takes no new events.
+	Spread   bool `json:"spread,omitempty"`
+	Draining bool `json:"draining,omitempty"`
 }
 
 // ErrUnknownSubject and ErrKindRejected are loud ingress failures by design.
@@ -244,6 +257,12 @@ var (
 	ErrSubjectExpired = errors.New("astral: subject expired (its declarer is gone; do not retry)")
 	// ErrSubjectFull is the max-events cap rejecting an append.
 	ErrSubjectFull = errors.New("astral: subject is full (max events reached)")
+	// ErrDraining is a spread host refusing new events while it empties;
+	// a publisher takes it as "try the next host", never as a failure of
+	// the queue.
+	ErrDraining = errors.New("astral: subject is draining on this host")
+	// ErrSpreadPolicy is a spread declaration the model cannot honour.
+	ErrSpreadPolicy = errors.New("astral: only a shared, permanent subject can be spread over several hosts")
 )
 
 // ValidName checks the namespace prefixes.
@@ -398,8 +417,16 @@ func (s *Store) Declare(m Subject) error {
 		return err
 	} else if ok {
 		m.Created = prev.Created
+		// A service that redeclares its queue at every start must not
+		// quietly take it out of the rotation or end a drain.
+		m.Spread = m.Spread || prev.Spread
+		m.Draining = prev.Draining
 	} else {
 		m.Created = time.Now().UnixNano()
+		m.Draining = false
+	}
+	if m.Spread && (m.Delivery != DeliveryShared || ref.Ephemeral() || m.IsReplySlot()) {
+		return fmt.Errorf("%w: %s", ErrSpreadPolicy, ref)
 	}
 	raw, err := json.Marshal(m)
 	if err != nil {
@@ -579,6 +606,9 @@ func (s *Store) Append(ref Ref, ev Event) (fresh bool, err error) {
 	}
 	if !m.accepts(ev.Kind) {
 		return false, fmt.Errorf("%w: %s rejects kind %q", ErrKindRejected, ref, ev.Kind)
+	}
+	if m.Draining {
+		return false, fmt.Errorf("%w: %s", ErrDraining, ref)
 	}
 	if ev.At == 0 {
 		ev.At = time.Now().UnixNano()
@@ -866,21 +896,6 @@ func (s *Store) Host(ref Ref) (string, bool, error) {
 	return string(raw), true, nil
 }
 
-// Hosts lists every placement record.
-func (s *Store) Hosts() ([]Placement, error) {
-	it, err := s.db.NewIter(prefixBounds("p/"))
-	if err != nil {
-		return nil, err
-	}
-	defer it.Close()
-	var out []Placement
-	for it.First(); it.Valid(); it.Next() {
-		ref, _ := mustParseKey(string(it.Key())[2:])
-		out = append(out, Placement{Ref: ref, Host: string(it.Value())})
-	}
-	return out, nil
-}
-
 // ConflictError lists the refs an announcement could not place because
 // another node already holds them. The rest of the announcement landed.
 type ConflictError struct {
@@ -896,76 +911,6 @@ func (e *ConflictError) Error() string {
 }
 
 func (e *ConflictError) Unwrap() error { return ErrNameConflict }
-
-// ReplaceHost atomically replaces every placement learned from host with
-// refs. Registry refreshes use replacement rather than additive updates so
-// a subject that a node stopped hosting does not remain routable forever.
-// Conflicts are per ref (memo §12.4): a ref another host holds is refused
-// and reported in a *ConflictError, the rest land. An invalid ref fails the
-// whole call — that is a malformed announcement, not a contest.
-func (s *Store) ReplaceHost(host string, refs []Ref) error {
-	if host == "" {
-		return errors.New("astral: registry host required")
-	}
-	for _, ref := range refs {
-		if err := ref.Valid(); err != nil {
-			return err
-		}
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	b := s.db.NewBatch()
-	defer b.Close()
-	var conflicts []Ref
-	var accepted []Ref
-	for _, ref := range refs {
-		raw, closer, err := s.db.Get([]byte(k1("p/", ref)))
-		if err == nil {
-			existing := string(raw)
-			closer.Close()
-			if existing != host {
-				conflicts = append(conflicts, ref)
-				continue
-			}
-		} else if !errors.Is(err, pebble.ErrNotFound) {
-			return err
-		}
-		accepted = append(accepted, ref)
-	}
-	it, err := s.db.NewIter(prefixBounds("p/"))
-	if err != nil {
-		return err
-	}
-	for it.First(); it.Valid(); it.Next() {
-		// Ephemeral reply routes are learned from claimed requests, not
-		// from announcements — a registry refresh must not wipe them.
-		ref, _ := mustParseKey(string(it.Key())[2:])
-		if ref.Ephemeral() {
-			continue
-		}
-		if string(it.Value()) == host {
-			if err := b.Delete(append([]byte(nil), it.Key()...), nil); err != nil {
-				it.Close()
-				return err
-			}
-		}
-	}
-	if err := it.Close(); err != nil {
-		return err
-	}
-	for _, ref := range accepted {
-		if err := b.Set([]byte(k1("p/", ref)), []byte(host), nil); err != nil {
-			return err
-		}
-	}
-	if err := b.Commit(pebble.Sync); err != nil {
-		return err
-	}
-	if len(conflicts) > 0 {
-		return &ConflictError{Refs: conflicts}
-	}
-	return nil
-}
 
 // --- client outbox: a cast that could not reach its host yet ---
 
