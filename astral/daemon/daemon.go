@@ -78,6 +78,11 @@ const (
 	OpWatch     Op = "watch"     // Name = entity, Consumer = watcher subject
 	OpRegistry  Op = "registry"  // exchange refs hosted by each endpoint
 	OpPresent   Op = "present"   // Principal.Chain: compile and remember a chain for this connection
+
+	// Request/reply (call.go): a request's reply is state of the request.
+	OpComplete Op = "complete" // EventID = request, Event = the signed reply: record it and ack the request
+	OpOutcome  Op = "outcome"  // EventID = request: its reply, parking up to LeaseNS for it
+	OpRelease  Op = "release"  // EventID = request: the caller has the reply; forget it
 )
 
 type request struct {
@@ -102,7 +107,8 @@ type request struct {
 	// grantee): the host verifies the envelope and checks that chain, not
 	// the peer's own admission.
 	Principal *astral.Principal `cbor:"principal,omitempty"`
-	// Reply asks the host to allocate a reply slot for this append.
+	// Reply marks an append as a request whose publisher will wait for the
+	// reply: the host keeps a call record with it.
 	Reply bool `cbor:"reply,omitempty"`
 }
 
@@ -113,6 +119,10 @@ func (r request) digestFields() (eventID, consumer, value string) {
 		return r.Event.ID, "", appendDigestValue(r.Event, r.Reply)
 	case OpAck:
 		return r.EventID, r.Consumer, ""
+	case OpComplete:
+		return r.EventID, "", replyDigestValue(r.Event)
+	case OpOutcome, OpRelease:
+		return r.EventID, "", ""
 	case OpSet:
 		return "", "", r.Value
 	default:
@@ -125,7 +135,6 @@ func (r request) ref() astral.Ref { return astral.Ref{Circle: r.Circle, Name: r.
 type response struct {
 	Err     string           `cbor:"err,omitempty"`
 	Fresh   bool             `cbor:"fresh,omitempty"`
-	Reply   string           `cbor:"reply,omitempty"` // the allocated reply slot's name
 	Claimed []astral.Claimed `cbor:"claimed,omitempty"`
 	Reg     *astral.Register `cbor:"reg,omitempty"`
 	Woke    string           `cbor:"woke,omitempty"`
@@ -134,6 +143,12 @@ type response struct {
 	// Registry answer: as in the request.
 	Spread   []astral.Ref `cbor:"spread,omitempty"`
 	Draining []astral.Ref `cbor:"draining,omitempty"`
+	// Complete: whether a caller was waiting for the reply. Outcome: the
+	// reply (absent while there is none yet) and the chain its signer held
+	// the request's lease under, for the caller to check.
+	Delivered bool          `cbor:"delivered,omitempty"`
+	Outcome   *astral.Event `cbor:"outcome,omitempty"`
+	Chain     []byte        `cbor:"chain,omitempty"`
 }
 
 // Daemon hosts a journal and routes verbs.
@@ -150,8 +165,9 @@ type Daemon struct {
 	done              chan struct{} // outbox loop exited
 	mdone             chan struct{} // monitor loop exited
 	wake              *waiters
+	calls             *waiters     // parked outcome waits (one shared key, see anyCall)
 	waits             *waitTable   // parked waits, by holder, for revocation push
-	origins           *originTable // host each claimed event of a spread name came from
+	origins           *originTable // host each claimed or published event of a spread name is on
 	rotate            atomic.Uint32
 	recheckMu         sync.Mutex
 	stopNetworkNotify func()
@@ -192,7 +208,7 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 	d := &Daemon{
 		Path: statePath, Store: st,
 		kick: make(chan struct{}, 1), done: make(chan struct{}), mdone: make(chan struct{}),
-		wake: newWaiters(), waits: newWaitTable(), origins: newOriginTable(),
+		wake: newWaiters(), calls: newWaiters(), waits: newWaitTable(), origins: newOriginTable(),
 		ctx: ctx, cancel: cancel,
 	}
 	if fd != nil {
@@ -204,6 +220,13 @@ func New(statePath string, fd *fabricdaemon.Daemon) (*Daemon, error) {
 		return nil, fmt.Errorf("astral: migrating the journal into circle %s: %w", d.Home(), err)
 	} else if n > 0 {
 		log.Printf("astral: %d journal key(s) moved into circle %s (layout %d)", n, d.Home(), astral.Layout)
+	}
+	if n, err := st.DropRetired(); err != nil {
+		cancel()
+		st.Close()
+		return nil, fmt.Errorf("astral: dropping retired reply subjects: %w", err)
+	} else if n > 0 {
+		log.Printf("astral: dropped %d leftover reply subject(s) and route(s); replies are kept with their request now", n)
 	}
 	if fd != nil {
 		fd.Host.SetStreamHandler(Protocol, d.gateStream(d.handleStreamV2))
@@ -323,19 +346,20 @@ func (d *Daemon) MemberName() string {
 // node's member name; a remote host re-stamps it from the authenticated
 // peer, so a client cannot impersonate another member.
 func (d *Daemon) Append(pr *astral.Principal, ref astral.Ref, ev astral.Event) (fresh bool, err error) {
-	fresh, _, err = d.append(pr, ref, ev, false)
-	return fresh, err
+	return d.append(pr, ref, ev, false)
 }
 
-// AppendRequest is Append for a request: the host allocates a reply slot
-// (memo §12.3) and returns its name; the caller claims or waits on it.
-func (d *Daemon) AppendRequest(pr *astral.Principal, ref astral.Ref, ev astral.Event) (fresh bool, slot string, err error) {
+// AppendRequest is Append for a request whose publisher will wait for the
+// reply: the host that journals it keeps a call record with it (see
+// Outcome). Such a request is never parked in the outbox: its caller is
+// waiting now.
+func (d *Daemon) AppendRequest(pr *astral.Principal, ref astral.Ref, ev astral.Event) (fresh bool, err error) {
 	return d.append(pr, ref, ev, true)
 }
 
-func (d *Daemon) append(pr *astral.Principal, ref astral.Ref, ev astral.Event, wantReply bool) (fresh bool, slot string, err error) {
+func (d *Daemon) append(pr *astral.Principal, ref astral.Ref, ev astral.Event, wantReply bool) (fresh bool, err error) {
 	if err := ref.Valid(); err != nil {
-		return false, "", err
+		return false, err
 	}
 	by := d.principalLabel(pr)
 	ev.Source = stampSource(ev.Source, by)
@@ -344,151 +368,103 @@ func (d *Daemon) append(pr *astral.Principal, ref astral.Ref, ev astral.Event, w
 	}
 	ev.DeriveID()
 	if err := astral.ValidID(ev.ID); err != nil {
-		return false, "", err
-	}
-	// A reply from this device is signed with the device key; a sub-key
-	// signs its own on the client side.
-	if ref.Ephemeral() && ev.CorrelationID != "" && pr == nil && len(ev.Signature) == 0 && d.Fabric != nil {
-		dg := astral.ReplyDigest(ev)
-		sig, signer, err := d.Fabric.DeviceSign(dg[:])
-		if err != nil {
-			return false, "", err
-		}
-		ev.Signer, ev.Signature = signer, sig
+		return false, err
 	}
 	draining := false
 	if m, ok, err := d.Store.Subject(ref); err != nil {
-		return false, "", err
+		return false, err
 	} else if ok {
-		if m.IsReplySlot() {
-			if err := d.localAuthorizeValid(pr); err != nil {
-				return false, "", err
+		if pr != nil {
+			if err := signableEvent(ev); err != nil {
+				return false, err
 			}
-			if err := d.checkReplyAppend(m, ev, d.localPrincipal(pr)); err != nil {
-				return false, "", err
-			}
-		} else if err := d.localAuthorize(pr, OpAppend, ref, ev.ID, "", appendDigestValue(ev, wantReply)); err != nil {
-			return false, "", err
+		}
+		if err := d.localAuthorize(pr, OpAppend, ref, ev.ID, "", appendDigestValue(ev, wantReply)); err != nil {
+			return false, err
 		}
 		if !(m.Spread && m.Draining) {
-			return d.appendLocal(ref, ev, d.localPrincipal(pr), wantReply)
+			fresh, err := d.appendLocal(ref, ev, d.localPrincipal(pr), wantReply)
+			if err == nil && wantReply && m.Spread {
+				d.origins.put(ref, ev.ID, "")
+			}
+			return fresh, err
 		}
 		// This host is draining the name: the event goes to another one.
 		draining = true
 	}
 	rt, err := d.remoteRoute(ref)
 	if err != nil {
-		return false, "", err
+		return false, err
 	}
 	if !rt.known() {
 		if draining {
-			return false, "", fmt.Errorf("%w: %s", astral.ErrDraining, ref)
+			return false, fmt.Errorf("%w: %s", astral.ErrDraining, ref)
 		}
 		if exp, err := d.Store.Expired(ref); err != nil {
-			return false, "", err
+			return false, err
 		} else if exp {
-			return false, "", fmt.Errorf("%w: %s", astral.ErrSubjectExpired, ref)
+			return false, fmt.Errorf("%w: %s", astral.ErrSubjectExpired, ref)
 		}
-		return false, "", astral.ErrUnknownSubject
+		return false, astral.ErrUnknownSubject
 	}
 	resp, host, unreachable, err := d.appendRemote(rt, ref, ev, pr, wantReply)
 	if err != nil {
 		// A host answered and refused (expired, kind rejected, full):
 		// that is a loud semantic outcome, never parked — the outbox is
 		// for unreachable hosts only, and a refusal would never succeed
-		// on retry. A dead reply route is also dropped here, so learned
-		// ephemeral placements do not outlive their subject.
+		// on retry.
 		if !unreachable {
-			d.dropDeadRoute(ref, resp)
-			return false, "", err
+			return false, err
 		}
 		if wantReply {
-			return false, "", fmt.Errorf("astral: %s unreachable; a request with a reply slot is not parked: %w", ref, err)
+			return false, fmt.Errorf("astral: %s unreachable; a request that waits for a reply is not parked: %w", ref, err)
 		}
 		if pr != nil {
 			// A signed operation cannot be replayed later: the outbox
 			// retries as the device, which would publish under its
 			// broader rights (Codex review, 2026-11-03).
-			return false, "", fmt.Errorf("astral: %s unreachable; a sub-key's publish is not parked: %w", ref, err)
+			return false, fmt.Errorf("astral: %s unreachable; a sub-key's publish is not parked: %w", ref, err)
 		}
 		// Park it; the outbox loop retries when a host is reachable.
 		if qerr := d.Store.Enqueue(ref, ev); qerr != nil {
-			return false, "", qerr
+			return false, qerr
 		}
 		log.Printf("astral: %s unreachable (%v); parked %s in outbox", ref, err, ev.ID)
-		return true, "", nil
+		return true, nil
 	}
-	if resp.Reply != "" {
-		// The slot lives where the request does.
-		_ = d.Store.SetHost(astral.Ref{Circle: ref.Circle, Name: resp.Reply}, host)
+	if wantReply && rt.single == "" {
+		// The reply is kept by the host that took the request.
+		d.origins.put(ref, ev.ID, host)
 	}
-	return resp.Fresh, resp.Reply, nil
+	return resp.Fresh, nil
 }
 
-// dropDeadRoute forgets a learned reply-slot route once its host says the
-// slot expired: learned ephemeral placements do not outlive their subject.
-func (d *Daemon) dropDeadRoute(ref astral.Ref, resp response) {
-	if ref.Ephemeral() && strings.Contains(resp.Err, "expired") {
-		_ = d.Store.SetHost(ref, "")
-	}
-}
-
-// appendLocal journals and wakes parked waiters; with wantReply it first
-// allocates the reply slot for the request (owned by this host's circle,
-// consumer = by, idle TTL and cap from the ephemeral defaults, quota per
-// principal) and points the event at it.
-func (d *Daemon) appendLocal(ref astral.Ref, ev astral.Event, principal string, wantReply bool) (bool, string, error) {
-	slot := ""
+// appendLocal journals and wakes parked waiters; with wantReply the request
+// is journaled as a call, its reply reserved for principal.
+func (d *Daemon) appendLocal(ref astral.Ref, ev astral.Event, principal string, wantReply bool) (fresh bool, err error) {
+	// Signer and Signature belong to a reply, where the host and the
+	// caller's node check them (call.go). On a published event nothing
+	// checks them and no signed publish covers them, so they are not
+	// carried: a consumer never sees a signer the plane did not verify.
+	ev.Signer, ev.Signature = "", nil
 	if wantReply {
-		if principal == "" {
-			return false, "", errors.New("astral: a reply slot needs a principal (a mesh node)")
-		}
-		slot = astral.EphemeralPrefix + ev.ID
-		slotRef := astral.Ref{Circle: ref.Circle, Name: slot}
-		if _, exists, _ := d.Store.Subject(slotRef); !exists {
-			n, err := d.Store.ReplySlotsOf(ref.Circle, principal)
-			if err != nil {
-				return false, "", err
-			}
-			if n >= astral.ReplyQuota {
-				return false, "", fmt.Errorf("astral: %s holds %d reply slots here (quota)", keyLabel(principal), n)
-			}
-			if err := d.Store.Declare(astral.Subject{
-				Circle: ref.Circle, Name: slot, Delivery: astral.DeliveryExclusive,
-				ReplyFor: ev.ID, ReplyOf: ref.Name, ReplyConsumer: principal,
-			}); err != nil {
-				return false, "", err
-			}
-		}
-		ev.ReplyTarget = slot
+		fresh, err = d.Store.AppendCall(ref, ev, principal)
+	} else {
+		fresh, err = d.Store.Append(ref, ev)
 	}
-	fresh, err := d.Store.Append(ref, ev)
 	if err == nil && fresh {
 		d.wake.notify(ref)
 	}
-	return fresh, slot, err
+	return fresh, err
 }
 
-// checkReplyAppend is the reply slot's append rule: the appender is the
-// live claimant of the correlated request (host-side state, no token), the
-// reply answers that request, and it is signed by the appender's key.
-func (d *Daemon) checkReplyAppend(m astral.Subject, ev astral.Event, principal string) error {
-	if ev.CorrelationID != m.ReplyFor {
-		return fmt.Errorf("%w: reply does not answer request %s", ErrDenied, m.ReplyFor)
-	}
-	_, hold, live, err := d.Store.LeaseHolder(astral.Ref{Circle: m.Circle, Name: m.ReplyOf}, m.ReplyFor, time.Now())
-	if err != nil {
+// ackLocal acknowledges an event in this node's journal. A caller parked
+// on the request's reply is woken: an ack without a reply ends its call.
+func (d *Daemon) ackLocal(ref astral.Ref, consumer, eventID string) error {
+	if err := d.Store.Ack(ref, consumer, eventID); err != nil {
 		return err
 	}
-	if !live || principal == "" || hold.Principal != principal {
-		return fmt.Errorf("%w: only the live claimant of request %s may reply (%s is not)", ErrDenied, m.ReplyFor, keyLabel(principal))
-	}
-	if err := ev.VerifyReply(); err != nil {
-		return fmt.Errorf("%w: %v", ErrDenied, err)
-	}
-	if ev.Signer != principal {
-		return fmt.Errorf("%w: reply signed by %s, appended by %s", ErrDenied, keyLabel(ev.Signer), keyLabel(principal))
-	}
+	d.callsChanged()
 	return nil
 }
 
@@ -496,15 +472,6 @@ func (d *Daemon) checkReplyAppend(m astral.Subject, ev astral.Event, principal s
 func (d *Daemon) ownsLease(ref astral.Ref, eventID, principal string) bool {
 	_, hold, live, _ := d.Store.LeaseHolder(ref, eventID, time.Now())
 	return live && principal != "" && hold.Principal == principal
-}
-
-// replyAccess is the reply slot's read side: only the principal that
-// published the request may claim, wait on or read it.
-func (d *Daemon) replyAccess(m astral.Subject, principal string) error {
-	if principal == "" || m.ReplyConsumer != principal {
-		return fmt.Errorf("%w: reply slot %s belongs to %s", ErrDenied, m.Name, keyLabel(m.ReplyConsumer))
-	}
-	return nil
 }
 
 // Claim leases events from a ref, wherever it is hosted.
@@ -515,14 +482,7 @@ func (d *Daemon) Claim(pr *astral.Principal, ref astral.Ref, consumer string, le
 	if m, ok, err := d.Store.Subject(ref); err != nil {
 		return nil, err
 	} else if ok {
-		if m.IsReplySlot() {
-			if err := d.localAuthorizeValid(pr); err != nil {
-				return nil, err
-			}
-			if err := d.replyAccess(m, d.localPrincipal(pr)); err != nil {
-				return nil, err
-			}
-		} else if err := d.localAuthorize(pr, OpClaim, ref, "", consumer, ""); err != nil {
+		if err := d.localAuthorize(pr, OpClaim, ref, "", consumer, ""); err != nil {
 			return nil, err
 		}
 		if m.Spread {
@@ -539,31 +499,9 @@ func (d *Daemon) Claim(pr *astral.Principal, ref astral.Ref, consumer string, le
 	}
 	resp, err := d.remote(host, request{Op: OpClaim, Circle: ref.Circle, Name: ref.Name, Consumer: consumer, LeaseNS: int64(lease), N: n, Principal: pr})
 	if err != nil {
-		d.dropDeadRoute(ref, resp)
 		return nil, err
 	}
-	d.learnReplyRoutes(ref.Circle, resp.Claimed, host)
 	return resp.Claimed, nil
-}
-
-// learnReplyRoutes records placements for the reply slots named in claimed
-// requests: a slot lives on the host of the request (memo §12.3), which is
-// exactly the node the claim came from. Slots are never announced through
-// the registry.
-func (d *Daemon) learnReplyRoutes(circle string, claimed []astral.Claimed, host string) {
-	for _, c := range claimed {
-		target := c.Event.ReplyTarget
-		if target == "" || !astral.Ephemeral(target) {
-			continue
-		}
-		ref := astral.Ref{Circle: circle, Name: target}
-		if _, hosted, err := d.Store.Subject(ref); err != nil || hosted {
-			continue
-		}
-		if err := d.Store.SetHost(ref, host); err != nil {
-			log.Printf("astral: learning reply route %s → %s: %v", ref, d.hostLabel(host), err)
-		}
-	}
 }
 
 // Ack force-acks an event, wherever the ref is hosted.
@@ -575,19 +513,19 @@ func (d *Daemon) Ack(pr *astral.Principal, ref astral.Ref, consumer, eventID str
 		return err
 	} else if ok {
 		if m.Spread {
-			return d.ackSpread(pr, ref, true, consumer, eventID)
+			return d.ackSpread(pr, ref, consumer, eventID)
 		}
 		if err := d.localAuthorize(pr, OpAck, ref, eventID, consumer, ""); err != nil {
 			return err
 		}
-		return d.Store.Ack(ref, d.localConsumer(pr, consumer), eventID)
+		return d.ackLocal(ref, d.localConsumer(pr, consumer), eventID)
 	}
 	host, ok, err := d.Store.Host(ref)
 	if err != nil {
 		return err
 	}
 	if !ok {
-		return d.ackSpread(pr, ref, false, consumer, eventID)
+		return d.ackSpread(pr, ref, consumer, eventID)
 	}
 	_, err = d.remote(host, request{Op: OpAck, Circle: ref.Circle, Name: ref.Name, Consumer: consumer, EventID: eventID, Principal: pr})
 	return err
@@ -733,17 +671,18 @@ func (d *Daemon) localAuthorize(pr *astral.Principal, op Op, ref astral.Ref, eve
 	return d.authorizePrincipal(d.Fabric.Host.ID(), pr, op, ref, eventID, consumer, value, ownLease)
 }
 
-// localAuthorizeValid is localAuthorize for an operation whose right comes
-// from host-side state (a reply slot): the chain must still be live, no
-// verb is asked of it. The device itself is local trust.
-func (d *Daemon) localAuthorizeValid(pr *astral.Principal) error {
+// localAuthorizeHeld is localAuthorize for an operation whose right comes
+// from host-side state (the lease on a request, the call record): the
+// envelope must be signed by the key and its chain still live, but no verb
+// is asked of it. The device itself is local trust.
+func (d *Daemon) localAuthorizeHeld(pr *astral.Principal, op Op, ref astral.Ref, eventID, value string) error {
 	if pr == nil {
 		return nil
 	}
 	if d.Fabric == nil || d.Fabric.Circle == nil {
 		return fmt.Errorf("%w: sub-keys need a mesh node", ErrDenied)
 	}
-	return d.presentOnly(d.Fabric.Host.ID(), pr)
+	return d.authorizePrincipal(d.Fabric.Host.ID(), pr, op, ref, eventID, "", value, true)
 }
 
 // presentOnly presents (or finds) a principal's chain on a connection and
@@ -783,6 +722,16 @@ func (d *Daemon) authorizePrincipal(p peer.ID, pr *astral.Principal, op Op, ref 
 		if _, err := d.Fabric.Circle.Present(p, pr.Chain); err != nil {
 			d.dropStranger(p)
 			return fmt.Errorf("%w: %v", ErrDenied, err)
+		}
+	}
+	if err := zeroFree("circle", ref.Circle, "name", ref.Name, "event id", eventID, "consumer", consumer); err != nil {
+		return err
+	}
+	if op != OpAppend && op != OpSet {
+		// A publish's value is structured (signableEvent, at the caller,
+		// covers it); a set's is the one free field.
+		if err := zeroFree("value", value); err != nil {
+			return err
 		}
 	}
 	if err := pr.Verify(string(op), ref, eventID, consumer, value, time.Now()); err != nil {
@@ -907,11 +856,11 @@ func (d *Daemon) handleStreamV1(s network.Stream) {
 }
 
 // streamContext is the context a request runs under: the daemon's, and
-// for a wait also the stream's — a peer that goes away (or is cut off by a
+// for a wait (on mail, or on a reply) also the stream's — a peer that goes away (or is cut off by a
 // revocation closing its connection) ends its park at once instead of
 // leaving a goroutine until the timeout (memo §12.24).
 func (d *Daemon) streamContext(s network.Stream, op Op) (context.Context, context.CancelFunc) {
-	if op != OpWait {
+	if op != OpWait && op != OpOutcome {
 		return context.WithCancel(d.ctx)
 	}
 	_ = s.SetDeadline(time.Now().Add(11*time.Minute + 15*time.Second))
@@ -975,7 +924,8 @@ func (d *Daemon) authorize(p peer.ID, ref astral.Ref, verb string) error {
 
 // authorizeMember checks that the connection peer is a live device of a
 // circle (its admission there is still valid), asking for no verb beyond
-// member: what a reply slot's reader or appender must at least be.
+// member: what the reader of a reply, or the worker completing a request it
+// holds, must at least be.
 func (d *Daemon) authorizeMember(p peer.ID, circle string) error {
 	if d.Fabric == nil {
 		return nil
@@ -1037,19 +987,69 @@ func entityOf(register string) string {
 	return rest
 }
 
+// zeroFree refuses a zero byte in the named fields of a signed operation
+// (pairs of label, value). The operation digest (astral.OpDigest,
+// "astral-op-v1") and the publish value inside it put a zero byte between
+// fields, so a zero byte *inside* a field lets the same signature be read
+// with the boundary somewhere else: content "x\x00y" with no payload ref
+// signs like content "x" with payload ref "y". The format is on the fleet
+// and stays; instead every signed field but one per level is refused a
+// zero byte, which leaves a single way to cut the signed string: the
+// register value of a set, and the content of a published event, are the
+// only fields that may hold one.
+func zeroFree(pairs ...string) error {
+	for i := 0; i+1 < len(pairs); i += 2 {
+		if strings.IndexByte(pairs[i+1], 0) >= 0 {
+			return fmt.Errorf("%w: the %s of a signed operation holds a zero byte", ErrDenied, pairs[i])
+		}
+	}
+	return nil
+}
+
+// signableEvent is zeroFree for the event of a signed publish: everything
+// appendDigestValue joins except the content.
+func signableEvent(ev astral.Event) error {
+	return zeroFree("event kind", ev.Kind, "payload ref", ev.PayloadRef, "correlation id", ev.CorrelationID)
+}
+
 // appendDigestValue is what a signing principal covers on an append
-// beyond the event ID: the event itself and whether a reply slot was asked
-// for, so a forwarding daemon cannot rewrite either (agy, 2026-11-03).
+// beyond the event ID: the event itself and whether a reply is wanted, so
+// a forwarding daemon cannot rewrite either (agy, 2026-11-03). A host that
+// verifies it checks signableEvent first.
+//
+// There are two forms. An event that names no reply target is signed as it
+// has been since 2026-11-03 (fields joined by a zero byte), so old and new
+// nodes agree on it. An event that names one is signed in a second form
+// that covers the target too: before 2026-11-16 the target was not signed
+// at all, and a daemon between a sub-key and the host could point a
+// service's answers at another subject. The second form has no zero byte
+// and the first always has four, so neither can be read as the other, and
+// a target added to or taken off a signed event changes the form and
+// fails the signature. A node from before the second form refuses a
+// sub-key's publish that names a reply target; nothing else changes
+// between old and new nodes.
 func appendDigestValue(ev astral.Event, reply bool) string {
 	r := ""
 	if reply {
 		r = "1"
+	}
+	if ev.ReplyTarget != "" {
+		d := astral.FieldDigest("astral-append-v2", ev.Kind, ev.Content, ev.PayloadRef, ev.CorrelationID, r, ev.ReplyTarget)
+		return "v2:" + hex.EncodeToString(d[:])
 	}
 	return strings.Join([]string{ev.Kind, ev.Content, ev.PayloadRef, ev.CorrelationID, r}, "\x00")
 }
 
 // AppendDigestValue is appendDigestValue for clients.
 func AppendDigestValue(ev astral.Event, reply bool) string { return appendDigestValue(ev, reply) }
+
+// replyDigestValue is what a signing principal covers on a complete beyond
+// the request ID: the reply it hands in, as a digest of its length-prefixed
+// fields so that nothing can be moved between them.
+func replyDigestValue(reply astral.Event) string {
+	d := astral.FieldDigest("astral-complete-v1", reply.Kind, reply.Content, reply.PayloadRef)
+	return hex.EncodeToString(d[:])
+}
 
 // holdOf is the Hold for a call: the principal's key, the connection peer
 // and, for a sub-key or grantee, its chain.
@@ -1126,42 +1126,21 @@ func (d *Daemon) serve(ctx context.Context, req request, remote peer.ID) (resp r
 		}
 		return response{}
 	}
-	// Reply slots have their own rules (memo §12.3): the consumer that
-	// published the request reads it, the request's live claimant appends
-	// to it with a signed reply; verbs do not apply. A sub-key's envelope
-	// is still verified so the key is who it says.
-	if m, hosted, _ := d.Store.Subject(ref); hosted && m.IsReplySlot() {
-		// The chain (or the device's standing in the slot's circle) must
-		// be live; the right itself comes from host-side state.
-		if req.Principal != nil {
-			eventID, consumer, value := req.digestFields()
-			if err := d.authorizePrincipal(remote, req.Principal, req.Op, ref, eventID, consumer, value, true); err != nil {
-				return fail(err)
-			}
-			from = keyLabel(req.Principal.Key) + "@" + from
-		} else if err := d.authorizeMember(remote, m.Circle); err != nil {
+	// The right to complete a request or read its reply comes from host-side
+	// state (the lease, the call record), not from a verb: authorizePrincipal
+	// then checks the envelope and that the chain is live, and a device must
+	// still be a live device of the circle.
+	hostState := req.Op == OpComplete || req.Op == OpOutcome || req.Op == OpRelease
+	if req.Principal == nil && hostState {
+		if err := d.authorizeMember(remote, ref.Circle); err != nil {
 			return fail(err)
 		}
-		switch req.Op {
-		case OpAppend:
-			ev := req.Event
-			ev.Source = stampSource(ev.Source, from)
-			if err := d.checkReplyAppend(m, ev, principal); err != nil {
-				return fail(err)
-			}
-			fresh, _, err := d.appendLocal(ref, ev, principal, false)
-			if err != nil {
-				return fail(err)
-			}
-			return response{Fresh: fresh}
-		case OpClaim, OpWait, OpGet:
-			if err := d.replyAccess(m, principal); err != nil {
-				return fail(err)
-			}
-		default:
-			return fail(fmt.Errorf("%w: %s on a reply slot", ErrDenied, req.Op))
-		}
 	} else if req.Principal != nil {
+		if req.Op == OpAppend {
+			if err := signableEvent(req.Event); err != nil {
+				return fail(err)
+			}
+		}
 		eventID, consumer, value := req.digestFields()
 		ownLease := req.Op == OpAck && d.ownsLease(ref, req.EventID, principal)
 		if err := d.authorizePrincipal(remote, req.Principal, req.Op, ref, eventID, consumer, value, ownLease); err != nil {
@@ -1204,11 +1183,34 @@ func (d *Daemon) serve(ctx context.Context, req request, remote peer.ID) (resp r
 	case OpAppend:
 		ev := req.Event
 		ev.Source = stampSource(ev.Source, from)
-		fresh, slot, err := d.appendLocal(ref, ev, principal, req.Reply)
+		fresh, err := d.appendLocal(ref, ev, principal, req.Reply)
 		if err != nil {
 			return fail(err)
 		}
-		return response{Fresh: fresh, Reply: slot}
+		return response{Fresh: fresh}
+	case OpComplete:
+		reply := req.Event
+		reply.Source = stampSource(reply.Source, from)
+		delivered, err := d.completeLocal(ref, req.EventID, principal, reply)
+		if err != nil {
+			return fail(err)
+		}
+		return response{Delivered: delivered}
+	case OpOutcome:
+		call, err := d.awaitOutcome(ctx, ref, req.EventID, principal, outcomeTimeout(time.Duration(req.LeaseNS)), hold)
+		if err != nil {
+			return fail(err)
+		}
+		if call == nil {
+			return response{Woke: string(WokeTimeout)}
+		}
+		return response{Woke: string(WokeMail), Outcome: call.Outcome, Chain: call.Chain}
+	case OpRelease:
+		if err := d.Store.ReleaseCall(ref, req.EventID, principal); err != nil {
+			return fail(err)
+		}
+		d.callsChanged()
+		return response{}
 	case OpWait:
 		timeout := time.Duration(req.LeaseNS)
 		if timeout <= 0 || timeout > 10*time.Minute {
@@ -1231,7 +1233,7 @@ func (d *Daemon) serve(ctx context.Context, req request, remote peer.ID) (resp r
 		}
 		return response{Claimed: c}
 	case OpAck:
-		return fail0(d.Store.Ack(ref, req.Consumer+"@"+from, req.EventID))
+		return fail0(d.ackLocal(ref, req.Consumer+"@"+from, req.EventID))
 	case OpSet:
 		return fail0(d.Store.Set(astral.Register{Circle: ref.Circle, Name: ref.Name, Value: req.Value, By: from}))
 	case OpGet:
@@ -1247,9 +1249,7 @@ func (d *Daemon) serve(ctx context.Context, req request, remote peer.ID) (resp r
 	return fail(fmt.Errorf("astral: unknown op %q", req.Op))
 }
 
-// hostedRefs lists the refs this node announces. Ephemeral reply subjects
-// are deliberately absent: they are unlisted, and their route travels
-// inside the claimed request (learnReplyRoutes).
+// hostedRefs lists the refs this node announces.
 func (d *Daemon) hostedRefs() []astral.Ref {
 	boxes, err := d.Store.Subjects()
 	if err != nil {
@@ -1257,24 +1257,18 @@ func (d *Daemon) hostedRefs() []astral.Ref {
 	}
 	refs := make([]astral.Ref, 0, len(boxes))
 	for _, box := range boxes {
-		if astral.Ephemeral(box.Name) {
-			continue
-		}
 		refs = append(refs, box.Ref())
 	}
 	return refs
 }
 
 // learnRegistry records what a peer hosts. A ref hosted here is kept
-// local and the contest logged, unless both sides spread it; an ephemeral
-// ref is dropped; a ref another peer already holds alone is refused per
-// ref (ConflictError, the rest land).
+// local and the contest logged, unless both sides spread it; a ref another
+// peer already holds alone is refused per ref (ConflictError, the rest
+// land).
 func (d *Daemon) learnRegistry(from peer.ID, placed []astral.Announced) error {
 	filtered := make([]astral.Announced, 0, len(placed))
 	for _, a := range placed {
-		if a.Ref.Ephemeral() {
-			continue
-		}
 		// A name hosted here too: fellow hosts if both sides spread it,
 		// otherwise a contest the local journal wins.
 		if m, ok, err := d.Store.Subject(a.Ref); err != nil {

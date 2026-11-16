@@ -50,10 +50,12 @@ type StatusReply struct {
 	Connected  []string           `json:"connected,omitempty"`  // member labels reachable now
 }
 
-// HostedInfo is one locally hosted subject with its backlog.
+// HostedInfo is one locally hosted subject with its backlog. Calls counts
+// the requests whose reply is still kept here: awaited, or not collected.
 type HostedInfo struct {
 	astral.Subject
 	Pending int `json:"pending"`
+	Calls   int `json:"calls,omitempty"`
 }
 
 type declareBody struct {
@@ -61,8 +63,8 @@ type declareBody struct {
 	Name     string          `json:"name"`
 	Delivery astral.Delivery `json:"delivery,omitempty"`
 	Accepts  []string        `json:"accepts,omitempty"`
-	IdleS    int             `json:"idle_s,omitempty"`     // idle TTL seconds; 0 = never (ephemeral names default)
-	MaxEv    int             `json:"max_events,omitempty"` // total-append cap; 0 = unlimited (ephemeral names default)
+	IdleS    int             `json:"idle_s,omitempty"`     // idle TTL seconds; 0 = never
+	MaxEv    int             `json:"max_events,omitempty"` // total-append cap; 0 = unlimited
 	// Spread: true lets other nodes host the same name too (shared
 	// delivery only); false turns that off; absent leaves it as it is.
 	Spread *bool `json:"spread,omitempty"`
@@ -90,13 +92,43 @@ type appendBody struct {
 	Circle    string            `json:"circle,omitempty"`
 	Name      string            `json:"name"`
 	Event     astral.Event      `json:"event"`
-	Reply     bool              `json:"reply,omitempty"` // allocate a reply slot at the host
+	Reply     bool              `json:"reply,omitempty"` // a request: the publisher will wait for its reply
 }
 
 type appendReply struct {
 	ID    string `json:"id"`
 	Fresh bool   `json:"fresh"`
-	Reply string `json:"reply,omitempty"` // the reply slot's name
+}
+
+type completeBody struct {
+	Principal *astral.Principal `json:"principal,omitempty"`
+	Circle    string            `json:"circle,omitempty"`
+	Name      string            `json:"name"`
+	EventID   string            `json:"event_id"` // the request
+	Event     astral.Event      `json:"event"`    // the reply
+}
+
+type completeReply struct {
+	Delivered bool `json:"delivered"` // a caller was waiting for the reply
+}
+
+type outcomeBody struct {
+	Principal *astral.Principal `json:"principal,omitempty"`
+	Circle    string            `json:"circle,omitempty"`
+	Name      string            `json:"name"`
+	EventID   string            `json:"event_id"`
+	TimeoutS  int               `json:"timeout_s,omitempty"`
+}
+
+type outcomeReply struct {
+	Outcome *astral.Event `json:"outcome,omitempty"` // absent: no reply yet
+}
+
+type releaseBody struct {
+	Principal *astral.Principal `json:"principal,omitempty"`
+	Circle    string            `json:"circle,omitempty"`
+	Name      string            `json:"name"`
+	EventID   string            `json:"event_id"`
 }
 
 type claimBody struct {
@@ -164,6 +196,9 @@ func (d *Daemon) serveControl() (func(), error) {
 	mux.HandleFunc("POST /v0/drain", d.ctlDrain)
 	mux.HandleFunc("POST /v0/hosts", d.ctlHost)
 	mux.HandleFunc("POST /v0/append", d.ctlAppend)
+	mux.HandleFunc("POST /v0/complete", d.ctlComplete)
+	mux.HandleFunc("POST /v0/outcome", d.ctlOutcome)
+	mux.HandleFunc("POST /v0/release", d.ctlRelease)
 	mux.HandleFunc("POST /v0/claim", d.ctlClaim)
 	mux.HandleFunc("POST /v0/ack", d.ctlAck)
 	mux.HandleFunc("POST /v0/set", d.ctlSet)
@@ -189,18 +224,22 @@ func writeJSON(w http.ResponseWriter, v any) {
 func writeErr(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	switch {
-	case errors.Is(err, astral.ErrSubjectExpired):
+	case errors.Is(err, astral.ErrSubjectExpired), errors.Is(err, astral.ErrNoReply):
 		code = http.StatusGone
-	case errors.Is(err, astral.ErrUnknownSubject):
+	case errors.Is(err, astral.ErrUnknownSubject), errors.Is(err, astral.ErrNoCall):
 		code = http.StatusNotFound
 	case errors.Is(err, astral.ErrKindRejected), errors.Is(err, astral.ErrBadName),
 		errors.Is(err, astral.ErrBadCircle), errors.Is(err, astral.ErrSubjectFull),
-		errors.Is(err, astral.ErrSpreadPolicy):
+		errors.Is(err, astral.ErrSpreadPolicy), errors.Is(err, astral.ErrRetiredName):
 		code = http.StatusBadRequest
 	case errors.Is(err, astral.ErrDraining):
 		code = http.StatusConflict
-	case errors.Is(err, ErrDenied):
+	case errors.Is(err, astral.ErrCallQuota):
+		code = http.StatusTooManyRequests
+	case errors.Is(err, ErrDenied), errors.Is(err, astral.ErrNotCaller), errors.Is(err, astral.ErrNotClaimant):
 		code = http.StatusForbidden
+	case errors.Is(err, ErrUnverified):
+		code = http.StatusBadGateway
 	}
 	http.Error(w, err.Error(), code)
 }
@@ -229,9 +268,10 @@ func (d *Daemon) ctlStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	calls, _ := d.Store.CallCounts()
 	for _, m := range boxes {
 		n, _ := d.Store.Pending(m.Ref())
-		reply.Hosted = append(reply.Hosted, HostedInfo{Subject: m, Pending: n})
+		reply.Hosted = append(reply.Hosted, HostedInfo{Subject: m, Pending: n, Calls: calls[m.Ref()]})
 	}
 	reply.Placements, _ = d.Store.Hosts()
 	if len(reply.Placements) > 0 {
@@ -366,12 +406,68 @@ func (d *Daemon) ctlAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ev.DeriveID()
-	fresh, slot, err := d.append(b.Principal, d.Ref(b.Circle, b.Name), ev, b.Reply)
+	fresh, err := d.append(b.Principal, d.Ref(b.Circle, b.Name), ev, b.Reply)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, appendReply{ID: ev.ID, Fresh: fresh, Reply: slot})
+	writeJSON(w, appendReply{ID: ev.ID, Fresh: fresh})
+}
+
+func (d *Daemon) ctlComplete(w http.ResponseWriter, r *http.Request) {
+	var b completeBody
+	if err := decode(w, r, &b); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if !d.begin() {
+		writeErr(w, errors.New("shutting down"))
+		return
+	}
+	defer d.end()
+	delivered, err := d.Complete(b.Principal, d.Ref(b.Circle, b.Name), b.EventID, b.Event)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, completeReply{Delivered: delivered})
+}
+
+func (d *Daemon) ctlOutcome(w http.ResponseWriter, r *http.Request) {
+	var b outcomeBody
+	if err := decode(w, r, &b); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if !d.begin() {
+		writeErr(w, errors.New("shutting down"))
+		return
+	}
+	defer d.end()
+	reply, err := d.Outcome(r.Context(), b.Principal, d.Ref(b.Circle, b.Name), b.EventID, time.Duration(b.TimeoutS)*time.Second)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, outcomeReply{Outcome: reply})
+}
+
+func (d *Daemon) ctlRelease(w http.ResponseWriter, r *http.Request) {
+	var b releaseBody
+	if err := decode(w, r, &b); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if !d.begin() {
+		writeErr(w, errors.New("shutting down"))
+		return
+	}
+	defer d.end()
+	if err := d.ReleaseCall(b.Principal, d.Ref(b.Circle, b.Name), b.EventID); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func (d *Daemon) ctlClaim(w http.ResponseWriter, r *http.Request) {

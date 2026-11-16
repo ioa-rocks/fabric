@@ -74,6 +74,7 @@ type waitTable struct {
 type parkedWait struct {
 	ref    astral.Ref
 	hold   astral.Hold
+	verb   string // what the holder must still have on ref; "" = a live chain, no verb
 	cancel context.CancelCauseFunc
 }
 
@@ -106,13 +107,23 @@ func (w *waitTable) all() []*parkedWait {
 // errRevoked ends a wait whose holder lost its authority.
 var errRevoked = errors.New("astral: authority revoked while waiting")
 
-// waitHeld is waitLocal registered under a holder: a revocation push can
-// end it early.
+// park registers a wait under its holder, so a revocation push can end it
+// early: the returned context is then cancelled with errRevoked. verb is
+// what the holder must still have on ref ("" for a wait whose right comes
+// from host-side state). Call done when the wait is over.
+func (d *Daemon) park(ctx context.Context, ref astral.Ref, hold astral.Hold, verb string) (parked context.Context, done func()) {
+	parked, cancel := context.WithCancelCause(ctx)
+	id := d.waits.add(&parkedWait{ref: ref, hold: hold, verb: verb, cancel: cancel})
+	return parked, func() {
+		d.waits.remove(id)
+		cancel(nil)
+	}
+}
+
+// waitHeld is waitLocal registered under a holder.
 func (d *Daemon) waitHeld(ctx context.Context, ref astral.Ref, timeout time.Duration, hold astral.Hold) (Woke, error) {
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	id := d.waits.add(&parkedWait{ref: ref, hold: hold, cancel: cancel})
-	defer d.waits.remove(id)
+	ctx, done := d.park(ctx, ref, hold, statement.VerbClaim)
+	defer done()
 	woke, err := d.waitLocal(ctx, ref, timeout)
 	if err != nil && errors.Is(context.Cause(ctx), errRevoked) {
 		return "", errRevoked
@@ -121,8 +132,8 @@ func (d *Daemon) waitHeld(ctx context.Context, ref astral.Ref, timeout time.Dura
 }
 
 // waitLocal parks until ref (hosted here) has pending mail or timeout.
-// An active wait counts as activity: a parked waiter keeps its ephemeral
-// reply subject from idling out under it.
+// An active wait counts as activity: a parked waiter keeps a subject with
+// an idle TTL from expiring under it.
 func (d *Daemon) waitLocal(ctx context.Context, ref astral.Ref, timeout time.Duration) (Woke, error) {
 	_ = d.Store.Touch(ref)
 	deadline := time.NewTimer(timeout)
@@ -158,14 +169,7 @@ func (d *Daemon) Wait(ctx context.Context, pr *astral.Principal, ref astral.Ref,
 	if m, ok, err := d.Store.Subject(ref); err != nil {
 		return "", err
 	} else if ok {
-		if m.IsReplySlot() {
-			if err := d.localAuthorizeValid(pr); err != nil {
-				return "", err
-			}
-			if err := d.replyAccess(m, d.localPrincipal(pr)); err != nil {
-				return "", err
-			}
-		} else if err := d.localAuthorize(pr, OpWait, ref, "", "", ""); err != nil {
+		if err := d.localAuthorize(pr, OpWait, ref, "", "", ""); err != nil {
 			return "", err
 		}
 		if m.Spread {
@@ -182,7 +186,6 @@ func (d *Daemon) Wait(ctx context.Context, pr *astral.Principal, ref astral.Ref,
 	}
 	resp, err := d.remoteWithin(host, request{Op: OpWait, Circle: ref.Circle, Name: ref.Name, LeaseNS: int64(timeout), Principal: pr}, timeout+5*time.Second)
 	if err != nil {
-		d.dropDeadRoute(ref, resp)
 		return "", err
 	}
 	return Woke(resp.Woke), nil
@@ -239,7 +242,7 @@ func (d *Daemon) entityHost(entity astral.Ref) (host string, remote bool, err er
 }
 
 // TombstoneKeep is how long an expired subject's marker outlives it, so a
-// late replier still gets "expired" rather than "unknown". Variable so
+// late publisher still gets "expired" rather than "unknown". Variable so
 // tests can shrink it.
 var TombstoneKeep = 24 * time.Hour
 
@@ -269,7 +272,7 @@ func (d *Daemon) monitorLoop() {
 
 // stillHolds re-verifies one holder for verb on ref ("" = the chain's
 // own validity only, for rights that come from host-side state such as a
-// reply slot). A key holder is checked from the chain stored with the
+// wait on the reply to one's own request). A key holder is checked from the chain stored with the
 // hold, connected or not, without touching presence state; a device
 // holder is checked through the circle service while connected and, when
 // not, against member-level revocation and the admission stored with
@@ -320,15 +323,6 @@ func (d *Daemon) stillHolds(h astral.Hold, ref astral.Ref, verb string) error {
 	return d.Fabric.Circle.Verify(ctx, p, want)
 }
 
-// verbForHold is the verb a holder must still have on a ref: claim on a
-// subject, nothing beyond liveness on a reply slot.
-func (d *Daemon) verbForHold(ref astral.Ref) string {
-	if m, ok, _ := d.Store.Subject(ref); ok && m.IsReplySlot() {
-		return ""
-	}
-	return statement.VerbClaim
-}
-
 // recheck releases every lease, drops every watch and ends every parked
 // wait whose holder no longer verifies (memo §12.24: push-invalidate, so
 // another worker can reclaim at once and a revoked key's wait returns).
@@ -345,7 +339,7 @@ func (d *Daemon) recheck() {
 	now := time.Now()
 	if leases, err := d.Store.Leases(now); err == nil {
 		for _, l := range leases {
-			if err := d.stillHolds(l.Hold, l.Ref, d.verbForHold(l.Ref)); err != nil {
+			if err := d.stillHolds(l.Hold, l.Ref, statement.VerbClaim); err != nil {
 				log.Printf("astral: lease on %s by %s released: %v", l.Ref, l.Consumer, err)
 				_ = d.Store.Release(l.Ref, l.EventID)
 			}
@@ -361,14 +355,15 @@ func (d *Daemon) recheck() {
 		}
 	}
 	for _, pw := range d.waits.all() {
-		if err := d.stillHolds(pw.hold, pw.ref, d.verbForHold(pw.ref)); err != nil {
+		if err := d.stillHolds(pw.hold, pw.ref, pw.verb); err != nil {
 			pw.cancel(errRevoked)
 		}
 	}
 }
 
 // sweepExpired self-destructs subjects whose idle TTL elapsed, leaving
-// tombstones, and eventually drops the tombstones themselves.
+// tombstones, eventually drops the tombstones themselves, and forgets
+// calls whose caller stopped waiting.
 func (d *Daemon) sweepExpired() {
 	if !d.begin() {
 		return
@@ -389,6 +384,12 @@ func (d *Daemon) sweepExpired() {
 	}
 	if err := d.Store.SweepTombstones(now, TombstoneKeep); err != nil {
 		log.Printf("astral: tombstone sweep: %v", err)
+	}
+	if n, err := d.Store.SweepCalls(now); err != nil {
+		log.Printf("astral: call sweep: %v", err)
+	} else if n > 0 {
+		log.Printf("astral: %d request(s) no longer have a caller waiting; their replies are dropped", n)
+		d.callsChanged()
 	}
 }
 

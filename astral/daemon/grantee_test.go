@@ -60,8 +60,8 @@ func grantFor(t *testing.T, root ed25519.PrivateKey, gate string, verbs ...strin
 
 // TestGranteeWorkerAtListedGate: a worker that is a member of nothing holds
 // a root-signed claim grant; it dials a listed gate hosting the queue,
-// claims a request, answers into its reply slot with a signed reply the
-// requester verifies, and is refused once the grant is revoked. Without a
+// claims a request, completes it with a signed reply the requester's node
+// verifies against the grant, and is refused once the grant is revoked. Without a
 // grant it gets nothing. A dark node never lets it connect at all.
 func TestGranteeWorkerAtListedGate(t *testing.T) {
 	daemon.OutboxInterval = 300 * time.Millisecond
@@ -114,7 +114,7 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	clDesk := daemon.NewClient(desk.statePath)
 	waitConnected(t, clDesk, "gate")
 	waitPlaced(t, clDesk, "subject:jobs")
-	reqID, slot, err := clDesk.AppendRequest("subject:jobs", astral.Event{Kind: "request", Source: "team", Content: "crawl example.org"})
+	reqID, err := clDesk.AppendRequest("subject:jobs", astral.Event{Kind: "request", Source: "team", Content: "crawl example.org"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,8 +122,8 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	gateAddr := fgate.Host.Addrs()[0].String() + "/p2p/" + fgate.Host.ID().String()
 	signer := grantFor(t, root, gateAddr, "claim")
 	// Each CLI invocation is a fresh connection with a throwaway transport
-	// identity: claim, reply and ack must hang together across three of
-	// them (agy review, 2026-11-03).
+	// identity: claim and completion must hang together across them (agy
+	// review, 2026-11-03).
 	dial := func() *daemon.Worker {
 		w, err := daemon.DialGate(t.Context(), signer)
 		if err != nil {
@@ -137,8 +137,8 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	if err != nil || len(c) != 1 || c[0].Event.ID != reqID {
 		t.Fatalf("grantee claim: %+v err=%v", c, err)
 	}
-	if c[0].Event.ReplyTarget != slot {
-		t.Fatalf("claimed request has no slot: %+v", c[0].Event)
+	if !c[0].Awaited {
+		t.Fatalf("the grantee is not told a caller is waiting: %+v", c[0])
 	}
 	if !fgate.Auth.IsKept(w.ID()) {
 		t.Fatal("the grantee's connection is not kept past the grace")
@@ -193,22 +193,37 @@ func TestGranteeWorkerAtListedGate(t *testing.T) {
 	if _, err := w2.Append(t.Context(), "subject:jobs", astral.Event{Kind: "job", Source: "worker", Content: "sneak"}); err == nil || !strings.Contains(err.Error(), "denied") {
 		t.Fatalf("grantee published: %v", err)
 	}
-	// The reply: lease-bound, signed by the worker key, from a new connection.
-	if _, err := w2.Append(t.Context(), slot, astral.Event{Kind: "result", Source: "worker", Content: "42 pages", CorrelationID: reqID}); err != nil {
-		t.Fatalf("grantee reply: %v", err)
-	}
-	got := waitClaim(t, clDesk, slot, "team")
-	if got.Event.Content != "42 pages" || got.Event.Signer != signer.Key || got.Event.VerifyReply() != nil {
-		t.Fatalf("reply at the requester: %+v", got.Event)
+	// The reply: lease-bound, signed by the worker key, from a new
+	// connection, with a claim-only grant. One step records it and
+	// acknowledges the request.
+	if delivered, err := w2.Complete(t.Context(), "subject:jobs", reqID, astral.Event{Kind: "result", Source: "worker", Content: "42 pages"}); err != nil || !delivered {
+		t.Fatalf("grantee completes: delivered=%v err=%v", delivered, err)
 	}
 	w2.Close()
-	if err := dial().Ack(t.Context(), "subject:jobs", "worker", reqID); err != nil {
-		t.Fatalf("grantee acks its own lease from a third connection: %v", err)
+	if s, _ := clGate.Status(); len(s.Hosted) != 1 || s.Hosted[0].Pending != 0 {
+		t.Fatalf("request still pending at the gate after its reply: %+v", s.Hosted)
+	}
+	// Desk's node checks the reply itself: the worker is no device of the
+	// circle, so what entitles it is the grant the gate kept with the lease.
+	got, err := clDesk.Outcome("subject:jobs", reqID, 10)
+	if err != nil || got == nil {
+		t.Fatalf("reply at the requester: %+v, %v", got, err)
+	}
+	if got.Content != "42 pages" || got.Signer != signer.Key || astral.VerifyReply(astral.Ref{Circle: signer.Circle, Name: "subject:jobs"}, *got) != nil {
+		t.Fatalf("reply at the requester: %+v", got)
+	}
+	// A retry from a third connection (the answer to the first was lost)
+	// is harmless.
+	if delivered, err := dial().Complete(t.Context(), "subject:jobs", reqID, astral.Event{Kind: "result", Source: "worker", Content: "42 pages"}); err != nil || !delivered {
+		t.Fatalf("grantee retries its completion: delivered=%v err=%v", delivered, err)
+	}
+	if err := clDesk.Release("subject:jobs", reqID); err != nil {
+		t.Fatal(err)
 	}
 
 	// A lease held by a worker that is offline is released once its
 	// grant is revoked: the re-check uses the chain stored with the hold.
-	if _, _, err := clDesk.AppendRequest("subject:jobs", astral.Event{Kind: "request", Source: "team", Content: "second"}); err != nil {
+	if _, err := clDesk.AppendRequest("subject:jobs", astral.Event{Kind: "request", Source: "team", Content: "second"}); err != nil {
 		t.Fatal(err)
 	}
 	w3 := dial()

@@ -31,9 +31,6 @@ func (r Ref) String() string {
 	return r.Name + " @ " + r.Circle
 }
 
-// Ephemeral reports whether this is a temporary reply subject.
-func (r Ref) Ephemeral() bool { return Ephemeral(r.Name) }
-
 // ErrBadCircle is a circle id the store cannot key by.
 var ErrBadCircle = errors.New("astral: circle required (a did:key, no '/')")
 

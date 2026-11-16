@@ -116,9 +116,6 @@ func (d *Daemon) claimSpread(pr *astral.Principal, ref astral.Ref, local bool, c
 			var resp response
 			resp, err = d.remote(host, request{Op: OpClaim, Circle: ref.Circle, Name: ref.Name, Consumer: consumer, LeaseNS: int64(lease), N: n - len(out), Principal: pr})
 			got = resp.Claimed
-			if err == nil {
-				d.learnReplyRoutes(ref.Circle, got, host)
-			}
 		}
 		if err != nil {
 			last = err
@@ -139,40 +136,21 @@ func (d *Daemon) claimSpread(pr *astral.Principal, ref astral.Ref, local bool, c
 // ackSpread acknowledges on the host the event was claimed from. If that
 // is no longer known (this daemon restarted in between), the host that has
 // the event takes the ack.
-func (d *Daemon) ackSpread(pr *astral.Principal, ref astral.Ref, local bool, consumer, eventID string) error {
-	try := func(host string) error {
+func (d *Daemon) ackSpread(pr *astral.Principal, ref astral.Ref, consumer, eventID string) error {
+	err := d.onEventHost(ref, eventID, func(host string) error {
 		if host == "" {
 			if err := d.localAuthorize(pr, OpAck, ref, eventID, consumer, ""); err != nil {
 				return err
 			}
-			return d.Store.Ack(ref, d.localConsumer(pr, consumer), eventID)
+			return d.ackLocal(ref, d.localConsumer(pr, consumer), eventID)
 		}
 		_, err := d.remote(host, request{Op: OpAck, Circle: ref.Circle, Name: ref.Name, Consumer: consumer, EventID: eventID, Principal: pr})
 		return err
+	})
+	if err == nil {
+		d.origins.drop(ref, eventID)
 	}
-	if origin, ok := d.origins.get(ref, eventID); ok && (origin != "" || local) {
-		err := try(origin)
-		if err == nil {
-			d.origins.drop(ref, eventID)
-		}
-		return err
-	}
-	hosts, err := d.Store.SpreadHosts(ref)
-	if err != nil {
-		return err
-	}
-	last := error(astral.ErrUnknownSubject)
-	if local {
-		if last = try(""); last == nil {
-			return nil
-		}
-	}
-	for _, h := range hosts {
-		if last = try(h.Host); last == nil {
-			return nil
-		}
-	}
-	return last
+	return err
 }
 
 // waitSpread parks on every host of a spread name at once and returns at
@@ -299,9 +277,10 @@ func announcedOf(refs, spread, draining []astral.Ref) []astral.Announced {
 	return out
 }
 
-// originTable remembers which host a claimed event of a spread name came
-// from, so its ack goes back there. It is a cache: losing it costs one
-// round of asking each host.
+// originTable remembers which host holds an event of a spread name: the
+// one a claimed event came from, so its ack or completion goes back there,
+// and the one that took a request, so its caller asks there for the reply.
+// It is a cache: losing it costs one round of asking each host.
 type originTable struct {
 	mu sync.Mutex
 	m  map[originKey]originAt

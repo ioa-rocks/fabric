@@ -14,7 +14,9 @@
 //     internal cursor and never leaves this package (the rule that keeps a
 //     alternative placement modes possible later);
 //   - there is no silent dump subject: a name must be declared before it
-//     accepts mail, and an undeclared kind is rejected loudly.
+//     accepts mail, and an undeclared kind is rejected loudly;
+//   - a reply is state of the request it answers, not a subject of its own
+//     (call.go).
 //
 // Every resource is a Ref — (circle DID, name) — since the Astral-per-circle
 // step (overlapping-circles memo §17): a subject belongs to a circle, and
@@ -22,7 +24,6 @@
 package astral
 
 import (
-	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -33,8 +34,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
-
-	"ioa.rocks/fabric/did"
 )
 
 // Event is the envelope that travels on the plane. Payloads enter by
@@ -45,52 +44,16 @@ type Event struct {
 	Source        string `json:"source"`                   // principal: "<tool>@<member>"
 	Content       string `json:"content,omitempty"`        // short text
 	PayloadRef    string `json:"payload_ref,omitempty"`    // artifact reference
-	ReplyTarget   string `json:"reply_target,omitempty"`   // subject (same circle) for a correlated reply
+	ReplyTarget   string `json:"reply_target,omitempty"`   // a standing subject (same circle) the sender reads replies from
 	CorrelationID string `json:"correlation_id,omitempty"` // spawn/request this answers
 	At            int64  `json:"at"`                       // source clock, Unix nanoseconds
 
-	// A reply is signed by the worker that answered: Signer is its key
-	// (did:key), Signature covers ReplyDigest. The host of the reply slot
-	// checks it against the claimant; the requester may check it against
-	// the provider's chain (memo §12.3, §12.8).
+	// A reply (the outcome of a request, call.go) is signed by the worker
+	// that answered: Signer is its key (did:key), Signature covers
+	// ReplyDigest. The host checks it against the claimant; the caller's
+	// node checks it again, and that the signer was entitled to answer.
 	Signer    string `json:"signer,omitempty"`
 	Signature []byte `json:"signature,omitempty"`
-}
-
-// ReplyDigest is what a worker signs on a reply: the request it answers
-// (CorrelationID), and the answer.
-func ReplyDigest(e Event) [32]byte {
-	h := sha256.New()
-	for _, s := range []string{"astral-reply-v1", e.CorrelationID, e.Kind, e.Content, e.PayloadRef} {
-		h.Write([]byte(s))
-		h.Write([]byte{0})
-	}
-	var out [32]byte
-	copy(out[:], h.Sum(nil))
-	return out
-}
-
-// SignReply signs a reply with the worker's key.
-func SignReply(priv ed25519.PrivateKey, signer string, e *Event) {
-	d := ReplyDigest(*e)
-	e.Signer = signer
-	e.Signature = ed25519.Sign(priv, d[:])
-}
-
-// VerifyReply checks a reply's signature against its Signer.
-func (e Event) VerifyReply() error {
-	if e.Signer == "" || len(e.Signature) == 0 {
-		return errors.New("astral: reply is not signed")
-	}
-	pub, err := did.KeyFor(e.Signer)
-	if err != nil {
-		return fmt.Errorf("astral: reply signer: %w", err)
-	}
-	d := ReplyDigest(e)
-	if !ed25519.Verify(pub, d[:], e.Signature) {
-		return errors.New("astral: reply signature does not verify")
-	}
-	return nil
 }
 
 // DeriveID fills ID deterministically from the envelope when the source did
@@ -127,8 +90,7 @@ type Subject struct {
 	// IdleTTLNS self-destructs the subject after this much inactivity
 	// (0 = never); appends, claims, acks, and active waits all count as
 	// activity. MaxEvents caps total appends over the subject's lifetime
-	// (0 = unlimited). Ephemeral reply subjects get tight defaults at
-	// Declare (coordination-plane contract: Ephemeral subjects).
+	// (0 = unlimited).
 	IdleTTLNS int64 `json:"idle_ttl_ns,omitempty"`
 	MaxEvents int   `json:"max_events,omitempty"`
 
@@ -140,57 +102,10 @@ type Subject struct {
 	// Both are sticky across a redeclare (SetSpread, SetDraining).
 	Spread   bool `json:"spread,omitempty"`
 	Draining bool `json:"draining,omitempty"`
-
-	// A reply slot (memo §12.3): allocated by the host of a request subject
-	// when it accepts a publish that asked for one, in the request's
-	// circle and owned by the host. ReplyFor is the request event, ReplyOf its subject,
-	// ReplyConsumer the principal that published it (the only one who may
-	// claim, wait on or read the slot); the only appender is the live
-	// claimant of the request, signing its reply.
-	ReplyFor      string `json:"reply_for,omitempty"`
-	ReplyOf       string `json:"reply_of,omitempty"`
-	ReplyConsumer string `json:"reply_consumer,omitempty"`
 }
 
 // Ref is the subject's identity.
 func (m Subject) Ref() Ref { return Ref{Circle: m.Circle, Name: m.Name} }
-
-// IsReplySlot reports whether the subject is a host-allocated reply slot.
-func (m Subject) IsReplySlot() bool { return m.ReplyFor != "" }
-
-// ReplyQuota is how many live reply slots one principal may hold on a
-// host at once.
-var ReplyQuota = 100
-
-// ReplySlotsOf counts the live reply slots a principal holds in a circle.
-func (s *Store) ReplySlotsOf(circle, consumer string) (int, error) {
-	boxes, err := s.Subjects()
-	if err != nil {
-		return 0, err
-	}
-	n := 0
-	for _, m := range boxes {
-		if m.Circle == circle && m.ReplyConsumer == consumer {
-			n++
-		}
-	}
-	return n, nil
-}
-
-// EphemeralPrefix marks SDK-created temporary reply subjects. They are
-// unlisted — never announced through the registry (their route travels in
-// the claimed request instead) — and short-lived by default.
-const EphemeralPrefix = "subject:queues/_reply/"
-
-// Ephemeral reports whether a name is a temporary reply subject.
-func Ephemeral(name string) bool { return strings.HasPrefix(name, EphemeralPrefix) }
-
-// Defaults applied to ephemeral subjects declared without explicit policy.
-// Variables so tests can shrink them.
-var (
-	ReplyIdleTTL   = 10 * time.Minute
-	ReplyMaxEvents = 100
-)
 
 func (m Subject) accepts(kind string) bool {
 	if len(m.Accepts) == 0 {
@@ -216,11 +131,14 @@ type Register struct {
 // Ref is the register's identity.
 func (r Register) Ref() Ref { return Ref{Circle: r.Circle, Name: r.Name} }
 
-// Claimed is one leased event.
+// Claimed is one leased event. Awaited says a caller is waiting for a
+// reply to it: finish the work with Complete, which records the reply and
+// acknowledges the request together.
 type Claimed struct {
 	Event    Event  `json:"event"`
 	Consumer string `json:"consumer"`
 	Until    int64  `json:"lease_until"` // Unix nanoseconds
+	Awaited  bool   `json:"awaited,omitempty"`
 }
 
 // LeaseInfo is an active claim lease surfaced to operators. It deliberately
@@ -253,8 +171,11 @@ var (
 
 	// ErrSubjectExpired is a normal outcome, not a fault: the temporary
 	// subject reached its idle TTL and self-destructed — its declarer is
-	// gone. A late replier must not retry or park this.
+	// gone. A late publisher must not retry or park this.
 	ErrSubjectExpired = errors.New("astral: subject expired (its declarer is gone; do not retry)")
+	// ErrNoEvent: this journal has no event of that ID in the subject. For
+	// a spread name it means "ask another host".
+	ErrNoEvent = errors.New("astral: no event")
 	// ErrSubjectFull is the max-events cap rejecting an append.
 	ErrSubjectFull = errors.New("astral: subject is full (max events reached)")
 	// ErrDraining is a spread host refusing new events while it empties;
@@ -262,7 +183,7 @@ var (
 	// the queue.
 	ErrDraining = errors.New("astral: subject is draining on this host")
 	// ErrSpreadPolicy is a spread declaration the model cannot honour.
-	ErrSpreadPolicy = errors.New("astral: only a shared, permanent subject can be spread over several hosts")
+	ErrSpreadPolicy = errors.New("astral: only a shared subject can be spread over several hosts")
 )
 
 // ValidName checks the namespace prefixes.
@@ -289,6 +210,7 @@ func ValidRegister(name string) error {
 //	e/<ref>/<seq>      Event, arrival order (internal cursor)
 //	i/<ref>/<id>       seq, for idempotent append
 //	a/<ref>/<id>       ack {consumer, at}
+//	c/<ref>/<id>       Call: the reply state of a request (call.go)
 //	l/<ref>/<id>       lease {consumer, until}
 //	r/<ref>            Register
 //	o/<ref>/<id>       outbox: Event waiting for a remote host
@@ -404,13 +326,8 @@ func (s *Store) Declare(m Subject) error {
 	if m.Delivery != DeliveryExclusive && m.Delivery != DeliveryShared {
 		return fmt.Errorf("astral: invalid delivery %q", m.Delivery)
 	}
-	if ref.Ephemeral() {
-		if m.IdleTTLNS == 0 {
-			m.IdleTTLNS = int64(ReplyIdleTTL)
-		}
-		if m.MaxEvents == 0 {
-			m.MaxEvents = ReplyMaxEvents
-		}
+	if strings.HasPrefix(m.Name, RetiredPrefix) {
+		return fmt.Errorf("%w: %s", ErrRetiredName, m.Name)
 	}
 	var prev Subject
 	if ok, err := s.getJSON(k1("m/", ref), &prev); err != nil {
@@ -425,7 +342,7 @@ func (s *Store) Declare(m Subject) error {
 		m.Created = time.Now().UnixNano()
 		m.Draining = false
 	}
-	if m.Spread && (m.Delivery != DeliveryShared || ref.Ephemeral() || m.IsReplySlot()) {
+	if m.Spread && m.Delivery != DeliveryShared {
 		return fmt.Errorf("%w: %s", ErrSpreadPolicy, ref)
 	}
 	raw, err := json.Marshal(m)
@@ -466,7 +383,7 @@ func (s *Store) unknownOrExpired(ref Ref) error {
 }
 
 // Touch records activity on a hosted subject (an active wait counts: a
-// parked waiter keeps its reply subject alive).
+// parked waiter keeps a subject with an idle TTL alive).
 func (s *Store) Touch(ref Ref) error {
 	raw, err := json.Marshal(time.Now().UnixNano())
 	if err != nil {
@@ -501,13 +418,13 @@ func (s *Store) Subjects() ([]Subject, error) {
 }
 
 // Remove deletes a declared subject and every event, index, ack, lease,
-// and parked outbox entry under it.
+// call, and parked outbox entry under it.
 func (s *Store) Remove(ref Ref) error {
 	return s.remove(ref, false)
 }
 
 // Expire removes an idle subject and leaves a tombstone, so a late
-// publish gets "expired" — the replier learns the declarer is gone —
+// publish gets "expired" — the publisher learns the declarer is gone —
 // instead of "unknown".
 func (s *Store) Expire(ref Ref) error {
 	return s.remove(ref, true)
@@ -529,7 +446,7 @@ func (s *Store) remove(ref Ref, tombstone bool) error {
 			return err
 		}
 	}
-	for _, prefix := range []string{"e/", "i/", "a/", "l/", "o/"} {
+	for _, prefix := range []string{"e/", "i/", "a/", "l/", "c/", "o/"} {
 		bounds := prefixBounds(k1(prefix, ref) + "/")
 		if err := b.DeleteRange(bounds.LowerBound, bounds.UpperBound, nil); err != nil {
 			return err
@@ -594,6 +511,13 @@ func (s *Store) SweepTombstones(now time.Time, keep time.Duration) error {
 // present (the idempotent retry case). The event's own ID is honoured;
 // an empty ID is derived.
 func (s *Store) Append(ref Ref, ev Event) (fresh bool, err error) {
+	return s.append(ref, ev, nil)
+}
+
+// append journals an event and, when call is given, the record that will
+// hold its reply — one write, so a request never exists without its call
+// nor a call without its request.
+func (s *Store) append(ref Ref, ev Event, call *Call) (fresh bool, err error) {
 	m, ok, err := s.Subject(ref)
 	if err != nil {
 		return false, err
@@ -637,6 +561,17 @@ func (s *Store) Append(ref Ref, ev Event) (fresh bool, err error) {
 	}
 	b := s.db.NewBatch()
 	defer b.Close()
+	if call != nil {
+		if n, err := s.OpenCalls(ref.Circle, call.Caller); err != nil {
+			return false, err
+		} else if n >= CallQuota {
+			return false, fmt.Errorf("%w: %d in flight here (collect or release their replies)", ErrCallQuota, n)
+		}
+		call.Created = time.Now().UnixNano()
+		if err := s.setJSON(b, k2("c/", ref, ev.ID), call); err != nil {
+			return false, err
+		}
+	}
 	if err := s.setJSON(b, eventKey(ref, seq), ev); err != nil {
 		return false, err
 	}
@@ -750,7 +685,12 @@ func (s *Store) ClaimAs(ref Ref, consumer string, d time.Duration, n int, hold H
 		if err := s.setJSON(b, k2("l/", ref, ev.ID), lease{Consumer: consumer, Until: until, Hold: hold}); err != nil {
 			return nil, err
 		}
-		out = append(out, Claimed{Event: ev, Consumer: consumer, Until: until})
+		var call Call
+		awaited, err := s.getJSON(k2("c/", ref, ev.ID), &call)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, Claimed{Event: ev, Consumer: consumer, Until: until, Awaited: awaited && !call.Done()})
 	}
 	if len(out) == 0 {
 		return nil, nil
@@ -760,13 +700,15 @@ func (s *Store) ClaimAs(ref Ref, consumer string, d time.Duration, n int, hold H
 
 // Ack marks an event incorporated by consumer. It is a force-ack: no lease
 // is required, because the consumer's own durable commit is the proof.
-// Acking twice is harmless; acking an unknown event is an error.
+// Acking twice is harmless; acking an unknown event is an error. Acking a
+// request whose caller waits for a reply closes the call without one: the
+// caller is told instead of waiting out its timeout.
 func (s *Store) Ack(ref Ref, consumer, eventID string) error {
 	var seq uint64
 	if ok, err := s.getJSON(k2("i/", ref, eventID), &seq); err != nil {
 		return err
 	} else if !ok {
-		return fmt.Errorf("astral: no event %s in %s", eventID, ref)
+		return fmt.Errorf("%w %s in %s", ErrNoEvent, eventID, ref)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -777,6 +719,15 @@ func (s *Store) Ack(ref Ref, consumer, eventID string) error {
 	}
 	if err := b.Delete([]byte(k2("l/", ref, eventID)), nil); err != nil {
 		return err
+	}
+	var call Call
+	if ok, err := s.getJSON(k2("c/", ref, eventID), &call); err != nil {
+		return err
+	} else if ok && !call.Done() {
+		call.Closed, call.DoneAt = true, time.Now().UnixNano()
+		if err := s.setJSON(b, k2("c/", ref, eventID), call); err != nil {
+			return err
+		}
 	}
 	if err := s.setJSON(b, k1("t/", ref), time.Now().UnixNano()); err != nil {
 		return err

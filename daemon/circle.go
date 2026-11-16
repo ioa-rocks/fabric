@@ -782,6 +782,21 @@ func (s *CircleService) rootsForLocked(circleDID string) (statement.Roots, error
 // else the chain's own resource — without touching the presence state.
 // What a data plane uses to re-check a holder whose connection is gone.
 func (s *CircleService) CheckChain(raw []byte, want statement.Want) error {
+	return s.checkChain(raw, "", want)
+}
+
+// CheckChainOf is CheckChain for a chain someone else handed over on a
+// key's behalf: it must also be the chain of that key, in want's circle.
+// What a caller uses to check that the signer of a reply was entitled to
+// answer, from the chain the host kept with it.
+func (s *CircleService) CheckChainOf(raw []byte, key string, want statement.Want) error {
+	if key == "" {
+		return errors.New("check chain: key required")
+	}
+	return s.checkChain(raw, key, want)
+}
+
+func (s *CircleService) checkChain(raw []byte, key string, want statement.Want) error {
 	st, err := statement.Decode(raw)
 	if err != nil {
 		return err
@@ -793,6 +808,14 @@ func (s *CircleService) CheckChain(raw []byte, want statement.Want) error {
 	chain, err := statement.Compile(st, nil, st.Payload.Sub, roots)
 	if err != nil {
 		return err
+	}
+	if key != "" {
+		if chain.PresentingKey != key {
+			return fmt.Errorf("chain is for %s, not %s", shortDID(chain.PresentingKey), shortDID(key))
+		}
+		if want.Sub != "" && want.Sub != chain.Sub {
+			return fmt.Errorf("chain is for circle %s, not %s", shortDID(chain.Sub), shortDID(want.Sub))
+		}
 	}
 	if want.Now.IsZero() {
 		want.Now = time.Now()
@@ -1055,8 +1078,8 @@ func (s *CircleService) DeviceChain(peerID peer.ID, circleDID string) ([]byte, b
 // VerifyPresentedValid is VerifyPresented without a verb: is the presented
 // chain itself still live (window, roots, revocations)? Used where the
 // right to act comes from host-side state — a claimant acking its own
-// lease, a requester reading its reply slot — but the chain must still
-// be alive (agy review, 2026-11-03).
+// lease, a requester reading the reply to its request — but the chain
+// must still be alive (agy review, 2026-11-03).
 func (s *CircleService) VerifyPresentedValid(peerID peer.ID, auth [32]byte, key string) error {
 	s.mu.RLock()
 	pc, ok := s.presented[peerID][presentKey{auth: auth, key: key}]

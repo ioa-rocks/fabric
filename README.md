@@ -698,10 +698,10 @@ fabric astral status                                                  # anywhere
 Each host keeps its own journal; the hosts do not talk to each other.
 A publishing node ranks the hosts by a hash of the queue and host IDs,
 so all publishers prefer the same one, and moves to the next when a host
-is unreachable; the outbox is used only when none is. A request with a
-reply slot does the same, and its reply slot is on whichever host took
-it. A consuming node claims from every host and waits on all of them at
-once; each ack goes back to the host the event came from. Applications
+is unreachable; the outbox is used only when none is. A request that
+waits for a reply does the same, and its reply is kept by whichever host
+took it. A consuming node claims from every host and waits on all of them
+at once; each ack or completion goes back to the host the event came from. Applications
 and workers see one queue and never name a host.
 
 What this does not give: nothing is replicated. Events already accepted
@@ -756,7 +756,14 @@ the key file is the only copy. A call made with `-key` is signed by the
 sub-key over the operation (op, circle, name, event id, consumer, value,
 time) and carries its chain; the host, local or remote, verifies the
 signature and checks the chain for the verb, so a claim-only key cannot
-publish even on its own node. Leases and sources name the key
+publish even on its own node. The signed fields are separated by a zero
+byte, so the host refuses a signed operation with a zero byte in any of
+them except the one free field (an event's content, a register's value):
+one signature then reads one way only. A publish is signed over the
+event's kind, content, payload ref, correlation id, whether a reply is
+wanted, and its reply target when it names one; the host stamps the
+source and does not carry a signer on a published event. Leases and
+sources name the key
 (`<consumer>@<key8>@<member>`). Foreign grantees present their chain the
 same way (next slices, `tasks/open/astral-per-circle.md`).
 
@@ -771,18 +778,48 @@ its parked waits return a revocation error. The same re-check runs on a
 timer for chains that merely expire. Leases and heartbeat TTLs are capped at ten
 minutes, and a wait ends when its stream does.
 
-**Request and reply.** `fabric astral append <queue> -reply …` asks the
-host of the queue for a reply slot: the host allocates
-`subject:queues/_reply/<request-id>` in the queue's circle, owned by itself,
-readable only by the principal that published the request, and points the
-request at it. The worker that holds the request's live lease is the only
-one who may append to the slot, with a reply signed over the request it
-answers (`-corr <request-id>`; the device key signs for a device, the
-sub-key for a `-key` caller), so a host can drop a reply but neither forge
-nor replay one. Slots are never announced; the requester's node routes to
-the host it published through, the worker's to the host it claimed from.
-A slot idles out after ten minutes and a late reply is refused loudly, not
-parked. Quota: 100 live slots per principal per host.
+**Request and reply.** The reply to a request is kept with the request,
+by the host that journaled it. Nothing is declared and there is no reply
+subject.
+
+```sh
+fabric astral append subject:jobs -reply "crawl example.org"      # caller: prints the request id
+fabric astral claim subject:jobs -consumer crawler -wait 30       # worker
+fabric astral complete subject:jobs <request-id> "42 pages"       # worker: reply + ack, one step
+fabric astral reply subject:jobs <request-id> -wait 30            # caller: prints the reply, releases it
+fabric astral append subject:jobs -reply -wait 30 "crawl …"       # caller: the same in one command
+```
+
+`append -reply` records, with the event, the principal that published it;
+only that principal can read the reply. `complete` is accepted only from
+the principal holding the request's live lease. It records the reply and
+acknowledges the request in one write, and needs no verb beyond the
+`claim` that took the lease, so a claim-only key or grant can answer.
+The reply is signed over the request it answers (circle, queue, request
+id) by the device key, or by the sub-key for a `-key` caller; every signed
+field carries its length, so one signature fits one reply. The caller's
+own node checks that signature, and that the signer holds `claim` on the
+queue, before it hands the reply on, so a host can drop a reply but can
+neither make one up nor pass off another request's. The check is the same
+when the queue is hosted on the caller's own node.
+
+Reading a reply does not consume it; `reply` releases it once printed
+(`-keep` leaves it). A principal may have 100 requests in flight per host
+(published, reply not yet released); collecting replies frees the quota at
+once. A request whose caller stops waiting is forgotten after ten minutes
+idle. The request itself stays in the queue, and the worker that completes
+it is told nobody is waiting. `complete` on a request published without
+`-reply` is simply an ack. Acknowledging a request with plain `ack` closes
+it without a reply, and the caller is told so.
+
+A long-lived conversation needs none of this: name an ordinary subject
+you host in the event's `reply_target` and let the other side publish
+there under the usual verbs.
+
+Requests in flight when a node is upgraded from the reply-slot releases
+(`subject:queues/_reply/<id>`) lose their replies: leftover slots are
+dropped at start, and declaring a name in that family is refused. Both
+ends of a request must run this release.
 
 **Grantees: a worker that joins nothing.** A circle can hand a bare key
 the right to a verb on a subject, with no membership anywhere (the team
@@ -796,7 +833,7 @@ fabric circle grant revoke 3f9a2c1e          # root-signed; pushed to members on
 
 # on the worker's machine — no daemon, no state, just the file
 fabric astral worker claim -key worker.key subject:jobs -consumer crawler -wait 30
-fabric astral worker append -key worker.key subject:queues/_reply/<request-id> -corr <request-id> "done"
+fabric astral worker complete -key worker.key subject:jobs <request-id> "done"
 ```
 
 The key file is the credential: the worker's key, the root-signed grant

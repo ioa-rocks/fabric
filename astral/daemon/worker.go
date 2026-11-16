@@ -131,8 +131,7 @@ func (w *Worker) Wait(ctx context.Context, name string, timeout time.Duration) (
 	return Woke(resp.Woke), err
 }
 
-// Append casts an event; a reply (CorrelationID set, ephemeral target) is
-// signed by the worker's key.
+// Append casts an event.
 func (w *Worker) Append(ctx context.Context, name string, ev astral.Event) (fresh bool, err error) {
 	if ev.ID == "" {
 		ev.ID = NewEventID()
@@ -140,11 +139,21 @@ func (w *Worker) Append(ctx context.Context, name string, ev astral.Event) (fres
 	if ev.At == 0 {
 		ev.At = time.Now().UnixNano()
 	}
-	if ev.CorrelationID != "" && astral.Ephemeral(name) && len(ev.Signature) == 0 {
-		astral.SignReply(w.signer.Priv, w.signer.Key, &ev)
-	}
 	resp, err := w.call(ctx, request{Op: OpAppend, Name: name, Event: ev}, 15*time.Second)
 	return resp.Fresh, err
+}
+
+// Complete finishes a request the worker holds the lease on: the reply,
+// signed by the worker's key, is recorded and the request acknowledged in
+// one write at the gate. delivered is false when no caller is waiting.
+func (w *Worker) Complete(ctx context.Context, name, requestID string, reply astral.Event) (delivered bool, err error) {
+	reply.CorrelationID = requestID
+	if reply.At == 0 {
+		reply.At = time.Now().UnixNano()
+	}
+	astral.SignReply(w.signer.Priv, w.signer.Key, astral.Ref{Circle: w.signer.Circle, Name: name}, &reply)
+	resp, err := w.call(ctx, request{Op: OpComplete, Name: name, EventID: requestID, Event: reply}, 15*time.Second)
+	return resp.Delivered, err
 }
 
 // Ack acknowledges an event for consumer.

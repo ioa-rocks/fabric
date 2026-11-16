@@ -32,10 +32,18 @@ const usage = `usage: fabric astral <command> [flags] [args]
                                        serving claims; rm it once status shows nothing pending
   rm <name>                            remove a hosted subject and its journal
   host <name> <member|peer-id>         record that a node hosts <name> ("" clears)
-  append <name> [-kind user] [-source tool] [-id id] [-ref artifact] [-reply] [-corr id] <content|->
-                                       -reply asks the host for a reply slot (printed); -corr answers a request
+  append <name> [-kind user] [-source tool] [-id id] [-ref artifact] [-corr id] [-reply [-wait 30]] <content|->
+                                       -reply makes it a request: the host keeps the reply with it, and
+                                       the request id printed is the handle for 'reply'; with -wait N the
+                                       reply is awaited and printed here instead
+  reply <name> <request-id> [-wait 30] [-keep]
+                                       print the reply to a request you published with -reply, waiting
+                                       up to N seconds; it is released once printed unless -keep
   claim <name> [-consumer me] [-lease 30] [-n 1] [-wait 0]
                                        -wait N parks up to N seconds for mail first
+  complete <name> <request-id> [-kind result] [-source tool] [-ref artifact] <content|->
+                                       finish a request you claimed: its reply is signed and recorded and
+                                       the request acknowledged, in one step
   heartbeat <entity> [-ttl 30]         extend <entity>'s liveness lease
   watch <entity> <watcher-subject>     cast a system death notice there when the lease lapses
   ack <name> <event-id> [-consumer me]
@@ -45,7 +53,7 @@ const usage = `usage: fabric astral <command> [flags] [args]
                                        mint a sub-key under this device's admission in -circle
   key list                             sub-keys this device issued
   key revoke <id-prefix>               revoke an issued sub-key (reaches members online now)
-  worker claim|wait|append|ack|heartbeat -key worker.key [-gate addr] <name> …
+  worker claim|wait|append|complete|ack|heartbeat -key worker.key [-gate addr] <name> …
                                        act as a grantee against a listed gate, no daemon
                                        (the key file from 'fabric circle grant new')
 
@@ -77,6 +85,10 @@ func Main(args []string) int {
 		err = cmdAppend(rest)
 	case "claim":
 		err = cmdClaim(rest)
+	case "complete":
+		err = cmdComplete(rest)
+	case "reply":
+		err = cmdReply(rest)
 	case "ack":
 		err = cmdAck(rest)
 	case "heartbeat":
@@ -270,6 +282,9 @@ func cmdStatus(args []string) error {
 			if h.Draining {
 				acc += "  draining"
 			}
+			if h.Calls > 0 {
+				acc += fmt.Sprintf("  replies kept %d", h.Calls)
+			}
 			fmt.Printf("  %-32s pending %-4d accepts %s\n", name, h.Pending, acc)
 		}
 	}
@@ -289,8 +304,8 @@ func cmdSubject(args []string) error {
 	fs, st := flags("subject")
 	accepts := fs.String("accepts", "", "comma-separated kinds accepted (empty = any)")
 	delivery := fs.String("delivery", string(astral.DeliveryExclusive), "exclusive or shared")
-	idle := fs.Duration("idle", 0, "self-destruct after this much inactivity (0 = never; _reply/ names default tight)")
-	maxEvents := fs.Int("max", 0, "cap on total appended events (0 = unlimited; _reply/ names default tight)")
+	idle := fs.Duration("idle", 0, "self-destruct after this much inactivity (0 = never)")
+	maxEvents := fs.Int("max", 0, "cap on total appended events (0 = unlimited)")
 	spread := fs.Bool("spread", false, "let other nodes host this shared queue too (declare it on each); -spread=false turns it off here")
 	pos := parse(fs, args)
 	if len(pos) != 1 {
@@ -352,29 +367,29 @@ func cmdAppend(args []string) error {
 	source := fs.String("source", "cli", "source tool (member label is stamped by the daemon)")
 	id := fs.String("id", "", "event id (derived when empty)")
 	ref := fs.String("ref", "", "payload artifact reference")
-	reply := fs.Bool("reply", false, "ask the host to allocate a reply slot for this request")
-	corr := fs.String("corr", "", "correlation id: the request event this answers (replies are signed)")
+	reply := fs.Bool("reply", false, "a request: the host keeps the reply with it (read it with 'reply')")
+	wait := fs.Int("wait", 0, "with -reply: wait up to this many seconds and print the reply")
+	corr := fs.String("corr", "", "correlation id: the event this one refers to")
 	pos := parse(fs, args)
 	if len(pos) != 2 {
 		return fmt.Errorf("usage: append <name> [flags] <content|->")
 	}
-	content := pos[1]
-	if content == "-" {
-		b, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			return err
-		}
-		content = strings.TrimRight(string(b), "\n")
+	content, err := contentArg(pos[1])
+	if err != nil {
+		return err
 	}
 	ev := astral.Event{ID: *id, Kind: *kind, Source: *source, Content: content, PayloadRef: *ref, CorrelationID: *corr}
 	cl := client(fs, st)
 	if *reply {
-		eid, slot, err := cl.AppendRequest(pos[0], ev)
+		eid, err := cl.AppendRequest(pos[0], ev)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%s\nreply slot %s\n", eid, slot)
-		return nil
+		if *wait <= 0 {
+			fmt.Println(eid)
+			return nil
+		}
+		return printReply(cl, pos[0], eid, *wait, false)
 	}
 	eid, fresh, err := cl.Append(pos[0], ev)
 	if err != nil {
@@ -413,6 +428,71 @@ func cmdClaim(args []string) error {
 		if err := enc.Encode(cl.Event); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// contentArg reads an event's content: the argument, or stdin for "-".
+func contentArg(arg string) (string, error) {
+	if arg != "-" {
+		return arg, nil
+	}
+	b, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(string(b), "\n"), nil
+}
+
+// printReply waits for the reply to a request, prints it and, unless keep,
+// releases it: once it is on stdout the host need not hold it.
+func printReply(cl *daemon.Client, name, requestID string, waitS int, keep bool) error {
+	reply, err := cl.Outcome(name, requestID, waitS)
+	if err != nil {
+		return err
+	}
+	if reply == nil {
+		return fmt.Errorf("no reply to %s yet (fabric astral reply %s %s -wait N)", requestID, name, requestID)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(reply); err != nil {
+		return err
+	}
+	if keep {
+		return nil
+	}
+	return cl.Release(name, requestID)
+}
+
+func cmdReply(args []string) error {
+	fs, st := flags("reply")
+	wait := fs.Int("wait", 0, "wait up to this many seconds for the reply")
+	keep := fs.Bool("keep", false, "leave the reply at the host (read it again later)")
+	pos := parse(fs, args)
+	if len(pos) != 2 {
+		return fmt.Errorf("usage: reply <name> <request-id> [-wait 30] [-keep]")
+	}
+	return printReply(client(fs, st), pos[0], pos[1], *wait, *keep)
+}
+
+func cmdComplete(args []string) error {
+	fs, st := flags("complete")
+	kind := fs.String("kind", "result", "reply kind (result, error, …)")
+	source := fs.String("source", "cli", "source tool (member label is stamped by the daemon)")
+	ref := fs.String("ref", "", "payload artifact reference")
+	pos := parse(fs, args)
+	if len(pos) != 3 {
+		return fmt.Errorf("usage: complete <name> <request-id> [-kind result] <content|->")
+	}
+	content, err := contentArg(pos[2])
+	if err != nil {
+		return err
+	}
+	delivered, err := client(fs, st).Complete(pos[0], pos[1], astral.Event{Kind: *kind, Source: *source, Content: content, PayloadRef: *ref})
+	if err != nil {
+		return err
+	}
+	if !delivered {
+		fmt.Println("acknowledged; nobody is waiting for the reply")
 	}
 	return nil
 }
@@ -476,7 +556,7 @@ func cmdWatch(args []string) error {
 // a direct connection to a listed gate, no daemon or state directory.
 func cmdWorker(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: worker claim|wait|append|ack|heartbeat -key worker.key [-gate addr] <name> …")
+		return fmt.Errorf("usage: worker claim|wait|append|complete|ack|heartbeat -key worker.key [-gate addr] <name> …")
 	}
 	verb, rest := args[0], args[1:]
 	fs := flag.NewFlagSet("astral worker "+verb, flag.ExitOnError)
@@ -487,9 +567,9 @@ func cmdWorker(args []string) error {
 	lease := fs.Int("lease", 30, "lease seconds (claim)")
 	n := fs.Int("n", 1, "max events (claim)")
 	wait := fs.Int("wait", 0, "park up to this many seconds for mail (claim/wait)")
-	kind := fs.String("kind", "result", "event kind (append)")
-	source := fs.String("source", "worker", "source tool (append)")
-	corr := fs.String("corr", "", "correlation id: the request this answers (append)")
+	kind := fs.String("kind", "result", "event kind (append, complete)")
+	source := fs.String("source", "worker", "source tool (append, complete)")
+	corr := fs.String("corr", "", "correlation id: the event this one refers to (append)")
 	ttl := fs.Int("ttl", 30, "lease seconds (heartbeat)")
 	pos := parse(fs, rest)
 	if *keyPath == "" || len(pos) < 1 {
@@ -533,15 +613,11 @@ func cmdWorker(args []string) error {
 		return nil
 	case "append":
 		if len(pos) != 2 {
-			return fmt.Errorf("usage: worker append -key worker.key <name> [-corr request-id] <content|->")
+			return fmt.Errorf("usage: worker append -key worker.key <name> [-corr event-id] <content|->")
 		}
-		content := pos[1]
-		if content == "-" {
-			b, err := io.ReadAll(os.Stdin)
-			if err != nil {
-				return err
-			}
-			content = strings.TrimRight(string(b), "\n")
+		content, err := contentArg(pos[1])
+		if err != nil {
+			return err
 		}
 		fresh, err := w.Append(ctx, name, astral.Event{Kind: *kind, Source: *source, Content: content, CorrelationID: *corr})
 		if err != nil {
@@ -549,6 +625,22 @@ func cmdWorker(args []string) error {
 		}
 		if !fresh {
 			fmt.Println("(duplicate)")
+		}
+		return nil
+	case "complete":
+		if len(pos) != 3 {
+			return fmt.Errorf("usage: worker complete -key worker.key <name> <request-id> [-kind result] <content|->")
+		}
+		content, err := contentArg(pos[2])
+		if err != nil {
+			return err
+		}
+		delivered, err := w.Complete(ctx, name, pos[1], astral.Event{Kind: *kind, Source: *source, Content: content})
+		if err != nil {
+			return err
+		}
+		if !delivered {
+			fmt.Println("acknowledged; nobody is waiting for the reply")
 		}
 		return nil
 	case "ack":

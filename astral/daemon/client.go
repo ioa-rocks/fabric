@@ -119,8 +119,7 @@ func (c *Client) Declare(name string, delivery astral.Delivery, accepts []string
 }
 
 // DeclareExpiring is Declare with an explicit lifecycle: idle self-destruct
-// TTL and a total-append cap (zero keeps each unlimited — except for
-// ephemeral `_reply/` names, which default to tight limits either way).
+// TTL and a total-append cap (zero keeps each unlimited).
 func (c *Client) DeclareExpiring(name string, delivery astral.Delivery, accepts []string, idle time.Duration, maxEvents int) error {
 	return c.post("/v0/subjects", declareBody{
 		Circle: c.Circle, Name: name, Delivery: delivery, Accepts: accepts,
@@ -163,30 +162,59 @@ func (c *Client) SetHost(name, host string) error {
 // Append casts an event. Returns the (possibly derived) event ID and
 // whether it was new.
 func (c *Client) Append(name string, ev astral.Event) (id string, fresh bool, err error) {
-	id, fresh, _, err = c.append(name, ev, false)
-	return id, fresh, err
+	return c.append(name, ev, false)
 }
 
-// AppendRequest casts a request and returns the reply slot the host
-// allocated for it; claim or wait on that slot for the answer.
-func (c *Client) AppendRequest(name string, ev astral.Event) (id, slot string, err error) {
-	id, _, slot, err = c.append(name, ev, true)
-	return id, slot, err
+// AppendRequest casts a request whose reply the caller will wait for and
+// returns its ID: the handle for Outcome and Release. The host that
+// journals the request keeps the reply with it; nothing is declared.
+func (c *Client) AppendRequest(name string, ev astral.Event) (id string, err error) {
+	id, _, err = c.append(name, ev, true)
+	return id, err
 }
 
-func (c *Client) append(name string, ev astral.Event, reply bool) (id string, fresh bool, slot string, err error) {
+func (c *Client) append(name string, ev astral.Event, reply bool) (id string, fresh bool, err error) {
 	var r appendReply
 	if c.Signer != nil && ev.ID == "" {
 		ev.ID = NewEventID()
 	}
-	// A sub-key signs its replies itself; the device's are signed by the daemon.
-	if c.Signer != nil && ev.CorrelationID != "" && astral.Ephemeral(name) && len(ev.Signature) == 0 {
-		astral.SignReply(c.Signer.Priv, c.Signer.Key, &ev)
-	}
 	if err := c.post("/v0/append", appendBody{Principal: c.sign(OpAppend, name, ev.ID, "", appendDigestValue(ev, reply)), Circle: c.Circle, Name: name, Event: ev, Reply: reply}, &r); err != nil {
-		return "", false, "", err
+		return "", false, err
 	}
-	return r.ID, r.Fresh, r.Reply, nil
+	return r.ID, r.Fresh, nil
+}
+
+// Complete finishes a claimed request with its reply: the host records the
+// reply and acknowledges the request in one write. It is how a worker
+// finishes any request — delivered is false when no caller is waiting for
+// the reply (none was wanted, or the caller is gone), and the request is
+// acknowledged either way. A sub-key signs the reply here; the device's
+// is signed by the daemon.
+func (c *Client) Complete(name, requestID string, reply astral.Event) (delivered bool, err error) {
+	reply.CorrelationID = requestID
+	if c.Signer != nil && len(reply.Signature) == 0 {
+		astral.SignReply(c.Signer.Priv, c.Signer.Key, astral.Ref{Circle: c.Circle, Name: name}, &reply)
+	}
+	var r completeReply
+	err = c.post("/v0/complete", completeBody{Principal: c.sign(OpComplete, name, requestID, "", replyDigestValue(reply)), Circle: c.Circle, Name: name, EventID: requestID, Event: reply}, &r)
+	return r.Delivered, err
+}
+
+// Outcome waits up to timeoutS seconds for the reply to a request this
+// client published with AppendRequest; nil when there is none yet. The
+// daemon has checked the reply before handing it on: its signature binds
+// it to the request, and its signer was entitled to answer. Reading does
+// not consume — call Release once the reply has been acted on.
+func (c *Client) Outcome(name, requestID string, timeoutS int) (*astral.Event, error) {
+	var r outcomeReply
+	err := c.post("/v0/outcome", outcomeBody{Principal: c.sign(OpOutcome, name, requestID, "", ""), Circle: c.Circle, Name: name, EventID: requestID, TimeoutS: timeoutS}, &r)
+	return r.Outcome, err
+}
+
+// Release tells the host the caller has its reply, or no longer wants one;
+// the request stops counting against the caller's quota.
+func (c *Client) Release(name, requestID string) error {
+	return c.post("/v0/release", releaseBody{Principal: c.sign(OpRelease, name, requestID, "", ""), Circle: c.Circle, Name: name, EventID: requestID}, nil)
 }
 
 // Claim leases up to n events for lease seconds.

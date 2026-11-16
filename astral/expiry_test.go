@@ -16,36 +16,28 @@ func openStore(t *testing.T) *Store {
 	return s
 }
 
-func TestEphemeralDefaults(t *testing.T) {
+func TestLifecycleIsDeclaredNeverImplied(t *testing.T) {
 	s := openStore(t)
-	if !Ephemeral("subject:queues/_reply/abc") || Ephemeral("subject:queues/fortune") {
-		t.Fatal("Ephemeral prefix detection wrong")
-	}
-	if err := s.Declare(Subject{Circle: LocalCircle, Name: "subject:queues/_reply/abc"}); err != nil {
+	// Explicit policy is kept.
+	if err := s.Declare(Subject{Circle: LocalCircle, Name: "subject:queues/scratch", IdleTTLNS: int64(time.Hour), MaxEvents: 7}); err != nil {
 		t.Fatal(err)
 	}
-	m, ok, err := s.Subject(R("subject:queues/_reply/abc"))
-	if err != nil || !ok {
-		t.Fatalf("lookup: ok=%v err=%v", ok, err)
-	}
-	if m.IdleTTLNS != int64(ReplyIdleTTL) || m.MaxEvents != ReplyMaxEvents {
-		t.Fatalf("defaults not applied: %+v", m)
-	}
-	// Explicit policy wins over defaults.
-	if err := s.Declare(Subject{Circle: LocalCircle, Name: "subject:queues/_reply/xyz", IdleTTLNS: int64(time.Hour), MaxEvents: 7}); err != nil {
-		t.Fatal(err)
-	}
-	m, _, _ = s.Subject(R("subject:queues/_reply/xyz"))
+	m, _, _ := s.Subject(R("subject:queues/scratch"))
 	if m.IdleTTLNS != int64(time.Hour) || m.MaxEvents != 7 {
-		t.Fatalf("explicit policy overridden: %+v", m)
+		t.Fatalf("explicit policy lost: %+v", m)
 	}
-	// Ordinary subjects stay unlimited unless asked.
+	// No name gets limits it did not ask for.
 	if err := s.Declare(Subject{Circle: LocalCircle, Name: "subject:queues/fortune"}); err != nil {
 		t.Fatal(err)
 	}
 	m, _, _ = s.Subject(R("subject:queues/fortune"))
 	if m.IdleTTLNS != 0 || m.MaxEvents != 0 {
 		t.Fatalf("ordinary subject got limits: %+v", m)
+	}
+	// The reply-subject family is gone: a client still declaring one is
+	// told so where it starts.
+	if err := s.Declare(Subject{Circle: LocalCircle, Name: RetiredPrefix + "abc"}); !errors.Is(err, ErrRetiredName) {
+		t.Fatalf("declare under the retired prefix = %v, want ErrRetiredName", err)
 	}
 }
 
@@ -71,7 +63,7 @@ func TestSubjectFull(t *testing.T) {
 
 func TestExpireTombstoneAndRedeclare(t *testing.T) {
 	s := openStore(t)
-	name := R("subject:queues/_reply/gone")
+	name := R("subject:queues/scratch/gone")
 	if err := s.Declare(Subject{Circle: LocalCircle, Name: name.Name}); err != nil {
 		t.Fatal(err)
 	}
@@ -105,8 +97,8 @@ func TestExpireTombstoneAndRedeclare(t *testing.T) {
 
 func TestIdleExpiredAndTouch(t *testing.T) {
 	s := openStore(t)
-	idle := R("subject:queues/_reply/idle")
-	busy := R("subject:queues/_reply/busy")
+	idle := R("subject:queues/scratch/idle")
+	busy := R("subject:queues/scratch/busy")
 	forever := R("subject:queues/fortune")
 	for _, decl := range []Subject{
 		{Circle: LocalCircle, Name: idle.Name, IdleTTLNS: int64(50 * time.Millisecond)},
@@ -130,19 +122,65 @@ func TestIdleExpiredAndTouch(t *testing.T) {
 	}
 }
 
-func TestReplaceHostPreservesEphemeralRoutes(t *testing.T) {
+// TestDropRetired: a journal written before calls replaced reply subjects
+// holds slots, their events and the routes learned for them; they go at
+// start and nothing else does.
+func TestDropRetired(t *testing.T) {
 	s := openStore(t)
-	reply := R("subject:queues/_reply/r1")
-	if err := s.SetHost(reply, "desk"); err != nil {
+	keep := R("subject:queues/fortune")
+	if err := s.Declare(Subject{Circle: LocalCircle, Name: keep.Name}); err != nil {
 		t.Fatal(err)
 	}
-	// A registry refresh from desk announces only durable names; the
-	// learned reply route must survive the replacement.
-	if err := s.ReplaceHost("desk", []Ref{R("subject:queues/desk-things")}); err != nil {
+	if _, err := s.Append(keep, Event{ID: "e1", Kind: "request"}); err != nil {
 		t.Fatal(err)
 	}
-	host, ok, err := s.Host(reply)
-	if err != nil || !ok || host != "desk" {
-		t.Fatalf("reply route after refresh: %q ok=%v err=%v", host, ok, err)
+	slot, route := R(RetiredPrefix+"abc"), R(RetiredPrefix+"elsewhere")
+	// As the previous release wrote them (Declare refuses the name now).
+	b := s.db.NewBatch()
+	if err := s.setJSON(b, k1("m/", slot), Subject{Circle: slot.Circle, Name: slot.Name, Delivery: DeliveryExclusive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.setJSON(b, eventKey(slot, 1), Event{ID: "r1", Kind: "result"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.setJSON(b, k2("i/", slot, "r1"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.setJSON(b, k1("x/", R(RetiredPrefix+"expired")), time.Now().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Commit(nil); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+	if err := s.SetHost(route, "desk"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetHost(R("subject:queues/desk-things"), "desk"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.DropRetired(); err != nil || n != 3 {
+		t.Fatalf("DropRetired = %d, %v; want the slot, its route and the marker", n, err)
+	}
+	if _, ok, _ := s.Subject(slot); ok {
+		t.Fatal("retired slot survived")
+	}
+	if n, _ := s.Pending(slot); n != 0 {
+		t.Fatal("retired slot's events survived")
+	}
+	if _, ok, _ := s.Host(route); ok {
+		t.Fatal("route to a retired slot survived")
+	}
+	if exp, _ := s.Expired(R(RetiredPrefix + "expired")); exp {
+		t.Fatal("expiry marker of a retired slot survived")
+	}
+	if n, _ := s.Pending(keep); n != 1 {
+		t.Fatal("an ordinary subject lost its events")
+	}
+	if host, ok, _ := s.Host(R("subject:queues/desk-things")); !ok || host != "desk" {
+		t.Fatal("an ordinary route was dropped")
+	}
+	if n, err := s.DropRetired(); err != nil || n != 0 {
+		t.Fatalf("second DropRetired = %d, %v; want nothing left", n, err)
 	}
 }

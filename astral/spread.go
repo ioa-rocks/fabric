@@ -31,7 +31,7 @@ type Announced struct {
 // SetSpread turns spread placement on or off for a subject hosted here.
 func (s *Store) SetSpread(ref Ref, on bool) error {
 	return s.updateSubject(ref, func(m *Subject) error {
-		if on && (m.Delivery != DeliveryShared || ref.Ephemeral() || m.IsReplySlot()) {
+		if on && m.Delivery != DeliveryShared {
 			return ErrSpreadPolicy
 		}
 		m.Spread = on
@@ -181,13 +181,7 @@ func (s *Store) ReplaceHosting(host string, placed []Announced) error {
 			return err
 		}
 		for it.First(); it.Valid(); it.Next() {
-			// Ephemeral reply routes are learned from claimed requests,
-			// not from announcements — a registry refresh must not wipe
-			// them.
-			ref, tail := mustParseKey(string(it.Key())[2:])
-			if ref.Ephemeral() {
-				continue
-			}
+			_, tail := mustParseKey(string(it.Key())[2:])
 			mine := string(it.Value()) == host
 			if prefix == "s/" {
 				mine = strings.TrimPrefix(tail, "/") == host
