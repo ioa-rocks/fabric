@@ -363,10 +363,13 @@ function renderAstral(d) {
   const claims = (a.claims || []).filter(inCircle);
   const monitors = a.monitors || [];
   const pending = hosted.reduce((n, h) => n + (h.pending || 0), 0);
+  /* Requests whose reply this node still keeps: awaited, or not collected. */
+  const calls = hosted.reduce((n, h) => n + (h.calls || 0), 0);
   document.getElementById("astral-summary").textContent =
-    `${hosted.length} hosted · ${placed.length} remote · ${pending} pending · ${claims.length} claimed`;
+    `${hosted.length} hosted · ${placed.length} remote · ${pending} pending · ${claims.length} claimed` +
+    (calls ? ` · ${calls} ${calls === 1 ? "reply" : "replies"} kept` : "");
   document.getElementById("astral-security").textContent =
-    `Authorization: ${d.astral.capability}. Subject ACLs and client keys are the next security slice.`;
+    `Authorization: ${d.astral.capability}. Sub-keys and grants act only within the subjects and verbs they name.`;
 
   const box = document.getElementById("astral");
   box.innerHTML = "";
@@ -408,10 +411,12 @@ function operatorTable(headers, rows, empty) {
 
 function hostedTable(hosted) {
   const d = state.data;
-  return operatorTable(["name", "circle", "delivery", "pending", "accepts"], hosted.map(h => {
+  return operatorTable(["name", "circle", "delivery", "pending", "replies kept", "accepts"], hosted.map(h => {
     const c = document.createElement("span");
     if (h.circle) c.append(dot(circleColor(h.circle)), " ", circleName(d, h.circle));
-    return [mono(h.name), c, h.delivery || "exclusive", String(h.pending || 0), (h.accepts || []).join(", ") || "any kind"];
+    /* Spread: several nodes host this name. Draining: this one takes no new events. */
+    const delivery = [h.delivery || "exclusive", h.spread ? "spread" : "", h.draining ? "draining" : ""].filter(Boolean).join(" · ");
+    return [mono(h.name), c, delivery, String(h.pending || 0), String(h.calls || 0), (h.accepts || []).join(", ") || "any kind"];
   }), state.circle ? `No subjects of ${circleName(d, state.circle)} are hosted on this node.` : "No subjects are hosted on this node.");
 }
 
