@@ -114,7 +114,7 @@ func TestAnnounceKind(t *testing.T) {
 		"/ip4/1.2.3.4/tcp/4517": "multiaddr",
 		"3.133.152.236":         "ip",
 		"2600:1f16::1":          "ip",
-		"gate.example.com":        "host",
+		"gate.example.com":      "host",
 	}
 	for entry, want := range tests {
 		if got := announceKind(entry); got != want {

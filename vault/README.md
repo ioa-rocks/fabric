@@ -1,263 +1,120 @@
-# vault
+# Vault
 
-An API-first, content-addressed object store for a personal mesh —
-the data layer of the Aethera stack. Apps talk to Vault through its
-API; sync happens at the object level; the filesystem is one
-*surface* (read-only projections now, FUSE later), never the
-substrate. Rides [fabric](../fabric) in library mode for membership
-and transport.
+Vault is Fabric's content-addressed data layer. It synchronizes bucket metadata
+and selected content between authorized devices of the owning circle. Folder
+replicas and FUSE mounts expose that data as files; applications can also use
+the local API directly.
 
-Spec: `components/vault/memos/bucket-model.md` in the project docs.
-Design anchors: ADR 0009 (build the semantics, adopt the
-primitives), ADR 0010 (user keys + capability tokens), ADR 0011
-(buckets live in circles; policy inherits).
+Start with [two connected devices](../docs/getting-started.md), then run
+`fabric up` without `-no-vault` on both. The existing circle admissions
+provide resource authority; no owner-key export is needed on the second device.
 
-## Model in one breath
+## Create and read a bucket
 
-A **circle** is a user key plus policy defaults. A **bucket** is a
-signed genesis record (its BLAKE3 hash is the bucket ID) plus a
-policy document, an **index** (object metadata: LWW scalars,
-OR-Set tags, tombstones — and blob location records), and
-**blobs** (whole-file, BLAKE3-addressed, immutable). Placement is
-subscription-based: each device declares `full`, `shard(group)`, or
-`cache` per bucket; bucket health = number of complete copies.
-Hierarchy is a rendered view; tags are the navigation truth
-(faceted addressing).
-
-## v2 API surface (sketch — evolves with its three consumers)
-
-The three consumers the API is sketched against: the CLI importer,
-the projection writer, and the shared-album read path.
-
-```
-Circle:    fabric-level `circle` package — Init(name) / Open(dir) / Unlock
-Store:     Open(dir, circle) — blobs, bucket records, placement (this package tree)
-Buckets:   Create(name) -> Bucket, List(), Open(id|name)
-Objects:   Put(bucket, name, reader, tags...) -> Object
-           Get(bucket, objectID) -> reader
-           List(bucket, tagFilter...) -> []Object     // faceted query
-           Tag(bucket, objectID, +tag/-tag)
-           Delete(bucket, objectID)                    // tombstone
-Surfaces:  Project(bucket, dir)                        // read-only materialization
-Later:     Subscribe(bucket, mode), Grant(bucket, userKey, caps),
-           serve layer (gallery / URL shares), FUSE
-```
-
-## Build
-
-The fabric binary carries the CLI (ADR 0013 — one binary). Ownership is
-`fabric circle …` (the user key; a fabric-level package, ADR 0017), data is
-`fabric bucket …` — one noun per group, consumed once (fabric ADR 0006). A
-`vault → fabric` symlink means `fabric bucket` (argv[0] dispatch,
-busybox-style); `cmd/vault` builds the same group standalone.
+On the owner device, with the daemon running:
 
 ```sh
-go build -o fabric ./cmd/fabric && ln -s fabric vault
-go test ./...
+./fabric bucket create -circle demo photos
+./fabric bucket put photos cat.jpg -tag pets
+./fabric bucket ls photos -tag pets
+./fabric bucket get photos '<object-ref>' -o cat-copy.jpg
 ```
 
-Quickstart (throwaway directories; `-state` is the fabric state dir for
-circle commands and the store dir for bucket commands):
+Creating a bucket signs its genesis and policy, so it requires the circle's
+owner key. The CLI prompts for the passphrase; the daemon does not receive
+it. The creating device initially places the bucket in full.
+
+The catalog becomes visible to admitted devices with the appropriate bucket
+authority. On the other device:
 
 ```sh
-export CIRCLE_PASSPHRASE=test         # or omit for an interactive prompt
-./fabric circle init -state /tmp/f -name alex
-./fabric bucket create -state /tmp/v -circle-state /tmp/f/circle family-photos
-./fabric bucket put -state /tmp/v -circle-state /tmp/f/circle -tag pets,2026 family-photos cat.jpg
-./fabric bucket ls  -state /tmp/v -circle-state /tmp/f/circle -tag pets family-photos
-./fabric bucket project -state /tmp/v -circle-state /tmp/f/circle family-photos /tmp/album
+./fabric bucket list
+./fabric bucket place photos full
 ```
 
-Defaults: circle `~/.config/fabric/circle`, store `~/.local/share/vault`
-(`$XDG_DATA_HOME/vault` when set). With a
-daemon running, bucket commands never need `-circle-state` (the daemon
-holds the circle); without one, the direct path opens it. Flags may come
-before or after positional arguments (after `tag`'s `<bucket>
-<object-ref>`, `-x` means "remove tag x").
+Allow a connect/gossip cycle for metadata to arrive. Use a bucket ID when
+names are ambiguous. Synchronization checks `sync`, merging records checks
+`write`, and serving content checks `blob` on the bucket in its owning circle.
+The general cross-circle grantee synchronization path is unfinished.
 
-## Daemon & mesh
+## Choose where content lives
 
-On upgrade, the next default `fabric up` moves an existing
-`~/.config/vault` store to the data directory while the old daemon is
-stopped. Clients continue to find the old store until then. The migration
-refuses an active daemon or open index and never overwrites an existing
-destination. Explicit `-vault-state` paths keep their location.
-
-Vault is a **subsystem of the node daemon** (ADR 0013 — one process,
-one device identity per machine). `fabric up` activates it when the
-node has a circle (`<state>/circle`; the store defaults to
-`~/.local/share/vault`, override with `-vault-state`; `-no-vault` to skip)
-and is pure connectivity otherwise. A circle still living in the store
-directory from before the hoist is adopted automatically at startup
-(the two files are copied; the originals stay, unused). The subsystem
-serves the object API over a local control socket
-(`<vault-state>/control.sock`, HTTP+JSON — the seed of the
-network-facing API). While the daemon runs it owns the store (Pebble
-locks); the bucket CLI detects the socket and routes through it —
-same commands, same output. With no daemon running, the CLI opens
-the store directly.
-
-Mesh membership is the machine's, managed by the fabric CLI:
+| Placement | Behavior |
+| --- | --- |
+| `full` | Fetch and retain a complete copy. |
+| `cache` | Retain accessed content; an optional budget evicts older reads. |
+| `none` | Keep metadata and permit on-demand reads; refuse local edits. Reads can retain bytes. |
+| `folder <dir>` | Maintain a synchronized real directory; a complete placement. |
 
 ```sh
-fabric join -name desk /ip4/…/tcp/4517/p2p/12D3Koo…   # approve on the master
-fabric circle init -name alex   # create the circle (once, on one device); a node may hold several
-fabric up &                     # node daemon; vault subsystem activates
-fabric circle status            # circle, buckets served, mesh, vault peers
+./fabric bucket place photos cache -keep 20G
+./fabric bucket place photos full -at /mnt/storage/vault
+./fabric bucket place photos folder ~/Pictures/Shared
+./fabric bucket place photos
 ```
 
-"Which devices run vault" is simply which members have vault state —
-participation is opt-in per device (memo §5). Vault peers find each
-other among mesh members by the `/vault/hello/1` protocol
-(member-gated; carries circle DID + version) — but they **sync and serve
-blobs only to verified devices of their own circle**: each device holds
-a *device attestation* signed by the circle key (`circle init`/`join`
-mint it; `fabric circle attest` for a device that joined earlier), and
-peers check it on `/fabric/circle/3` after membership auth. A mesh
-member outside the circle sees the hello card and nothing else.
-Attestations live one year and renew by re-signing (`fabric circle
-attest -expiring`); an owner device signs one out with `fabric circle
-revoke`, and the revocation travels on the same exchange (fabric
-README, *Circle attestations*).
-Mesh-level debugging: `fabric status`; `fabric circle status` shows
-whether this device is attested and which peers verify as same-circle.
+Use a fresh directory for an initial folder experiment. The daemon owns
+scanning, synchronization and filesystem materialization. Changing placement
+away from `folder` leaves the directory in place. `-at` is device-local; it
+selects the blob-store root without moving existing blobs.
 
-**A second device of the same owner** (interim procedure until
-capability grants let a device hold a sub-key — `circle init` there
-would mint a *different* user key): export the circle, join with it,
-then restart the daemon so the subsystem activates.
+A budgeted cache evicts least-recently-read content only after a full holder
+confirms it has that blob. This is a confirmation from that holder, not a
+cryptographic proof of durable storage.
+
+## Mount and inspect
+
+On Linux with FUSE available:
 
 ```sh
-fabric circle export -circle alex alex.circle   # carries the key container (passphrase-protected)
-scp alex.circle other:                    # move it privately
-ssh other 'fabric circle join alex.circle && rm alex.circle && systemctl --user restart fabric'
-#   join asks for the circle passphrase and attests the device (needs the fabric
-#   identity — if the node has not joined the mesh yet, run 'fabric circle attest' after it has)
-# on other:
-fabric bucket list                        # catalog arrives via sync (≤30 s after connect)
+./fabric bucket mount photos /path/to/mount
+./fabric bucket mount photos /path/to/writable-mount -write
+./fabric bucket unmount /path/to/mount
 ```
 
-**Sharing with another person** is a second circle, not a grant: mint it,
-join their device to it, and mint the shared buckets in it. Each device
-syncs exactly the buckets of the circles it is attested into — the
-personal circle's buckets never reach the other person, not even their
-catalog entries.
+Mount declarations are served by the node daemon, including across restarts.
+Writable mounts require a writable placement (`full` or `cache`). The local
+web UI lists buckets, placements, files, conflicts and held deletions.
+
+## Retention and repair
 
 ```sh
-fabric circle init -name family                 # on the desk: now holds "main" and "family"
-fabric circle export -circle family family.circle
-# their device: fabric circle join family.circle   (joins family only; attests itself)
-fabric bucket create album -circle family       # owned by the shared circle
-fabric bucket list                              # shows the owner circle per bucket
-fabric bucket place <bucket> full         # and blobs follow
+./fabric bucket trash photos
+./fabric bucket restore photos '<object-ref>'
+./fabric bucket versions photos '<object-ref>'
+./fabric bucket revert photos '<object-ref>' '<version>'
+./fabric bucket conflicts photos
+./fabric bucket reclaim -dry-run
+./fabric bucket scrub photos
 ```
 
-Only the circle travels — `blobs/`, `buckets/`, `subs.json`,
-`mounts.json` and `folders.json` are per-device state that sync owns.
+Deletion is a synchronized tombstone. Deleted content is restorable while
+retained under `trash_days`; overwritten content is kept under `version_days`
+(by default following trash retention). A device records versions it sees
+replaced; the editing folder device may need another holder to retain the old
+bytes. Policy, conflict and held-deletion commands are described by
+`./fabric bucket -h`.
 
-## Sync & placement
+Reclaim removes content no bucket on that device retains. Scrub reads held
+content, detects damage, and attempts repair from a full peer. These mechanisms
+do not replace an independent backup.
 
-The dashboard shows this device's actual blob storage directory and each
-bucket's override or folder endpoint. Paths stay device-local; the other
-devices' placement columns show who holds the content.
+## Storage and transfer
 
-Placement `none` is read-only for local object edits: choose `cache` or
-`full` before uploading, replacing, renaming, deleting or changing tags.
-It still receives metadata and can read content on demand; those reads
-may keep local bytes. Writable mounts require `cache` or `full`; remount
-read-only before changing a mounted bucket to `none`.
+The default store is `~/.local/share/vault` (`$XDG_DATA_HOME/vault` when set).
+The node's circles are in `~/.config/fabric/circles/<name>`; the old singular
+`circle/` layout is not the current format. Override the daemon store with
+`-vault-state`; the bucket CLI's `-state` refers to that same store.
 
-Anti-entropy on `/vault/sync/2` (fabric spec-§5 pattern): a full
-catalog + index swap on every connect, on a 30 s timer, and pushed
-after local writes — the CRDT merge (LWW / OR-Set / tombstones) makes
-repetition and reordering harmless. Unknown buckets are adopted after
-signature verification. A peer sees a bucket only with `sync` on it,
-has its records merged only with `write`, and is served content only
-with `blob` — each asked of its admission in the owning circle.
+While a daemon owns the store, the CLI uses its local socket. With no daemon,
+the CLI can open the store directly using `-circle-state <circles-root>`.
+Do not copy a live database as a synchronization mechanism.
 
-Blobs move separately on `/vault/blob/3`: byte ranges, each checked
-against the blob's BLAKE3 hash as it arrives (Bao slices), so a broken
-transfer continues where it stopped and a file that is not held can be
-read from the middle (`GET …/content` with `Range`, the web UI, a
-mount). `/vault/blob/2` (whole blobs) is still served for peers a
-release behind. Movement is driven by subscriptions (memo §5 — pull,
-not push):
+Content is immutable and addressed by BLAKE3. `/vault/blob/3` transfers verified,
+resumable byte ranges; the older whole-blob transfer remains for compatibility.
+Metadata merges use per-field LWW and OR-Set rules, with retained conflicts and
+tombstones. Content synchronization is not a globally ordered transaction log.
 
-```sh
-fabric bucket place photos full          # hold a complete copy; fetch what's missing
-fabric bucket place photos cache         # hold what gets accessed, without limit
-fabric bucket place photos cache -keep 20G  # ...up to 20 GiB: past it the least recently read goes,
-                                         # once a device holding the bucket in full confirms it has it
-fabric bucket place photos none          # catalog + index only
-fabric bucket place photos folder ~/Sync # keep it as a real directory (a full placement)
-fabric bucket place photos full -at /mnt/array/vault  # keep its blobs on that disk
-fabric bucket place photos full -at default           # back to <state>/blobs
-fabric bucket place photos               # this device's placement, in detail
-fabric bucket list                       # id, placement word, held/objects, name, where
-```
-
-Placement is one word per bucket per device; moving off `folder`
-withdraws the folder declaration and leaves the directory alone. `-at
-<dir>` gives a `full`/`cache` placement its own blob store root (a NAS
-keeps the photo bucket on the array and small buckets on NVMe); the
-root is this device's business and never travels. Blobs already in the
-default store stay there and stay readable — nothing is moved; a root
-that cannot be opened refuses writes rather than landing them on the
-wrong disk. Per-device placement records live in `subs.json`
-(`{"mode": "full", "root": "/mnt/array/vault"}`; the older bare-mode
-form still reads).
-Mounts (`fabric bucket mount <bucket> <dir> [-write]`) are a surface over
-the store, not a placement. The creating device places `full` by
-default. `fabric bucket get` works
-on *any* vault node that can reach a holder — a missing blob is a
-mesh lookup, not an error. Transfers are verified by re-hashing
-(content addressing is the integrity check). Trust boundary today:
-any authenticated mesh member may sync and fetch; per-circle
-visibility and capability checks arrive with grants.
-
-## Layout
-
-- `bucket/` — genesis record, bucket ID, policy document
-- `blobstore/` — content-addressed whole-file blob store
-- `index/` — object records + merge semantics (LWW / OR-Set), Pebble-backed
-- `store/` — the device's store: bucket records, blobs, placements
-  (mode + optional store root), mounts, folder declarations, bucket handles; opened against a circle
-  (`../circle` — user key, age-encrypted via fabric's keystore; the
-  ownership layer, fabric-level since 2026-09-30)
-- `folder/` — folder replicas (M1): scanner, materializer, shadow store
-- `daemon/` — the vault subsystem: control API (HTTP over unix
-  socket), sync/blob/hello protocols; attached to the fabric daemon
-  by `cmd/fabric up` (the composition root)
-- `cli/` — the `fabric bucket` group (daemon client when one is
-  running, direct otherwise); `../cmd/vault` builds it standalone
-
-## Status
-
-Bootstrapped 2026-07-05. Local object-store core, daemon, and sync
-(same day): create circle + bucket, put/tag/list/get objects, project
-a bucket to a directory; mesh presence via the fabric daemon;
-catalog/index anti-entropy +
-subscription-driven blob movement verified end-to-end (two-node tests:
-on-demand get, full-sub proactive fetch, concurrent tag merge,
-tombstone propagation — race-detector clean). 2026-07-07: one-process
-topology per ADR 0013, then the repo merge — vault moved into the
-fabric repo as `vault/` packages; `fabric up` hosts the subsystem,
-`vault join/up` deleted (mesh membership is `fabric join`), the
-`vault` binary is the data CLI only. 2026-09-30: the circle hoisted to
-the fabric level (`circle` package; `vault/circle` → `vault/store`) and
-the CLI regrammared to `fabric circle …` + `fabric bucket …` (fabric
-ADR 0006).
-Next: live two-machine rollout (desk + NAS), then capability grants
-(second user key) and
-the projection consumer. 2026-11-10: a cache placement takes a budget
-(`-keep`) and drops by least recent read, verify-before-drop
-(`/vault/hold/1`). 2026-11-11: content nothing on the device retains is
-reclaimed hourly (`fabric bucket reclaim -dry-run` to preview) — versions
-past `version_days`, deletions past `trash_days` — and held content is read back and
-repaired from a peer (`fabric bucket scrub [bucket]`, the whole device every
-30 days). The content a file had before it was overwritten is kept for the
-policy's `version_days` (unset: as long as the trash) and can be listed and
-made current again (`fabric bucket versions`, `fabric bucket revert`).
-Deferred: shard groups, health targets, delta sync. The
-years-old Python prototype lives at `../../vault_proto_py`
-(parts-bin).
+`bucket`, `blobstore`, `index`, `store`, `folder`, `fusefs`, `verified`,
+`daemon`, and `cli` contain the implementation. Sharded placement, delta sync
+and a stable public wire protocol are future work.

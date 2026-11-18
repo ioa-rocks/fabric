@@ -1,3 +1,8 @@
 /fabric
 *.age
 /build/
+*.key
+*.bundle
+.env
+/tasks/
+/.claude/
