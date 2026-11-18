@@ -42,7 +42,7 @@ func TestFolderReplicaOverMesh(t *testing.T) {
 	addrs := da.Fabric.Host.Addrs()
 	bootstrap := addrs[0].String() + "/p2p/" + da.Fabric.Host.ID().String()
 	b.writeConfig(t, root, "b-vault", []string{bootstrap}, a.cert, b.cert)
-	startDaemon(t, b.statePath)
+	db, stopB := runDaemon(t, b.statePath)
 	clA, clB := daemon.NewClient(a.statePath), daemon.NewClient(b.statePath)
 
 	genesis, policy := signBucket(t, a.statePath, "pw", "sync-lab")
@@ -117,13 +117,38 @@ func TestFolderReplicaOverMesh(t *testing.T) {
 		return err == nil && string(body) == "hello from nas"
 	})
 
-	// Concurrent edit: B replaces n01 while A edits it in the folder.
-	if _, err := clB.Replace("sync-lab", "docs/n01.md", strings.NewReader("nas version")); err != nil {
-		t.Fatal(err)
-	}
+	// Make the edits while B is offline so both revisions start from the
+	// same head. With both nodes connected, sync can deliver B's edit before
+	// A's folder scan and legitimately turn the second edit into an overwrite.
+	stopB()
+	func() {
+		st := openTestStore(t, b.statePath)
+		st.NodeID = db.Store.NodeID
+		h, err := st.ResolveBucket("sync-lab")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer h.Close()
+		obj, err := h.ResolveObject("docs/n01.md")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.Replace(obj, strings.NewReader("nas version")); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	if err := os.WriteFile(filepath.Join(dir, "docs", "n01.md"), []byte("desk version"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	waitFor(t, "A to record its edit before reconnecting B", func() bool {
+		rc, err := clA.Get("sync-lab", "docs/n01.md")
+		if err != nil {
+			return false
+		}
+		body, _ := readAll(rc)
+		return string(body) == "desk version"
+	})
+	startDaemon(t, b.statePath)
 	waitFor(t, "conflict copy in the folder", func() bool {
 		ents, _ := os.ReadDir(filepath.Join(dir, "docs"))
 		for _, e := range ents {
