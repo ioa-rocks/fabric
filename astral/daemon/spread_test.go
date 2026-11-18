@@ -113,6 +113,30 @@ func pending(t *testing.T, n *spreadNode, name string) int {
 	return -1
 }
 
+// Placement snapshots must converge without another declaration or reconnect.
+// Losing an announcement (or applying a stale empty snapshot) must not strand
+// a queue whose host stays connected.
+func TestRegistryRepairsLostPlacements(t *testing.T) {
+	const queue = "subject:crawl"
+	n := spreadMesh(t, "nas", "desk")
+	if err := n["nas"].cl.DeclareSpread(queue, nil); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "desk learns the host", func() bool {
+		return len(placements(t, n["desk"].cl, queue)) == 1
+	})
+	// Repeat beyond the finite connection/declaration exchanges already in
+	// flight, so one late initial reply cannot satisfy the recovery check.
+	for range 10 {
+		if err := n["desk"].d.Store.ReplaceHosting(n["nas"].fd.Host.ID().String(), nil); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, "desk repairs its lost placement", func() bool {
+			return len(placements(t, n["desk"].cl, queue)) == 1
+		})
+	}
+}
+
 // serveOne is a worker's loop body: wait, claim one request, complete it.
 func serveOne(t *testing.T, worker *spreadNode, queue, answer string) string {
 	t.Helper()

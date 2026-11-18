@@ -564,10 +564,8 @@ func TestFailedPublishIsReportedAndContentKept(t *testing.T) {
 	kept := filepath.Join(stage, "unpublished", "holiday.jpg")
 	deadline := time.Now().Add(5 * time.Second) // Release runs after close returns
 	for {
-		if got, err := os.ReadFile(kept); err == nil {
-			if string(got) != content {
-				t.Fatalf("preserved content = %q, want %q", got, content)
-			}
+		// A rescue reserves its name before renaming the staged bytes onto it.
+		if got, err := os.ReadFile(kept); err == nil && string(got) == content {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -646,10 +644,8 @@ func TestRefusedPublishLeavesPathBroken(t *testing.T) {
 	kept := filepath.Join(stage, "unpublished", "holiday.jpg")
 	deadline := time.Now().Add(5 * time.Second) // Release runs after close returns
 	for {
-		if got, err := os.ReadFile(kept); err == nil {
-			if string(got) != content {
-				t.Fatalf("preserved content = %q, want %q", got, content)
-			}
+		// A rescue reserves its name before renaming the staged bytes onto it.
+		if got, err := os.ReadFile(kept); err == nil && string(got) == content {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -688,7 +684,16 @@ func TestUnpublishedRescuesDoNotOverwriteEachOther(t *testing.T) {
 			t.Fatal(err)
 		}
 		f.Close()
-		if err := waitFor(func() bool { return len(rescued(t, stage)) > 0 }); err != nil {
+		// Release is asynchronous, and the reserved name is visible before
+		// the rename. Wait for this write's bytes, including on the second pass.
+		if err := waitFor(func() bool {
+			for _, p := range rescued(t, stage) {
+				if b, err := os.ReadFile(p); err == nil && string(b) == content {
+					return true
+				}
+			}
+			return false
+		}); err != nil {
 			t.Fatalf("%q was not rescued: %v", content, err)
 		}
 		// Clear the broken path so the next copy can reuse the name.

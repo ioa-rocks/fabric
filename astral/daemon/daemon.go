@@ -59,8 +59,8 @@ const (
 
 const maxWireSize = 256 * 1024
 
-// OutboxInterval is the outbox retry timer; auth of a new peer also
-// triggers a flush. Variable so tests can shrink it.
+// OutboxInterval is the retry timer for the outbox and placement registry;
+// auth of a new peer also triggers a flush. Variable so tests can shrink it.
 var OutboxInterval = 10 * time.Second
 
 // Op names the verbs carried on Protocol.
@@ -1515,6 +1515,10 @@ func (d *Daemon) outboxLoop() {
 		case <-d.ctx.Done():
 			return
 		case <-t.C:
+			// A missed push or a late stale snapshot must not strand a
+			// connected queue. Only the timer refreshes: registry replies
+			// kick the outbox, so refreshing on kicks would feed itself.
+			d.announceRegistry()
 		case <-d.kick:
 		}
 		d.flushOutbox()

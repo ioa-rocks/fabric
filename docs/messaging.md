@@ -19,9 +19,12 @@ On the node that will hold its journal:
 
 Use `shared` for competing workers, `exclusive` for one active consumer.
 Only one host declares an ordinary queue. Other nodes find that placement
-through the authenticated resource registry. A claim leases an event;
-acknowledging it removes it from pending work. An unacknowledged event can
-be claimed again after the lease expires.
+through the authenticated resource registry. Placement changes are announced
+immediately and refreshed periodically (every 10 seconds by default), so a
+missed announcement can recover while peers stay connected.
+
+A claim leases an event; acknowledging it removes it from pending work. An
+unacknowledged event can be claimed again after the lease expires.
 
 For request/reply:
 
