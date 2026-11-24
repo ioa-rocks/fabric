@@ -322,7 +322,19 @@ func cmdUp(args []string) error {
 	noVault := fs.Bool("no-vault", false, "run without the vault subsystem for this run")
 	astralState := fs.String("astral-state", astraldaemon.DefaultPath(), "astral state directory (the coordination plane; always on)")
 	noAstral := fs.Bool("no-astral", false, "run without the astral subsystem for this run")
+	paths := fs.Bool("paths", false, "print the directories and sockets this daemon would use as 'kind<TAB>path' lines and exit, starting nothing (the service installer builds its sandbox from this)")
 	fs.Parse(args)
+
+	if *paths {
+		lines, err := servicePaths(*statePath, *vaultState, *astralState, *noVault, *noAstral)
+		if err != nil {
+			return err
+		}
+		for _, line := range lines {
+			fmt.Println(line)
+		}
+		return nil
+	}
 
 	dir, err := state.Open(*statePath)
 	if err != nil {

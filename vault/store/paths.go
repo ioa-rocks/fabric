@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/cockroachdb/pebble/vfs"
@@ -44,6 +45,42 @@ func ExistingPath(path string) string {
 		}
 	}
 	return path
+}
+
+// References lists the directories outside the store that its declarations
+// name: placement roots, folder replicas and mountpoints, each sorted. It
+// reads the declaration files only and opens no index, so it is safe
+// beside a running daemon. A store that does not exist names nothing.
+func References(path string) (roots, folders, mounts []string, err error) {
+	declared := &Store{Path: path}
+	if err := declared.loadPlacements(); err != nil {
+		return nil, nil, nil, err
+	}
+	seen := map[string]bool{}
+	for _, placement := range declared.placements {
+		if placement.Root != "" && !seen[placement.Root] {
+			seen[placement.Root] = true
+			roots = append(roots, placement.Root)
+		}
+	}
+	folderDecls, err := declared.Folders()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	for directory := range folderDecls {
+		folders = append(folders, directory)
+	}
+	mountDecls, err := declared.Mounts()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	for directory := range mountDecls {
+		mounts = append(mounts, directory)
+	}
+	sort.Strings(roots)
+	sort.Strings(folders)
+	sort.Strings(mounts)
+	return roots, folders, mounts, nil
 }
 
 // MigrateDefaultPath moves the complete old store at daemon startup. The

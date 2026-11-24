@@ -57,6 +57,21 @@ service user's `~/.local/bin/fabric`, writes the unit and starts/restarts it.
 Use `-u <user>`, `-s <state-dir>` and `-n` for the user, state and no-TUN choices.
 Read `scripts/install-systemd.sh -h` before changing an existing installation.
 
+The system service runs in a sandbox. The daemon sees a read-only system and
+an empty, read-only home directory, and can write only its state directories,
+the folder replicas and placement roots already declared, and directories
+named with `-w <dir>`. A flaw in the daemon then reaches Fabric's own data
+but not the rest of the account. The installer takes the list from
+`fabric up -paths`, which prints what the daemon would use and starts
+nothing. To put a folder replica or placement root somewhere new, re-run the
+installer with `-w <dir>` first, then declare it.
+
+A sandboxed daemon cannot serve FUSE mounts. The installer refuses a node
+that has declared mounts unless it is given `-m`, which installs the service
+with no sandbox at all. It also refuses while a state directory is still
+waiting for its move out of `~/.config`; run once with `-m`, then again
+without.
+
 For a user service on a shared machine:
 
 ```sh
@@ -65,6 +80,7 @@ For a user service on a shared machine:
 
 It runs without TUN. An IP overlay interface is host-wide, so granting it on
 a shared machine would expose a network path to other local processes/users.
+The user service is not sandboxed: a user service manager cannot enforce it.
 
 The defaults reserve `100.64.0.0/24` at initial setup. A device admitted with
 `-tun` receives a signed overlay address. The current bridge serves one
@@ -129,6 +145,12 @@ Key rotation is not a way to recover an owner key for which no copy remains.
   very long state paths is not implemented; prefer short explicit paths.
 - **File edits refused:** Vault placement `none` is read-only. Select `full`,
   `cache` or a folder placement first.
+- **"Read-only file system" from a bucket command:** the system service is
+  sandboxed and the directory is outside what it may write. Re-run the
+  installer with `-w <dir>`. The same applies to `bucket project`; the
+  daemon's `/tmp` is also private to it.
+- **"Runs in a service sandbox and cannot establish mounts":** see the
+  services section; mounts need the service installed with `-m`.
 
 For service logs use `journalctl --user -u fabric -f` or the system unit's
 `journalctl -u fabric -f`. Keep the web UI local, and inspect logs before
