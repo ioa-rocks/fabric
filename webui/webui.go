@@ -15,7 +15,10 @@ import (
 	"io"
 	"io/fs"
 	"mime"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -38,8 +41,9 @@ type Server struct {
 	dir        state.Dir
 	client     *daemon.Client
 	master     bool
-	vaultPath  string // vault state dir; the vault view lights up when a daemon serves its socket
-	astralPath string // astral state dir; read through its mode-0600 control socket
+	vaultPath  string          // vault state dir; the vault view lights up when a daemon serves its socket
+	astralPath string          // astral state dir; read through its mode-0600 control socket
+	hosts      map[string]bool // host names answered besides localhost and IP addresses
 }
 
 func New(dir state.Dir, vaultPath string, astralPaths ...string) *Server {
@@ -70,7 +74,90 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/vault/objects", s.handleVaultObjects)
 	mux.HandleFunc("GET /api/vault/content", s.handleVaultContent)
 	mux.HandleFunc("POST /api/vault/sub", s.handleVaultSub)
-	return mux
+	return s.guard(mux)
+}
+
+// AllowHost lets the UI answer requests addressed to a host name. Without
+// it only localhost and IP addresses are answered (see guard).
+func (s *Server) AllowHost(name string) {
+	if s.hosts == nil {
+		s.hosts = map[string]bool{}
+	}
+	s.hosts[normalizeHost(name)] = true
+}
+
+// guard refuses the requests a web page elsewhere can make a browser send
+// here. The UI has no login: anything that reaches a handler reads buckets
+// and changes the queue as the operator.
+//
+// A page cannot read another origin's responses, so it first has to become
+// this origin: it serves itself from a name it controls and then points that
+// name at this listener (DNS rebinding). Such a request still carries the
+// page's name in Host, so only localhost, IP addresses and names the operator
+// allowed are answered. What a page can send without reading the answer, a
+// form post or an embedded image, is refused by where the request came from:
+// state changes and everything under /api/ must come from the UI's own pages.
+// Following a link to a page of the UI from elsewhere stays possible.
+//
+// This does not stop another program or user on the machine, which can
+// connect to the listener and send any headers it likes.
+func (s *Server) guard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, httpReq *http.Request) {
+		if !s.hostAllowed(httpReq.Host) {
+			httpError(writer, http.StatusForbidden, fmt.Errorf("host %q is not allowed: open the UI by IP address or as localhost, or start it with -host", httpReq.Host))
+			return
+		}
+		readOnly := httpReq.Method == http.MethodGet || httpReq.Method == http.MethodHead
+		if (!readOnly || strings.HasPrefix(httpReq.URL.Path, "/api/")) && fromAnotherOrigin(httpReq) {
+			httpError(writer, http.StatusForbidden, errors.New("request from another origin refused"))
+			return
+		}
+		writer.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+		writer.Header().Set("X-Frame-Options", "DENY")
+		next.ServeHTTP(writer, httpReq)
+	})
+}
+
+func (s *Server) hostAllowed(hostport string) bool {
+	host := normalizeHost(hostport)
+	if host == "localhost" {
+		return true
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true // a name can be repointed, an address cannot
+	}
+	return s.hosts[host]
+}
+
+// normalizeHost reduces a Host header or a listen address to its lower-case
+// host: no port, no IPv6 brackets, no trailing dot.
+func normalizeHost(hostport string) string {
+	host := hostport
+	if splitHost, _, err := net.SplitHostPort(hostport); err == nil {
+		host = splitHost
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	return strings.ToLower(strings.TrimSuffix(host, "."))
+}
+
+// fromAnotherOrigin reports whether a browser sent the request on behalf of
+// a page that is not the UI's own. Browsers say so in Sec-Fetch-Site ("none"
+// is the user's own navigation); where that is missing, Origin is compared
+// with Host. A request with neither comes from a program, not a page.
+func fromAnotherOrigin(httpReq *http.Request) bool {
+	switch httpReq.Header.Get("Sec-Fetch-Site") {
+	case "same-origin", "none":
+		return false
+	case "":
+		origin := httpReq.Header.Get("Origin")
+		if origin == "" {
+			return false
+		}
+		parsed, err := url.Parse(origin)
+		return err != nil || parsed.Host != httpReq.Host
+	default:
+		return true
+	}
 }
 
 // Overview is one poll's worth of everything the UI shows.
@@ -449,7 +536,7 @@ func (s *Server) handleVaultContent(writer http.ResponseWriter, req *http.Reques
 	header.Set("Content-Type", mediaType)
 	header.Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": path.Base(resp.Header.Get("X-Vault-Name"))}))
 	header.Set("X-Content-Type-Options", "nosniff")
-	header.Set("Content-Security-Policy", "sandbox; default-src 'none'")
+	header.Set("Content-Security-Policy", "sandbox; default-src 'none'; frame-ancestors 'none'")
 	header.Set("Cache-Control", "private, no-cache") // revalidated by ETag: the object may be replaced
 	writer.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(writer, resp.Body)

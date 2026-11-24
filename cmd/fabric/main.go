@@ -1399,6 +1399,7 @@ func cmdUI(args []string) error {
 	fs := flag.NewFlagSet("ui", flag.ExitOnError)
 	statePath := stateFlag(fs)
 	listen := fs.String("listen", "127.0.0.1:4518", "listen address; keep it on localhost — the UI has no auth of its own")
+	hostNames := fs.String("host", "", "comma-separated host names the UI answers to, besides localhost, IP addresses and a name given in -listen; requests addressed to any other name are refused")
 	vaultState := fs.String("vault-state", vaultstore.DefaultPath(), "vault store directory (vault card lights up when its daemon runs)")
 	astralState := fs.String("astral-state", astraldaemon.DefaultPath(), "astral state directory (coordination card lights up when its daemon runs)")
 	fs.Parse(args)
@@ -1414,8 +1415,17 @@ func cmdUI(args []string) error {
 	if dir.IsMaster() {
 		role = "master — approvals and revocations enabled"
 	}
+	ui := webui.New(dir, *vaultState, *astralState)
+	if listenHost, _, err := net.SplitHostPort(*listen); err == nil && listenHost != "" {
+		ui.AllowHost(listenHost)
+	}
+	for _, name := range strings.Split(*hostNames, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			ui.AllowHost(name)
+		}
+	}
 	fmt.Printf("topology UI: http://%s  (%s)\n", *listen, role)
-	return http.ListenAndServe(*listen, webui.New(dir, *vaultState, *astralState).Handler())
+	return http.ListenAndServe(*listen, ui.Handler())
 }
 
 func cmdQueue(args []string) error {

@@ -17,5 +17,7 @@ do not sandbox the process holding them. Queue and storage hosts can read their
 content, and revocation depends on nodes receiving the updated circle state.
 
 Keep the web UI on localhost. It has administrative signing operations and
-no independent login. Use disposable state for experiments and redact logs
+no independent login. It refuses requests addressed to a host name it was not
+given and requests sent by pages of another origin; it does not authenticate
+other programs or users on the same machine. Use disposable state for experiments and redact logs
 before sharing them.

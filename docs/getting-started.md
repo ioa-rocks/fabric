@@ -89,6 +89,9 @@ Initial gossip and reconnects can take a few seconds. On either machine:
 
 Open `http://127.0.0.1:4518` locally for the topology, Astral and Vault views.
 The UI is a separate process with no login: keep its listener on localhost.
+It answers requests addressed to `localhost` or an IP address and refuses any
+other host name, so a web page cannot reach it through a name its author
+controls. To open it under a name, start it with `-host <name>`.
 
 You can now [host a work queue](messaging.md). To enable Vault, stop `up`
 and restart it without `-no-vault`. The daemon uses the existing identity.

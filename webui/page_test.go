@@ -11,6 +11,12 @@ import (
 	vaultdaemon "ioa.rocks/fabric/vault/daemon"
 )
 
+// localRequest is a request addressed the way a browser on this machine
+// addresses the UI; httptest's default Host is a name the guard refuses.
+func localRequest(method, target string) *http.Request {
+	return httptest.NewRequest(method, "http://127.0.0.1:4518"+target, nil)
+}
+
 func TestVaultObjectsUsesBoundedEndpoint(t *testing.T) {
 	dir := t.TempDir()
 	l, err := net.Listen("unix", vaultdaemon.SocketPath(dir))
@@ -43,7 +49,7 @@ func TestBucketDetailDeepLink(t *testing.T) {
 	s := &Server{}
 	for _, path := range []string{"/", "/buckets/abc123"} {
 		w := httptest.NewRecorder()
-		s.Handler().ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		s.Handler().ServeHTTP(w, localRequest("GET", path))
 		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `id="bucket-page"`) {
 			t.Fatalf("%s: %d %s", path, w.Code, w.Body.String())
 		}
@@ -84,7 +90,7 @@ func TestVaultContentPassesRangesThrough(t *testing.T) {
 		w.Write([]byte("4567"))
 	})
 	s := &Server{vaultPath: dir}
-	req := httptest.NewRequest("GET", "/api/vault/content?bucket=media&ref=obj1", nil)
+	req := localRequest("GET", "/api/vault/content?bucket=media&ref=obj1")
 	req.Header.Set("Range", "bytes=4-7")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -116,7 +122,7 @@ func TestVaultContentNeverServesADocument(t *testing.T) {
 		})
 		s := &Server{vaultPath: dir}
 		w := httptest.NewRecorder()
-		s.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/api/vault/content?bucket=b&ref=o", nil))
+		s.Handler().ServeHTTP(w, localRequest("GET", "/api/vault/content?bucket=b&ref=o"))
 		header := w.Header()
 		if w.Code != http.StatusOK {
 			t.Fatalf("%q: status %d", mediaType, w.Code)
@@ -136,12 +142,12 @@ func TestVaultContentRelaysDaemonErrors(t *testing.T) {
 	})
 	s := &Server{vaultPath: dir}
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/api/vault/content?bucket=b&ref=nope", nil))
+	s.Handler().ServeHTTP(w, localRequest("GET", "/api/vault/content?bucket=b&ref=nope"))
 	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "no object matches") {
 		t.Fatalf("response: %d %s", w.Code, w.Body.String())
 	}
 	w = httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/api/vault/content?bucket=b", nil))
+	s.Handler().ServeHTTP(w, localRequest("GET", "/api/vault/content?bucket=b"))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("missing ref: %d", w.Code)
 	}
